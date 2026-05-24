@@ -155,8 +155,95 @@ func TestLiveRoomServiceOnAuctionClosedReleasesLock(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
-	if got.ActiveAuctionID != 0 || got.Status == domain.LiveRoomStatusLive {
-		t.Fatalf("expected room reset, got %+v", got)
+	if got.ActiveAuctionID != 0 || got.Status != domain.LiveRoomStatusLive {
+		t.Fatalf("expected room to keep live with no active auction, got %+v", got)
+	}
+}
+
+func TestLiveRoomServiceDeactivateKeepsRoomLive(t *testing.T) {
+	svc, auctionRepo, _, _ := newLiveRoomFixture(t)
+	ctx := context.Background()
+	room, err := svc.Create(ctx, CreateLiveRoomInput{ActorID: "m_1", ActorRole: domain.RoleMerchant, Title: "t"})
+	if err != nil {
+		t.Fatalf("create room: %v", err)
+	}
+	now := time.Now().UTC()
+	a := domain.AuctionLot{AuctionID: 7101, ItemID: 1, SellerID: "m_1", AuctionType: domain.AuctionTypeEnglish, Status: domain.AuctionStatusReady, LiveRoomID: room.ID, StartTime: now, EndTime: now.Add(time.Hour)}
+	if err := auctionRepo.Create(ctx, &a); err != nil {
+		t.Fatalf("create auction: %v", err)
+	}
+	if _, err := svc.ActivateAuction(ctx, room.ID, a.AuctionID, "m_1", domain.RoleMerchant); err != nil {
+		t.Fatalf("activate: %v", err)
+	}
+
+	got, err := svc.DeactivateAuction(ctx, room.ID, "m_1", domain.RoleMerchant)
+	if err != nil {
+		t.Fatalf("deactivate: %v", err)
+	}
+	if got.ActiveAuctionID != 0 || got.Status != domain.LiveRoomStatusLive {
+		t.Fatalf("expected room to keep live with no active auction, got %+v", got)
+	}
+}
+
+func TestLiveRoomServiceActivateUsesDurationSec(t *testing.T) {
+	svc, auctionRepo, _, _ := newLiveRoomFixture(t)
+	ctx := context.Background()
+	auctionSvc := NewAuctionService(auctionRepo, repository.NewMemoryItemRepository(), repository.NoopTxManager{})
+	svc.SetAuctionService(auctionSvc)
+	room, err := svc.Create(ctx, CreateLiveRoomInput{ActorID: "m_1", ActorRole: domain.RoleMerchant, Title: "t"})
+	if err != nil {
+		t.Fatalf("create room: %v", err)
+	}
+	now := time.Now().UTC().Add(time.Hour)
+	a := domain.AuctionLot{AuctionID: 7201, ItemID: 1, SellerID: "m_1", AuctionType: domain.AuctionTypeEnglish, Status: domain.AuctionStatusReady, LiveRoomID: room.ID, StartTime: now, EndTime: now.Add(time.Hour)}
+	if err := auctionRepo.Create(ctx, &a); err != nil {
+		t.Fatalf("create auction: %v", err)
+	}
+
+	started, err := svc.ActivateAuctionWithOptions(ctx, ActivateAuctionInput{RoomID: room.ID, AuctionID: a.AuctionID, ActorID: "m_1", ActorRole: domain.RoleMerchant, DurationSec: 600})
+	if err != nil {
+		t.Fatalf("activate: %v", err)
+	}
+	if got := int(started.EndTime.Sub(started.StartTime).Seconds()); got != 600 {
+		t.Fatalf("expected 600 second duration, got %d", got)
+	}
+	stored, err := auctionRepo.FindByID(ctx, a.AuctionID)
+	if err != nil {
+		t.Fatalf("find auction: %v", err)
+	}
+	if got := int(stored.EndTime.Sub(stored.StartTime).Seconds()); got != 600 {
+		t.Fatalf("expected stored 600 second duration, got %d", got)
+	}
+}
+
+func TestAuctionCancelClearsActiveAuctionAndKeepsLive(t *testing.T) {
+	svc, auctionRepo, _, _ := newLiveRoomFixture(t)
+	ctx := context.Background()
+	auctionSvc := NewAuctionService(auctionRepo, repository.NewMemoryItemRepository(), repository.NoopTxManager{})
+	auctionSvc.SetOnClose(svc.OnAuctionClosed)
+	svc.SetAuctionService(auctionSvc)
+	room, err := svc.Create(ctx, CreateLiveRoomInput{ActorID: "m_1", ActorRole: domain.RoleMerchant, Title: "t"})
+	if err != nil {
+		t.Fatalf("create room: %v", err)
+	}
+	now := time.Now().UTC()
+	a := domain.AuctionLot{AuctionID: 7301, ItemID: 1, SellerID: "m_1", AuctionType: domain.AuctionTypeEnglish, Status: domain.AuctionStatusReady, LiveRoomID: room.ID, StartTime: now, EndTime: now.Add(time.Hour)}
+	if err := auctionRepo.Create(ctx, &a); err != nil {
+		t.Fatalf("create auction: %v", err)
+	}
+	if _, err := svc.ActivateAuction(ctx, room.ID, a.AuctionID, "m_1", domain.RoleMerchant); err != nil {
+		t.Fatalf("activate: %v", err)
+	}
+
+	if _, err := auctionSvc.Cancel(ctx, a.AuctionID, "m_1", domain.RoleMerchant); err != nil {
+		t.Fatalf("cancel: %v", err)
+	}
+	got, err := svc.Get(ctx, room.ID)
+	if err != nil {
+		t.Fatalf("get room: %v", err)
+	}
+	if got.ActiveAuctionID != 0 || got.Status != domain.LiveRoomStatusLive {
+		t.Fatalf("expected cancel to clear active auction and keep live room, got %+v", got)
 	}
 }
 

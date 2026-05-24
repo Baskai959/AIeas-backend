@@ -212,6 +212,22 @@ func (h *AdminHandler) ListAuditLogs(ctx context.Context, c *app.RequestContext)
 	WriteSuccess(c, adminPageData("items", logs, c))
 }
 
+func (h *AdminHandler) ListOwnAuditLogs(ctx context.Context, c *app.RequestContext) {
+	filter := domain.AuditFilter{OperatorID: AuthUserID(c), Action: strings.TrimSpace(c.Query("action")), Limit: adminPageSize(c), Offset: adminOffset(c)}
+	if start, ok := parseTimeQuery(c, "startTime"); ok {
+		filter.StartTime = &start
+	}
+	if end, ok := parseTimeQuery(c, "endTime"); ok {
+		filter.EndTime = &end
+	}
+	logs, err := h.admin.ListAuditLogs(ctx, filter)
+	if err != nil {
+		writeServiceError(c, err)
+		return
+	}
+	WriteSuccess(c, adminPageData("items", logs, c))
+}
+
 func (h *AdminHandler) ListRiskEvents(ctx context.Context, c *app.RequestContext) {
 	filter := domain.RiskEventFilter{Status: normalizeRiskEventStatus(c.Query("status")), EventType: strings.TrimSpace(firstNonEmpty(c.Query("riskType"), c.Query("eventType"))), UserID: strings.TrimSpace(c.Query("userId")), Limit: adminPageSize(c), Offset: adminOffset(c)}
 	events, err := h.admin.ListRiskEvents(ctx, filter)

@@ -97,12 +97,16 @@ func newWSBidFixture(t *testing.T, cfg appconfig.AuctionConfig, hub *corews.Hub)
 		AntiSnipingSec: 60,
 		AntiExtendSec:  30,
 		DepositAmount:  100,
-		Status:         domain.AuctionStatusReady,
+		Status:         domain.AuctionStatusPendingAudit,
 		StartTime:      time.Now().UTC().Add(-time.Minute),
 		EndTime:        time.Now().UTC().Add(time.Hour),
 	})
 	if err != nil {
 		t.Fatalf("create auction: %v", err)
+	}
+	auction.Status = domain.AuctionStatusReady
+	if err := auctionRepo.Update(ctx, &auction); err != nil {
+		t.Fatalf("approve auction: %v", err)
 	}
 	if _, err := auctionSvc.Start(ctx, auction.AuctionID, "u_2001", domain.RoleMerchant); err != nil {
 		t.Fatalf("start auction: %v", err)

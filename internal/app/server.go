@@ -205,6 +205,7 @@ func NewServerWithDependencies(cfg appconfig.Config, deps ServerDependencies) *s
 	liveRoomService := service.NewLiveRoomService(deps.LiveRoomRepo, deps.AuctionRepo, deps.TxManager, deps.LiveRoomLock)
 	liveRoomService.SetAuctionService(auctionService)
 	liveRoomService.SetStatsDeps(deps.BidRepo, deps.RealtimeStore, deps.Hub)
+	auctionService.SetOnClose(liveRoomService.OnAuctionClosed)
 	hammerService.SetOnClose(liveRoomService.OnAuctionClosed)
 	bidService := service.NewBidService(deps.BidRepo, deps.AuctionRepo, deps.RealtimeStore, riskService, deps.Hub, cfg.Auction)
 	var stopWorkers context.CancelFunc
@@ -261,6 +262,7 @@ func NewServerWithAuth(authService *service.AuthService) *server.Hertz {
 	liveRoomService := service.NewLiveRoomService(liveRoomRepo, auctionRepo, repository.NoopTxManager{}, liveRoomLock)
 	liveRoomService.SetAuctionService(auctionService)
 	liveRoomService.SetStatsDeps(bidRepo, realtimeStore, hub)
+	auctionService.SetOnClose(liveRoomService.OnAuctionClosed)
 	hammerService.SetOnClose(liveRoomService.OnAuctionClosed)
 	return newServerWithServices(
 		authService,
@@ -331,6 +333,8 @@ func newServerWithServices(
 		protected := v1.Group("/auth", authHandler.AuthMiddleware())
 		protected.GET("/me", authHandler.Me)
 		protected.POST("/logout", authHandler.Logout)
+
+		v1.GET("/audit-logs", authHandler.AuthMiddleware(), httptransport.RoleAuth(domain.RoleMerchant, domain.RoleAdmin), adminHandler.ListOwnAuditLogs)
 
 		items := v1.Group("/items", authHandler.AuthMiddleware(), httptransport.RoleAuth(domain.RoleMerchant, domain.RoleAdmin))
 		items.POST("", itemHandler.Create)

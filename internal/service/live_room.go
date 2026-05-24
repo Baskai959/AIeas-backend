@@ -87,6 +87,14 @@ type UpdateLiveRoomInput struct {
 	Status      *domain.LiveRoomStatus
 }
 
+type ActivateAuctionInput struct {
+	RoomID      uint64
+	AuctionID   uint64
+	ActorID     string
+	ActorRole   domain.Role
+	DurationSec int
+}
+
 func (s *LiveRoomService) Create(ctx context.Context, in CreateLiveRoomInput) (domain.LiveRoom, error) {
 	title := strings.TrimSpace(in.Title)
 	if title == "" || strings.TrimSpace(in.ActorID) == "" {
@@ -205,25 +213,40 @@ func (s *LiveRoomService) ListLots(ctx context.Context, roomID uint64) ([]domain
 
 // ActivateAuction 在房间内启动指定拍品；保证同一房间同时只有一个拍品在拍。
 func (s *LiveRoomService) ActivateAuction(ctx context.Context, roomID uint64, auctionID uint64, actorID string, actorRole domain.Role) (domain.AuctionLot, error) {
-	room, err := s.rooms.FindByID(ctx, roomID)
+	return s.ActivateAuctionWithOptions(ctx, ActivateAuctionInput{RoomID: roomID, AuctionID: auctionID, ActorID: actorID, ActorRole: actorRole})
+}
+
+// ActivateAuctionWithOptions 在房间内启动指定拍品，可按前端传入的 durationSec 重置讲解时长。
+func (s *LiveRoomService) ActivateAuctionWithOptions(ctx context.Context, in ActivateAuctionInput) (domain.AuctionLot, error) {
+	if in.DurationSec < 0 {
+		return domain.AuctionLot{}, domain.ErrInvalidArgument
+	}
+	room, err := s.rooms.FindByID(ctx, in.RoomID)
 	if err != nil {
 		return domain.AuctionLot{}, err
 	}
-	if !canAccessSellerOwned(actorID, actorRole, room.MerchantID) {
+	if !canAccessSellerOwned(in.ActorID, in.ActorRole, room.MerchantID) {
 		return domain.AuctionLot{}, domain.ErrForbidden
 	}
-	auction, err := s.auctions.FindByID(ctx, auctionID)
+	auction, err := s.auctions.FindByID(ctx, in.AuctionID)
 	if err != nil {
 		return domain.AuctionLot{}, err
 	}
-	if auction.LiveRoomID != roomID {
-		return domain.AuctionLot{}, fmt.Errorf("%w: auction %d not in live room %d", domain.ErrInvalidArgument, auctionID, roomID)
+	if auction.LiveRoomID != in.RoomID {
+		return domain.AuctionLot{}, fmt.Errorf("%w: auction %d not in live room %d", domain.ErrInvalidArgument, in.AuctionID, in.RoomID)
 	}
 	if auction.Status.Terminal() {
 		return domain.AuctionLot{}, domain.ErrInvalidState
 	}
+	var startTime, endTime time.Time
+	if in.DurationSec > 0 {
+		startTime = time.Now().UTC()
+		endTime = startTime.Add(time.Duration(in.DurationSec) * time.Second)
+		auction.StartTime = startTime
+		auction.EndTime = endTime
+	}
 	ttl := lockTTLForAuction(auction)
-	acquired, holder, err := s.lock.Acquire(ctx, roomID, auctionID, ttl)
+	acquired, holder, err := s.lock.Acquire(ctx, in.RoomID, in.AuctionID, ttl)
 	if err != nil {
 		return domain.AuctionLot{}, err
 	}
@@ -231,18 +254,18 @@ func (s *LiveRoomService) ActivateAuction(ctx context.Context, roomID uint64, au
 		return domain.AuctionLot{}, fmt.Errorf("%w: held by auction %d", ErrLiveRoomBusy, holder)
 	}
 	// 写持久化字段；只要 active 不一致就更新。
-	if room.ActiveAuctionID != auctionID || room.Status != domain.LiveRoomStatusLive {
-		room.ActiveAuctionID = auctionID
+	if room.ActiveAuctionID != in.AuctionID || room.Status != domain.LiveRoomStatusLive {
+		room.ActiveAuctionID = in.AuctionID
 		room.Status = domain.LiveRoomStatusLive
 		if err := s.rooms.Update(ctx, &room); err != nil {
-			_ = s.lock.Release(ctx, roomID, auctionID)
+			_ = s.lock.Release(ctx, in.RoomID, in.AuctionID)
 			return domain.AuctionLot{}, err
 		}
 	}
 	if s.auction != nil {
-		started, err := s.auction.Start(ctx, auctionID, actorID, actorRole)
+		started, err := s.auction.StartWithTiming(ctx, in.AuctionID, in.ActorID, in.ActorRole, startTime, endTime)
 		if err != nil {
-			_ = s.lock.Release(ctx, roomID, auctionID)
+			_ = s.lock.Release(ctx, in.RoomID, in.AuctionID)
 			room.ActiveAuctionID = 0
 			_ = s.rooms.Update(ctx, &room)
 			return domain.AuctionLot{}, err
@@ -264,9 +287,6 @@ func (s *LiveRoomService) DeactivateAuction(ctx context.Context, roomID uint64, 
 	if room.ActiveAuctionID != 0 {
 		_ = s.lock.Release(ctx, roomID, room.ActiveAuctionID)
 		room.ActiveAuctionID = 0
-	}
-	if room.Status == domain.LiveRoomStatusLive {
-		room.Status = domain.LiveRoomStatusOffline
 	}
 	if err := s.rooms.Update(ctx, &room); err != nil {
 		return domain.LiveRoom{}, err
@@ -292,9 +312,6 @@ func (s *LiveRoomService) OnAuctionClosed(ctx context.Context, auctionID uint64)
 	}
 	if room.ActiveAuctionID == auctionID {
 		room.ActiveAuctionID = 0
-		if room.Status == domain.LiveRoomStatusLive {
-			room.Status = domain.LiveRoomStatusOffline
-		}
 		_ = s.rooms.Update(ctx, &room)
 	}
 }

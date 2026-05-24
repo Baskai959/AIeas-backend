@@ -35,7 +35,9 @@ type liveRoomPatchRequest struct {
 }
 
 type liveRoomActivateRequest struct {
-	AuctionID uint64 `json:"auctionId"`
+	AuctionID       uint64 `json:"auctionId"`
+	DurationSec     int    `json:"durationSec"`
+	DurationMinutes int    `json:"durationMinutes"`
 }
 
 type liveRoomMountRequest struct {
@@ -154,7 +156,13 @@ func (h *LiveRoomHandler) Activate(ctx context.Context, c *app.RequestContext) {
 		WriteError(c, 400, 20001, "参数不合法", nil)
 		return
 	}
-	auction, err := h.rooms.ActivateAuction(ctx, id, req.AuctionID, AuthUserID(c), AuthRole(c))
+	auction, err := h.rooms.ActivateAuctionWithOptions(ctx, service.ActivateAuctionInput{
+		RoomID:      id,
+		AuctionID:   req.AuctionID,
+		ActorID:     AuthUserID(c),
+		ActorRole:   AuthRole(c),
+		DurationSec: req.DurationSec,
+	})
 	if err != nil {
 		writeLiveRoomError(c, err)
 		return

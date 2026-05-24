@@ -31,7 +31,7 @@ func (s *AdminService) AuditAuction(ctx context.Context, auctionID uint64, appro
 	if approved {
 		status = domain.AuctionStatusReady
 	}
-	return s.auctions.Update(ctx, auctionID, UpdateAuctionInput{ActorID: actorID, ActorRole: domain.RoleAdmin, Status: &status})
+	return s.auctions.Update(ctx, auctionID, UpdateAuctionInput{ActorID: actorID, ActorRole: domain.RoleAdmin, Status: &status, allowSystemStatus: true})
 }
 
 func (s *AdminService) CancelAuction(ctx context.Context, auctionID uint64, actorID string) (domain.AuctionLot, error) {

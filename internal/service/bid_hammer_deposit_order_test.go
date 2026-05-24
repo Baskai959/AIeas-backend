@@ -363,19 +363,20 @@ func newRealtimeAuctionFixtureWithRule(t *testing.T, cfg appconfig.AuctionConfig
 		startTime = endTime.Add(-time.Minute)
 	}
 	auction, err := auctionSvc.Create(ctx, CreateAuctionInput{
-		ActorID:        "u_2001",
-		ActorRole:      domain.RoleMerchant,
-		ItemID:         item.ID,
-		AuctionType:    domain.AuctionTypeEnglish,
-		StartPrice:     1000,
-		ReservePrice:   reservePrice,
-		IncrementRule:  rule,
-		AntiSnipingSec: 60,
-		AntiExtendSec:  30,
-		DepositAmount:  100,
-		Status:         domain.AuctionStatusReady,
-		StartTime:      startTime,
-		EndTime:        endTime,
+		ActorID:           "u_2001",
+		ActorRole:         domain.RoleMerchant,
+		ItemID:            item.ID,
+		AuctionType:       domain.AuctionTypeEnglish,
+		StartPrice:        1000,
+		ReservePrice:      reservePrice,
+		IncrementRule:     rule,
+		AntiSnipingSec:    60,
+		AntiExtendSec:     30,
+		DepositAmount:     100,
+		Status:            domain.AuctionStatusReady,
+		StartTime:         startTime,
+		EndTime:           endTime,
+		allowSystemStatus: true,
 	})
 	if err != nil {
 		t.Fatalf("create auction: %v", err)

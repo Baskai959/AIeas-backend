@@ -19,6 +19,7 @@ type AuctionService struct {
 	realtime  repository.AuctionRealtimeStore
 	publisher EventPublisher
 	timer     *TimerScheduler
+	onClose   func(ctx context.Context, auctionID uint64)
 	cfg       appconfig.AuctionConfig
 }
 
@@ -27,36 +28,38 @@ type AuctionIDGenerator interface {
 }
 
 type CreateAuctionInput struct {
-	ActorID        string
-	ActorRole      domain.Role
-	AuctionID      uint64
-	ItemID         uint64
-	SellerID       string
-	LiveRoomID     uint64
-	AuctionType    domain.AuctionType
-	StartPrice     int64
-	ReservePrice   int64
-	IncrementRule  json.RawMessage
-	AntiSnipingSec int
-	AntiExtendSec  int
-	DepositAmount  int64
-	Status         domain.AuctionStatus
-	StartTime      time.Time
-	EndTime        time.Time
+	ActorID           string
+	ActorRole         domain.Role
+	AuctionID         uint64
+	ItemID            uint64
+	SellerID          string
+	LiveRoomID        uint64
+	AuctionType       domain.AuctionType
+	StartPrice        int64
+	ReservePrice      int64
+	IncrementRule     json.RawMessage
+	AntiSnipingSec    int
+	AntiExtendSec     int
+	DepositAmount     int64
+	Status            domain.AuctionStatus
+	StartTime         time.Time
+	EndTime           time.Time
+	allowSystemStatus bool
 }
 
 type UpdateAuctionInput struct {
-	ActorID        string
-	ActorRole      domain.Role
-	StartPrice     *int64
-	ReservePrice   *int64
-	IncrementRule  *json.RawMessage
-	AntiSnipingSec *int
-	AntiExtendSec  *int
-	DepositAmount  *int64
-	Status         *domain.AuctionStatus
-	StartTime      *time.Time
-	EndTime        *time.Time
+	ActorID           string
+	ActorRole         domain.Role
+	StartPrice        *int64
+	ReservePrice      *int64
+	IncrementRule     *json.RawMessage
+	AntiSnipingSec    *int
+	AntiExtendSec     *int
+	DepositAmount     *int64
+	Status            *domain.AuctionStatus
+	StartTime         *time.Time
+	EndTime           *time.Time
+	allowSystemStatus bool
 }
 
 func NewAuctionService(auctions repository.AuctionRepository, items repository.ItemRepository, tx repository.TxManager) *AuctionService {
@@ -79,6 +82,10 @@ func (s *AuctionService) SetPublisher(publisher EventPublisher) {
 
 func (s *AuctionService) SetTimer(timer *TimerScheduler) {
 	s.timer = timer
+}
+
+func (s *AuctionService) SetOnClose(fn func(ctx context.Context, auctionID uint64)) {
+	s.onClose = fn
 }
 
 func (s *AuctionService) SetAuctionConfig(cfg appconfig.AuctionConfig) {
@@ -132,6 +139,9 @@ func (s *AuctionService) Create(ctx context.Context, in CreateAuctionInput) (dom
 		in.Status = domain.AuctionStatusDraft
 	}
 	if !in.Status.Valid() {
+		return domain.AuctionLot{}, domain.ErrInvalidArgument
+	}
+	if !in.allowSystemStatus && !isEditableAuctionStatus(in.Status) {
 		return domain.AuctionLot{}, domain.ErrInvalidArgument
 	}
 	now := time.Now().UTC()
@@ -259,6 +269,9 @@ func (s *AuctionService) Update(ctx context.Context, id uint64, in UpdateAuction
 			return domain.ErrInvalidArgument
 		}
 		if in.Status != nil {
+			if !in.allowSystemStatus && !isEditableAuctionStatus(*in.Status) {
+				return domain.ErrInvalidArgument
+			}
 			if !in.Status.Valid() || !domain.CanTransitionAuction(current.Status, *in.Status) {
 				return domain.ErrInvalidState
 			}
@@ -297,8 +310,21 @@ func (s *AuctionService) Delete(ctx context.Context, id uint64, actorID string, 
 }
 
 func (s *AuctionService) Start(ctx context.Context, id uint64, actorID string, actorRole domain.Role) (domain.AuctionLot, error) {
+	return s.StartWithTiming(ctx, id, actorID, actorRole, time.Time{}, time.Time{})
+}
+
+func (s *AuctionService) StartWithTiming(ctx context.Context, id uint64, actorID string, actorRole domain.Role, startTime, endTime time.Time) (domain.AuctionLot, error) {
 	status := domain.AuctionStatusRunning
-	auction, err := s.Update(ctx, id, UpdateAuctionInput{ActorID: actorID, ActorRole: actorRole, Status: &status})
+	input := UpdateAuctionInput{ActorID: actorID, ActorRole: actorRole, Status: &status, allowSystemStatus: true}
+	if !startTime.IsZero() {
+		start := startTime.UTC()
+		input.StartTime = &start
+	}
+	if !endTime.IsZero() {
+		end := endTime.UTC()
+		input.EndTime = &end
+	}
+	auction, err := s.Update(ctx, id, input)
 	if err != nil {
 		return domain.AuctionLot{}, err
 	}
@@ -319,7 +345,14 @@ func (s *AuctionService) Start(ctx context.Context, id uint64, actorID string, a
 
 func (s *AuctionService) Cancel(ctx context.Context, id uint64, actorID string, actorRole domain.Role) (domain.AuctionLot, error) {
 	status := domain.AuctionStatusClosedFailed
-	return s.Update(ctx, id, UpdateAuctionInput{ActorID: actorID, ActorRole: actorRole, Status: &status})
+	auction, err := s.Update(ctx, id, UpdateAuctionInput{ActorID: actorID, ActorRole: actorRole, Status: &status, allowSystemStatus: true})
+	if err != nil {
+		return domain.AuctionLot{}, err
+	}
+	if s.onClose != nil {
+		s.onClose(ctx, id)
+	}
+	return auction, nil
 }
 
 func (s *AuctionService) State(ctx context.Context, id uint64, actorID string, actorRole domain.Role) (domain.AuctionState, error) {
@@ -378,6 +411,10 @@ func snapshotFromAuction(auction domain.AuctionLot) (json.RawMessage, error) {
 		},
 	}
 	return json.Marshal(payload)
+}
+
+func isEditableAuctionStatus(status domain.AuctionStatus) bool {
+	return status == domain.AuctionStatusDraft || status == domain.AuctionStatusPendingAudit
 }
 
 func hasAuctionContentPatch(in UpdateAuctionInput) bool {

@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -46,7 +47,7 @@ func TestAuctionServiceCreateGeneratesAuctionID(t *testing.T) {
 		ItemID:        item.ID,
 		StartPrice:    1000,
 		ReservePrice:  5000,
-		Status:        domain.AuctionStatusReady,
+		Status:        domain.AuctionStatusPendingAudit,
 		StartTime:     start,
 		EndTime:       start.Add(time.Hour),
 		AuctionType:   domain.AuctionTypeEnglish,
@@ -94,7 +95,7 @@ func TestAuctionServiceCreatePreservesProvidedAuctionID(t *testing.T) {
 		ItemID:        item.ID,
 		StartPrice:    1000,
 		ReservePrice:  5000,
-		Status:        domain.AuctionStatusReady,
+		Status:        domain.AuctionStatusPendingAudit,
 		StartTime:     start,
 		EndTime:       start.Add(time.Hour),
 		AuctionType:   domain.AuctionTypeEnglish,
@@ -105,5 +106,77 @@ func TestAuctionServiceCreatePreservesProvidedAuctionID(t *testing.T) {
 	}
 	if auction.AuctionID != 987654321 {
 		t.Fatalf("expected provided auction ID, got %d", auction.AuctionID)
+	}
+}
+
+func TestAuctionServiceCreateRejectsApprovedStatus(t *testing.T) {
+	ctx := context.Background()
+	itemRepo := repository.NewMemoryItemRepository()
+	auctionRepo := repository.NewMemoryAuctionRepository()
+	svc := NewAuctionService(auctionRepo, itemRepo, repository.NoopTxManager{})
+
+	item := domain.Item{SellerID: "u_2001", Title: "Watch", Category: "luxury", ConditionGrade: domain.ConditionNew, Status: domain.ItemStatusReady}
+	if err := itemRepo.Create(ctx, &item); err != nil {
+		t.Fatalf("create item: %v", err)
+	}
+
+	start := time.Now().UTC().Add(time.Minute)
+	_, err := svc.Create(ctx, CreateAuctionInput{
+		ActorID:       "u_2001",
+		ActorRole:     domain.RoleMerchant,
+		ItemID:        item.ID,
+		StartPrice:    1000,
+		ReservePrice:  5000,
+		Status:        domain.AuctionStatusReady,
+		StartTime:     start,
+		EndTime:       start.Add(time.Hour),
+		AuctionType:   domain.AuctionTypeEnglish,
+		DepositAmount: 100,
+	})
+	if !errors.Is(err, domain.ErrInvalidArgument) {
+		t.Fatalf("expected invalid argument, got %v", err)
+	}
+}
+
+func TestAuctionServiceUpdateRejectsApprovedStatusOutsideAudit(t *testing.T) {
+	ctx := context.Background()
+	itemRepo := repository.NewMemoryItemRepository()
+	auctionRepo := repository.NewMemoryAuctionRepository()
+	svc := NewAuctionService(auctionRepo, itemRepo, repository.NoopTxManager{})
+
+	item := domain.Item{SellerID: "u_2001", Title: "Watch", Category: "luxury", ConditionGrade: domain.ConditionNew, Status: domain.ItemStatusReady}
+	if err := itemRepo.Create(ctx, &item); err != nil {
+		t.Fatalf("create item: %v", err)
+	}
+
+	start := time.Now().UTC().Add(time.Minute)
+	auction, err := svc.Create(ctx, CreateAuctionInput{
+		ActorID:       "u_2001",
+		ActorRole:     domain.RoleMerchant,
+		ItemID:        item.ID,
+		StartPrice:    1000,
+		ReservePrice:  5000,
+		Status:        domain.AuctionStatusPendingAudit,
+		StartTime:     start,
+		EndTime:       start.Add(time.Hour),
+		AuctionType:   domain.AuctionTypeEnglish,
+		DepositAmount: 100,
+	})
+	if err != nil {
+		t.Fatalf("create auction: %v", err)
+	}
+
+	ready := domain.AuctionStatusReady
+	if _, err := svc.Update(ctx, auction.AuctionID, UpdateAuctionInput{ActorID: "u_2001", ActorRole: domain.RoleMerchant, Status: &ready}); !errors.Is(err, domain.ErrInvalidArgument) {
+		t.Fatalf("expected invalid argument, got %v", err)
+	}
+
+	admin := NewAdminService(repository.NewSeedUserRepository(), svc, nil, nil, nil, nil)
+	approved, err := admin.AuditAuction(ctx, auction.AuctionID, true, "u_9001")
+	if err != nil {
+		t.Fatalf("audit auction: %v", err)
+	}
+	if approved.Status != domain.AuctionStatusReady {
+		t.Fatalf("expected audit to approve auction, got %s", approved.Status)
 	}
 }

@@ -239,6 +239,7 @@ func TestItemCreateRejectsImageLargerThan2MB(t *testing.T) {
 func TestItemRoutesProtectItemsBoundToActiveAuctions(t *testing.T) {
 	h := newTestServer()
 	merchantToken := loginForToken(t, h.Engine, "merchant001", "Passw0rd!", "merchant")
+	adminToken := loginForToken(t, h.Engine, "admin001", "AdminPassw0rd!", "admin")
 
 	missing := doJSONWithHeaders(t, h.Engine, consts.MethodGet, "/api/v1/items/999999", "", ut.Header{Key: "Authorization", Value: "Bearer " + merchantToken})
 	if missing.status != 404 || missing.body.Code != 30001 {
@@ -258,7 +259,7 @@ func TestItemRoutesProtectItemsBoundToActiveAuctions(t *testing.T) {
 	}
 	mustDecodeData(t, createItem.body.Data, &itemData)
 
-	auctionBody := `{"itemId":` + strconv.FormatUint(itemData.ID, 10) + `,"startPrice":10000,"reservePrice":10000,"depositAmount":0,"status":"READY","incrementRule":{"type":"fixed","amount":100}}`
+	auctionBody := `{"itemId":` + strconv.FormatUint(itemData.ID, 10) + `,"startPrice":10000,"reservePrice":10000,"depositAmount":0,"status":"PENDING_AUDIT","incrementRule":{"type":"fixed","amount":100}}`
 	createAuction := doJSONWithHeaders(t, h.Engine, consts.MethodPost, "/api/v1/auctions", auctionBody, ut.Header{Key: "Authorization", Value: "Bearer " + merchantToken})
 	if createAuction.status != 200 || createAuction.body.Code != 0 {
 		t.Fatalf("expected auction create success, got status=%d raw=%s", createAuction.status, createAuction.raw)
@@ -267,6 +268,11 @@ func TestItemRoutesProtectItemsBoundToActiveAuctions(t *testing.T) {
 		AuctionID uint64 `json:"auctionId"`
 	}
 	mustDecodeData(t, createAuction.body.Data, &auctionData)
+
+	auditAuction := doJSONWithHeaders(t, h.Engine, consts.MethodPost, "/api/v1/admin/auctions/"+strconv.FormatUint(auctionData.AuctionID, 10)+"/audit", `{"auditResult":"APPROVED"}`, ut.Header{Key: "Authorization", Value: "Bearer " + adminToken}, ut.Header{Key: "Idempotency-Key", Value: "item-active-auction-audit"})
+	if auditAuction.status != 200 || auditAuction.body.Code != 0 {
+		t.Fatalf("expected auction audit success, got status=%d raw=%s", auditAuction.status, auditAuction.raw)
+	}
 
 	start := doJSONWithHeaders(t, h.Engine, consts.MethodPost, "/api/v1/auctions/"+strconv.FormatUint(auctionData.AuctionID, 10)+"/start", "", ut.Header{Key: "Authorization", Value: "Bearer " + merchantToken}, ut.Header{Key: "Idempotency-Key", Value: "item-active-auction-start"})
 	if start.status != 200 || start.body.Code != 0 {
@@ -293,10 +299,55 @@ func TestItemRoutesProtectItemsBoundToActiveAuctions(t *testing.T) {
 	}
 }
 
+func TestAuctionCreateAndUpdateRejectApprovedStatus(t *testing.T) {
+	h := newTestServer()
+	merchantToken := loginForToken(t, h.Engine, "merchant001", "Passw0rd!", "merchant")
+
+	item := doMultipartWithHeaders(t, h.Engine, consts.MethodPost, "/api/v1/items", map[string]string{
+		"title":          "Audit Required Lot",
+		"category":       "collectible",
+		"conditionGrade": "GOOD",
+	}, nil, ut.Header{Key: "Authorization", Value: "Bearer " + merchantToken})
+	if item.status != 200 || item.body.Code != 0 {
+		t.Fatalf("expected item create success, got status=%d raw=%s", item.status, item.raw)
+	}
+	var itemData struct {
+		ID uint64 `json:"id"`
+	}
+	mustDecodeData(t, item.body.Data, &itemData)
+
+	readyBody := `{"itemId":` + strconv.FormatUint(itemData.ID, 10) + `,"startPrice":10000,"reservePrice":15000,"depositAmount":1000,"status":"READY","incrementRule":{"type":"fixed","amount":500}}`
+	createReady := doJSONWithHeaders(t, h.Engine, consts.MethodPost, "/api/v1/auctions", readyBody, ut.Header{Key: "Authorization", Value: "Bearer " + merchantToken})
+	if createReady.status != 400 || createReady.body.Code != 20001 {
+		t.Fatalf("expected create READY to fail validation, got status=%d code=%d raw=%s", createReady.status, createReady.body.Code, createReady.raw)
+	}
+
+	pendingBody := `{"itemId":` + strconv.FormatUint(itemData.ID, 10) + `,"startPrice":10000,"reservePrice":15000,"depositAmount":1000,"status":"PENDING_AUDIT","incrementRule":{"type":"fixed","amount":500}}`
+	createPending := doJSONWithHeaders(t, h.Engine, consts.MethodPost, "/api/v1/auctions", pendingBody, ut.Header{Key: "Authorization", Value: "Bearer " + merchantToken})
+	if createPending.status != 200 || createPending.body.Code != 0 {
+		t.Fatalf("expected create PENDING_AUDIT success, got status=%d raw=%s", createPending.status, createPending.raw)
+	}
+	ladderBody := `{"itemId":` + strconv.FormatUint(itemData.ID, 10) + `,"startPrice":100,"reservePrice":5000,"depositAmount":0,"status":"PENDING_AUDIT","incrementRule":{"type":"ladder","steps":[{"min":0,"max":1000,"amount":100},{"min":1000,"amount":200}]}}`
+	createLadder := doJSONWithHeaders(t, h.Engine, consts.MethodPost, "/api/v1/auctions", ladderBody, ut.Header{Key: "Authorization", Value: "Bearer " + merchantToken})
+	if createLadder.status != 200 || createLadder.body.Code != 0 {
+		t.Fatalf("expected create ladder PENDING_AUDIT success, got status=%d raw=%s", createLadder.status, createLadder.raw)
+	}
+	var auctionData struct {
+		AuctionID uint64 `json:"auctionId"`
+	}
+	mustDecodeData(t, createPending.body.Data, &auctionData)
+
+	patchReady := doJSONWithHeaders(t, h.Engine, consts.MethodPatch, "/api/v1/auctions/"+strconv.FormatUint(auctionData.AuctionID, 10), `{"status":"READY"}`, ut.Header{Key: "Authorization", Value: "Bearer " + merchantToken})
+	if patchReady.status != 400 || patchReady.body.Code != 20001 {
+		t.Fatalf("expected patch READY to fail validation, got status=%d code=%d raw=%s", patchReady.status, patchReady.body.Code, patchReady.raw)
+	}
+}
+
 func TestAuctionRoutesStateAndIdempotencyMiddleware(t *testing.T) {
 	h := newTestServer()
 	merchantToken := loginForToken(t, h.Engine, "merchant001", "Passw0rd!", "merchant")
 	buyerToken := loginForToken(t, h.Engine, "buyer001", "Passw0rd!", "buyer")
+	adminToken := loginForToken(t, h.Engine, "admin001", "AdminPassw0rd!", "admin")
 
 	item := doMultipartWithHeaders(t, h.Engine, consts.MethodPost, "/api/v1/items", map[string]string{
 		"title":          "Watch",
@@ -311,7 +362,7 @@ func TestAuctionRoutesStateAndIdempotencyMiddleware(t *testing.T) {
 	}
 	mustDecodeData(t, item.body.Data, &itemData)
 
-	auctionBody := `{"itemId":` + strconv.FormatUint(itemData.ID, 10) + `,"startPrice":10000,"reservePrice":15000,"depositAmount":1000,"status":"READY","incrementRule":{"type":"fixed","amount":500}}`
+	auctionBody := `{"itemId":` + strconv.FormatUint(itemData.ID, 10) + `,"startPrice":10000,"reservePrice":15000,"depositAmount":1000,"status":"PENDING_AUDIT","incrementRule":{"type":"fixed","amount":500}}`
 	createAuction := doJSONWithHeaders(t, h.Engine, consts.MethodPost, "/api/v1/auctions", auctionBody, ut.Header{Key: "Authorization", Value: "Bearer " + merchantToken})
 	if createAuction.status != 200 || createAuction.body.Code != 0 {
 		t.Fatalf("expected auction create success, got status=%d raw=%s", createAuction.status, createAuction.raw)
@@ -321,8 +372,13 @@ func TestAuctionRoutesStateAndIdempotencyMiddleware(t *testing.T) {
 		Status    string `json:"status"`
 	}
 	mustDecodeData(t, createAuction.body.Data, &auctionData)
-	if auctionData.AuctionID == 0 || auctionData.Status != "READY" {
+	if auctionData.AuctionID == 0 || auctionData.Status != "PENDING_AUDIT" {
 		t.Fatalf("unexpected auction create payload: %+v", auctionData)
+	}
+
+	auditAuction := doJSONWithHeaders(t, h.Engine, consts.MethodPost, "/api/v1/admin/auctions/"+strconv.FormatUint(auctionData.AuctionID, 10)+"/audit", `{"auditResult":"APPROVED"}`, ut.Header{Key: "Authorization", Value: "Bearer " + adminToken}, ut.Header{Key: "Idempotency-Key", Value: "auction-route-audit-1"})
+	if auditAuction.status != 200 || auditAuction.body.Code != 0 {
+		t.Fatalf("expected auction audit success, got status=%d raw=%s", auditAuction.status, auditAuction.raw)
 	}
 
 	noKey := doJSONWithHeaders(t, h.Engine, consts.MethodPost, "/api/v1/auctions/"+strconv.FormatUint(auctionData.AuctionID, 10)+"/start", "", ut.Header{Key: "Authorization", Value: "Bearer " + merchantToken})
@@ -451,6 +507,7 @@ func TestAdminRoutesMinimalClosedLoop(t *testing.T) {
 	}
 	h := NewServerWithDependencies(cfg, ServerDependencies{UserRepo: userRepo, AuctionRepo: auctionRepo, OrderRepo: orderRepo, RiskRepo: riskRepo, AuditRepo: auditRepo})
 	adminToken := loginForToken(t, h.Engine, "admin001", "AdminPassw0rd!", "admin")
+	merchantToken := loginForToken(t, h.Engine, "merchant001", "Passw0rd!", "merchant")
 	buyerToken := loginForToken(t, h.Engine, "buyer001", "Passw0rd!", "buyer")
 
 	noAuth := doJSON(t, h.Engine, consts.MethodGet, "/api/v1/admin/users", "")
@@ -520,6 +577,30 @@ func TestAdminRoutesMinimalClosedLoop(t *testing.T) {
 	auditLogs := doJSONWithHeaders(t, h.Engine, consts.MethodGet, "/api/v1/admin/audit-logs", "", ut.Header{Key: "Authorization", Value: "Bearer " + adminToken})
 	if auditLogs.status != 200 || auditLogs.body.Code != 0 {
 		t.Fatalf("expected admin audit logs success, got status=%d raw=%s", auditLogs.status, auditLogs.raw)
+	}
+	merchantCreateItem := doMultipartWithHeaders(t, h.Engine, consts.MethodPost, "/api/v1/items", map[string]string{
+		"title":          "Audit Log Item",
+		"category":       "collectible",
+		"conditionGrade": "GOOD",
+	}, nil, ut.Header{Key: "Authorization", Value: "Bearer " + merchantToken})
+	if merchantCreateItem.status != 200 || merchantCreateItem.body.Code != 0 {
+		t.Fatalf("expected merchant item create success, got status=%d raw=%s", merchantCreateItem.status, merchantCreateItem.raw)
+	}
+	merchantAuditLogs := doJSONWithHeaders(t, h.Engine, consts.MethodGet, "/api/v1/audit-logs?page=1&page_size=5", "", ut.Header{Key: "Authorization", Value: "Bearer " + merchantToken})
+	if merchantAuditLogs.status != 200 || merchantAuditLogs.body.Code != 0 {
+		t.Fatalf("expected merchant audit logs success, got status=%d raw=%s", merchantAuditLogs.status, merchantAuditLogs.raw)
+	}
+	var merchantAuditData struct {
+		Items []domain.AuditLog `json:"items"`
+	}
+	mustDecodeData(t, merchantAuditLogs.body.Data, &merchantAuditData)
+	if len(merchantAuditData.Items) == 0 {
+		t.Fatalf("expected merchant audit logs, got %+v", merchantAuditData)
+	}
+	for _, log := range merchantAuditData.Items {
+		if log.OperatorID != "u_2001" {
+			t.Fatalf("expected only merchant logs, got %+v", merchantAuditData.Items)
+		}
 	}
 	riskEvents := doJSONWithHeaders(t, h.Engine, consts.MethodGet, "/api/v1/admin/risk/events", "", ut.Header{Key: "Authorization", Value: "Bearer " + adminToken})
 	if riskEvents.status != 200 || riskEvents.body.Code != 0 {
