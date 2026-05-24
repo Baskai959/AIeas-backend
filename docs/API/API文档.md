@@ -4,7 +4,7 @@
 
 - 版本号：v1
 - API 基础地址：`https://api.example.com/api/v1`（演示环境）
-- 协议：HTTP/1.1 + 原生 WebSocket
+- 协议：HTTP/1.1 + Hertz WebSocket（`github.com/hertz-contrib/websocket`）
 - 数据格式：`application/json; charset=utf-8`
 - 时间格式：ISO 8601；时间戳字段使用毫秒，例如 `bidTsMs: 1769155200000`
 - 金额字段：统一单位「分」，例如 100 元表示为 `10000`
@@ -38,6 +38,7 @@ JWT claims：
 
 - REST 写操作建议携带请求头：`Idempotency-Key: <uuid>`
 - 落锤、支付等关键写操作必须携带 `Idempotency-Key`
+- REST 幂等缓存优先使用 Redis，缓存 key 由用户 ID、HTTP method、path、`Idempotency-Key` 组成；缓存 TTL 由 `idempotency.ttl` / `IDEMPOTENCY_TTL` 配置，默认 24h
 - WebSocket 出价使用报文字段 `requestId` 做客户端请求幂等与响应关联
 
 ### 2.3 通用响应结构
@@ -296,37 +297,42 @@ curl 'https://api.example.com/api/v1/auth/me' \
 #### POST /api/v1/items
 
 - 用途：商家创建商品
-- Header：`Authorization`、`Content-Type`、`Idempotency-Key`
-- Body 示例：
+- Header：`Authorization`、`Content-Type: multipart/form-data`、`Idempotency-Key`
+- FormData 字段：
 
-```json
-{
-  "title": "孤品手作陶瓷杯",
-  "description": "直播间限量拍卖款",
-  "images": ["https://cdn.example.com/item/1.jpg"],
-  "category": "home",
-  "marketPrice": 12900
-}
-```
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `title` | string | 是 | 商品标题 |
+| `category` | string | 是 | 类目 |
+| `brand` | string | 否 | 品牌 |
+| `conditionGrade` | string | 否 | `NEW`、`LIKE_NEW`、`GOOD`、`FAIR`，默认 `NEW` |
+| `status` | string | 否 | `DRAFT`、`READY`、`LISTED`、`OFFLINE`，默认 `DRAFT` |
+| `description` | string | 否 | 商品描述 |
+| `images` | file[] | 否 | 可重复提交的图片文件字段；单张图片不超过 2MB，后端上传对象存储后保存 URL 数组 |
 
 - 请求示例：
 
 ```bash
 curl -X POST 'https://api.example.com/api/v1/items' \
   -H 'Authorization: Bearer <merchant_jwt>' \
-  -H 'Content-Type: application/json; charset=utf-8' \
   -H 'Idempotency-Key: item-create-001' \
-  -d '{"title":"孤品手作陶瓷杯","description":"直播间限量拍卖款","images":["https://cdn.example.com/item/1.jpg"],"category":"home","marketPrice":12900}'
+  -F 'title=孤品手作陶瓷杯' \
+  -F 'category=home' \
+  -F 'brand=DemoBrand' \
+  -F 'conditionGrade=NEW' \
+  -F 'description=直播间限量拍卖款' \
+  -F 'images=@/path/to/item-1.jpg' \
+  -F 'images=@/path/to/item-2.jpg'
 ```
 
 - Response 示例：
 
 ```json
-{"code":0,"message":"success","data":{"id":"item_1001","title":"孤品手作陶瓷杯","marketPrice":12900,"status":"ACTIVE"},"trace_id":"trc_item_create"}
+{"code":0,"message":"success","data":{"id":1001,"sellerId":"u_2001","title":"孤品手作陶瓷杯","category":"home","brand":"DemoBrand","conditionGrade":"NEW","images":["https://aieas.tos-cn-boe.volces.com/abc.png"],"description":"直播间限量拍卖款","status":"DRAFT"},"trace_id":"trc_item_create"}
 ```
 
 - 常见错误码：`10003`、`20001`、`90004`
-- 备注：金额字段 `marketPrice` 单位为分。
+- 备注：接口不接收图片 URL。图片必须以二进制文件提交，单张图片大小限制 2MB 以内，响应中的 `images` 为对象存储访问 URL。
 
 #### GET /api/v1/items
 
@@ -364,7 +370,7 @@ curl 'https://api.example.com/api/v1/items/item_1001' \
 - Response 示例：
 
 ```json
-{"code":0,"message":"success","data":{"id":"item_1001","title":"孤品手作陶瓷杯","description":"直播间限量拍卖款","images":["https://cdn.example.com/item/1.jpg"],"category":"home","marketPrice":12900,"status":"ACTIVE"},"trace_id":"trc_item_get"}
+{"code":0,"message":"success","data":{"id":"item_1001","title":"孤品手作陶瓷杯","description":"直播间限量拍卖款","images":["https://aieas.tos-cn-boe.volces.com/abc.png"],"category":"home","marketPrice":12900,"status":"ACTIVE"},"trace_id":"trc_item_get"}
 ```
 
 - 常见错误码：`30001`、`30002`
@@ -373,30 +379,24 @@ curl 'https://api.example.com/api/v1/items/item_1001' \
 #### PATCH /api/v1/items/{id}
 
 - 用途：更新商品信息
-- Header：`Authorization`、`Content-Type`、`Idempotency-Key`
-- Body 示例：
-
-```json
-{
-  "title": "孤品手作陶瓷杯升级款",
-  "marketPrice": 13900
-}
-```
+- Header：`Authorization`、`Content-Type: multipart/form-data`、`Idempotency-Key`
+- Body：同创建接口的 FormData 字段，全部字段均可选；提交新的 `images` 文件时会替换原图片 URL 数组，不提交 `images` 则保持原图片不变；单张图片不超过 2MB。
 
 - 请求示例：
 
 ```bash
 curl -X PATCH 'https://api.example.com/api/v1/items/item_1001' \
   -H 'Authorization: Bearer <merchant_jwt>' \
-  -H 'Content-Type: application/json; charset=utf-8' \
   -H 'Idempotency-Key: item-patch-001' \
-  -d '{"title":"孤品手作陶瓷杯升级款","marketPrice":13900}'
+  -F 'title=孤品手作陶瓷杯升级款' \
+  -F 'description=直播间限量拍卖升级款' \
+  -F 'images=@/path/to/new-item-1.jpg'
 ```
 
 - Response 示例：
 
 ```json
-{"code":0,"message":"success","data":{"id":"item_1001","title":"孤品手作陶瓷杯升级款","marketPrice":13900,"status":"ACTIVE"},"trace_id":"trc_item_patch"}
+{"code":0,"message":"success","data":{"id":1001,"title":"孤品手作陶瓷杯升级款","images":["https://aieas.tos-cn-boe.volces.com/new.png"],"status":"DRAFT"},"trace_id":"trc_item_patch"}
 ```
 
 - 常见错误码：`30001`、`30002`、`30003`
@@ -1087,15 +1087,15 @@ curl -X POST 'https://api.example.com/api/v1/ai/announcement' \
 
 ### 4.1 连接
 
-- 连接地址：`wss://api.example.com/ws?token=<jwt>&auctionId=<id>`
+- 连接地址：`wss://api.example.com/ws/auctions/<auction_id>?token=<jwt>&lastSeq=<seq>`
 - 升级时校验 JWT；校验失败关闭连接，建议关闭码 `4401`
 - 服务端每 30s 发送 ping；客户端 60s 未响应则断开
-- 客户端可在断线重连后调用 `GET /api/v1/auctions/{id}/state` 拉取快照
+- 客户端断线重连可携带 `lastSeq`，服务端会补发近期窗口内 `seq > lastSeq` 的事件；若窗口已过期，会发送 `room.snapshot_required`，客户端应调用 `GET /api/v1/auctions/{id}/state` 拉取快照
 
 连接示例：
 
 ```bash
-wscat -c 'wss://api.example.com/ws?token=<jwt>&auctionId=auc_1001'
+wscat -c 'wss://api.example.com/ws/auctions/1001?token=<jwt>&lastSeq=102'
 ```
 
 ### 4.2 统一 JSON 报文

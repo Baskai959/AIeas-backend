@@ -1,0 +1,539 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "默认模块-商品图片上传接口更新",
+    "version": "v1",
+    "description": "仅包含商品创建、商品更新接口中图片上传方式的变更：图片由 JSON URL 数组调整为 multipart/form-data 二进制文件上传。"
+  },
+  "servers": [
+    {
+      "url": "http://localhost:8888",
+      "description": "Local"
+    }
+  ],
+  "tags": [
+    {
+      "name": "Item",
+      "description": "商家商品管理"
+    }
+  ],
+  "paths": {
+    "/api/v1/items": {
+      "post": {
+        "tags": [
+          "Item"
+        ],
+        "summary": "创建商品",
+        "description": "需要 merchant 或 admin 角色。图片通过 multipart/form-data 的 images 文件字段上传，服务端上传至对象存储后保存访问 URL。",
+        "operationId": "createItem",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "$ref": "#/components/schemas/ItemCreateRequest"
+              },
+              "encoding": {
+                "images": {
+                  "contentType": "image/*"
+                }
+              },
+              "example": {
+                "title": "限量版机械键盘",
+                "category": "digital",
+                "brand": "DemoBrand",
+                "conditionGrade": "NEW",
+                "images": [
+                  "keyboard-front.jpg",
+                  "keyboard-back.jpg"
+                ],
+                "description": "全新未拆封",
+                "status": "READY"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "商品创建成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/ApiResponse"
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "data": {
+                          "$ref": "#/components/schemas/Item"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/ParamInvalid"
+          },
+          "401": {
+            "$ref": "#/components/responses/AuthTokenInvalid"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/items/{id}": {
+      "patch": {
+        "tags": [
+          "Item"
+        ],
+        "summary": "更新商品",
+        "description": "图片通过 multipart/form-data 的 images 文件字段上传；提交图片文件时会替换商品原有图片，未提交图片文件时保持原图片不变。",
+        "operationId": "updateItem",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdPath"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "$ref": "#/components/schemas/ItemPatchRequest"
+              },
+              "encoding": {
+                "images": {
+                  "contentType": "image/*"
+                }
+              },
+              "example": {
+                "title": "更新后的标题",
+                "status": "READY",
+                "images": [
+                  "keyboard-new-front.jpg"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "更新成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/ApiResponse"
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "data": {
+                          "$ref": "#/components/schemas/Item"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/ParamInvalid"
+          },
+          "401": {
+            "$ref": "#/components/responses/AuthTokenInvalid"
+          },
+          "403": {
+            "$ref": "#/components/responses/ItemForbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/ItemNotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/ItemInvalidState"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT"
+      }
+    },
+    "parameters": {
+      "IdPath": {
+        "name": "id",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 1
+        },
+        "description": "资源 ID"
+      }
+    },
+    "schemas": {
+      "ItemCreateRequest": {
+        "type": "object",
+        "required": [
+          "title",
+          "category"
+        ],
+        "properties": {
+          "title": {
+            "type": "string",
+            "example": "限量版机械键盘"
+          },
+          "category": {
+            "type": "string",
+            "example": "digital"
+          },
+          "brand": {
+            "type": "string",
+            "example": "DemoBrand"
+          },
+          "conditionGrade": {
+            "type": "string",
+            "enum": [
+              "NEW",
+              "LIKE_NEW",
+              "GOOD",
+              "FAIR"
+            ],
+            "default": "NEW"
+          },
+          "images": {
+            "type": "array",
+            "description": "商品图片文件数组。使用 multipart/form-data 重复提交 images 文件字段，例如 images=@front.jpg、images=@back.jpg；单张图片不超过 2MB。",
+            "items": {
+              "type": "string",
+              "format": "binary"
+            },
+            "default": []
+          },
+          "description": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "DRAFT",
+              "READY",
+              "LISTED",
+              "OFFLINE"
+            ],
+            "default": "DRAFT"
+          }
+        }
+      },
+      "ItemPatchRequest": {
+        "type": "object",
+        "properties": {
+          "title": {
+            "type": "string"
+          },
+          "category": {
+            "type": "string"
+          },
+          "brand": {
+            "type": "string"
+          },
+          "conditionGrade": {
+            "type": "string",
+            "enum": [
+              "NEW",
+              "LIKE_NEW",
+              "GOOD",
+              "FAIR"
+            ]
+          },
+          "images": {
+            "type": "array",
+            "description": "商品图片文件数组。提交 images 文件字段时会替换原图片；不提交 images 文件字段时保持原图片不变；单张图片不超过 2MB。",
+            "items": {
+              "type": "string",
+              "format": "binary"
+            }
+          },
+          "description": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "DRAFT",
+              "READY",
+              "LISTED",
+              "OFFLINE"
+            ]
+          }
+        }
+      },
+      "Item": {
+        "type": "object",
+        "required": [
+          "id",
+          "sellerId",
+          "title",
+          "category",
+          "conditionGrade",
+          "images",
+          "status",
+          "createdAt",
+          "updatedAt"
+        ],
+        "properties": {
+          "id": {
+            "type": "integer",
+            "format": "uint64",
+            "example": 1001
+          },
+          "sellerId": {
+            "type": "string",
+            "example": "2001"
+          },
+          "title": {
+            "type": "string"
+          },
+          "category": {
+            "type": "string"
+          },
+          "brand": {
+            "type": "string"
+          },
+          "conditionGrade": {
+            "type": "string",
+            "enum": [
+              "NEW",
+              "LIKE_NEW",
+              "GOOD",
+              "FAIR"
+            ]
+          },
+          "images": {
+            "type": "array",
+            "description": "对象存储返回的图片访问 URL 数组。",
+            "items": {
+              "type": "string",
+              "format": "uri"
+            }
+          },
+          "description": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "DRAFT",
+              "READY",
+              "LISTED",
+              "OFFLINE"
+            ]
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "updatedAt": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "ApiResponse": {
+        "type": "object",
+        "required": [
+          "code",
+          "message",
+          "data",
+          "trace_id"
+        ],
+        "properties": {
+          "code": {
+            "type": "integer",
+            "example": 0
+          },
+          "message": {
+            "type": "string",
+            "example": "success"
+          },
+          "data": {
+            "nullable": true,
+            "description": "业务数据，错误时通常为 null"
+          },
+          "trace_id": {
+            "type": "string",
+            "example": "req_1710000000000000000"
+          }
+        }
+      },
+      "ErrorResponse": {
+        "type": "object",
+        "required": [
+          "code",
+          "message",
+          "trace_id"
+        ],
+        "properties": {
+          "code": {
+            "type": "integer",
+            "example": 20001
+          },
+          "message": {
+            "type": "string",
+            "example": "参数不合法"
+          },
+          "data": {
+            "nullable": true,
+            "example": null
+          },
+          "trace_id": {
+            "type": "string",
+            "example": "req_1710000000000000000"
+          }
+        }
+      }
+    },
+    "responses": {
+      "ParamInvalid": {
+        "description": "参数不合法",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            },
+            "example": {
+              "code": 20001,
+              "message": "参数不合法",
+              "data": null,
+              "trace_id": "req_1710000000000000000"
+            }
+          }
+        }
+      },
+      "AuthTokenInvalid": {
+        "description": "访问令牌无效、缺失或已过期",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            },
+            "example": {
+              "code": 10002,
+              "message": "访问令牌无效或已过期",
+              "data": null,
+              "trace_id": "req_1710000000000000000"
+            }
+          }
+        }
+      },
+      "Forbidden": {
+        "description": "无访问权限",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            },
+            "example": {
+              "code": 10003,
+              "message": "无访问权限",
+              "data": null,
+              "trace_id": "req_1710000000000000000"
+            }
+          }
+        }
+      },
+      "InternalError": {
+        "description": "系统内部错误",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            },
+            "example": {
+              "code": 90001,
+              "message": "系统内部错误",
+              "data": null,
+              "trace_id": "req_1710000000000000000"
+            }
+          }
+        }
+      },
+      "ItemNotFound": {
+        "description": "商品不存在",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            },
+            "example": {
+              "code": 30001,
+              "message": "商品不存在",
+              "data": null,
+              "trace_id": "req_1710000000000000000"
+            }
+          }
+        }
+      },
+      "ItemForbidden": {
+        "description": "无商品操作权限",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            },
+            "example": {
+              "code": 30002,
+              "message": "无商品操作权限",
+              "data": null,
+              "trace_id": "req_1710000000000000000"
+            }
+          }
+        }
+      },
+      "ItemInvalidState": {
+        "description": "商品状态不允许操作",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            },
+            "example": {
+              "code": 30003,
+              "message": "商品状态不允许操作",
+              "data": null,
+              "trace_id": "req_1710000000000000000"
+            }
+          }
+        }
+      }
+    }
+  }
+}

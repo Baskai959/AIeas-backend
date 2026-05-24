@@ -1,0 +1,61 @@
+server:
+  addr: ":8888"
+  readTimeout: 5s
+  writeTimeout: 10s
+  shutdownTimeout: 20s
+
+mysql:
+  dsn: "auction:auction@tcp(127.0.0.1:3306)/auction?charset=utf8mb4&parseTime=true&loc=Local"
+  maxOpenConns: 100
+  maxIdleConns: 20
+  connMaxLifetime: 1h
+
+redis:
+  addr: "127.0.0.1:6379"
+  username: "default"
+  password: ""
+  db: 0
+  poolSize: 100
+
+idempotency:
+  ttl: 24h
+
+jwt:
+  issuer: "realtime-auction-master"
+  secret: "change-me-in-local-dev"
+  accessTokenTTL: 12h
+
+idgen:
+  workerID: 1
+
+auction:
+  minIncrementCent: 100
+  antiSnipeMs: 30000
+  extendMs: 30000
+  maxExtendCount: 20
+  freqLimitCount: 10
+  freqWindowMs: 1000
+
+websocket:
+  readLimitBytes: 65536
+  sendBufferSize: 256
+  pingInterval: 20s
+  pongTimeout: 60s
+
+objectStorage:
+  enabled: false
+  endpoint: "https://tos-cn-boe.volces.com"
+  region: "cn-guilin-boe"
+  bucket: "aieas"
+  bucketURL: "https://aieas.tos-cn-boe.volces.com"
+  accessKey: ""
+  secretKey: ""
+  objectPrefix: ""
+
+observability:
+  logLevel: "info"
+  metricsPath: "/metrics"
+  # format: text → 控制台彩色对齐文本 (dev)；json → 一行一条 JSON (prod)
+  format: "text"
+  # GORM 慢 SQL 阈值（毫秒），<=0 关闭慢 SQL 检测
+  slowSQLThresholdMs: 200

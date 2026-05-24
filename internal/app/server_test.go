@@ -1,0 +1,631 @@
+package app
+
+import (
+	"bytes"
+	"encoding/json"
+	"mime/multipart"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+
+	appconfig "aieas_backend/internal/config"
+	"aieas_backend/internal/domain"
+	"aieas_backend/internal/infra/objectstorage"
+	"aieas_backend/internal/repository"
+
+	"github.com/cloudwego/hertz/pkg/app/server"
+	"github.com/cloudwego/hertz/pkg/common/ut"
+	"github.com/cloudwego/hertz/pkg/protocol/consts"
+	"github.com/cloudwego/hertz/pkg/route"
+)
+
+type apiResponse struct {
+	Code    int             `json:"code"`
+	Message string          `json:"message"`
+	Data    json.RawMessage `json:"data"`
+	TraceID string          `json:"trace_id"`
+}
+
+func TestPingStillWorks(t *testing.T) {
+	h := newTestServer()
+	resp := ut.PerformRequest(h.Engine, consts.MethodGet, "/ping", nil)
+	if resp.Code != 200 {
+		t.Fatalf("expected status 200, got %d: %s", resp.Code, resp.Body.String())
+	}
+	if !strings.Contains(resp.Body.String(), "pong") {
+		t.Fatalf("expected pong response, got %s", resp.Body.String())
+	}
+}
+
+func TestAuthLoginAndMeSuccess(t *testing.T) {
+	h := newTestServer()
+	login := doJSON(t, h.Engine, consts.MethodPost, "/api/v1/auth/login", `{"account":"buyer001","password":"Passw0rd!","role":"buyer"}`)
+	if login.status != 200 || login.body.Code != 0 {
+		t.Fatalf("expected successful login, got status=%d body=%+v raw=%s", login.status, login.body, login.raw)
+	}
+	var loginData struct {
+		AccessToken  string `json:"accessToken"`
+		RefreshToken string `json:"refreshToken"`
+		ExpiresIn    int64  `json:"expiresIn"`
+		User         struct {
+			ID       string `json:"id"`
+			Nickname string `json:"nickname"`
+			Role     string `json:"role"`
+			Status   string `json:"status"`
+		} `json:"user"`
+	}
+	mustDecodeData(t, login.body.Data, &loginData)
+	if loginData.AccessToken == "" || loginData.RefreshToken == "" || loginData.ExpiresIn != 43200 {
+		t.Fatalf("unexpected token payload: %+v", loginData)
+	}
+	if loginData.User.ID != "u_1001" || loginData.User.Role != "buyer" || loginData.User.Status != "" {
+		t.Fatalf("unexpected login user payload: %+v", loginData.User)
+	}
+
+	me := doJSONWithHeaders(t, h.Engine, consts.MethodGet, "/api/v1/auth/me", "", ut.Header{Key: "Authorization", Value: "Bearer " + loginData.AccessToken})
+	if me.status != 200 || me.body.Code != 0 {
+		t.Fatalf("expected successful me, got status=%d body=%+v raw=%s", me.status, me.body, me.raw)
+	}
+	var meData struct {
+		ID       string `json:"id"`
+		Nickname string `json:"nickname"`
+		Role     string `json:"role"`
+		Status   string `json:"status"`
+	}
+	mustDecodeData(t, me.body.Data, &meData)
+	if meData.ID != "u_1001" || meData.Role != "buyer" || meData.Status != "ACTIVE" {
+		t.Fatalf("unexpected me payload: %+v", meData)
+	}
+}
+
+func TestNewServerWithConfigUsesJWTTTL(t *testing.T) {
+	cfg := appconfig.Default()
+	cfg.JWT.AccessTokenTTL = appconfig.Duration(45 * time.Minute)
+	h := NewServerWithUserRepository(cfg, repository.NewSeedUserRepository())
+
+	login := doJSON(t, h.Engine, consts.MethodPost, "/api/v1/auth/login", `{"account":"buyer001","password":"Passw0rd!","role":"buyer"}`)
+	if login.status != 200 || login.body.Code != 0 {
+		t.Fatalf("expected successful login, got status=%d body=%+v raw=%s", login.status, login.body, login.raw)
+	}
+
+	var loginData struct {
+		ExpiresIn int64 `json:"expiresIn"`
+	}
+	mustDecodeData(t, login.body.Data, &loginData)
+	if loginData.ExpiresIn != 2700 {
+		t.Fatalf("expected configured expiresIn 2700, got %d", loginData.ExpiresIn)
+	}
+}
+
+func TestAuthLoginFailures(t *testing.T) {
+	h := newTestServer()
+	tests := []struct {
+		name       string
+		body       string
+		wantStatus int
+		wantCode   int
+	}{
+		{name: "wrong password", body: `{"account":"buyer001","password":"wrong","role":"buyer"}`, wantStatus: 401, wantCode: 10004},
+		{name: "disabled user", body: `{"account":"disabled001","password":"Passw0rd!","role":"buyer"}`, wantStatus: 403, wantCode: 10005},
+		{name: "invalid role", body: `{"account":"buyer001","password":"Passw0rd!","role":"unknown"}`, wantStatus: 400, wantCode: 20001},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := doJSON(t, h.Engine, consts.MethodPost, "/api/v1/auth/login", tt.body)
+			if got.status != tt.wantStatus || got.body.Code != tt.wantCode {
+				t.Fatalf("expected status/code %d/%d, got %d/%d raw=%s", tt.wantStatus, tt.wantCode, got.status, got.body.Code, got.raw)
+			}
+		})
+	}
+}
+
+func TestAuthMeRejectsMissingAndInvalidToken(t *testing.T) {
+	h := newTestServer()
+	missing := doJSON(t, h.Engine, consts.MethodGet, "/api/v1/auth/me", "")
+	if missing.status != 401 || missing.body.Code != 10001 {
+		t.Fatalf("expected missing token error, got status=%d code=%d raw=%s", missing.status, missing.body.Code, missing.raw)
+	}
+	invalid := doJSONWithHeaders(t, h.Engine, consts.MethodGet, "/api/v1/auth/me", "", ut.Header{Key: "Authorization", Value: "Bearer invalid.token.value"})
+	if invalid.status != 401 || invalid.body.Code != 10002 {
+		t.Fatalf("expected invalid token error, got status=%d code=%d raw=%s", invalid.status, invalid.body.Code, invalid.raw)
+	}
+}
+
+func TestAuthRefreshLogoutAndAdminLogin(t *testing.T) {
+	h := newTestServer()
+	login := doJSON(t, h.Engine, consts.MethodPost, "/api/v1/auth/login", `{"account":"buyer001","password":"Passw0rd!","role":"buyer"}`)
+	var loginData struct {
+		AccessToken  string `json:"accessToken"`
+		RefreshToken string `json:"refreshToken"`
+	}
+	mustDecodeData(t, login.body.Data, &loginData)
+
+	refresh := doJSON(t, h.Engine, consts.MethodPost, "/api/v1/auth/refresh", `{"refreshToken":"`+loginData.RefreshToken+`"}`)
+	if refresh.status != 200 || refresh.body.Code != 0 {
+		t.Fatalf("expected refresh success, got status=%d code=%d raw=%s", refresh.status, refresh.body.Code, refresh.raw)
+	}
+
+	logout := doJSONWithHeaders(t, h.Engine, consts.MethodPost, "/api/v1/auth/logout", `{"refreshToken":"`+loginData.RefreshToken+`"}`, ut.Header{Key: "Authorization", Value: "Bearer " + loginData.AccessToken})
+	if logout.status != 200 || logout.body.Code != 0 {
+		t.Fatalf("expected logout success, got status=%d code=%d raw=%s", logout.status, logout.body.Code, logout.raw)
+	}
+	meAfterLogout := doJSONWithHeaders(t, h.Engine, consts.MethodGet, "/api/v1/auth/me", "", ut.Header{Key: "Authorization", Value: "Bearer " + loginData.AccessToken})
+	if meAfterLogout.status != 401 || meAfterLogout.body.Code != 10002 {
+		t.Fatalf("expected revoked token error, got status=%d code=%d raw=%s", meAfterLogout.status, meAfterLogout.body.Code, meAfterLogout.raw)
+	}
+
+	admin := doJSON(t, h.Engine, consts.MethodPost, "/api/v1/admin/auth/login", `{"account":"admin001","password":"AdminPassw0rd!"}`)
+	if admin.status != 200 || admin.body.Code != 0 {
+		t.Fatalf("expected admin login success, got status=%d code=%d raw=%s", admin.status, admin.body.Code, admin.raw)
+	}
+}
+
+func TestItemCRUDRoutes(t *testing.T) {
+	h := newTestServer()
+	token := loginForToken(t, h.Engine, "merchant001", "Passw0rd!", "merchant")
+
+	create := doMultipartWithHeaders(t, h.Engine, consts.MethodPost, "/api/v1/items", map[string]string{
+		"title":          "Vintage Camera",
+		"category":       "camera",
+		"brand":          "Minolta",
+		"conditionGrade": "GOOD",
+		"description":    "tested",
+	}, []multipartTestFile{
+		{FieldName: "images", Filename: "camera.jpg", Body: "fake image bytes"},
+	}, ut.Header{Key: "Authorization", Value: "Bearer " + token})
+	if create.status != 200 || create.body.Code != 0 {
+		t.Fatalf("expected item create success, got status=%d body=%+v raw=%s", create.status, create.body, create.raw)
+	}
+	var created struct {
+		ID       uint64   `json:"id"`
+		SellerID string   `json:"sellerId"`
+		Status   string   `json:"status"`
+		Images   []string `json:"images"`
+	}
+	mustDecodeData(t, create.body.Data, &created)
+	if created.ID == 0 || created.SellerID != "u_2001" || created.Status != "DRAFT" {
+		t.Fatalf("unexpected created item: %+v", created)
+	}
+	if len(created.Images) != 1 || !strings.HasPrefix(created.Images[0], "https://cdn.test/") || strings.Contains(created.Images[0], "/items/") {
+		t.Fatalf("expected uploaded object URL, got %+v", created.Images)
+	}
+
+	patch := doMultipartWithHeaders(t, h.Engine, consts.MethodPatch, "/api/v1/items/"+strconv.FormatUint(created.ID, 10), map[string]string{
+		"status": "READY",
+		"title":  "Vintage Camera Kit",
+	}, nil, ut.Header{Key: "Authorization", Value: "Bearer " + token})
+	if patch.status != 200 || patch.body.Code != 0 {
+		t.Fatalf("expected item patch success, got status=%d raw=%s", patch.status, patch.raw)
+	}
+
+	list := doJSONWithHeaders(t, h.Engine, consts.MethodGet, "/api/v1/items?status=READY", "", ut.Header{Key: "Authorization", Value: "Bearer " + token})
+	if list.status != 200 || list.body.Code != 0 {
+		t.Fatalf("expected item list success, got status=%d raw=%s", list.status, list.raw)
+	}
+	var listed struct {
+		Items []struct {
+			ID     uint64 `json:"id"`
+			Status string `json:"status"`
+		} `json:"items"`
+	}
+	mustDecodeData(t, list.body.Data, &listed)
+	if len(listed.Items) != 1 || listed.Items[0].ID != created.ID || listed.Items[0].Status != "READY" {
+		t.Fatalf("unexpected item list: %+v", listed)
+	}
+
+	deleteResp := doJSONWithHeaders(t, h.Engine, consts.MethodDelete, "/api/v1/items/"+strconv.FormatUint(created.ID, 10), "", ut.Header{Key: "Authorization", Value: "Bearer " + token})
+	if deleteResp.status != 200 || deleteResp.body.Code != 0 {
+		t.Fatalf("expected item delete success, got status=%d raw=%s", deleteResp.status, deleteResp.raw)
+	}
+}
+
+func TestItemCreateRejectsImageLargerThan2MB(t *testing.T) {
+	h := newTestServer()
+	token := loginForToken(t, h.Engine, "merchant001", "Passw0rd!", "merchant")
+
+	create := doMultipartWithHeaders(t, h.Engine, consts.MethodPost, "/api/v1/items", map[string]string{
+		"title":    "Large Image Item",
+		"category": "camera",
+	}, []multipartTestFile{
+		{FieldName: "images", Filename: "large.jpg", Body: strings.Repeat("x", 2*1024*1024+1)},
+	}, ut.Header{Key: "Authorization", Value: "Bearer " + token})
+
+	if create.status != 400 || create.body.Code != 20001 {
+		t.Fatalf("expected image size validation error, got status=%d body=%+v raw=%s", create.status, create.body, create.raw)
+	}
+}
+
+func TestItemRoutesProtectItemsBoundToActiveAuctions(t *testing.T) {
+	h := newTestServer()
+	merchantToken := loginForToken(t, h.Engine, "merchant001", "Passw0rd!", "merchant")
+
+	missing := doJSONWithHeaders(t, h.Engine, consts.MethodGet, "/api/v1/items/999999", "", ut.Header{Key: "Authorization", Value: "Bearer " + merchantToken})
+	if missing.status != 404 || missing.body.Code != 30001 {
+		t.Fatalf("expected item not found code 30001, got status=%d code=%d raw=%s", missing.status, missing.body.Code, missing.raw)
+	}
+
+	createItem := doMultipartWithHeaders(t, h.Engine, consts.MethodPost, "/api/v1/items", map[string]string{
+		"title":          "Running Lot Item",
+		"category":       "collectible",
+		"conditionGrade": "GOOD",
+	}, nil, ut.Header{Key: "Authorization", Value: "Bearer " + merchantToken})
+	if createItem.status != 200 || createItem.body.Code != 0 {
+		t.Fatalf("expected item create success, got status=%d raw=%s", createItem.status, createItem.raw)
+	}
+	var itemData struct {
+		ID uint64 `json:"id"`
+	}
+	mustDecodeData(t, createItem.body.Data, &itemData)
+
+	auctionBody := `{"itemId":` + strconv.FormatUint(itemData.ID, 10) + `,"startPrice":10000,"reservePrice":10000,"depositAmount":0,"status":"READY","incrementRule":{"type":"fixed","amount":100}}`
+	createAuction := doJSONWithHeaders(t, h.Engine, consts.MethodPost, "/api/v1/auctions", auctionBody, ut.Header{Key: "Authorization", Value: "Bearer " + merchantToken})
+	if createAuction.status != 200 || createAuction.body.Code != 0 {
+		t.Fatalf("expected auction create success, got status=%d raw=%s", createAuction.status, createAuction.raw)
+	}
+	var auctionData struct {
+		AuctionID uint64 `json:"auctionId"`
+	}
+	mustDecodeData(t, createAuction.body.Data, &auctionData)
+
+	start := doJSONWithHeaders(t, h.Engine, consts.MethodPost, "/api/v1/auctions/"+strconv.FormatUint(auctionData.AuctionID, 10)+"/start", "", ut.Header{Key: "Authorization", Value: "Bearer " + merchantToken}, ut.Header{Key: "Idempotency-Key", Value: "item-active-auction-start"})
+	if start.status != 200 || start.body.Code != 0 {
+		t.Fatalf("expected auction start success, got status=%d raw=%s", start.status, start.raw)
+	}
+
+	descriptionPatch := doMultipartWithHeaders(t, h.Engine, consts.MethodPatch, "/api/v1/items/"+strconv.FormatUint(itemData.ID, 10), map[string]string{
+		"description": "updated display copy",
+	}, nil, ut.Header{Key: "Authorization", Value: "Bearer " + merchantToken})
+	if descriptionPatch.status != 200 || descriptionPatch.body.Code != 0 {
+		t.Fatalf("expected non-critical description patch success, got status=%d raw=%s", descriptionPatch.status, descriptionPatch.raw)
+	}
+
+	titlePatch := doMultipartWithHeaders(t, h.Engine, consts.MethodPatch, "/api/v1/items/"+strconv.FormatUint(itemData.ID, 10), map[string]string{
+		"title": "Blocked Critical Change",
+	}, nil, ut.Header{Key: "Authorization", Value: "Bearer " + merchantToken})
+	if titlePatch.status != 409 || titlePatch.body.Code != 30003 {
+		t.Fatalf("expected active-auction critical patch to fail with 30003, got status=%d code=%d raw=%s", titlePatch.status, titlePatch.body.Code, titlePatch.raw)
+	}
+
+	deleteResp := doJSONWithHeaders(t, h.Engine, consts.MethodDelete, "/api/v1/items/"+strconv.FormatUint(itemData.ID, 10), "", ut.Header{Key: "Authorization", Value: "Bearer " + merchantToken})
+	if deleteResp.status != 409 || deleteResp.body.Code != 30003 {
+		t.Fatalf("expected active-auction delete to fail with 30003, got status=%d code=%d raw=%s", deleteResp.status, deleteResp.body.Code, deleteResp.raw)
+	}
+}
+
+func TestAuctionRoutesStateAndIdempotencyMiddleware(t *testing.T) {
+	h := newTestServer()
+	merchantToken := loginForToken(t, h.Engine, "merchant001", "Passw0rd!", "merchant")
+	buyerToken := loginForToken(t, h.Engine, "buyer001", "Passw0rd!", "buyer")
+
+	item := doMultipartWithHeaders(t, h.Engine, consts.MethodPost, "/api/v1/items", map[string]string{
+		"title":          "Watch",
+		"category":       "luxury",
+		"conditionGrade": "LIKE_NEW",
+	}, nil, ut.Header{Key: "Authorization", Value: "Bearer " + merchantToken})
+	if item.status != 200 || item.body.Code != 0 {
+		t.Fatalf("expected item create success, got status=%d raw=%s", item.status, item.raw)
+	}
+	var itemData struct {
+		ID uint64 `json:"id"`
+	}
+	mustDecodeData(t, item.body.Data, &itemData)
+
+	auctionBody := `{"itemId":` + strconv.FormatUint(itemData.ID, 10) + `,"startPrice":10000,"reservePrice":15000,"depositAmount":1000,"status":"READY","incrementRule":{"type":"fixed","amount":500}}`
+	createAuction := doJSONWithHeaders(t, h.Engine, consts.MethodPost, "/api/v1/auctions", auctionBody, ut.Header{Key: "Authorization", Value: "Bearer " + merchantToken})
+	if createAuction.status != 200 || createAuction.body.Code != 0 {
+		t.Fatalf("expected auction create success, got status=%d raw=%s", createAuction.status, createAuction.raw)
+	}
+	var auctionData struct {
+		AuctionID uint64 `json:"auctionId"`
+		Status    string `json:"status"`
+	}
+	mustDecodeData(t, createAuction.body.Data, &auctionData)
+	if auctionData.AuctionID == 0 || auctionData.Status != "READY" {
+		t.Fatalf("unexpected auction create payload: %+v", auctionData)
+	}
+
+	noKey := doJSONWithHeaders(t, h.Engine, consts.MethodPost, "/api/v1/auctions/"+strconv.FormatUint(auctionData.AuctionID, 10)+"/start", "", ut.Header{Key: "Authorization", Value: "Bearer " + merchantToken})
+	if noKey.status != 400 || noKey.body.Code != 20011 {
+		t.Fatalf("expected missing idempotency key, got status=%d code=%d raw=%s", noKey.status, noKey.body.Code, noKey.raw)
+	}
+
+	start := doJSONWithHeaders(t, h.Engine, consts.MethodPost, "/api/v1/auctions/"+strconv.FormatUint(auctionData.AuctionID, 10)+"/start", "", ut.Header{Key: "Authorization", Value: "Bearer " + merchantToken}, ut.Header{Key: "Idempotency-Key", Value: "idem-start-1"})
+	if start.status != 200 || start.body.Code != 0 {
+		t.Fatalf("expected auction start success, got status=%d raw=%s", start.status, start.raw)
+	}
+
+	state := doJSONWithHeaders(t, h.Engine, consts.MethodGet, "/api/v1/auctions/"+strconv.FormatUint(auctionData.AuctionID, 10)+"/state", "", ut.Header{Key: "Authorization", Value: "Bearer " + buyerToken})
+	if state.status != 200 || state.body.Code != 0 {
+		t.Fatalf("expected auction state success for buyer, got status=%d raw=%s", state.status, state.raw)
+	}
+	var stateData struct {
+		AuctionID    uint64 `json:"auctionId"`
+		Status       string `json:"status"`
+		CurrentPrice int64  `json:"currentPrice"`
+		Source       string `json:"source"`
+	}
+	mustDecodeData(t, state.body.Data, &stateData)
+	if stateData.AuctionID != auctionData.AuctionID || stateData.Status != "RUNNING" || stateData.CurrentPrice != 10000 || stateData.Source != "redis" {
+		t.Fatalf("unexpected state payload: %+v", stateData)
+	}
+
+	enroll := doJSONWithHeaders(t, h.Engine, consts.MethodPost, "/api/v1/auctions/"+strconv.FormatUint(auctionData.AuctionID, 10)+"/enroll", "", ut.Header{Key: "Authorization", Value: "Bearer " + buyerToken})
+	if enroll.status != 200 || enroll.body.Code != 0 {
+		t.Fatalf("expected enroll success, got status=%d raw=%s", enroll.status, enroll.raw)
+	}
+	var enrollData struct {
+		AuctionID uint64 `json:"auctionId"`
+		UserID    string `json:"userId"`
+		Status    string `json:"status"`
+	}
+	mustDecodeData(t, enroll.body.Data, &enrollData)
+	if enrollData.AuctionID != auctionData.AuctionID || enrollData.UserID != "u_1001" || enrollData.Status != "READY" {
+		t.Fatalf("unexpected enroll payload: %+v", enrollData)
+	}
+
+	hammer := doJSONWithHeaders(t, h.Engine, consts.MethodPost, "/api/v1/auctions/"+strconv.FormatUint(auctionData.AuctionID, 10)+"/hammer", "", ut.Header{Key: "Authorization", Value: "Bearer " + merchantToken}, ut.Header{Key: "Idempotency-Key", Value: "hammer-empty-1"})
+	if hammer.status != 409 || hammer.body.Code != 20010 {
+		t.Fatalf("expected not-ended hammer rejection, got status=%d code=%d raw=%s", hammer.status, hammer.body.Code, hammer.raw)
+	}
+}
+
+func TestOrderRoutesPayIdempotency(t *testing.T) {
+	cfg := appconfig.Default()
+	orderRepo := repository.NewMemoryOrderRepository()
+	deadline := time.Now().UTC().Add(time.Hour)
+	order, _, err := orderRepo.CreateIfAbsentByAuction(t.Context(), &domain.OrderDeal{
+		AuctionID:     12345,
+		WinnerID:      "u_1001",
+		SellerID:      "u_2001",
+		DealPrice:     12000,
+		DepositAmount: 1000,
+		Status:        domain.OrderStatusCreated,
+		PayStatus:     domain.PayStatusUnpaid,
+		PayDeadline:   &deadline,
+	})
+	if err != nil {
+		t.Fatalf("seed order: %v", err)
+	}
+	h := NewServerWithDependencies(cfg, ServerDependencies{UserRepo: repository.NewSeedUserRepository(), OrderRepo: orderRepo})
+	buyerToken := loginForToken(t, h.Engine, "buyer001", "Passw0rd!", "buyer")
+
+	mine := doJSONWithHeaders(t, h.Engine, consts.MethodGet, "/api/v1/orders/mine", "", ut.Header{Key: "Authorization", Value: "Bearer " + buyerToken})
+	if mine.status != 200 || mine.body.Code != 0 {
+		t.Fatalf("expected mine success, got status=%d raw=%s", mine.status, mine.raw)
+	}
+	var mineData struct {
+		Orders []domain.OrderDeal `json:"orders"`
+	}
+	mustDecodeData(t, mine.body.Data, &mineData)
+	if len(mineData.Orders) != 1 || mineData.Orders[0].ID != order.ID {
+		t.Fatalf("unexpected mine orders: %+v", mineData.Orders)
+	}
+
+	noKey := doJSONWithHeaders(t, h.Engine, consts.MethodPost, "/api/v1/orders/"+strconv.FormatUint(order.ID, 10)+"/pay", "", ut.Header{Key: "Authorization", Value: "Bearer " + buyerToken})
+	if noKey.status != 400 || noKey.body.Code != 20011 {
+		t.Fatalf("expected pay idempotency key error, got status=%d raw=%s", noKey.status, noKey.raw)
+	}
+	paid := doJSONWithHeaders(t, h.Engine, consts.MethodPost, "/api/v1/orders/"+strconv.FormatUint(order.ID, 10)+"/pay", "", ut.Header{Key: "Authorization", Value: "Bearer " + buyerToken}, ut.Header{Key: "Idempotency-Key", Value: "pay-1"})
+	if paid.status != 200 || paid.body.Code != 0 {
+		t.Fatalf("expected pay success, got status=%d raw=%s", paid.status, paid.raw)
+	}
+	paidAgain := doJSONWithHeaders(t, h.Engine, consts.MethodPost, "/api/v1/orders/"+strconv.FormatUint(order.ID, 10)+"/pay", "", ut.Header{Key: "Authorization", Value: "Bearer " + buyerToken}, ut.Header{Key: "Idempotency-Key", Value: "pay-1"})
+	if paidAgain.status != 200 || paidAgain.body.Code != 0 {
+		t.Fatalf("expected duplicate pay success, got status=%d raw=%s", paidAgain.status, paidAgain.raw)
+	}
+}
+
+func TestAdminRoutesMinimalClosedLoop(t *testing.T) {
+	cfg := appconfig.Default()
+	userRepo := repository.NewSeedUserRepository()
+	auctionRepo := repository.NewMemoryAuctionRepository()
+	orderRepo := repository.NewMemoryOrderRepository()
+	riskRepo := repository.NewMemoryRiskRepository()
+	auditRepo := repository.NewMemoryAuditRepository()
+	now := time.Now().UTC()
+	auction := &domain.AuctionLot{
+		AuctionID:      88001,
+		ItemID:         1001,
+		SellerID:       "u_2001",
+		AuctionType:    domain.AuctionTypeEnglish,
+		StartPrice:     1000,
+		ReservePrice:   0,
+		IncrementRule:  json.RawMessage(`{"type":"fixed","amount":100}`),
+		AntiSnipingSec: 15,
+		AntiExtendSec:  30,
+		DepositAmount:  100,
+		Status:         domain.AuctionStatusPendingAudit,
+		RuleSnapshot:   json.RawMessage(`{"auctionType":"ENGLISH"}`),
+		StartTime:      now.Add(time.Minute),
+		EndTime:        now.Add(time.Hour),
+	}
+	if err := auctionRepo.Create(t.Context(), auction); err != nil {
+		t.Fatalf("seed auction: %v", err)
+	}
+	if _, _, err := orderRepo.CreateIfAbsentByAuction(t.Context(), &domain.OrderDeal{AuctionID: 88001, WinnerID: "u_1001", SellerID: "u_2001", DealPrice: 1200, Status: domain.OrderStatusCreated, PayStatus: domain.PayStatusUnpaid}); err != nil {
+		t.Fatalf("seed order: %v", err)
+	}
+	if err := riskRepo.CreateEvent(t.Context(), &domain.RiskEvent{EventType: "BID_FREQ", UserID: "u_1001", AuctionID: 88001, Severity: domain.RiskSeverityMid, Status: domain.RiskEventPending}); err != nil {
+		t.Fatalf("seed risk event: %v", err)
+	}
+	h := NewServerWithDependencies(cfg, ServerDependencies{UserRepo: userRepo, AuctionRepo: auctionRepo, OrderRepo: orderRepo, RiskRepo: riskRepo, AuditRepo: auditRepo})
+	adminToken := loginForToken(t, h.Engine, "admin001", "AdminPassw0rd!", "admin")
+	buyerToken := loginForToken(t, h.Engine, "buyer001", "Passw0rd!", "buyer")
+
+	noAuth := doJSON(t, h.Engine, consts.MethodGet, "/api/v1/admin/users", "")
+	if noAuth.status != 401 || noAuth.body.Code != 10001 {
+		t.Fatalf("expected admin users require auth, got status=%d raw=%s", noAuth.status, noAuth.raw)
+	}
+	forbidden := doJSONWithHeaders(t, h.Engine, consts.MethodGet, "/api/v1/admin/users", "", ut.Header{Key: "Authorization", Value: "Bearer " + buyerToken})
+	if forbidden.status != 403 || forbidden.body.Code != 10003 {
+		t.Fatalf("expected buyer forbidden, got status=%d raw=%s", forbidden.status, forbidden.raw)
+	}
+
+	users := doJSONWithHeaders(t, h.Engine, consts.MethodGet, "/api/v1/admin/users?page=1&page_size=20", "", ut.Header{Key: "Authorization", Value: "Bearer " + adminToken})
+	if users.status != 200 || users.body.Code != 0 {
+		t.Fatalf("expected admin users success, got status=%d raw=%s", users.status, users.raw)
+	}
+
+	patchUser := doJSONWithHeaders(t, h.Engine, consts.MethodPatch, "/api/v1/admin/users/u_1001", `{"status":"DISABLED","reason":"test"}`, ut.Header{Key: "Authorization", Value: "Bearer " + adminToken}, ut.Header{Key: "Idempotency-Key", Value: "admin-user-disable-1"})
+	if patchUser.status != 200 || patchUser.body.Code != 0 {
+		t.Fatalf("expected admin user patch success, got status=%d raw=%s", patchUser.status, patchUser.raw)
+	}
+	patchUserAgain := doJSONWithHeaders(t, h.Engine, consts.MethodPatch, "/api/v1/admin/users/u_1001", `{"status":"DISABLED","reason":"test"}`, ut.Header{Key: "Authorization", Value: "Bearer " + adminToken}, ut.Header{Key: "Idempotency-Key", Value: "admin-user-disable-1"})
+	if patchUserAgain.status != 200 || patchUserAgain.body.Code != 0 || patchUserAgain.raw != patchUser.raw {
+		t.Fatalf("expected identical idempotency replay, first=%s second=%s", patchUser.raw, patchUserAgain.raw)
+	}
+	patchUserConflict := doJSONWithHeaders(t, h.Engine, consts.MethodPatch, "/api/v1/admin/users/u_1001", `{"status":"ACTIVE","reason":"different"}`, ut.Header{Key: "Authorization", Value: "Bearer " + adminToken}, ut.Header{Key: "Idempotency-Key", Value: "admin-user-disable-1"})
+	if patchUserConflict.status != 409 || patchUserConflict.body.Code != 20012 {
+		t.Fatalf("expected idempotency body conflict, got status=%d code=%d raw=%s", patchUserConflict.status, patchUserConflict.body.Code, patchUserConflict.raw)
+	}
+	updated, err := userRepo.FindByID("u_1001")
+	if err != nil || updated.Status != domain.UserStatusDisabled {
+		t.Fatalf("expected user disabled, user=%+v err=%v", updated, err)
+	}
+	if len(auditRepo.Logs()) == 0 {
+		t.Fatal("expected write operation to create audit log")
+	}
+
+	auctions := doJSONWithHeaders(t, h.Engine, consts.MethodGet, "/api/v1/admin/auctions?page=1&page_size=20", "", ut.Header{Key: "Authorization", Value: "Bearer " + adminToken})
+	if auctions.status != 200 || auctions.body.Code != 0 {
+		t.Fatalf("expected admin auctions success, got status=%d raw=%s", auctions.status, auctions.raw)
+	}
+	auditAuction := doJSONWithHeaders(t, h.Engine, consts.MethodPost, "/api/v1/admin/auctions/88001/audit", `{"auditResult":"APPROVED","reason":"ok"}`, ut.Header{Key: "Authorization", Value: "Bearer " + adminToken}, ut.Header{Key: "Idempotency-Key", Value: "admin-audit-1"})
+	if auditAuction.status != 200 || auditAuction.body.Code != 0 {
+		t.Fatalf("expected admin auction audit success, got status=%d raw=%s", auditAuction.status, auditAuction.raw)
+	}
+	approved, err := auctionRepo.FindByID(t.Context(), 88001)
+	if err != nil || approved.Status != domain.AuctionStatusReady {
+		t.Fatalf("expected auction ready, auction=%+v err=%v", approved, err)
+	}
+
+	blacklist := doJSONWithHeaders(t, h.Engine, consts.MethodPost, "/api/v1/admin/blacklist", `{"userId":"u_1002","reason":"abuse"}`, ut.Header{Key: "Authorization", Value: "Bearer " + adminToken}, ut.Header{Key: "Idempotency-Key", Value: "blacklist-add-1"})
+	if blacklist.status != 200 || blacklist.body.Code != 0 {
+		t.Fatalf("expected blacklist add success, got status=%d raw=%s", blacklist.status, blacklist.raw)
+	}
+	blacklistList := doJSONWithHeaders(t, h.Engine, consts.MethodGet, "/api/v1/admin/blacklist", "", ut.Header{Key: "Authorization", Value: "Bearer " + adminToken})
+	if blacklistList.status != 200 || blacklistList.body.Code != 0 {
+		t.Fatalf("expected blacklist list success, got status=%d raw=%s", blacklistList.status, blacklistList.raw)
+	}
+	blacklistDelete := doJSONWithHeaders(t, h.Engine, consts.MethodDelete, "/api/v1/admin/blacklist/u_1002", "", ut.Header{Key: "Authorization", Value: "Bearer " + adminToken}, ut.Header{Key: "Idempotency-Key", Value: "blacklist-del-1"})
+	if blacklistDelete.status != 200 || blacklistDelete.body.Code != 0 {
+		t.Fatalf("expected blacklist delete success, got status=%d raw=%s", blacklistDelete.status, blacklistDelete.raw)
+	}
+
+	orders := doJSONWithHeaders(t, h.Engine, consts.MethodGet, "/api/v1/admin/orders", "", ut.Header{Key: "Authorization", Value: "Bearer " + adminToken})
+	if orders.status != 200 || orders.body.Code != 0 {
+		t.Fatalf("expected admin orders success, got status=%d raw=%s", orders.status, orders.raw)
+	}
+	auditLogs := doJSONWithHeaders(t, h.Engine, consts.MethodGet, "/api/v1/admin/audit-logs", "", ut.Header{Key: "Authorization", Value: "Bearer " + adminToken})
+	if auditLogs.status != 200 || auditLogs.body.Code != 0 {
+		t.Fatalf("expected admin audit logs success, got status=%d raw=%s", auditLogs.status, auditLogs.raw)
+	}
+	riskEvents := doJSONWithHeaders(t, h.Engine, consts.MethodGet, "/api/v1/admin/risk/events", "", ut.Header{Key: "Authorization", Value: "Bearer " + adminToken})
+	if riskEvents.status != 200 || riskEvents.body.Code != 0 {
+		t.Fatalf("expected risk events success, got status=%d raw=%s", riskEvents.status, riskEvents.raw)
+	}
+	handleRisk := doJSONWithHeaders(t, h.Engine, consts.MethodPatch, "/api/v1/admin/risk/events/1", `{"status":"REVIEWED","remark":"ok"}`, ut.Header{Key: "Authorization", Value: "Bearer " + adminToken}, ut.Header{Key: "Idempotency-Key", Value: "risk-event-1"})
+	if handleRisk.status != 200 || handleRisk.body.Code != 0 {
+		t.Fatalf("expected risk handle success, got status=%d raw=%s", handleRisk.status, handleRisk.raw)
+	}
+	handled, err := riskRepo.FindEventByID(t.Context(), 1)
+	if err != nil || handled.Status != domain.RiskEventReviewed || handled.ReviewedBy != "u_9001" {
+		t.Fatalf("expected risk reviewed by admin, event=%+v err=%v", handled, err)
+	}
+}
+
+func newTestServer() *server.Hertz {
+	return NewServerWithDependencies(appconfig.Default(), ServerDependencies{
+		UserRepo:       repository.NewSeedUserRepository(),
+		ObjectUploader: objectstorage.NewMemoryUploader("https://cdn.test"),
+	})
+}
+
+func loginForToken(t *testing.T, engine *route.Engine, account, password, role string) string {
+	t.Helper()
+	login := doJSON(t, engine, consts.MethodPost, "/api/v1/auth/login", `{"account":"`+account+`","password":"`+password+`","role":"`+role+`"}`)
+	if login.status != 200 || login.body.Code != 0 {
+		t.Fatalf("login failed status=%d raw=%s", login.status, login.raw)
+	}
+	var data struct {
+		AccessToken string `json:"accessToken"`
+	}
+	mustDecodeData(t, login.body.Data, &data)
+	if data.AccessToken == "" {
+		t.Fatal("expected access token")
+	}
+	return data.AccessToken
+}
+
+type testHTTPResult struct {
+	status int
+	body   apiResponse
+	raw    string
+}
+
+func doJSON(t *testing.T, engine *route.Engine, method, path, body string) testHTTPResult {
+	t.Helper()
+	return doJSONWithHeaders(t, engine, method, path, body)
+}
+
+func doJSONWithHeaders(t *testing.T, engine *route.Engine, method, path, body string, headers ...ut.Header) testHTTPResult {
+	t.Helper()
+	if body != "" {
+		headers = append(headers, ut.Header{Key: "Content-Type", Value: "application/json; charset=utf-8"})
+	}
+	var requestBody *ut.Body
+	if body != "" {
+		requestBody = &ut.Body{Body: strings.NewReader(body), Len: len(body)}
+	}
+	resp := ut.PerformRequest(engine, method, path, requestBody, headers...)
+	var decoded apiResponse
+	if err := json.Unmarshal(resp.Body.Bytes(), &decoded); err != nil {
+		t.Fatalf("decode response: %v raw=%s", err, resp.Body.String())
+	}
+	return testHTTPResult{status: resp.Code, body: decoded, raw: resp.Body.String()}
+}
+
+type multipartTestFile struct {
+	FieldName string
+	Filename  string
+	Body      string
+}
+
+func doMultipartWithHeaders(t *testing.T, engine *route.Engine, method, path string, fields map[string]string, files []multipartTestFile, headers ...ut.Header) testHTTPResult {
+	t.Helper()
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	for key, value := range fields {
+		if err := writer.WriteField(key, value); err != nil {
+			t.Fatalf("write multipart field: %v", err)
+		}
+	}
+	for _, file := range files {
+		part, err := writer.CreateFormFile(file.FieldName, file.Filename)
+		if err != nil {
+			t.Fatalf("create multipart file: %v", err)
+		}
+		if _, err := part.Write([]byte(file.Body)); err != nil {
+			t.Fatalf("write multipart file: %v", err)
+		}
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close multipart writer: %v", err)
+	}
+	headers = append(headers, ut.Header{Key: "Content-Type", Value: writer.FormDataContentType()})
+	requestBody := &ut.Body{Body: bytes.NewReader(body.Bytes()), Len: body.Len()}
+	resp := ut.PerformRequest(engine, method, path, requestBody, headers...)
+	var decoded apiResponse
+	if err := json.Unmarshal(resp.Body.Bytes(), &decoded); err != nil {
+		t.Fatalf("decode response: %v raw=%s", err, resp.Body.String())
+	}
+	return testHTTPResult{status: resp.Code, body: decoded, raw: resp.Body.String()}
+}
+
+func mustDecodeData(t *testing.T, data json.RawMessage, out interface{}) {
+	t.Helper()
+	if err := json.Unmarshal(data, out); err != nil {
+		t.Fatalf("decode data: %v raw=%s", err, string(data))
+	}
+}

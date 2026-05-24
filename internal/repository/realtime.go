@@ -1,0 +1,78 @@
+package repository
+
+import (
+	"context"
+
+	"aieas_backend/internal/domain"
+)
+
+type AuctionRealtimeStore interface {
+	InitAuction(ctx context.Context, auction domain.AuctionLot, minIncrement int64) (domain.AuctionState, error)
+	GetAuctionState(ctx context.Context, auctionID uint64) (domain.AuctionState, bool, error)
+	MarkEnrollment(ctx context.Context, auctionID uint64, userID string) error
+	PlaceBid(ctx context.Context, input domain.BidInput) (domain.BidResult, error)
+	Hammer(ctx context.Context, input domain.HammerInput) (domain.HammerResult, error)
+	TopN(ctx context.Context, auctionID uint64, limit int) ([]domain.RankingEntry, error)
+	IsBlacklisted(ctx context.Context, userID string) (bool, error)
+	SetBlacklisted(ctx context.Context, userID string, blacklisted bool) error
+}
+
+type NoopRealtimeStore struct{}
+
+func (NoopRealtimeStore) InitAuction(ctx context.Context, auction domain.AuctionLot, minIncrement int64) (domain.AuctionState, error) {
+	_ = ctx
+	_ = minIncrement
+	return domain.AuctionState{
+		AuctionID:    auction.AuctionID,
+		Status:       auction.Status,
+		CurrentPrice: auction.StartPrice,
+		StartTime:    auction.StartTime,
+		EndTime:      auction.EndTime,
+		Source:       "db",
+	}, nil
+}
+
+func (NoopRealtimeStore) GetAuctionState(ctx context.Context, auctionID uint64) (domain.AuctionState, bool, error) {
+	_ = ctx
+	_ = auctionID
+	return domain.AuctionState{}, false, nil
+}
+
+func (NoopRealtimeStore) MarkEnrollment(ctx context.Context, auctionID uint64, userID string) error {
+	_ = ctx
+	_ = auctionID
+	_ = userID
+	return nil
+}
+
+func (NoopRealtimeStore) PlaceBid(ctx context.Context, input domain.BidInput) (domain.BidResult, error) {
+	_ = ctx
+	_ = input
+	return domain.BidResult{}, domain.ErrInvalidState
+}
+
+func (NoopRealtimeStore) Hammer(ctx context.Context, input domain.HammerInput) (domain.HammerResult, error) {
+	_ = ctx
+	_ = input
+	return domain.HammerResult{}, domain.ErrInvalidState
+}
+
+func (NoopRealtimeStore) TopN(ctx context.Context, auctionID uint64, limit int) ([]domain.RankingEntry, error) {
+	_ = ctx
+	_ = auctionID
+	_ = limit
+	return []domain.RankingEntry{}, nil
+}
+
+func (NoopRealtimeStore) IsBlacklisted(ctx context.Context, userID string) (bool, error) {
+	_ = ctx
+	_ = userID
+	return false, nil
+}
+
+func (NoopRealtimeStore) SetBlacklisted(ctx context.Context, userID string, blacklisted bool) error {
+	_ = ctx
+	_ = userID
+	_ = blacklisted
+	return nil
+}
