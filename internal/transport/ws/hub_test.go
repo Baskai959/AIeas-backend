@@ -206,6 +206,91 @@ func TestHubHandleInboundRoomAliasesAndHeartbeat(t *testing.T) {
 	}
 }
 
+func TestHubBroadcastSessionEndDeliversAndCleansSessionIndex(t *testing.T) {
+	hub := NewHub()
+	const sessionID uint64 = 9001
+	c1 := NewClientWithSession("c1", "u1", 40001, sessionID, 8)
+	c2 := NewClientWithSession("c2", "u2", 40002, sessionID, 8)
+	other := NewClientWithSession("c3", "u3", 40001, 9999, 8)
+	if err := hub.Subscribe(40001, c1); err != nil {
+		t.Fatalf("subscribe c1: %v", err)
+	}
+	if err := hub.Subscribe(40002, c2); err != nil {
+		t.Fatalf("subscribe c2: %v", err)
+	}
+	if err := hub.Subscribe(40001, other); err != nil {
+		t.Fatalf("subscribe other: %v", err)
+	}
+	if got := hub.SessionClientCount(sessionID); got != 2 {
+		t.Fatalf("expected 2 session clients, got %d", got)
+	}
+	drainPresence(t, c1, c2, other)
+
+	payload := json.RawMessage(`{"liveSessionId":9001,"status":"ENDED"}`)
+	delivered := hub.BroadcastSessionEnd(sessionID, payload)
+	if delivered != 2 {
+		t.Fatalf("expected 2 delivered, got %d", delivered)
+	}
+	if got := hub.SessionClientCount(sessionID); got != 0 {
+		t.Fatalf("expected session index cleaned, got %d", got)
+	}
+	for _, c := range []*Client{c1, c2} {
+		select {
+		case env := <-c.Outbound():
+			if env.Type != "live_session.ended" || env.LiveSessionID != sessionID {
+				t.Fatalf("unexpected envelope on %s: %+v", c.ID, env)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("timed out waiting for live_session.ended on %s", c.ID)
+		}
+	}
+	// other client (different session) should not receive live_session.ended
+	select {
+	case env := <-other.Outbound():
+		if env.Type == "live_session.ended" {
+			t.Fatalf("other client got unexpected live_session.ended: %+v", env)
+		}
+	default:
+	}
+}
+
+func TestHubBroadcastSessionEndZeroIDIsNoop(t *testing.T) {
+	hub := NewHub()
+	if got := hub.BroadcastSessionEnd(0, nil); got != 0 {
+		t.Fatalf("expected 0 delivered for zero session id, got %d", got)
+	}
+}
+
+func TestHubStatsExposesRoomsClientsAndSessions(t *testing.T) {
+	hub := NewHub()
+	const sessionID uint64 = 9100
+	c1 := NewClientWithSession("c1", "u1", 41001, sessionID, 8)
+	c2 := NewClientWithSession("c2", "u2", 41002, sessionID, 8)
+	c3 := NewClient("c3", "u3", 41001, 8)
+	if err := hub.Subscribe(41001, c1); err != nil {
+		t.Fatalf("subscribe c1: %v", err)
+	}
+	if err := hub.Subscribe(41002, c2); err != nil {
+		t.Fatalf("subscribe c2: %v", err)
+	}
+	if err := hub.Subscribe(41001, c3); err != nil {
+		t.Fatalf("subscribe c3: %v", err)
+	}
+	stats := hub.Stats()
+	if stats.Rooms != 2 {
+		t.Fatalf("expected 2 rooms, got %d", stats.Rooms)
+	}
+	if stats.Clients != 3 {
+		t.Fatalf("expected 3 clients, got %d", stats.Clients)
+	}
+	if stats.LiveSessions != 1 {
+		t.Fatalf("expected 1 live session, got %d", stats.LiveSessions)
+	}
+	if got := stats.SessionClients[sessionID]; got != 2 {
+		t.Fatalf("expected session %d to have 2 clients, got %d", sessionID, got)
+	}
+}
+
 func drainPresence(t *testing.T, clients ...*Client) {
 	t.Helper()
 	for _, client := range clients {

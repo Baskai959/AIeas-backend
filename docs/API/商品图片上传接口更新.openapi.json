@@ -3,7 +3,7 @@
   "info": {
     "title": "默认模块-商品图片上传接口更新",
     "version": "v1",
-    "description": "仅包含商品创建、商品更新接口中图片上传方式的变更：图片由 JSON URL 数组调整为 multipart/form-data 二进制文件上传。"
+    "description": "仅包含商品创建、商品更新接口中图片上传方式的变更：图片由 JSON URL 数组调整为 multipart/form-data 二进制文件上传，响应返回后端图片代理 URL。"
   },
   "servers": [
     {
@@ -24,7 +24,7 @@
           "Item"
         ],
         "summary": "创建商品",
-        "description": "需要 merchant 或 admin 角色。图片通过 multipart/form-data 的 images 文件字段上传，服务端上传至对象存储后保存访问 URL。",
+        "description": "需要 merchant 或 admin 角色。图片通过 multipart/form-data 的 images 文件字段上传，服务端上传至私有对象存储后保存后端图片代理 URL。商家提交后调用 AI 审核；AI 通过则为 READY，AI 驳回则为 REJECTED，AI 未成功返回有效结论则为 PENDING_AUDIT 留待管理员审核。",
         "operationId": "createItem",
         "requestBody": {
           "required": true,
@@ -48,7 +48,7 @@
                   "keyboard-back.jpg"
                 ],
                 "description": "全新未拆封",
-                "status": "READY"
+                "status": "PENDING_AUDIT"
               }
             }
           }
@@ -102,7 +102,7 @@
           "Item"
         ],
         "summary": "更新商品",
-        "description": "图片通过 multipart/form-data 的 images 文件字段上传；提交图片文件时会替换商品原有图片，未提交图片文件时保持原图片不变。",
+        "description": "图片通过 multipart/form-data 的 images 文件字段上传；提交图片文件时会替换商品原有图片，未提交图片文件时保持原图片不变。商家提交后调用 AI 审核；AI 通过则为 READY，AI 驳回则为 REJECTED，AI 未成功返回有效结论则为 PENDING_AUDIT 留待管理员审核。管理员可通过 status 字段审核调整状态。",
         "operationId": "updateItem",
         "parameters": [
           {
@@ -123,7 +123,7 @@
               },
               "example": {
                 "title": "更新后的标题",
-                "status": "READY",
+                "status": "PENDING_AUDIT",
                 "images": [
                   "keyboard-new-front.jpg"
                 ]
@@ -245,11 +245,13 @@
             "type": "string",
             "enum": [
               "DRAFT",
+              "PENDING_AUDIT",
               "READY",
+              "REJECTED",
               "LISTED",
               "OFFLINE"
             ],
-            "default": "DRAFT"
+            "default": "PENDING_AUDIT"
           }
         }
       },
@@ -289,7 +291,9 @@
             "type": "string",
             "enum": [
               "DRAFT",
+              "PENDING_AUDIT",
               "READY",
+              "REJECTED",
               "LISTED",
               "OFFLINE"
             ]
@@ -339,10 +343,9 @@
           },
           "images": {
             "type": "array",
-            "description": "对象存储返回的图片访问 URL 数组。",
+            "description": "后端图片代理 URL 数组，例如 /api/v1/images/abc.png；浏览器通过后端读取私有对象存储图片。",
             "items": {
-              "type": "string",
-              "format": "uri"
+              "type": "string"
             }
           },
           "description": {
@@ -352,7 +355,9 @@
             "type": "string",
             "enum": [
               "DRAFT",
+              "PENDING_AUDIT",
               "READY",
+              "REJECTED",
               "LISTED",
               "OFFLINE"
             ]

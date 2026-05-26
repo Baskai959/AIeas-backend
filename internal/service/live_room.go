@@ -33,6 +33,8 @@ type LiveRoomService struct {
 	tx       repository.TxManager
 	lock     repository.LiveRoomLock
 	auction  *AuctionService
+	sessions *LiveSessionService
+	hammer   *HammerService
 
 	// 以下为 Stats 接口可选依赖，通过 SetStatsDeps 注入。
 	bids     repository.BidRepository
@@ -53,6 +55,17 @@ func NewLiveRoomService(rooms repository.LiveRoomRepository, auctions repository
 // SetAuctionService 注入 AuctionService 以便 Activate 时启动拍卖。
 func (s *LiveRoomService) SetAuctionService(auction *AuctionService) {
 	s.auction = auction
+}
+
+// SetLiveSessionService 注入直播场次服务，用于 Activate/Deactivate 时打开/关闭场次并回填 lot.live_session_id。
+func (s *LiveRoomService) SetLiveSessionService(sessions *LiveSessionService) {
+	s.sessions = sessions
+}
+
+// SetHammerService 注入结拍服务，用于 Deactivate 时收尾房间内仍在拍的拍品（强制 Force=true）。
+// 未注入时退化为旧行为：仅释放房间锁、不动 auction 状态。
+func (s *LiveRoomService) SetHammerService(hammer *HammerService) {
+	s.hammer = hammer
 }
 
 // SetStatsDeps 注入 Stats 接口所需依赖（可选）。
@@ -141,8 +154,14 @@ func (s *LiveRoomService) Get(ctx context.Context, id uint64) (domain.LiveRoom, 
 }
 
 func (s *LiveRoomService) List(ctx context.Context, filter domain.LiveRoomFilter, actorID string, actorRole domain.Role) ([]domain.LiveRoom, error) {
-	if actorRole == domain.RoleMerchant {
+	switch actorRole {
+	case domain.RoleBuyer:
+		filter.Status = domain.LiveRoomStatusLive
+	case domain.RoleMerchant:
 		filter.MerchantID = actorID
+	case domain.RoleAdmin:
+	default:
+		return nil, domain.ErrForbidden
 	}
 	return s.rooms.List(ctx, filter)
 }
@@ -262,6 +281,24 @@ func (s *LiveRoomService) ActivateAuctionWithOptions(ctx context.Context, in Act
 			return domain.AuctionLot{}, err
 		}
 	}
+	// 直播场次：本拍品挂入直播间后，所属场次为当前 LIVE 场次（不存在则开新一场）。
+	// 仅当 lot 之前未绑定 session（live_session_id IS NULL）时才回填，避免覆盖既有归属。
+	if s.sessions != nil {
+		session, err := s.sessions.OpenSession(ctx, in.RoomID, room.MerchantID, room.Title)
+		if err != nil {
+			_ = s.lock.Release(ctx, in.RoomID, in.AuctionID)
+			return domain.AuctionLot{}, err
+		}
+		if auction.LiveSessionID == nil {
+			sessionID := session.ID
+			auction.LiveSessionID = &sessionID
+			if err := s.auctions.Update(ctx, &auction); err != nil {
+				_ = s.lock.Release(ctx, in.RoomID, in.AuctionID)
+				return domain.AuctionLot{}, err
+			}
+			_ = s.sessions.IncrCounters(ctx, session.ID, domain.LiveSessionCounters{LotsTotalDelta: 1})
+		}
+	}
 	if s.auction != nil {
 		started, err := s.auction.StartWithTiming(ctx, in.AuctionID, in.ActorID, in.ActorRole, startTime, endTime)
 		if err != nil {
@@ -275,7 +312,14 @@ func (s *LiveRoomService) ActivateAuctionWithOptions(ctx context.Context, in Act
 	return auction, nil
 }
 
-// DeactivateAuction 释放房间锁；可由商家/管理员主动调用，也可在 OnAuctionClosed 钩子中触发。
+// DeactivateAuction 关闭房间当前在拍的拍品并释放房间锁。
+//
+// 调用顺序（先收尾 lot 再释放锁，保证押金/订单/state 全部走 HammerService 的 canonical 路径）：
+//  1. 若当前 ActiveAuctionID 指向一个非 Terminal 拍品，使用 HammerService.Hammer 以 Force=true 收尾它。
+//     Hammer 内部会广播 auction.closed、释放押金、调用 OnAuctionClosed（释放房间锁、清 ActiveAuctionID）。
+//  2. 重新读 room；若锁与 ActiveAuctionID 在第 1 步未被清掉（如 hammer 未注入或 lot 已是终态），
+//     再做一次保护性 release + Update。
+//  3. 关闭当前 LIVE 场次（CloseSession 内部会先把 realtime 计数 flush 到 MySQL）。
 func (s *LiveRoomService) DeactivateAuction(ctx context.Context, roomID uint64, actorID string, actorRole domain.Role) (domain.LiveRoom, error) {
 	room, err := s.rooms.FindByID(ctx, roomID)
 	if err != nil {
@@ -284,12 +328,35 @@ func (s *LiveRoomService) DeactivateAuction(ctx context.Context, roomID uint64, 
 	if !canAccessSellerOwned(actorID, actorRole, room.MerchantID) {
 		return domain.LiveRoom{}, domain.ErrForbidden
 	}
+	// Step 1: 若 active auction 仍在非终态，走 HammerService 的 canonical 收尾路径。
+	if room.ActiveAuctionID != 0 && s.hammer != nil {
+		if auction, err := s.auctions.FindByID(ctx, room.ActiveAuctionID); err == nil && !auction.Status.Terminal() {
+			_, _, _ = s.hammer.Hammer(ctx, domain.HammerInput{
+				RequestID: fmt.Sprintf("deactivate-%d-%d", roomID, time.Now().UTC().UnixNano()),
+				AuctionID: auction.AuctionID,
+				ActorID:   actorID,
+				ActorRole: actorRole,
+				ClosedBy:  actorID,
+				Force:     true,
+				Now:       time.Now().UTC(),
+			})
+		}
+	}
+	// Step 2: 重新读 room，取 hammer 路径里 OnAuctionClosed 已应用的最新状态。
+	room, err = s.rooms.FindByID(ctx, roomID)
+	if err != nil {
+		return domain.LiveRoom{}, err
+	}
 	if room.ActiveAuctionID != 0 {
 		_ = s.lock.Release(ctx, roomID, room.ActiveAuctionID)
 		room.ActiveAuctionID = 0
 	}
 	if err := s.rooms.Update(ctx, &room); err != nil {
 		return domain.LiveRoom{}, err
+	}
+	// Step 3: 关闭当前 LIVE 场次（若存在）。CloseSession 会先 flush 计数再切状态。
+	if s.sessions != nil {
+		_, _, _ = s.sessions.CloseActiveByRoom(ctx, roomID)
 	}
 	return room, nil
 }
@@ -323,6 +390,29 @@ func (s *LiveRoomService) ActiveAuctionID(ctx context.Context, roomID uint64) (u
 		return 0, err
 	}
 	return room.ActiveAuctionID, nil
+}
+
+// ActiveAuctionAndSession 返回直播间当前正在拍卖的 auction ID 以及该拍品所属的 liveSessionID。
+// 当房间无 active auction 时返回 (0, 0, nil)；找不到 auction 不视为致命错误，liveSessionID 退化为 0。
+//
+// WS 入口用它一次性拿到订阅所需的双键，避免一次连接内多次回查 auction。
+func (s *LiveRoomService) ActiveAuctionAndSession(ctx context.Context, roomID uint64) (uint64, uint64, error) {
+	room, err := s.rooms.FindByID(ctx, roomID)
+	if err != nil {
+		return 0, 0, err
+	}
+	if room.ActiveAuctionID == 0 {
+		return 0, 0, nil
+	}
+	auction, err := s.auctions.FindByID(ctx, room.ActiveAuctionID)
+	if err != nil {
+		return room.ActiveAuctionID, 0, nil
+	}
+	var sessionID uint64
+	if auction.LiveSessionID != nil {
+		sessionID = *auction.LiveSessionID
+	}
+	return room.ActiveAuctionID, sessionID, nil
 }
 
 // LiveRoomStats 描述直播间的实时统计指标。

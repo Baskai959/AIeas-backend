@@ -91,6 +91,7 @@ func (r *MySQLAuctionRepository) Update(ctx context.Context, auction *domain.Auc
 		"item_id":          row.ItemID,
 		"seller_id":        row.SellerID,
 		"live_room_id":     row.LiveRoomID,
+		"live_session_id":  row.LiveSessionID,
 		"auction_type":     row.AuctionType,
 		"start_price":      row.StartPrice,
 		"reserve_price":    row.ReservePrice,
@@ -139,6 +140,7 @@ type auctionRow struct {
 	ItemID         uint64               `gorm:"column:item_id"`
 	SellerID       string               `gorm:"column:seller_id"`
 	LiveRoomID     uint64               `gorm:"column:live_room_id"`
+	LiveSessionID  *uint64              `gorm:"column:live_session_id"`
 	AuctionType    domain.AuctionType   `gorm:"column:auction_type"`
 	StartPrice     int64                `gorm:"column:start_price"`
 	ReservePrice   int64                `gorm:"column:reserve_price"`
@@ -164,6 +166,7 @@ func auctionRowFromDomain(auction domain.AuctionLot) auctionRow {
 		ItemID:         auction.ItemID,
 		SellerID:       normalizeUserIDForDB(auction.SellerID),
 		LiveRoomID:     auction.LiveRoomID,
+		LiveSessionID:  cloneUint64Ptr(auction.LiveSessionID),
 		AuctionType:    auction.AuctionType,
 		StartPrice:     auction.StartPrice,
 		ReservePrice:   auction.ReservePrice,
@@ -198,6 +201,7 @@ func (r auctionRow) toDomain() domain.AuctionLot {
 		ItemID:         r.ItemID,
 		SellerID:       r.SellerID,
 		LiveRoomID:     r.LiveRoomID,
+		LiveSessionID:  cloneUint64Ptr(r.LiveSessionID),
 		AuctionType:    r.AuctionType,
 		StartPrice:     r.StartPrice,
 		ReservePrice:   r.ReservePrice,

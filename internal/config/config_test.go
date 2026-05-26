@@ -39,6 +39,9 @@ jwt:
 	t.Setenv("OBJECT_STORAGE_BUCKET_URL", "https://aieas.tos-cn-boe.volces.com")
 	t.Setenv("OBJECT_STORAGE_ACCESS_KEY", "ak")
 	t.Setenv("OBJECT_STORAGE_SECRET_KEY", "sk")
+	t.Setenv("AGENT_PRODUCT_DESCRIPTION_URL", "http://127.0.0.1:9000/api/v1/product-description")
+	t.Setenv("AGENT_PRODUCT_AUDIT_URL", "http://127.0.0.1:9000/api/v1/product-audit")
+	t.Setenv("AGENT_TIMEOUT", "5s")
 
 	cfg, err := Load(path)
 	if err != nil {
@@ -65,6 +68,9 @@ jwt:
 	}
 	if !cfg.ObjectStorage.Enabled || cfg.ObjectStorage.Bucket != "aieas" || cfg.ObjectStorage.BucketURL != "https://aieas.tos-cn-boe.volces.com" {
 		t.Fatalf("unexpected object storage config: %+v", cfg.ObjectStorage)
+	}
+	if cfg.Agent.ProductDescriptionURL != "http://127.0.0.1:9000/api/v1/product-description" || cfg.Agent.ProductAuditURL != "http://127.0.0.1:9000/api/v1/product-audit" || cfg.Agent.Timeout.Std() != 5*time.Second {
+		t.Fatalf("unexpected agent config: %+v", cfg.Agent)
 	}
 }
 
@@ -178,5 +184,13 @@ func TestObservabilityValidateRejectsNegativeSlowThreshold(t *testing.T) {
 	cfg.Observability.SlowSQLThresholdMs = -1
 	if err := cfg.Validate(); err == nil {
 		t.Fatal("expected negative observability.slowSQLThresholdMs to be rejected")
+	}
+}
+
+func TestValidateRejectsInvalidAgentProductDescriptionURL(t *testing.T) {
+	cfg := Default()
+	cfg.Agent.ProductDescriptionURL = "127.0.0.1:8000/api/v1/product-description"
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected invalid agent.productDescriptionURL to be rejected")
 	}
 }

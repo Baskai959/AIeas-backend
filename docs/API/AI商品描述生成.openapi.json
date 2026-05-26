@@ -1,0 +1,251 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "AI商品描述生成接口",
+    "version": "v1",
+    "description": "商家在商品创建或编辑页面上传商品图片并提交标题、类目、成色，后端转发给 Agent 服务生成 200 字以内的商品描述。"
+  },
+  "servers": [
+    {
+      "url": "http://localhost:8888",
+      "description": "Local"
+    }
+  ],
+  "tags": [
+    {
+      "name": "ItemAI",
+      "description": "商品 AI 辅助能力"
+    }
+  ],
+  "paths": {
+    "/api/v1/items/description/optimize": {
+      "post": {
+        "tags": [
+          "ItemAI"
+        ],
+        "summary": "AI 优化商品描述",
+        "description": "需要 merchant 或 admin 角色。后端接收 multipart/form-data 后调用 Agent 服务 POST /api/v1/product-description，并将 Agent 返回结果透传给前端。image 与 imageUrl 至少提交一个；同时提交时优先使用 image 文件。",
+        "operationId": "optimizeItemDescription",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "$ref": "#/components/schemas/OptimizeItemDescriptionRequest"
+              },
+              "encoding": {
+                "image": {
+                  "contentType": "image/*"
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "生成成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/ApiResponse"
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "data": {
+                          "$ref": "#/components/schemas/OptimizeItemDescriptionResponse"
+                        }
+                      }
+                    }
+                  ]
+                },
+                "example": {
+                  "code": 0,
+                  "message": "success",
+                  "data": {
+                    "title": "机械键盘 87键",
+                    "category": "电脑外设/键盘",
+                    "description": "200字以内的商品描述"
+                  },
+                  "trace_id": "req_1710000000000000000"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/ParamInvalid"
+          },
+          "401": {
+            "$ref": "#/components/responses/AuthTokenInvalid"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT"
+      }
+    },
+    "schemas": {
+      "OptimizeItemDescriptionRequest": {
+        "type": "object",
+        "required": ["title", "category", "condition"],
+        "properties": {
+          "image": {
+            "type": "string",
+            "format": "binary",
+            "description": "商品图片文件，单张不超过 2MB；创建页或编辑页选择新图片时使用"
+          },
+          "imageUrl": {
+            "type": "string",
+            "description": "已保存商品图片代理 URL；编辑页未选择新图片时可提交该字段"
+          },
+          "title": {
+            "type": "string",
+            "example": "机械键盘 87键"
+          },
+          "category": {
+            "type": "string",
+            "example": "电脑外设/键盘"
+          },
+          "condition": {
+            "type": "string",
+            "example": "九成新"
+          }
+        }
+      },
+      "OptimizeItemDescriptionResponse": {
+        "type": "object",
+        "required": [
+          "title",
+          "category",
+          "description"
+        ],
+        "properties": {
+          "title": {
+            "type": "string"
+          },
+          "category": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string",
+            "maxLength": 200
+          }
+        }
+      },
+      "ApiResponse": {
+        "type": "object",
+        "required": [
+          "code",
+          "message",
+          "data",
+          "trace_id"
+        ],
+        "properties": {
+          "code": {
+            "type": "integer",
+            "example": 0
+          },
+          "message": {
+            "type": "string",
+            "example": "success"
+          },
+          "data": {
+            "nullable": true
+          },
+          "trace_id": {
+            "type": "string",
+            "example": "req_1710000000000000000"
+          }
+        }
+      },
+      "ErrorResponse": {
+        "type": "object",
+        "required": [
+          "code",
+          "message",
+          "data",
+          "trace_id"
+        ],
+        "properties": {
+          "code": {
+            "type": "integer",
+            "example": 20001
+          },
+          "message": {
+            "type": "string",
+            "example": "参数不合法"
+          },
+          "data": {
+            "nullable": true,
+            "example": null
+          },
+          "trace_id": {
+            "type": "string",
+            "example": "req_1710000000000000000"
+          }
+        }
+      }
+    },
+    "responses": {
+      "ParamInvalid": {
+        "description": "参数不合法",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            }
+          }
+        }
+      },
+      "AuthTokenInvalid": {
+        "description": "访问令牌无效、缺失或已过期",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            }
+          }
+        }
+      },
+      "Forbidden": {
+        "description": "无访问权限",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            }
+          }
+        }
+      },
+      "InternalError": {
+        "description": "系统内部错误",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            }
+          }
+        }
+      }
+    }
+  }
+}

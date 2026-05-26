@@ -28,6 +28,7 @@ type ReplaySource interface {
 type Hub struct {
 	mu             sync.RWMutex
 	rooms          map[uint64]*Room
+	sessionClients map[uint64]map[string]*Client // liveSessionId -> clientID -> client
 	eventWindow    int
 	onlineCounter  OnlineCounter
 	replaySource   ReplaySource
@@ -51,15 +52,16 @@ type Room struct {
 }
 
 type Client struct {
-	ID          string
-	UserID      string
-	AuctionID   uint64
-	send        chan Envelope
-	sendMu      sync.Mutex
-	closed      atomic.Bool
-	dropped     atomic.Int64
-	failures    atomic.Int64
-	closeReason atomic.Value
+	ID            string
+	UserID        string
+	AuctionID     uint64
+	LiveSessionID uint64
+	send          chan Envelope
+	sendMu        sync.Mutex
+	closed        atomic.Bool
+	dropped       atomic.Int64
+	failures      atomic.Int64
+	closeReason   atomic.Value
 }
 
 func NewHub() *Hub {
@@ -81,6 +83,7 @@ func NewHubWithEventWindowAndOnlineCounter(eventWindow int, counter OnlineCounte
 	seq := nextHubInstanceID.Add(1)
 	return &Hub{
 		rooms:          make(map[uint64]*Room),
+		sessionClients: make(map[uint64]map[string]*Client),
 		eventWindow:    eventWindow,
 		onlineCounter:  counter,
 		onlineTimeout:  defaultOnlineCounterTimeout,
@@ -93,6 +96,15 @@ func NewClient(id, userID string, auctionID uint64, bufferSize int) *Client {
 		bufferSize = 32
 	}
 	return &Client{ID: id, UserID: userID, AuctionID: auctionID, send: make(chan Envelope, bufferSize)}
+}
+
+// NewClientWithSession 构造一个带 liveSessionId 关联的 Client。
+// liveSessionId 为 0 时与 NewClient 行为一致（不进入 session 反查表）。
+func NewClientWithSession(id, userID string, auctionID, liveSessionID uint64, bufferSize int) *Client {
+	if bufferSize <= 0 {
+		bufferSize = 32
+	}
+	return &Client{ID: id, UserID: userID, AuctionID: auctionID, LiveSessionID: liveSessionID, send: make(chan Envelope, bufferSize)}
 }
 
 func (h *Hub) Room(auctionID uint64) (*Room, bool) {
@@ -129,6 +141,7 @@ func (h *Hub) Subscribe(auctionID uint64, client *Client) error {
 	client.AuctionID = auctionID
 	room := h.GetOrCreateRoom(auctionID)
 	room.Add(client)
+	h.registerSessionClient(client)
 	h.broadcastPresence(room, h.joinOnline(auctionID, client.ID, room.ClientCount()))
 	return nil
 }
@@ -138,7 +151,10 @@ func (h *Hub) Unsubscribe(auctionID uint64, clientID string) {
 	if !ok {
 		return
 	}
-	if room.Remove(clientID) {
+	if removed, sessionID := room.removeReturning(clientID); removed {
+		if sessionID != 0 {
+			h.unregisterSessionClient(sessionID, clientID)
+		}
 		h.broadcastPresence(room, h.leaveOnline(auctionID, clientID, room.ClientCount()))
 	}
 }
@@ -149,10 +165,128 @@ func (h *Hub) Broadcast(auctionID uint64, env Envelope) int {
 	if len(removed) > 0 {
 		for _, clientID := range removed {
 			_ = h.leaveOnline(auctionID, clientID, room.ClientCount())
+			h.unregisterSessionClientByID(clientID)
 		}
 		h.broadcastPresence(room, h.onlineCount(auctionID, room.ClientCount()))
 	}
 	return delivered
+}
+
+// BroadcastSessionEnd 把 LiveSessionEnded 事件推送给所有订阅了该 liveSessionId 的客户端，
+// 并把它们从 session 反查表中移除。HTTP 层的 ws_handler 会随后通过 Unsubscribe 把客户端从所属 room 中清理掉。
+//
+// 返回投递成功的客户端数量。
+func (h *Hub) BroadcastSessionEnd(liveSessionID uint64, payload json.RawMessage) int {
+	if h == nil || liveSessionID == 0 {
+		return 0
+	}
+	h.mu.Lock()
+	bucket := h.sessionClients[liveSessionID]
+	clients := make([]*Client, 0, len(bucket))
+	for _, c := range bucket {
+		clients = append(clients, c)
+	}
+	delete(h.sessionClients, liveSessionID)
+	h.mu.Unlock()
+	if len(clients) == 0 {
+		return 0
+	}
+	env := Envelope{Type: "live_session.ended", LiveSessionID: liveSessionID, Payload: payload}
+	delivered := 0
+	for _, c := range clients {
+		if c.Deliver(env) {
+			delivered++
+		}
+	}
+	return delivered
+}
+
+// SessionClientCount 返回某 liveSessionId 下当前订阅的客户端数量（仅本实例视角）。
+func (h *Hub) SessionClientCount(liveSessionID uint64) int {
+	if h == nil || liveSessionID == 0 {
+		return 0
+	}
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return len(h.sessionClients[liveSessionID])
+}
+
+// HubStats 描述 Hub 的实例级运行状态，对外暴露用于运维 / 调试入口。
+type HubStats struct {
+	Rooms          int             `json:"rooms"`
+	Clients        int             `json:"clients"`
+	LiveSessions   int             `json:"liveSessions"`
+	SessionClients map[uint64]int  `json:"liveSessionId,omitempty"`
+}
+
+// Stats 返回 Hub 的实例级状态快照。SessionClients map 的 key 是 liveSessionId，value 是该 session 下挂着的客户端数。
+func (h *Hub) Stats() HubStats {
+	if h == nil {
+		return HubStats{}
+	}
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	stats := HubStats{
+		Rooms:          len(h.rooms),
+		LiveSessions:   len(h.sessionClients),
+		SessionClients: make(map[uint64]int, len(h.sessionClients)),
+	}
+	for _, room := range h.rooms {
+		stats.Clients += room.ClientCount()
+	}
+	for sessionID, bucket := range h.sessionClients {
+		stats.SessionClients[sessionID] = len(bucket)
+	}
+	return stats
+}
+
+// registerSessionClient 把 client.LiveSessionID -> client 加入反查表；为 0 时跳过。
+func (h *Hub) registerSessionClient(client *Client) {
+	if client == nil || client.LiveSessionID == 0 {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	bucket := h.sessionClients[client.LiveSessionID]
+	if bucket == nil {
+		bucket = make(map[string]*Client)
+		h.sessionClients[client.LiveSessionID] = bucket
+	}
+	bucket[client.ID] = client
+}
+
+func (h *Hub) unregisterSessionClient(sessionID uint64, clientID string) {
+	if sessionID == 0 || clientID == "" {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	bucket, ok := h.sessionClients[sessionID]
+	if !ok {
+		return
+	}
+	delete(bucket, clientID)
+	if len(bucket) == 0 {
+		delete(h.sessionClients, sessionID)
+	}
+}
+
+// unregisterSessionClientByID 在不知道 sessionID 的情况下兜底清理所有 bucket 中匹配 clientID 的条目，
+// 避免 slow_consumer 关闭路径漏删反查表项。
+func (h *Hub) unregisterSessionClientByID(clientID string) {
+	if clientID == "" {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for sessionID, bucket := range h.sessionClients {
+		if _, ok := bucket[clientID]; ok {
+			delete(bucket, clientID)
+			if len(bucket) == 0 {
+				delete(h.sessionClients, sessionID)
+			}
+		}
+	}
 }
 
 func (h *Hub) ReplaySince(auctionID uint64, lastSeq int64) ([]Envelope, bool) {
@@ -344,15 +478,23 @@ func (r *Room) Add(client *Client) {
 }
 
 func (r *Room) Remove(clientID string) bool {
+	removed, _ := r.removeReturning(clientID)
+	return removed
+}
+
+// removeReturning 与 Remove 一致，但额外返回该 client 关联的 LiveSessionID，
+// 供 Hub 同步清理 session 反查表。
+func (r *Room) removeReturning(clientID string) (bool, uint64) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if client := r.clients[clientID]; client != nil {
+		sessionID := client.LiveSessionID
 		client.CloseWithReason("unsubscribe")
 		delete(r.clients, clientID)
 		r.disconnects.Add(1)
-		return true
+		return true, sessionID
 	}
-	return false
+	return false, 0
 }
 
 func (r *Room) Broadcast(env Envelope) (int, []string) {

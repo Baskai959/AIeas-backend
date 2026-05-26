@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
@@ -9,6 +10,7 @@ import (
 
 	appconfig "aieas_backend/internal/config"
 	"aieas_backend/internal/domain"
+	"aieas_backend/internal/infra/agent"
 	"aieas_backend/internal/infra/idgen"
 	mysqlinfra "aieas_backend/internal/infra/mysql"
 	"aieas_backend/internal/infra/objectstorage"
@@ -17,6 +19,7 @@ import (
 	"aieas_backend/internal/repository"
 	"aieas_backend/internal/service"
 	httptransport "aieas_backend/internal/transport/http"
+	mcptransport "aieas_backend/internal/transport/mcp"
 	wstransport "aieas_backend/internal/transport/ws"
 	jwtpkg "aieas_backend/pkg/jwt"
 
@@ -55,25 +58,28 @@ func NewServerWithConfig(cfg appconfig.Config) *server.Hertz {
 	keys := redisinfra.NewKeyBuilder("")
 	onlineCounter := redisinfra.NewOnlineCounter(rdb, keys, 24*time.Hour)
 	eventLog := redisinfra.NewEventLog(rdb, keys)
+	liveSessionRealtimeStore := redisinfra.NewLiveSessionRealtimeStore(rdb, keys)
 
 	userRepo := repository.NewMySQLUserRepository(db)
 	deps := ServerDependencies{
-		UserRepo:      userRepo,
-		ItemRepo:      repository.NewMySQLItemRepository(db),
-		AuctionRepo:   repository.NewMySQLAuctionRepository(db),
-		LiveRoomRepo:  repository.NewMySQLLiveRoomRepository(db),
-		BidRepo:       repository.NewMySQLBidRepository(db),
-		DepositRepo:   repository.NewMySQLDepositRepository(db),
-		OrderRepo:     repository.NewMySQLOrderRepository(db),
-		RiskRepo:      repository.NewMySQLRiskRepository(db),
-		AuditRepo:     repository.NewMySQLAuditRepository(db),
-		RealtimeStore: realtimeStore,
-		LiveRoomLock:  redisinfra.NewLiveRoomLock(rdb, keys),
-		TxManager:     repository.NewGORMTxManager(db),
-		Hub:           wstransport.NewHubWithOnlineCounter(onlineCounter),
-		Idempotency:   httptransport.NewRedisIdempotencyStore(rdb, "idempotency"),
-		EventLog:      eventLog,
-		OnlineCounter: onlineCounter,
+		UserRepo:                 userRepo,
+		ItemRepo:                 repository.NewMySQLItemRepository(db),
+		AuctionRepo:              repository.NewMySQLAuctionRepository(db),
+		LiveRoomRepo:             repository.NewMySQLLiveRoomRepository(db),
+		LiveSessionRepo:          repository.NewMySQLLiveSessionRepository(db),
+		BidRepo:                  repository.NewMySQLBidRepository(db),
+		DepositRepo:              repository.NewMySQLDepositRepository(db),
+		OrderRepo:                repository.NewMySQLOrderRepository(db),
+		RiskRepo:                 repository.NewMySQLRiskRepository(db),
+		AuditRepo:                repository.NewMySQLAuditRepository(db),
+		RealtimeStore:            realtimeStore,
+		LiveSessionRealtimeStore: liveSessionRealtimeStore,
+		LiveRoomLock:             redisinfra.NewLiveRoomLock(rdb, keys),
+		TxManager:                repository.NewGORMTxManager(db),
+		Hub:                      wstransport.NewHubWithOnlineCounter(onlineCounter),
+		Idempotency:              httptransport.NewRedisIdempotencyStore(rdb, "idempotency"),
+		EventLog:                 eventLog,
+		OnlineCounter:            onlineCounter,
 	}
 	h := NewServerWithDependencies(cfg, deps)
 	h.OnShutdown = append(h.OnShutdown, func(ctx context.Context) {
@@ -84,25 +90,29 @@ func NewServerWithConfig(cfg appconfig.Config) *server.Hertz {
 }
 
 type ServerDependencies struct {
-	UserRepo       repository.UserRepository
-	ItemRepo       repository.ItemRepository
-	AuctionRepo    repository.AuctionRepository
-	LiveRoomRepo   repository.LiveRoomRepository
-	BidRepo        repository.BidRepository
-	DepositRepo    repository.DepositRepository
-	OrderRepo      repository.OrderRepository
-	RiskRepo       repository.RiskRepository
-	AuditRepo      repository.AuditRepository
-	RealtimeStore  repository.AuctionRealtimeStore
-	LiveRoomLock   repository.LiveRoomLock
-	TxManager      repository.TxManager
-	Hub            *wstransport.Hub
-	Idempotency    httptransport.IdempotencyStore
-	EventLog       *redisinfra.EventLog
-	OnlineCounter  *redisinfra.OnlineCounter
-	ObjectUploader objectstorage.Uploader
-	AuctionIDGen   service.AuctionIDGenerator
-	OrderIDGen     service.OrderIDGenerator
+	UserRepo                 repository.UserRepository
+	ItemRepo                 repository.ItemRepository
+	AuctionRepo              repository.AuctionRepository
+	LiveRoomRepo             repository.LiveRoomRepository
+	LiveSessionRepo          repository.LiveSessionRepository
+	BidRepo                  repository.BidRepository
+	DepositRepo              repository.DepositRepository
+	OrderRepo                repository.OrderRepository
+	RiskRepo                 repository.RiskRepository
+	AuditRepo                repository.AuditRepository
+	RealtimeStore            repository.AuctionRealtimeStore
+	LiveSessionRealtimeStore repository.LiveSessionRealtimeStore
+	LiveRoomLock             repository.LiveRoomLock
+	TxManager                repository.TxManager
+	Hub                      *wstransport.Hub
+	Idempotency              httptransport.IdempotencyStore
+	EventLog                 *redisinfra.EventLog
+	OnlineCounter            *redisinfra.OnlineCounter
+	ObjectUploader           objectstorage.Uploader
+	DescriptionGen           service.ProductDescriptionGenerator
+	ProductAuditor           service.ProductAuditor
+	AuctionIDGen             service.AuctionIDGenerator
+	OrderIDGen               service.OrderIDGenerator
 }
 
 func NewServerWithUserRepository(cfg appconfig.Config, userRepo repository.UserRepository) *server.Hertz {
@@ -137,6 +147,9 @@ func NewServerWithDependencies(cfg appconfig.Config, deps ServerDependencies) *s
 	if deps.LiveRoomRepo == nil {
 		deps.LiveRoomRepo = repository.NewMemoryLiveRoomRepository()
 	}
+	if deps.LiveSessionRepo == nil {
+		deps.LiveSessionRepo = repository.NewMemoryLiveSessionRepository()
+	}
 	if deps.BidRepo == nil {
 		deps.BidRepo = repository.NewMemoryBidRepository()
 	}
@@ -155,6 +168,9 @@ func NewServerWithDependencies(cfg appconfig.Config, deps ServerDependencies) *s
 	if deps.RealtimeStore == nil {
 		deps.RealtimeStore = repository.NewMemoryRealtimeStore()
 	}
+	if deps.LiveSessionRealtimeStore == nil {
+		deps.LiveSessionRealtimeStore = repository.NewMemoryLiveSessionRealtimeStore()
+	}
 	if deps.LiveRoomLock == nil {
 		deps.LiveRoomLock = repository.NewMemoryLiveRoomLock()
 	}
@@ -170,6 +186,12 @@ func NewServerWithDependencies(cfg appconfig.Config, deps ServerDependencies) *s
 			panic(fmt.Errorf("init object storage uploader: %w", err))
 		}
 		deps.ObjectUploader = uploader
+	}
+	if deps.DescriptionGen == nil {
+		deps.DescriptionGen = agent.NewProductDescriptionClient(cfg.Agent)
+	}
+	if deps.ProductAuditor == nil {
+		deps.ProductAuditor = agent.NewProductAuditClient(cfg.Agent)
 	}
 	if deps.AuctionIDGen == nil || deps.OrderIDGen == nil {
 		generator, err := idgen.NewSnowflake(cfg.IDGen.WorkerID)
@@ -190,6 +212,7 @@ func NewServerWithDependencies(cfg appconfig.Config, deps ServerDependencies) *s
 	authService := service.NewAuthService(deps.UserRepo, jwtManager)
 	itemService := service.NewItemService(deps.ItemRepo)
 	itemService.SetAuctionRepository(deps.AuctionRepo)
+	itemService.SetProductAuditor(deps.ProductAuditor)
 	auctionService := service.NewAuctionService(deps.AuctionRepo, deps.ItemRepo, deps.TxManager)
 	riskService := service.NewRiskService(deps.RiskRepo, deps.RealtimeStore, deps.Hub)
 	depositService := service.NewDepositService(deps.DepositRepo, deps.AuctionRepo, deps.RealtimeStore, riskService, deps.TxManager)
@@ -204,10 +227,18 @@ func NewServerWithDependencies(cfg appconfig.Config, deps ServerDependencies) *s
 	hammerService.SetOrderIDGenerator(deps.OrderIDGen)
 	liveRoomService := service.NewLiveRoomService(deps.LiveRoomRepo, deps.AuctionRepo, deps.TxManager, deps.LiveRoomLock)
 	liveRoomService.SetAuctionService(auctionService)
+	liveRoomService.SetHammerService(hammerService)
 	liveRoomService.SetStatsDeps(deps.BidRepo, deps.RealtimeStore, deps.Hub)
+	liveSessionService := service.NewLiveSessionService(deps.LiveSessionRepo, deps.LiveRoomRepo, deps.AuctionRepo)
+	liveSessionService.SetReadDeps(deps.BidRepo, deps.OrderRepo)
+	liveSessionService.SetRealtimeStore(deps.LiveSessionRealtimeStore)
+	liveSessionService.SetOnEnded(buildLiveSessionEndedHook(deps.Hub))
+	liveRoomService.SetLiveSessionService(liveSessionService)
+	hammerService.SetLiveSessionService(liveSessionService)
 	auctionService.SetOnClose(liveRoomService.OnAuctionClosed)
 	hammerService.SetOnClose(liveRoomService.OnAuctionClosed)
 	bidService := service.NewBidService(deps.BidRepo, deps.AuctionRepo, deps.RealtimeStore, riskService, deps.Hub, cfg.Auction)
+	bidService.SetLiveSessionService(liveSessionService)
 	var stopWorkers context.CancelFunc
 	if deps.EventLog != nil && deps.EventLog.Enabled() {
 		ctx, cancel := context.WithCancel(context.Background())
@@ -220,7 +251,22 @@ func NewServerWithDependencies(cfg appconfig.Config, deps ServerDependencies) *s
 		}
 	}
 	adminService := service.NewAdminService(deps.UserRepo, auctionService, hammerService, orderService, riskService, deps.AuditRepo)
-	h := newServerWithServices(authService, itemService, auctionService, bidService, depositService, hammerService, orderService, adminService, liveRoomService, deps.AuditRepo, deps.Hub, deps.Idempotency, deps.ObjectUploader, cfg)
+	mcpReadService := service.NewMCPReadService(service.MCPReadDependencies{
+		Users:       deps.UserRepo,
+		Items:       deps.ItemRepo,
+		Auctions:    deps.AuctionRepo,
+		Rooms:       deps.LiveRoomRepo,
+		Sessions:    deps.LiveSessionRepo,
+		Bids:        deps.BidRepo,
+		Orders:      deps.OrderRepo,
+		Risk:        riskService,
+		AuditLogs:   deps.AuditRepo,
+		AuctionSvc:  auctionService,
+		LiveRoomSvc: liveRoomService,
+		LiveSession: liveSessionService,
+		OrderSvc:    orderService,
+	})
+	h := newServerWithServices(authService, itemService, auctionService, bidService, depositService, hammerService, orderService, adminService, liveRoomService, liveSessionService, mcpReadService, deps.AuditRepo, deps.Hub, deps.Idempotency, deps.ObjectUploader, deps.DescriptionGen, cfg)
 	if stopWorkers != nil {
 		h.OnShutdown = append(h.OnShutdown, func(ctx context.Context) {
 			_ = ctx
@@ -261,12 +307,36 @@ func NewServerWithAuth(authService *service.AuthService) *server.Hertz {
 	liveRoomLock := repository.NewMemoryLiveRoomLock()
 	liveRoomService := service.NewLiveRoomService(liveRoomRepo, auctionRepo, repository.NoopTxManager{}, liveRoomLock)
 	liveRoomService.SetAuctionService(auctionService)
+	liveRoomService.SetHammerService(hammerService)
 	liveRoomService.SetStatsDeps(bidRepo, realtimeStore, hub)
+	liveSessionRepo := repository.NewMemoryLiveSessionRepository()
+	liveSessionService := service.NewLiveSessionService(liveSessionRepo, liveRoomRepo, auctionRepo)
+	liveSessionService.SetReadDeps(bidRepo, orderRepo)
+	liveSessionService.SetOnEnded(buildLiveSessionEndedHook(hub))
+	liveRoomService.SetLiveSessionService(liveSessionService)
+	hammerService.SetLiveSessionService(liveSessionService)
+	bidService.SetLiveSessionService(liveSessionService)
 	auctionService.SetOnClose(liveRoomService.OnAuctionClosed)
 	hammerService.SetOnClose(liveRoomService.OnAuctionClosed)
+	itemService := service.NewItemService(itemRepo)
+	mcpReadService := service.NewMCPReadService(service.MCPReadDependencies{
+		Users:       repository.NewSeedUserRepository(),
+		Items:       itemRepo,
+		Auctions:    auctionRepo,
+		Rooms:       liveRoomRepo,
+		Sessions:    liveSessionRepo,
+		Bids:        bidRepo,
+		Orders:      orderRepo,
+		Risk:        riskService,
+		AuditLogs:   auditRepo,
+		AuctionSvc:  auctionService,
+		LiveRoomSvc: liveRoomService,
+		LiveSession: liveSessionService,
+		OrderSvc:    orderService,
+	})
 	return newServerWithServices(
 		authService,
-		service.NewItemService(itemRepo),
+		itemService,
 		auctionService,
 		bidService,
 		depositService,
@@ -274,10 +344,13 @@ func NewServerWithAuth(authService *service.AuthService) *server.Hertz {
 		orderService,
 		adminService,
 		liveRoomService,
+		liveSessionService,
+		mcpReadService,
 		auditRepo,
 		hub,
 		nil,
 		objectstorage.DisabledUploader{},
+		service.DisabledProductDescriptionGenerator{},
 		cfg,
 	)
 }
@@ -292,10 +365,13 @@ func newServerWithServices(
 	orderService *service.OrderService,
 	adminService *service.AdminService,
 	liveRoomService *service.LiveRoomService,
+	liveSessionService *service.LiveSessionService,
+	mcpReadService *service.MCPReadService,
 	auditRepo repository.AuditRepository,
 	hub *wstransport.Hub,
 	idempotencyStore httptransport.IdempotencyStore,
 	objectUploader objectstorage.Uploader,
+	descriptionGen service.ProductDescriptionGenerator,
 	cfg appconfig.Config,
 ) *server.Hertz {
 	logger := buildLogger(cfg.Observability)
@@ -310,13 +386,17 @@ func newServerWithServices(
 	h.GET("/ping", func(ctx context.Context, c *hertzapp.RequestContext) {
 		c.JSON(consts.StatusOK, utils.H{"message": "pong"})
 	})
+	mcpHandler := mcptransport.NewHandler(authService, mcpReadService)
+	h.POST("/mcp", mcpHandler.Post)
+	h.GET("/mcp", mcpHandler.Get)
 
 	authHandler := httptransport.NewAuthHandler(authService)
-	itemHandler := httptransport.NewItemHandler(itemService, objectUploader)
+	itemHandler := httptransport.NewItemHandler(itemService, objectUploader, descriptionGen)
 	auctionHandler := httptransport.NewAuctionHandler(auctionService, depositService, hammerService)
 	orderHandler := httptransport.NewOrderHandler(orderService)
 	adminHandler := httptransport.NewAdminHandler(adminService)
 	liveRoomHandler := httptransport.NewLiveRoomHandler(liveRoomService)
+	liveSessionHandler := httptransport.NewLiveSessionHandler(liveSessionService)
 	wsHandler := httptransport.NewWSHandler(hub, bidService, cfg.WebSocket.SendBufferSize, cfg.WebSocket.ReadLimitBytes, cfg.WebSocket.PingInterval.Std(), cfg.WebSocket.PongTimeout.Std())
 	wsHandler.SetLiveRoomService(liveRoomService)
 	idempotencyTTL := cfg.Idempotency.TTL.Std()
@@ -330,6 +410,8 @@ func newServerWithServices(
 		v1.POST("/auth/refresh", authHandler.Refresh)
 		v1.POST("/admin/auth/login", authHandler.AdminLogin)
 
+		v1.GET("/images/*key", itemHandler.Image)
+
 		protected := v1.Group("/auth", authHandler.AuthMiddleware())
 		protected.GET("/me", authHandler.Me)
 		protected.POST("/logout", authHandler.Logout)
@@ -337,6 +419,7 @@ func newServerWithServices(
 		v1.GET("/audit-logs", authHandler.AuthMiddleware(), httptransport.RoleAuth(domain.RoleMerchant, domain.RoleAdmin), adminHandler.ListOwnAuditLogs)
 
 		items := v1.Group("/items", authHandler.AuthMiddleware(), httptransport.RoleAuth(domain.RoleMerchant, domain.RoleAdmin))
+		items.POST("/description/optimize", itemHandler.OptimizeDescription)
 		items.POST("", itemHandler.Create)
 		items.GET("", itemHandler.List)
 		items.GET("/:id", itemHandler.Get)
@@ -362,6 +445,16 @@ func newServerWithServices(
 		liveRoomsPublic.GET("/:id", liveRoomHandler.Get)
 		liveRoomsPublic.GET("/:id/lots", liveRoomHandler.Lots)
 		liveRoomsPublic.GET("/:id/stats", liveRoomHandler.Stats)
+		liveRoomsPublic.GET("/:id/sessions", liveSessionHandler.ListByRoom)
+
+		liveSessionsPublic := v1.Group("/live-sessions", authHandler.AuthMiddleware())
+		liveSessionsPublic.GET("/:sessionId", liveSessionHandler.Get)
+		liveSessionsPublic.GET("/:sessionId/lots", liveSessionHandler.Lots)
+		liveSessionsPublic.GET("/:sessionId/bids", liveSessionHandler.Bids)
+		liveSessionsPublic.GET("/:sessionId/orders", liveSessionHandler.Orders)
+
+		merchantSessions := v1.Group("/merchants", authHandler.AuthMiddleware(), httptransport.RoleAuth(domain.RoleMerchant, domain.RoleAdmin))
+		merchantSessions.GET("/:merchantId/live-sessions", liveSessionHandler.ListByMerchant)
 
 		liveRooms := v1.Group("/live-rooms", authHandler.AuthMiddleware(), httptransport.RoleAuth(domain.RoleMerchant, domain.RoleAdmin))
 		liveRooms.POST("", liveRoomHandler.Create)
@@ -406,6 +499,30 @@ func newServerWithServices(
 
 func timeMinute() time.Duration {
 	return time.Minute
+}
+
+// buildLiveSessionEndedHook 构造 LiveSession 闭播完成后用于通知 WS 订阅方的回调。
+//
+// 闭播路径会在 LiveSessionService.CloseSession 完成 MySQL 状态机切换后异步触发：
+// 通过 Hub.BroadcastSessionEnd 把 live_session.ended 事件推送给所有订阅了该 sessionID
+// 的客户端，并把它们从 session 反查表中清理掉（同房间的 ws 仍由 Unsubscribe 路径独立清理）。
+//
+// hub 为 nil 时返回 nil，使 LiveSessionService 跳过回调注入。
+func buildLiveSessionEndedHook(hub *wstransport.Hub) func(ctx context.Context, session domain.LiveSession) {
+	if hub == nil {
+		return nil
+	}
+	return func(_ context.Context, session domain.LiveSession) {
+		if session.ID == 0 {
+			return
+		}
+		payload, _ := json.Marshal(map[string]interface{}{
+			"liveSessionId": session.ID,
+			"liveRoomId":    session.LiveRoomID,
+			"status":        session.Status,
+		})
+		hub.BroadcastSessionEnd(session.ID, payload)
+	}
 }
 
 func serverOptions(cfg appconfig.ServerConfig) []hertzconfig.Option {

@@ -97,7 +97,7 @@ func (h *WSHandler) LiveRoom(ctx context.Context, c *app.RequestContext) {
 		WriteError(c, consts.StatusInternalServerError, 90001, "系统内部错误", nil)
 		return
 	}
-	auctionID, err := h.rooms.ActiveAuctionID(ctx, roomID)
+	auctionID, sessionID, err := h.rooms.ActiveAuctionAndSession(ctx, roomID)
 	if err != nil {
 		writeLiveRoomError(c, err)
 		return
@@ -111,7 +111,7 @@ func (h *WSHandler) LiveRoom(ctx context.Context, c *app.RequestContext) {
 	if userID == "" {
 		userID = "anonymous"
 	}
-	client := corews.NewClient(clientID, userID, auctionID, h.sendBufferSize)
+	client := corews.NewClientWithSession(clientID, userID, auctionID, sessionID, h.sendBufferSize)
 	lastSeq := parseLastSeq(c)
 	if err := h.hub.Subscribe(auctionID, client); err != nil {
 		WriteError(c, consts.StatusInternalServerError, 90001, "系统内部错误", nil)

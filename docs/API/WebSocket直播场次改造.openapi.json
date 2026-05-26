@@ -1,0 +1,383 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "WebSocket 直播场次改造",
+    "version": "v1",
+    "description": "本文件描述 WebSocket 入口在「直播场次（live_session）维度」改造后的契约：\n\n- 在原有 `/ws/auctions/{auction_id}`（直接拍卖流，保留兼容）基础上，新增 `/ws/live-rooms/{room_id}`，由后端解析 `room.active_auction_id` 路由到当前活跃拍品并注入 `liveSessionId`。\n- 帧 envelope 在原有 `type/requestId/seq/ack/payload` 基础上新增 `liveSessionId` 字段，供按场次维度反查/广播使用。\n- 关播时 `Hub.BroadcastSessionEnd` 会向当前 `liveSessionId` 下所有客户端推送 `live_session.ended` 帧；客户端可据此自行断开或等待 close。\n\n鉴权方式与 REST 一致：JWT Bearer，由路由层 `AuthMiddleware()` 统一校验；通过后将 userID 注入到 WS Client。注意：这些 WS 端点不属于 `/api/v1` 前缀，直接挂在根路径。"
+  },
+  "servers": [
+    {
+      "url": "http://localhost:8888",
+      "description": "Local"
+    }
+  ],
+  "tags": [
+    {
+      "name": "WebSocket",
+      "description": "实时推送通道（HTTP/1.1 Upgrade -> WebSocket）"
+    }
+  ],
+  "paths": {
+    "/ws/auctions/{auction_id}": {
+      "get": {
+        "tags": ["WebSocket"],
+        "summary": "订阅指定拍品的实时事件流（兼容入口）",
+        "description": "WebSocket Upgrade 端点。客户端需通过 HTTP/1.1 `Upgrade: websocket` 协议升级握手；握手成功后服务端返回 `101 Switching Protocols`，随后通过 WebSocket 文本帧承载 `Envelope` 协议双向通信。\n\n- 鉴权：与 REST 一致的 JWT Bearer，匿名连接 `userId` 默认为 `anonymous`，但出价等需鉴权动作仍会被服务端校验。\n- 订阅语义：连接成功后该 client 自动订阅到 `auction_id` 对应房间。\n- 重放：`?lastSeq=` 查询参数可在重连时请求增量重放；超出事件窗口时服务端会回推 `room.snapshot_required` 让客户端切换为快照拉取。\n- 不属于 `/api/v1` 前缀，路径直接挂在根路径下。",
+        "operationId": "wsAuctionSubscribe",
+        "parameters": [
+          {
+            "name": "auction_id",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "integer", "format": "uint64" },
+            "description": "拍品 ID（auction_lot.auction_id）"
+          },
+          {
+            "name": "lastSeq",
+            "in": "query",
+            "required": false,
+            "schema": { "type": "integer", "format": "int64", "minimum": 0 },
+            "description": "客户端最近收到的 seq；重连时携带可触发服务端按区间重放。"
+          },
+          {
+            "name": "Upgrade",
+            "in": "header",
+            "required": true,
+            "schema": { "type": "string", "enum": ["websocket"] }
+          },
+          {
+            "name": "Connection",
+            "in": "header",
+            "required": true,
+            "schema": { "type": "string", "enum": ["Upgrade"] }
+          },
+          {
+            "name": "Sec-WebSocket-Version",
+            "in": "header",
+            "required": true,
+            "schema": { "type": "string", "enum": ["13"] }
+          },
+          {
+            "name": "Sec-WebSocket-Key",
+            "in": "header",
+            "required": true,
+            "schema": { "type": "string" }
+          }
+        ],
+        "security": [{ "BearerAuth": [] }],
+        "responses": {
+          "101": {
+            "description": "协议升级成功，转入 WebSocket 帧流（参考 schemas.Envelope）。",
+            "headers": {
+              "Upgrade": { "schema": { "type": "string", "enum": ["websocket"] } },
+              "Connection": { "schema": { "type": "string", "enum": ["Upgrade"] } },
+              "Sec-WebSocket-Accept": { "schema": { "type": "string" } }
+            }
+          },
+          "400": {
+            "description": "auction_id 非法",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+              }
+            }
+          },
+          "401": { "description": "未鉴权或 token 无效" },
+          "500": {
+            "description": "Hub Subscribe 失败等内部错误",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/ws/live-rooms/{room_id}": {
+      "get": {
+        "tags": ["WebSocket"],
+        "summary": "订阅直播间当前活跃拍品 + 直播场次（场次维度入口）",
+        "description": "WebSocket Upgrade 端点。后端通过 `LiveRoomService.ActiveAuctionAndSession(roomID)` 一次性解析出 `(activeAuctionId, liveSessionId)`：\n\n- 当 `activeAuctionId == 0`：返回 `409 + 31005 直播间当前无在拍品`，不进入 Upgrade。\n- 当 `activeAuctionId != 0`：在 Hub 中为该客户端构造带 `LiveSessionID` 的 Client（`NewClientWithSession`），自动加入 `auctionId -> Room` 与 `liveSessionId -> Clients` 两张反查表。\n- 闭播路径：`LiveSessionService.CloseSession` 触发 `Hub.BroadcastSessionEnd(liveSessionId)`，向当前会话下所有客户端推送 `type=live_session.ended` 帧；客户端收到后应主动断开或等待服务端 close。\n\n鉴权与 `/ws/auctions/{auction_id}` 一致；同样不属于 `/api/v1` 前缀。",
+        "operationId": "wsLiveRoomSubscribe",
+        "parameters": [
+          {
+            "name": "room_id",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "integer", "format": "uint64" },
+            "description": "直播间 ID（live_room.id）"
+          },
+          {
+            "name": "lastSeq",
+            "in": "query",
+            "required": false,
+            "schema": { "type": "integer", "format": "int64", "minimum": 0 },
+            "description": "重放游标，与 /ws/auctions 一致。"
+          },
+          {
+            "name": "Upgrade",
+            "in": "header",
+            "required": true,
+            "schema": { "type": "string", "enum": ["websocket"] }
+          },
+          {
+            "name": "Connection",
+            "in": "header",
+            "required": true,
+            "schema": { "type": "string", "enum": ["Upgrade"] }
+          },
+          {
+            "name": "Sec-WebSocket-Version",
+            "in": "header",
+            "required": true,
+            "schema": { "type": "string", "enum": ["13"] }
+          },
+          {
+            "name": "Sec-WebSocket-Key",
+            "in": "header",
+            "required": true,
+            "schema": { "type": "string" }
+          }
+        ],
+        "security": [{ "BearerAuth": [] }],
+        "responses": {
+          "101": {
+            "description": "协议升级成功；连接已绑定 `(auctionId, liveSessionId)`。后续通过 WebSocket 帧（参考 schemas.Envelope）双向通信。",
+            "headers": {
+              "Upgrade": { "schema": { "type": "string", "enum": ["websocket"] } },
+              "Connection": { "schema": { "type": "string", "enum": ["Upgrade"] } },
+              "Sec-WebSocket-Accept": { "schema": { "type": "string" } }
+            }
+          },
+          "400": {
+            "description": "room_id 非法",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+              }
+            }
+          },
+          "401": { "description": "未鉴权或 token 无效" },
+          "404": {
+            "description": "直播间不存在",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+              }
+            }
+          },
+          "409": {
+            "description": "直播间当前无在拍品（activeAuctionId 为 0）。错误码 31005。",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" },
+                "example": {
+                  "code": 31005,
+                  "message": "直播间当前无在拍品"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "服务初始化未注入 LiveRoomService 或 Hub Subscribe 失败",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "BearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT",
+        "description": "与 REST API 共用同一份 JWT。WebSocket 升级请求的 Authorization 头由 AuthMiddleware 统一校验。"
+      }
+    },
+    "schemas": {
+      "Envelope": {
+        "type": "object",
+        "description": "WebSocket 双向帧统一信封。所有入站/出站帧（含心跳、订阅、出价、关播等）都包装为该结构。`liveSessionId` 字段在场次入口连接里由服务端注入，客户端无需主动设置。",
+        "properties": {
+          "type": {
+            "type": "string",
+            "description": "帧类型；下方 `EventType` 列举了实际广播 / 应答中出现过的常量。",
+            "$ref": "#/components/schemas/EventType"
+          },
+          "requestId": {
+            "type": "string",
+            "description": "客户端请求 ID（幂等键）；服务端 Ack 帧会原样回填。"
+          },
+          "seq": {
+            "type": "integer",
+            "format": "int64",
+            "description": "房间内单调递增序号；客户端可据此做重放游标。"
+          },
+          "ack": {
+            "type": "boolean",
+            "description": "是否为 Ack 帧。`type=ack` 时为 true。"
+          },
+          "liveSessionId": {
+            "type": "integer",
+            "format": "uint64",
+            "description": "所属直播场次 ID。仅在 `live_session.ended` 等场次维度帧上出现；普通房间帧（如 bid.accepted）目前由服务端不强制设置。"
+          },
+          "payload": {
+            "description": "帧载荷（原始 JSON）；不同 type 的载荷形状由具体事件决定。",
+            "oneOf": [
+              { "type": "object" },
+              { "type": "array" },
+              { "type": "string" },
+              { "type": "number" },
+              { "type": "boolean" },
+              { "type": "null" }
+            ]
+          }
+        },
+        "required": ["type"]
+      },
+      "EventType": {
+        "type": "string",
+        "description": "WebSocket 帧 type 枚举。来源：`internal/transport/ws/hub.go`、`internal/transport/http/ws_handler.go`、`internal/service/{auction,bid,hammer}.go` 中实际广播 / 应答常量。",
+        "enum": [
+          "ack",
+          "error",
+          "ping",
+          "pong",
+          "heartbeat",
+          "heartbeat.ack",
+          "subscribe",
+          "subscribed",
+          "room.subscribe",
+          "room.subscribed",
+          "room.unsubscribe",
+          "room.unsubscribed",
+          "room.online",
+          "room.snapshot_required",
+          "announcement",
+          "bid.place",
+          "bid.ack",
+          "bid.accepted",
+          "bid.rejected",
+          "auction.started",
+          "auction.closed",
+          "live_session.ended"
+        ]
+      },
+      "BidPlacePayload": {
+        "type": "object",
+        "description": "入站 `bid.place` 帧载荷。WS 服务端会调用 `BidService.Place(...)` 处理。",
+        "properties": {
+          "auctionId": { "type": "integer", "format": "uint64" },
+          "price": { "type": "integer", "format": "int64", "description": "出价金额（分）。" },
+          "requestId": { "type": "string", "description": "幂等键；缺省时回退到 envelope.requestId。" },
+          "idempotencyKey": { "type": "string", "description": "兼容旧字段，与 requestId 互为别名。" }
+        },
+        "required": ["price"]
+      },
+      "BidAckPayload": {
+        "type": "object",
+        "description": "出站 `bid.ack` 帧载荷。",
+        "properties": {
+          "accepted": { "type": "boolean" },
+          "code": { "type": "integer", "description": "服务端业务错误码（accepted=false 时出现）。" },
+          "reason": { "type": "string", "description": "拒绝原因或人类可读信息。" },
+          "auctionId": { "type": "integer", "format": "uint64" },
+          "currentPrice": { "type": "integer", "format": "int64" },
+          "seq": { "type": "integer", "format": "int64" },
+          "streamId": { "type": "string" },
+          "event": { "type": "string", "enum": ["bid.accepted", "bid.rejected"] }
+        }
+      },
+      "RoomSubscribePayload": {
+        "type": "object",
+        "description": "`room.subscribe` / `room.unsubscribe` / `room.subscribed` / `room.unsubscribed` 共用载荷。",
+        "properties": {
+          "auctionId": { "type": "integer", "format": "uint64" }
+        }
+      },
+      "RoomOnlinePayload": {
+        "type": "object",
+        "description": "`room.online` 在线人数变更广播载荷。",
+        "properties": {
+          "auctionId": { "type": "integer", "format": "uint64" },
+          "online": { "type": "integer", "minimum": 0 }
+        }
+      },
+      "RoomSnapshotRequiredPayload": {
+        "type": "object",
+        "description": "`room.snapshot_required` 触发条件：客户端 lastSeq 落在事件窗口外，需要走快照拉取。",
+        "properties": {
+          "auctionId": { "type": "integer", "format": "uint64" },
+          "lastSeq": { "type": "integer", "format": "int64" },
+          "reason": { "type": "string", "enum": ["EVENT_WINDOW_EXPIRED"] }
+        }
+      },
+      "HeartbeatAckPayload": {
+        "type": "object",
+        "description": "`heartbeat.ack` / `ping` 载荷。",
+        "properties": {
+          "ts": { "type": "integer", "format": "int64", "description": "服务端时间戳（毫秒）。" }
+        }
+      },
+      "LiveSessionEndedPayload": {
+        "type": "object",
+        "description": "`live_session.ended` 帧载荷，由 `Hub.BroadcastSessionEnd` 推送给当前 `liveSessionId` 下所有客户端。具体字段由调用方自定义，下列为典型字段。",
+        "properties": {
+          "liveSessionId": { "type": "integer", "format": "uint64" },
+          "liveRoomId": { "type": "integer", "format": "uint64" },
+          "closedAt": { "type": "string", "format": "date-time" },
+          "lotsTotal": { "type": "integer" },
+          "lotsSold": { "type": "integer" },
+          "lotsUnsold": { "type": "integer" },
+          "bidCount": { "type": "integer" },
+          "gmvCent": { "type": "integer", "format": "int64" }
+        }
+      },
+      "ErrorPayload": {
+        "type": "object",
+        "description": "`type=error` 帧载荷。",
+        "properties": {
+          "message": { "type": "string" }
+        }
+      },
+      "AckPayload": {
+        "type": "object",
+        "description": "`type=ack` 帧载荷。",
+        "properties": {
+          "requestId": { "type": "string" },
+          "seq": { "type": "integer", "format": "int64" }
+        }
+      },
+      "HubStats": {
+        "type": "object",
+        "description": "Hub 实例运行状态快照（来源：`Hub.Stats()`，仅运维 / 调试用途，不直接通过 WS 帧推送）。",
+        "properties": {
+          "rooms": { "type": "integer", "description": "Room 数量。" },
+          "clients": { "type": "integer", "description": "全部 Room 累计的 client 数量。" },
+          "liveSessions": { "type": "integer", "description": "当前挂载的 liveSessionId 数。" },
+          "liveSessionId": {
+            "type": "object",
+            "description": "key=liveSessionId，value=该 session 下挂载的 client 数量。",
+            "additionalProperties": { "type": "integer" }
+          }
+        }
+      },
+      "ErrorResponse": {
+        "type": "object",
+        "description": "REST 风格错误响应；用于 Upgrade 之前的握手错误（如 409 直播间无在拍品）。",
+        "properties": {
+          "code": { "type": "integer" },
+          "message": { "type": "string" },
+          "trace_id": { "type": "string" }
+        }
+      }
+    }
+  }
+}

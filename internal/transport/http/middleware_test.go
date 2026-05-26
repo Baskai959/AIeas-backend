@@ -96,6 +96,56 @@ func TestIdempotencyMiddlewareCachesSameBodyAndRejectsConflict(t *testing.T) {
 	}
 }
 
+func TestAuditMiddlewareSkipsUnauthorizedWithoutOperator(t *testing.T) {
+	h := server.Default()
+	sink := &captureAuditSink{}
+	h.Use(RequestIDMiddleware(), AuditMiddleware(sink, nil))
+	h.POST("/api/v1/auth/refresh", func(ctx context.Context, c *app.RequestContext) {
+		AbortError(c, consts.StatusUnauthorized, 10002, "访问令牌无效或已过期", nil)
+	})
+
+	resp := ut.PerformRequest(h.Engine, consts.MethodPost, "/api/v1/auth/refresh", nil)
+	if resp.Code != consts.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d body=%s", resp.Code, resp.Body.String())
+	}
+	if len(sink.logs) != 0 {
+		t.Fatalf("expected no audit log for unauthorized request, got %+v", sink.logs)
+	}
+}
+
+func TestAuditMiddlewareWritesAuthenticatedMutation(t *testing.T) {
+	h := server.Default()
+	sink := &captureAuditSink{}
+	h.Use(RequestIDMiddleware(), AuditMiddleware(sink, nil))
+	h.POST("/api/v1/items", func(ctx context.Context, c *app.RequestContext) {
+		c.Set(contextUserID, "2")
+		c.Set(contextRole, string(domain.RoleMerchant))
+		WriteSuccess(c, map[string]string{"ok": "true"})
+	})
+
+	resp := ut.PerformRequest(h.Engine, consts.MethodPost, "/api/v1/items", nil)
+	if resp.Code != consts.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", resp.Code, resp.Body.String())
+	}
+	if len(sink.logs) != 1 {
+		t.Fatalf("expected one audit log, got %d", len(sink.logs))
+	}
+	log := sink.logs[0]
+	if log.OperatorID != "2" || log.OperatorRole != domain.RoleMerchant || log.Action != "POST /api/v1/items" {
+		t.Fatalf("unexpected audit log: %+v", log)
+	}
+}
+
+type captureAuditSink struct {
+	logs []domain.AuditLog
+}
+
+func (s *captureAuditSink) Create(ctx context.Context, log *domain.AuditLog) error {
+	_ = ctx
+	s.logs = append(s.logs, *log)
+	return nil
+}
+
 func TestRedisIdempotencyStoreCachesWithTTL(t *testing.T) {
 	client := newFakeRedisIdempotencyClient()
 	store := NewRedisIdempotencyStore(client, "idem:test")

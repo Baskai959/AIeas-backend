@@ -17,6 +17,7 @@ type BidService struct {
 	realtime  repository.AuctionRealtimeStore
 	risk      *RiskService
 	publisher EventPublisher
+	sessions  *LiveSessionService
 	cfg       appconfig.AuctionConfig
 }
 
@@ -52,6 +53,11 @@ func NewBidService(bids repository.BidRepository, auctions repository.AuctionRep
 		cfg.FreqWindowMs = 1000
 	}
 	return &BidService{bids: bids, auctions: auctions, realtime: realtime, risk: risk, publisher: publisher, cfg: cfg}
+}
+
+// SetLiveSessionService 注入直播场次服务，用于在 persistBid 时回填 live_session_id 与累加 bid_count。
+func (s *BidService) SetLiveSessionService(sessions *LiveSessionService) {
+	s.sessions = sessions
 }
 
 func (s *BidService) Place(ctx context.Context, in PlaceBidInput) (domain.BidResult, error) {
@@ -243,16 +249,24 @@ func (s *BidService) persistBid(ctx context.Context, in PlaceBidInput, result do
 	if s.bids == nil {
 		return
 	}
+	var sessionID *uint64
+	if s.auctions != nil {
+		if lot, err := s.auctions.FindByID(ctx, in.AuctionID); err == nil && lot.LiveSessionID != nil {
+			id := *lot.LiveSessionID
+			sessionID = &id
+		}
+	}
 	record := domain.BidRecord{
-		RequestID:    in.RequestID,
-		AuctionID:    in.AuctionID,
-		BidderID:     in.BidderID,
-		BidPrice:     in.Price,
-		BidTSMS:      now.UnixMilli(),
-		Source:       in.Source,
-		RiskResult:   result.RiskResult,
-		RejectReason: result.Reason,
-		CreatedAt:    now,
+		RequestID:     in.RequestID,
+		AuctionID:     in.AuctionID,
+		LiveSessionID: sessionID,
+		BidderID:      in.BidderID,
+		BidPrice:      in.Price,
+		BidTSMS:       now.UnixMilli(),
+		Source:        in.Source,
+		RiskResult:    result.RiskResult,
+		RejectReason:  result.Reason,
+		CreatedAt:     now,
 	}
 	if result.Accepted {
 		record.RiskResult = domain.BidRiskAllow
@@ -260,6 +274,10 @@ func (s *BidService) persistBid(ctx context.Context, in PlaceBidInput, result do
 	}
 	if err := s.bids.Create(ctx, &record); err != nil && !errors.Is(err, domain.ErrConflict) {
 		return
+	}
+	// 仅在出价被接受时累加场次的 bid_count（拒绝/重复不计）。
+	if result.Accepted && sessionID != nil && s.sessions != nil {
+		_ = s.sessions.IncrCounters(ctx, *sessionID, domain.LiveSessionCounters{BidCountDelta: 1})
 	}
 }
 

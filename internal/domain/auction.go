@@ -82,6 +82,7 @@ type AuctionLot struct {
 	ItemID         uint64          `json:"itemId"`
 	SellerID       string          `json:"sellerId"`
 	LiveRoomID     uint64          `json:"liveRoomId,omitempty"`
+	LiveSessionID  *uint64         `json:"liveSessionId,omitempty"`
 	AuctionType    AuctionType     `json:"auctionType"`
 	StartPrice     int64           `json:"startPrice"`
 	ReservePrice   int64           `json:"reservePrice"`
@@ -144,16 +145,17 @@ const (
 )
 
 type BidRecord struct {
-	ID           uint64
-	RequestID    string
-	AuctionID    uint64
-	BidderID     string
-	BidPrice     int64
-	BidTSMS      int64
-	Source       string
-	RiskResult   BidRiskResult
-	RejectReason string
-	CreatedAt    time.Time
+	ID            uint64
+	RequestID     string
+	AuctionID     uint64
+	LiveSessionID *uint64
+	BidderID      string
+	BidPrice      int64
+	BidTSMS       int64
+	Source        string
+	RiskResult    BidRiskResult
+	RejectReason  string
+	CreatedAt     time.Time
 }
 
 type BidInput struct {

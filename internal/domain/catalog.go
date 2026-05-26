@@ -8,15 +8,17 @@ import (
 type ItemStatus string
 
 const (
-	ItemStatusDraft   ItemStatus = "DRAFT"
-	ItemStatusReady   ItemStatus = "READY"
-	ItemStatusListed  ItemStatus = "LISTED"
-	ItemStatusOffline ItemStatus = "OFFLINE"
+	ItemStatusDraft        ItemStatus = "DRAFT"
+	ItemStatusPendingAudit ItemStatus = "PENDING_AUDIT"
+	ItemStatusReady        ItemStatus = "READY"
+	ItemStatusRejected     ItemStatus = "REJECTED"
+	ItemStatusListed       ItemStatus = "LISTED"
+	ItemStatusOffline      ItemStatus = "OFFLINE"
 )
 
 func (s ItemStatus) Valid() bool {
 	switch s {
-	case ItemStatusDraft, ItemStatusReady, ItemStatusListed, ItemStatusOffline:
+	case ItemStatusDraft, ItemStatusPendingAudit, ItemStatusReady, ItemStatusRejected, ItemStatusListed, ItemStatusOffline:
 		return true
 	default:
 		return false

@@ -12,10 +12,12 @@ import (
 type ItemService struct {
 	items    repository.ItemRepository
 	auctions repository.AuctionRepository
+	auditor  ProductAuditor
 }
 
 type CreateItemInput struct {
 	SellerID       string
+	ActorRole      domain.Role
 	Title          string
 	Category       string
 	Brand          string
@@ -23,6 +25,7 @@ type CreateItemInput struct {
 	Images         []string
 	Description    string
 	Status         domain.ItemStatus
+	AuditImage     *ProductAuditImage
 }
 
 type UpdateItemInput struct {
@@ -35,6 +38,14 @@ type UpdateItemInput struct {
 	Images         *[]string
 	Description    *string
 	Status         *domain.ItemStatus
+	AuditImage     *ProductAuditImage
+}
+
+type ProductAuditImage struct {
+	ImageName   string
+	ContentType string
+	ImageSize   int64
+	Image       []byte
 }
 
 func NewItemService(items repository.ItemRepository) *ItemService {
@@ -43,6 +54,10 @@ func NewItemService(items repository.ItemRepository) *ItemService {
 
 func (s *ItemService) SetAuctionRepository(auctions repository.AuctionRepository) {
 	s.auctions = auctions
+}
+
+func (s *ItemService) SetProductAuditor(auditor ProductAuditor) {
+	s.auditor = auditor
 }
 
 func (s *ItemService) Create(ctx context.Context, in CreateItemInput) (domain.Item, error) {
@@ -58,10 +73,13 @@ func (s *ItemService) Create(ctx context.Context, in CreateItemInput) (domain.It
 		return domain.Item{}, domain.ErrInvalidArgument
 	}
 	if in.Status == "" {
-		in.Status = domain.ItemStatusDraft
+		in.Status = domain.ItemStatusPendingAudit
 	}
 	if !in.Status.Valid() {
 		return domain.Item{}, domain.ErrInvalidArgument
+	}
+	if in.ActorRole == domain.RoleMerchant {
+		in.Status = domain.ItemStatusPendingAudit
 	}
 	if in.Images == nil {
 		in.Images = []string{}
@@ -79,6 +97,9 @@ func (s *ItemService) Create(ctx context.Context, in CreateItemInput) (domain.It
 		Images:         images,
 		Description:    strings.TrimSpace(in.Description),
 		Status:         in.Status,
+	}
+	if in.ActorRole == domain.RoleMerchant {
+		item.Status = s.auditItem(ctx, item, in.AuditImage)
 	}
 	if err := s.items.Create(ctx, &item); err != nil {
 		return domain.Item{}, err
@@ -156,10 +177,48 @@ func (s *ItemService) Update(ctx context.Context, id uint64, in UpdateItemInput)
 		}
 		item.Status = *in.Status
 	}
+	if in.ActorRole == domain.RoleMerchant {
+		item.Status = s.auditItem(ctx, item, in.AuditImage)
+	}
 	if err := s.items.Update(ctx, &item); err != nil {
 		return domain.Item{}, err
 	}
 	return item, nil
+}
+
+func (s *ItemService) auditItem(ctx context.Context, item domain.Item, image *ProductAuditImage) domain.ItemStatus {
+	if s.auditor == nil || image == nil || len(image.Image) == 0 {
+		return domain.ItemStatusPendingAudit
+	}
+	result, err := s.auditor.AuditProduct(ctx, ProductAuditInput{
+		ProductText: buildProductAuditText(item),
+		ImageName:   image.ImageName,
+		ContentType: image.ContentType,
+		ImageSize:   image.ImageSize,
+		Image:       append([]byte(nil), image.Image...),
+	})
+	if err != nil || !result.Success {
+		return domain.ItemStatusPendingAudit
+	}
+	if result.IsApproved {
+		return domain.ItemStatusReady
+	}
+	return domain.ItemStatusRejected
+}
+
+func buildProductAuditText(item domain.Item) string {
+	parts := []string{
+		"商品标题：" + strings.TrimSpace(item.Title),
+		"类目：" + strings.TrimSpace(item.Category),
+		"成色：" + string(item.ConditionGrade),
+	}
+	if brand := strings.TrimSpace(item.Brand); brand != "" {
+		parts = append(parts, "品牌："+brand)
+	}
+	if description := strings.TrimSpace(item.Description); description != "" {
+		parts = append(parts, "卖点："+description)
+	}
+	return strings.Join(parts, "；") + "。"
 }
 
 func (s *ItemService) Delete(ctx context.Context, id uint64, actorID string, actorRole domain.Role) error {

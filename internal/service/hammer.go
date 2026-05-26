@@ -18,6 +18,7 @@ type HammerService struct {
 	tx        repository.TxManager
 	publisher EventPublisher
 	orderID   OrderIDGenerator
+	sessions  *LiveSessionService
 	onClose   func(ctx context.Context, auctionID uint64)
 }
 
@@ -42,6 +43,11 @@ func (s *HammerService) SetOnClose(fn func(ctx context.Context, auctionID uint64
 
 func (s *HammerService) SetOrderIDGenerator(idGen OrderIDGenerator) {
 	s.orderID = idGen
+}
+
+// SetLiveSessionService 注入直播场次服务，用于在 Hammer 时回填 order.live_session_id 与累加场次成交计数。
+func (s *HammerService) SetLiveSessionService(sessions *LiveSessionService) {
+	s.sessions = sessions
 }
 
 func (s *HammerService) Hammer(ctx context.Context, in domain.HammerInput) (domain.HammerResult, *domain.OrderDeal, error) {
@@ -129,6 +135,7 @@ func (s *HammerService) Hammer(ctx context.Context, in domain.HammerInput) (doma
 		dealOrder := &domain.OrderDeal{
 			ID:            orderID,
 			AuctionID:     current.AuctionID,
+			LiveSessionID: cloneLiveSessionID(current.LiveSessionID),
 			WinnerID:      result.WinnerID,
 			SellerID:      current.SellerID,
 			DealPrice:     result.Price,
@@ -158,6 +165,18 @@ func (s *HammerService) Hammer(ctx context.Context, in domain.HammerInput) (doma
 		return nil
 	}); err != nil {
 		return domain.HammerResult{}, nil, err
+	}
+	// 终态后累加场次计数：成交（CLOSED_WON）→ lots_sold/gmv；流拍/失败 → lots_unsold。
+	// 不在 tx 内完成以避免外部锁竞争影响主流程；失败仅日志级别忽略（已通过 Hub 广播）。
+	if s.sessions != nil && auction.LiveSessionID != nil {
+		counters := domain.LiveSessionCounters{}
+		if result.Status == domain.AuctionStatusClosedWon {
+			counters.LotsSoldDelta = 1
+			counters.GMVCentDelta = result.Price
+		} else {
+			counters.LotsUnsoldDelta = 1
+		}
+		_ = s.sessions.IncrCounters(ctx, *auction.LiveSessionID, counters)
 	}
 	payload := map[string]interface{}{
 		"auctionId": result.AuctionID,
@@ -229,6 +248,14 @@ func (s *HammerService) releaseDeposits(ctx context.Context, auctionID uint64, r
 
 func ptrTime(t time.Time) *time.Time {
 	return &t
+}
+
+func cloneLiveSessionID(p *uint64) *uint64 {
+	if p == nil {
+		return nil
+	}
+	v := *p
+	return &v
 }
 
 func strconvFormatTime(t time.Time) string {

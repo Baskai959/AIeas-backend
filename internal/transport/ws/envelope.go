@@ -3,11 +3,12 @@ package ws
 import "encoding/json"
 
 type Envelope struct {
-	Type      string          `json:"type"`
-	RequestID string          `json:"requestId,omitempty"`
-	Seq       int64           `json:"seq,omitempty"`
-	Ack       bool            `json:"ack,omitempty"`
-	Payload   json.RawMessage `json:"payload,omitempty"`
+	Type          string          `json:"type"`
+	RequestID     string          `json:"requestId,omitempty"`
+	Seq           int64           `json:"seq,omitempty"`
+	Ack           bool            `json:"ack,omitempty"`
+	LiveSessionID uint64          `json:"liveSessionId,omitempty"`
+	Payload       json.RawMessage `json:"payload,omitempty"`
 }
 
 func AckEnvelope(requestID string, seq int64) Envelope {

@@ -1,6 +1,7 @@
 package objectstorage
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -8,18 +9,21 @@ import (
 	"fmt"
 	"io"
 	"mime"
-	"net/url"
 	"path"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	appconfig "aieas_backend/internal/config"
 
 	"github.com/volcengine/ve-tos-golang-sdk/v2/tos"
-	"github.com/volcengine/ve-tos-golang-sdk/v2/tos/enum"
 )
 
-var ErrDisabled = errors.New("object storage disabled")
+var (
+	ErrDisabled         = errors.New("object storage disabled")
+	ErrInvalidObjectKey = errors.New("invalid object key")
+	ErrObjectNotFound   = errors.New("object not found")
+)
 
 type UploadInput struct {
 	Filename    string
@@ -28,8 +32,15 @@ type UploadInput struct {
 	Body        io.Reader
 }
 
+type DownloadOutput struct {
+	Content       io.ReadCloser
+	ContentType   string
+	ContentLength int64
+}
+
 type Uploader interface {
 	Upload(ctx context.Context, in UploadInput) (string, error)
+	Download(ctx context.Context, key string) (DownloadOutput, error)
 }
 
 type DisabledUploader struct{}
@@ -40,10 +51,15 @@ func (DisabledUploader) Upload(ctx context.Context, in UploadInput) (string, err
 	return "", ErrDisabled
 }
 
+func (DisabledUploader) Download(ctx context.Context, key string) (DownloadOutput, error) {
+	_ = ctx
+	_ = key
+	return DownloadOutput{}, ErrDisabled
+}
+
 type TOSUploader struct {
 	client       *tos.ClientV2
 	bucket       string
-	bucketURL    string
 	objectPrefix string
 }
 
@@ -62,7 +78,6 @@ func NewUploader(cfg appconfig.ObjectStorageConfig) (Uploader, error) {
 	return &TOSUploader{
 		client:       client,
 		bucket:       strings.TrimSpace(cfg.Bucket),
-		bucketURL:    strings.TrimRight(strings.TrimSpace(cfg.BucketURL), "/"),
 		objectPrefix: normalizePrefix(cfg.ObjectPrefix),
 	}, nil
 }
@@ -81,23 +96,51 @@ func (u *TOSUploader) Upload(ctx context.Context, in UploadInput) (string, error
 			Key:           key,
 			ContentLength: in.Size,
 			ContentType:   strings.TrimSpace(in.ContentType),
-			ACL:           enum.ACLPublicRead,
 		},
 		Content: in.Body,
 	})
 	if err != nil {
 		return "", err
 	}
-	return objectURL(u.bucketURL, key), nil
+	return proxyURL(key), nil
+}
+
+func (u *TOSUploader) Download(ctx context.Context, key string) (DownloadOutput, error) {
+	key, err := sanitizeObjectKey(key)
+	if err != nil {
+		return DownloadOutput{}, err
+	}
+	out, err := u.client.GetObjectV2(ctx, &tos.GetObjectV2Input{
+		Bucket: u.bucket,
+		Key:    key,
+	})
+	if err != nil {
+		if tos.StatusCode(err) == 404 {
+			return DownloadOutput{}, ErrObjectNotFound
+		}
+		return DownloadOutput{}, err
+	}
+	return DownloadOutput{
+		Content:       out.Content,
+		ContentType:   strings.TrimSpace(out.ContentType),
+		ContentLength: out.ContentLength,
+	}, nil
 }
 
 type MemoryUploader struct {
-	baseURL string
 	prefix  string
+	mu      sync.RWMutex
+	objects map[string]memoryObject
+}
+
+type memoryObject struct {
+	content     []byte
+	contentType string
 }
 
 func NewMemoryUploader(baseURL string) *MemoryUploader {
-	return &MemoryUploader{baseURL: strings.TrimRight(baseURL, "/")}
+	_ = baseURL
+	return &MemoryUploader{objects: make(map[string]memoryObject)}
 }
 
 func (u *MemoryUploader) Upload(ctx context.Context, in UploadInput) (string, error) {
@@ -105,14 +148,37 @@ func (u *MemoryUploader) Upload(ctx context.Context, in UploadInput) (string, er
 	if in.Body == nil {
 		return "", fmt.Errorf("upload object: empty body")
 	}
-	if _, err := io.Copy(io.Discard, in.Body); err != nil {
+	content, err := io.ReadAll(in.Body)
+	if err != nil {
 		return "", err
 	}
 	key, err := buildObjectKey(u.prefix, in.Filename, in.ContentType)
 	if err != nil {
 		return "", err
 	}
-	return objectURL(u.baseURL, key), nil
+	u.mu.Lock()
+	u.objects[key] = memoryObject{content: content, contentType: strings.TrimSpace(in.ContentType)}
+	u.mu.Unlock()
+	return proxyURL(key), nil
+}
+
+func (u *MemoryUploader) Download(ctx context.Context, key string) (DownloadOutput, error) {
+	_ = ctx
+	key, err := sanitizeObjectKey(key)
+	if err != nil {
+		return DownloadOutput{}, err
+	}
+	u.mu.RLock()
+	obj, ok := u.objects[key]
+	u.mu.RUnlock()
+	if !ok {
+		return DownloadOutput{}, ErrObjectNotFound
+	}
+	return DownloadOutput{
+		Content:       io.NopCloser(bytes.NewReader(obj.content)),
+		ContentType:   obj.contentType,
+		ContentLength: int64(len(obj.content)),
+	}, nil
 }
 
 func buildObjectKey(prefix, filename, contentType string) (string, error) {
@@ -151,18 +217,22 @@ func extensionByContentType(contentType string) string {
 	return exts[0]
 }
 
-func objectURL(baseURL, key string) string {
-	if baseURL == "" {
-		return key
+func ProxyPathPrefix() string {
+	return "/api/v1/images/"
+}
+
+func proxyURL(key string) string {
+	return ProxyPathPrefix() + strings.TrimLeft(key, "/")
+}
+
+func sanitizeObjectKey(key string) (string, error) {
+	key = strings.TrimSpace(key)
+	key = strings.TrimLeft(key, "/")
+	key = path.Clean(key)
+	if key == "." || key == "" || strings.HasPrefix(key, "../") || key == ".." {
+		return "", ErrInvalidObjectKey
 	}
-	escaped := make([]string, 0)
-	for _, part := range strings.Split(key, "/") {
-		if part == "" {
-			continue
-		}
-		escaped = append(escaped, url.PathEscape(part))
-	}
-	return strings.TrimRight(baseURL, "/") + "/" + strings.Join(escaped, "/")
+	return key, nil
 }
 
 func normalizePrefix(prefix string) string {

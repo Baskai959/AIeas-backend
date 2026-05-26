@@ -2,6 +2,7 @@ package app
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"mime/multipart"
 	"strconv"
@@ -13,6 +14,7 @@ import (
 	"aieas_backend/internal/domain"
 	"aieas_backend/internal/infra/objectstorage"
 	"aieas_backend/internal/repository"
+	"aieas_backend/internal/service"
 
 	"github.com/cloudwego/hertz/pkg/app/server"
 	"github.com/cloudwego/hertz/pkg/common/ut"
@@ -132,6 +134,134 @@ func TestAuthMeRejectsMissingAndInvalidToken(t *testing.T) {
 	}
 }
 
+func TestMCPInitializeAndToolsList(t *testing.T) {
+	h := newTestServer()
+	token := loginForToken(t, h.Engine, "merchant001", "Passw0rd!", "merchant")
+
+	initResp := doMCP(t, h.Engine, token, `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1.0.0"}}}`)
+	if initResp.status != 200 || initResp.body.Error != nil {
+		t.Fatalf("expected initialize success, status=%d raw=%s", initResp.status, initResp.raw)
+	}
+	var initResult struct {
+		ProtocolVersion string `json:"protocolVersion"`
+		ServerInfo      struct {
+			Name string `json:"name"`
+		} `json:"serverInfo"`
+	}
+	mustDecodeData(t, initResp.body.Result, &initResult)
+	if initResult.ProtocolVersion != "2025-06-18" || initResult.ServerInfo.Name != "aieas-readonly-mcp" {
+		t.Fatalf("unexpected initialize result: %+v", initResult)
+	}
+
+	toolsResp := doMCP(t, h.Engine, token, `{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}`)
+	if toolsResp.status != 200 || toolsResp.body.Error != nil {
+		t.Fatalf("expected tools/list success, status=%d raw=%s", toolsResp.status, toolsResp.raw)
+	}
+	var toolsResult struct {
+		Tools []struct {
+			Name string `json:"name"`
+		} `json:"tools"`
+	}
+	mustDecodeData(t, toolsResp.body.Result, &toolsResult)
+	if !containsTool(toolsResult.Tools, "read_live_session_bids") || !containsTool(toolsResult.Tools, "read_live_session_settlement") {
+		t.Fatalf("expected live session tools, got %+v", toolsResult.Tools)
+	}
+}
+
+func TestMCPReadLiveSessionBidsAuthorization(t *testing.T) {
+	ctx := context.Background()
+	userRepo := repository.NewSeedUserRepository()
+	itemRepo := repository.NewMemoryItemRepository()
+	auctionRepo := repository.NewMemoryAuctionRepository()
+	roomRepo := repository.NewMemoryLiveRoomRepository()
+	sessionRepo := repository.NewMemoryLiveSessionRepository()
+	bidRepo := repository.NewMemoryBidRepository()
+	orderRepo := repository.NewMemoryOrderRepository()
+
+	item := domain.Item{SellerID: "u_2001", Title: "Vintage Camera", Category: "camera", ConditionGrade: domain.ConditionGood, Images: json.RawMessage(`[]`), Status: domain.ItemStatusReady}
+	if err := itemRepo.Create(ctx, &item); err != nil {
+		t.Fatalf("create item: %v", err)
+	}
+	room := domain.LiveRoom{MerchantID: "u_2001", Title: "春拍专场", Status: domain.LiveRoomStatusLive}
+	if err := roomRepo.Create(ctx, &room); err != nil {
+		t.Fatalf("create room: %v", err)
+	}
+	closedAt := time.Now().UTC()
+	session := domain.LiveSession{LiveRoomID: room.ID, MerchantID: "u_2001", Title: "春拍专场", Status: domain.LiveSessionStatusEnded, OpenedAt: closedAt.Add(-time.Hour), ClosedAt: &closedAt, LotsTotal: 1, LotsSold: 1, BidCount: 1, GMVCent: 120000}
+	if err := sessionRepo.Create(ctx, &session); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	lot := domain.AuctionLot{
+		AuctionID:     10001,
+		ItemID:        item.ID,
+		SellerID:      "u_2001",
+		LiveRoomID:    room.ID,
+		LiveSessionID: &session.ID,
+		AuctionType:   domain.AuctionTypeEnglish,
+		StartPrice:    100000,
+		ReservePrice:  100000,
+		IncrementRule: domain.DefaultIncrementRule(),
+		RuleSnapshot:  json.RawMessage(`{}`),
+		Status:        domain.AuctionStatusClosedWon,
+		StartTime:     closedAt.Add(-time.Hour),
+		EndTime:       closedAt,
+		DealPrice:     ptrInt64(120000),
+		WinnerID:      ptrString("u_1001"),
+		ClosedAt:      &closedAt,
+	}
+	if err := auctionRepo.Create(ctx, &lot); err != nil {
+		t.Fatalf("create auction: %v", err)
+	}
+	if err := bidRepo.Create(ctx, &domain.BidRecord{RequestID: "bid-1", AuctionID: lot.AuctionID, LiveSessionID: &session.ID, BidderID: "u_1001", BidPrice: 120000, BidTSMS: closedAt.UnixMilli(), Source: "ws", RiskResult: domain.BidRiskAllow}); err != nil {
+		t.Fatalf("create bid: %v", err)
+	}
+	_, _, err := orderRepo.CreateIfAbsentByAuction(ctx, &domain.OrderDeal{AuctionID: lot.AuctionID, LiveSessionID: &session.ID, WinnerID: "u_1001", SellerID: "u_2001", DealPrice: 120000, Status: domain.OrderStatusPaid, PayStatus: domain.PayStatusPaid})
+	if err != nil {
+		t.Fatalf("create order: %v", err)
+	}
+
+	h := NewServerWithDependencies(appconfig.Default(), ServerDependencies{
+		UserRepo:        userRepo,
+		ItemRepo:        itemRepo,
+		AuctionRepo:     auctionRepo,
+		LiveRoomRepo:    roomRepo,
+		LiveSessionRepo: sessionRepo,
+		BidRepo:         bidRepo,
+		OrderRepo:       orderRepo,
+		ObjectUploader:  objectstorage.NewMemoryUploader(""),
+		ProductAuditor:  service.DisabledProductAuditor{},
+	})
+	merchantToken := loginForToken(t, h.Engine, "merchant001", "Passw0rd!", "merchant")
+	buyerToken := loginForToken(t, h.Engine, "buyer001", "Passw0rd!", "buyer")
+
+	body := `{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"read_live_session_bids","arguments":{"sessionId":` + strconv.FormatUint(session.ID, 10) + `,"limit":10}}}`
+	merchantResp := doMCP(t, h.Engine, merchantToken, body)
+	if merchantResp.status != 200 || merchantResp.body.Error != nil {
+		t.Fatalf("expected merchant mcp success, status=%d raw=%s", merchantResp.status, merchantResp.raw)
+	}
+	var toolResult mcpToolResult
+	mustDecodeData(t, merchantResp.body.Result, &toolResult)
+	if len(toolResult.Content) != 1 {
+		t.Fatalf("expected one tool content item, got %+v", toolResult)
+	}
+	var payload struct {
+		Data struct {
+			Items []domain.BidRecord `json:"items"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(toolResult.Content[0].Text), &payload); err != nil {
+		t.Fatalf("decode tool payload: %v text=%s", err, toolResult.Content[0].Text)
+	}
+	if len(payload.Data.Items) != 1 || payload.Data.Items[0].BidPrice != 120000 {
+		t.Fatalf("unexpected bid payload: %+v", payload.Data.Items)
+	}
+
+	buyerResp := doMCP(t, h.Engine, buyerToken, body)
+	if buyerResp.status != 200 || buyerResp.body.Error == nil || buyerResp.body.Error.Code != -32003 {
+		t.Fatalf("expected buyer forbidden json-rpc error, status=%d raw=%s", buyerResp.status, buyerResp.raw)
+	}
+}
+
 func TestAuthRefreshLogoutAndAdminLogin(t *testing.T) {
 	h := newTestServer()
 	login := doJSON(t, h.Engine, consts.MethodPost, "/api/v1/auth/login", `{"account":"buyer001","password":"Passw0rd!","role":"buyer"}`)
@@ -164,6 +294,7 @@ func TestAuthRefreshLogoutAndAdminLogin(t *testing.T) {
 func TestItemCRUDRoutes(t *testing.T) {
 	h := newTestServer()
 	token := loginForToken(t, h.Engine, "merchant001", "Passw0rd!", "merchant")
+	adminToken := loginForToken(t, h.Engine, "admin001", "AdminPassw0rd!", "admin")
 
 	create := doMultipartWithHeaders(t, h.Engine, consts.MethodPost, "/api/v1/items", map[string]string{
 		"title":          "Vintage Camera",
@@ -184,11 +315,15 @@ func TestItemCRUDRoutes(t *testing.T) {
 		Images   []string `json:"images"`
 	}
 	mustDecodeData(t, create.body.Data, &created)
-	if created.ID == 0 || created.SellerID != "u_2001" || created.Status != "DRAFT" {
+	if created.ID == 0 || created.SellerID != "u_2001" || created.Status != "PENDING_AUDIT" {
 		t.Fatalf("unexpected created item: %+v", created)
 	}
-	if len(created.Images) != 1 || !strings.HasPrefix(created.Images[0], "https://cdn.test/") || strings.Contains(created.Images[0], "/items/") {
-		t.Fatalf("expected uploaded object URL, got %+v", created.Images)
+	if len(created.Images) != 1 || !strings.HasPrefix(created.Images[0], "/api/v1/images/") || strings.Contains(created.Images[0], "/items/") {
+		t.Fatalf("expected proxied image URL, got %+v", created.Images)
+	}
+	imageResp := ut.PerformRequest(h.Engine, consts.MethodGet, created.Images[0], nil)
+	if imageResp.Code != 200 || imageResp.Body.String() != "fake image bytes" {
+		t.Fatalf("expected image proxy success, got status=%d body=%q", imageResp.Code, imageResp.Body.String())
 	}
 
 	patch := doMultipartWithHeaders(t, h.Engine, consts.MethodPatch, "/api/v1/items/"+strconv.FormatUint(created.ID, 10), map[string]string{
@@ -197,6 +332,21 @@ func TestItemCRUDRoutes(t *testing.T) {
 	}, nil, ut.Header{Key: "Authorization", Value: "Bearer " + token})
 	if patch.status != 200 || patch.body.Code != 0 {
 		t.Fatalf("expected item patch success, got status=%d raw=%s", patch.status, patch.raw)
+	}
+	var patched struct {
+		ID     uint64 `json:"id"`
+		Status string `json:"status"`
+	}
+	mustDecodeData(t, patch.body.Data, &patched)
+	if patched.ID != created.ID || patched.Status != "PENDING_AUDIT" {
+		t.Fatalf("expected merchant patch to submit item for audit, got %+v", patched)
+	}
+
+	adminPatch := doMultipartWithHeaders(t, h.Engine, consts.MethodPatch, "/api/v1/items/"+strconv.FormatUint(created.ID, 10), map[string]string{
+		"status": "READY",
+	}, nil, ut.Header{Key: "Authorization", Value: "Bearer " + adminToken})
+	if adminPatch.status != 200 || adminPatch.body.Code != 0 {
+		t.Fatalf("expected admin item patch success, got status=%d raw=%s", adminPatch.status, adminPatch.raw)
 	}
 
 	list := doJSONWithHeaders(t, h.Engine, consts.MethodGet, "/api/v1/items?status=READY", "", ut.Header{Key: "Authorization", Value: "Bearer " + token})
@@ -220,6 +370,67 @@ func TestItemCRUDRoutes(t *testing.T) {
 	}
 }
 
+func TestItemCreateRunsProductAudit(t *testing.T) {
+	cases := []struct {
+		name       string
+		result     service.ProductAuditResult
+		wantStatus string
+	}{
+		{
+			name:       "approved",
+			result:     service.ProductAuditResult{Success: true, IsApproved: true},
+			wantStatus: "READY",
+		},
+		{
+			name:       "rejected",
+			result:     service.ProductAuditResult{Success: true, IsApproved: false},
+			wantStatus: "REJECTED",
+		},
+		{
+			name:       "manual review",
+			result:     service.ProductAuditResult{Success: false},
+			wantStatus: "PENDING_AUDIT",
+		},
+	}
+
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			auditor := &captureProductAuditor{result: tt.result}
+			h := NewServerWithDependencies(appconfig.Default(), ServerDependencies{
+				UserRepo:       repository.NewSeedUserRepository(),
+				ObjectUploader: objectstorage.NewMemoryUploader(""),
+				ProductAuditor: auditor,
+			})
+			token := loginForToken(t, h.Engine, "merchant001", "Passw0rd!", "merchant")
+
+			resp := doMultipartWithHeaders(t, h.Engine, consts.MethodPost, "/api/v1/items", map[string]string{
+				"title":          "机械键盘 87键",
+				"category":       "电脑外设/键盘",
+				"conditionGrade": "GOOD",
+				"description":    "RGB背光，适合办公和游戏",
+			}, []multipartTestFile{
+				{FieldName: "images", Filename: "keyboard.jpg", Body: "audit image bytes"},
+			}, ut.Header{Key: "Authorization", Value: "Bearer " + token})
+			if resp.status != 200 || resp.body.Code != 0 {
+				t.Fatalf("expected item create success, got status=%d raw=%s", resp.status, resp.raw)
+			}
+			var item struct {
+				Status string `json:"status"`
+			}
+			mustDecodeData(t, resp.body.Data, &item)
+			if item.Status != tt.wantStatus {
+				t.Fatalf("expected status %s, got %+v", tt.wantStatus, item)
+			}
+			if auditor.input.ProductText == "" || !strings.Contains(auditor.input.ProductText, "机械键盘 87键") || !strings.Contains(auditor.input.ProductText, "电脑外设/键盘") {
+				t.Fatalf("unexpected audit product text: %q", auditor.input.ProductText)
+			}
+			if string(auditor.input.Image) != "audit image bytes" || auditor.input.ImageName != "keyboard.jpg" {
+				t.Fatalf("unexpected audit image: name=%q body=%q", auditor.input.ImageName, string(auditor.input.Image))
+			}
+		})
+	}
+}
+
 func TestItemCreateRejectsImageLargerThan2MB(t *testing.T) {
 	h := newTestServer()
 	token := loginForToken(t, h.Engine, "merchant001", "Passw0rd!", "merchant")
@@ -233,6 +444,81 @@ func TestItemCreateRejectsImageLargerThan2MB(t *testing.T) {
 
 	if create.status != 400 || create.body.Code != 20001 {
 		t.Fatalf("expected image size validation error, got status=%d body=%+v raw=%s", create.status, create.body, create.raw)
+	}
+}
+
+func TestItemDescriptionOptimizeRoute(t *testing.T) {
+	generator := &captureProductDescriptionGenerator{
+		result: service.ProductDescriptionResult{
+			Title:       "机械键盘 87键",
+			Category:    "电脑外设/键盘",
+			Description: "这是一款适合日常办公和游戏的 87 键机械键盘，成色良好，键帽干净，敲击手感清脆。",
+		},
+	}
+	h := NewServerWithDependencies(appconfig.Default(), ServerDependencies{
+		UserRepo:       repository.NewSeedUserRepository(),
+		DescriptionGen: generator,
+	})
+	token := loginForToken(t, h.Engine, "merchant001", "Passw0rd!", "merchant")
+
+	resp := doMultipartWithHeaders(t, h.Engine, consts.MethodPost, "/api/v1/items/description/optimize", map[string]string{
+		"title":     "机械键盘 87键",
+		"category":  "电脑外设/键盘",
+		"condition": "九成新",
+	}, []multipartTestFile{
+		{FieldName: "image", Filename: "keyboard.jpg", Body: "fake image bytes"},
+	}, ut.Header{Key: "Authorization", Value: "Bearer " + token})
+
+	if resp.status != 200 || resp.body.Code != 0 {
+		t.Fatalf("expected description optimize success, got status=%d body=%+v raw=%s", resp.status, resp.body, resp.raw)
+	}
+	var result service.ProductDescriptionResult
+	mustDecodeData(t, resp.body.Data, &result)
+	if result.Description == "" || result.Title != "机械键盘 87键" || result.Category != "电脑外设/键盘" {
+		t.Fatalf("unexpected optimize result: %+v", result)
+	}
+	if generator.input.Title != "机械键盘 87键" || generator.input.Category != "电脑外设/键盘" || generator.input.Condition != "九成新" || generator.imageBody != "fake image bytes" {
+		t.Fatalf("unexpected generator input: %+v image=%q", generator.input, generator.imageBody)
+	}
+}
+
+func TestItemDescriptionOptimizeRouteUsesImageURL(t *testing.T) {
+	uploader := objectstorage.NewMemoryUploader("")
+	imageURL, err := uploader.Upload(context.Background(), objectstorage.UploadInput{
+		Filename:    "saved-keyboard.jpg",
+		ContentType: "image/jpeg",
+		Size:        int64(len("saved image bytes")),
+		Body:        strings.NewReader("saved image bytes"),
+	})
+	if err != nil {
+		t.Fatalf("upload memory image: %v", err)
+	}
+	generator := &captureProductDescriptionGenerator{
+		result: service.ProductDescriptionResult{
+			Title:       "机械键盘 87键",
+			Category:    "电脑外设/键盘",
+			Description: "已保存图片也可以用于生成商品描述。",
+		},
+	}
+	h := NewServerWithDependencies(appconfig.Default(), ServerDependencies{
+		UserRepo:       repository.NewSeedUserRepository(),
+		ObjectUploader: uploader,
+		DescriptionGen: generator,
+	})
+	token := loginForToken(t, h.Engine, "merchant001", "Passw0rd!", "merchant")
+
+	resp := doMultipartWithHeaders(t, h.Engine, consts.MethodPost, "/api/v1/items/description/optimize", map[string]string{
+		"title":     "机械键盘 87键",
+		"category":  "电脑外设/键盘",
+		"condition": "九成新",
+		"imageUrl":  imageURL,
+	}, nil, ut.Header{Key: "Authorization", Value: "Bearer " + token})
+
+	if resp.status != 200 || resp.body.Code != 0 {
+		t.Fatalf("expected description optimize with imageUrl success, got status=%d body=%+v raw=%s", resp.status, resp.body, resp.raw)
+	}
+	if generator.imageBody != "saved image bytes" || generator.input.ImageName == "" {
+		t.Fatalf("expected generator to receive saved image bytes, input=%+v image=%q", generator.input, generator.imageBody)
 	}
 }
 
@@ -619,8 +905,41 @@ func TestAdminRoutesMinimalClosedLoop(t *testing.T) {
 func newTestServer() *server.Hertz {
 	return NewServerWithDependencies(appconfig.Default(), ServerDependencies{
 		UserRepo:       repository.NewSeedUserRepository(),
-		ObjectUploader: objectstorage.NewMemoryUploader("https://cdn.test"),
+		ObjectUploader: objectstorage.NewMemoryUploader(""),
+		ProductAuditor: service.DisabledProductAuditor{},
 	})
+}
+
+type captureProductDescriptionGenerator struct {
+	input     service.ProductDescriptionInput
+	imageBody string
+	result    service.ProductDescriptionResult
+	err       error
+}
+
+func (g *captureProductDescriptionGenerator) GenerateProductDescription(ctx context.Context, in service.ProductDescriptionInput) (service.ProductDescriptionResult, error) {
+	_ = ctx
+	g.input = in
+	g.imageBody = string(in.Image)
+	if g.err != nil {
+		return service.ProductDescriptionResult{}, g.err
+	}
+	return g.result, nil
+}
+
+type captureProductAuditor struct {
+	input  service.ProductAuditInput
+	result service.ProductAuditResult
+	err    error
+}
+
+func (a *captureProductAuditor) AuditProduct(ctx context.Context, in service.ProductAuditInput) (service.ProductAuditResult, error) {
+	_ = ctx
+	a.input = in
+	if a.err != nil {
+		return service.ProductAuditResult{}, a.err
+	}
+	return a.result, nil
 }
 
 func loginForToken(t *testing.T, engine *route.Engine, account, password, role string) string {
@@ -665,6 +984,64 @@ func doJSONWithHeaders(t *testing.T, engine *route.Engine, method, path, body st
 		t.Fatalf("decode response: %v raw=%s", err, resp.Body.String())
 	}
 	return testHTTPResult{status: resp.Code, body: decoded, raw: resp.Body.String()}
+}
+
+type mcpRPCResponse struct {
+	JSONRPC string          `json:"jsonrpc"`
+	ID      json.RawMessage `json:"id"`
+	Result  json.RawMessage `json:"result"`
+	Error   *struct {
+		Code    int             `json:"code"`
+		Message string          `json:"message"`
+		Data    json.RawMessage `json:"data"`
+	} `json:"error"`
+}
+
+type testMCPResult struct {
+	status int
+	body   mcpRPCResponse
+	raw    string
+}
+
+type mcpToolResult struct {
+	Content []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	} `json:"content"`
+	IsError bool `json:"isError"`
+}
+
+func doMCP(t *testing.T, engine *route.Engine, token, body string) testMCPResult {
+	t.Helper()
+	headers := []ut.Header{{Key: "Content-Type", Value: "application/json; charset=utf-8"}}
+	if token != "" {
+		headers = append(headers, ut.Header{Key: "Authorization", Value: "Bearer " + token})
+	}
+	resp := ut.PerformRequest(engine, consts.MethodPost, "/mcp", &ut.Body{Body: strings.NewReader(body), Len: len(body)}, headers...)
+	var decoded mcpRPCResponse
+	if err := json.Unmarshal(resp.Body.Bytes(), &decoded); err != nil {
+		t.Fatalf("decode mcp response: %v raw=%s", err, resp.Body.String())
+	}
+	return testMCPResult{status: resp.Code, body: decoded, raw: resp.Body.String()}
+}
+
+func containsTool(tools []struct {
+	Name string `json:"name"`
+}, name string) bool {
+	for _, tool := range tools {
+		if tool.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+func ptrInt64(v int64) *int64 {
+	return &v
+}
+
+func ptrString(v string) *string {
+	return &v
 }
 
 type multipartTestFile struct {

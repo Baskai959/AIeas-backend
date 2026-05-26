@@ -101,3 +101,13 @@ func (b KeyBuilder) ConfigItem(configKey string) string {
 func (b KeyBuilder) LiveRoomActiveLock(roomID uint64) string {
 	return b.key("live_room:%d:active", roomID)
 }
+
+// LiveSessionCounters 存放直播场次计数 HASH（lots_total/lots_sold/...）。
+func (b KeyBuilder) LiveSessionCounters(sessionID uint64) string {
+	return b.key("live_session:%d:counters", sessionID)
+}
+
+// LiveSessionViewerPeak 存放直播场次的观众峰值 STRING（Lua CAS max）。
+func (b KeyBuilder) LiveSessionViewerPeak(sessionID uint64) string {
+	return b.key("live_session:%d:viewer_peak", sessionID)
+}

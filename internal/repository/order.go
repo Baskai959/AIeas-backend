@@ -83,6 +83,9 @@ func (r *MySQLOrderRepository) List(ctx context.Context, filter domain.OrderFilt
 	if filter.SellerID != "" {
 		query = query.Where("seller_id = ?", normalizeUserIDForDB(filter.SellerID))
 	}
+	if filter.LiveSessionID != 0 {
+		query = query.Where("live_session_id = ?", filter.LiveSessionID)
+	}
 	if filter.Status != "" {
 		query = query.Where("status = ?", filter.Status)
 	}
@@ -127,6 +130,7 @@ func (r *MySQLOrderRepository) Update(ctx context.Context, order *domain.OrderDe
 type orderRow struct {
 	ID            uint64             `gorm:"column:id;primaryKey"`
 	AuctionID     uint64             `gorm:"column:auction_id"`
+	LiveSessionID *uint64            `gorm:"column:live_session_id"`
 	WinnerID      string             `gorm:"column:winner_id"`
 	SellerID      string             `gorm:"column:seller_id"`
 	DealPrice     int64              `gorm:"column:deal_price"`
@@ -144,6 +148,7 @@ func orderRowFromDomain(order domain.OrderDeal) orderRow {
 	return orderRow{
 		ID:            order.ID,
 		AuctionID:     order.AuctionID,
+		LiveSessionID: cloneUint64Ptr(order.LiveSessionID),
 		WinnerID:      normalizeUserIDForDB(order.WinnerID),
 		SellerID:      normalizeUserIDForDB(order.SellerID),
 		DealPrice:     order.DealPrice,
@@ -162,6 +167,7 @@ func (r orderRow) toDomain() domain.OrderDeal {
 	return domain.OrderDeal{
 		ID:            r.ID,
 		AuctionID:     r.AuctionID,
+		LiveSessionID: cloneUint64Ptr(r.LiveSessionID),
 		WinnerID:      r.WinnerID,
 		SellerID:      r.SellerID,
 		DealPrice:     r.DealPrice,
@@ -248,6 +254,9 @@ func (r *MemoryOrderRepository) List(ctx context.Context, filter domain.OrderFil
 		if filter.SellerID != "" && order.SellerID != filter.SellerID {
 			continue
 		}
+		if filter.LiveSessionID != 0 && (order.LiveSessionID == nil || *order.LiveSessionID != filter.LiveSessionID) {
+			continue
+		}
 		if filter.Status != "" && order.Status != filter.Status {
 			continue
 		}
@@ -281,5 +290,6 @@ func (r *MemoryOrderRepository) Update(ctx context.Context, order *domain.OrderD
 }
 
 func cloneOrder(order domain.OrderDeal) domain.OrderDeal {
+	order.LiveSessionID = cloneUint64Ptr(order.LiveSessionID)
 	return order
 }

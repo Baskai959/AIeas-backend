@@ -1788,12 +1788,12 @@ components:
           enum: [NEW, LIKE_NEW, GOOD, FAIR]
         status:
           type: string
-          enum: [DRAFT, READY, LISTED, OFFLINE]
+          enum: [DRAFT, PENDING_AUDIT, READY, REJECTED, LISTED, OFFLINE]
         description:
           type: string
         images:
           type: array
-          description: 重复提交 images 文件字段，单张图片不超过 2MB，后端上传到对象存储后在响应中返回 URL 数组
+          description: 重复提交 images 文件字段，单张图片不超过 2MB，后端上传到私有对象存储后在响应中返回图片代理 URL 数组
           items:
             type: string
             format: binary
@@ -1811,12 +1811,12 @@ components:
           enum: [NEW, LIKE_NEW, GOOD, FAIR]
         status:
           type: string
-          enum: [DRAFT, READY, LISTED, OFFLINE]
+          enum: [DRAFT, PENDING_AUDIT, READY, REJECTED, LISTED, OFFLINE]
         description:
           type: string
         images:
           type: array
-          description: 提交 images 文件字段时替换原图片 URL 数组；不提交则保持原图片不变；单张图片不超过 2MB
+          description: 提交 images 文件字段时替换原图片代理 URL 数组；不提交则保持原图片不变；单张图片不超过 2MB
           items:
             type: string
             format: binary
@@ -1833,6 +1833,7 @@ components:
           type: string
         images:
           type: array
+          description: 后端图片代理 URL 数组，浏览器通过后端读取私有对象存储图片
           items:
             type: string
         category:

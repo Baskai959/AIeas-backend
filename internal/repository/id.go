@@ -15,3 +15,13 @@ func normalizeUserIDForDB(id string) string {
 	}
 	return id
 }
+
+// cloneUint64Ptr 复制可空的 uint64 指针值，避免在 repo / domain 之间共享内存。
+func cloneUint64Ptr(p *uint64) *uint64 {
+	if p == nil {
+		return nil
+	}
+	v := *p
+	return &v
+}
+

@@ -25,6 +25,7 @@ const (
 type OrderDeal struct {
 	ID            uint64      `json:"id"`
 	AuctionID     uint64      `json:"auctionId"`
+	LiveSessionID *uint64     `json:"liveSessionId,omitempty"`
 	WinnerID      string      `json:"winnerId"`
 	SellerID      string      `json:"sellerId"`
 	DealPrice     int64       `json:"dealPrice"`
@@ -39,12 +40,13 @@ type OrderDeal struct {
 }
 
 type OrderFilter struct {
-	WinnerID  string
-	SellerID  string
-	Status    OrderStatus
-	PayStatus PayStatus
-	Limit     int
-	Offset    int
+	WinnerID      string
+	SellerID      string
+	LiveSessionID uint64
+	Status        OrderStatus
+	PayStatus     PayStatus
+	Limit         int
+	Offset        int
 }
 
 type DepositStatus string

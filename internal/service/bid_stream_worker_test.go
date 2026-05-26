@@ -182,6 +182,15 @@ func (r *trackingBidRepo) ListByAuction(ctx context.Context, auctionID uint64, l
 	return nil, nil
 }
 
+func (r *trackingBidRepo) ListByLiveSession(ctx context.Context, sessionID uint64, sortBy string, limit, offset int) ([]domain.BidRecord, error) {
+	_ = ctx
+	_ = sessionID
+	_ = sortBy
+	_ = limit
+	_ = offset
+	return nil, nil
+}
+
 type streamEnabledRealtime struct{ result domain.BidResult }
 
 func (s *streamEnabledRealtime) StreamEnabled() bool { return true }

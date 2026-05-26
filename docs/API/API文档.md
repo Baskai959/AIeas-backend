@@ -306,9 +306,9 @@ curl 'https://api.example.com/api/v1/auth/me' \
 | `category` | string | 是 | 类目 |
 | `brand` | string | 否 | 品牌 |
 | `conditionGrade` | string | 否 | `NEW`、`LIKE_NEW`、`GOOD`、`FAIR`，默认 `NEW` |
-| `status` | string | 否 | `DRAFT`、`READY`、`LISTED`、`OFFLINE`，默认 `DRAFT` |
+| `status` | string | 否 | `DRAFT`、`PENDING_AUDIT`、`READY`、`REJECTED`、`LISTED`、`OFFLINE`；商家提交后调用 AI 审核，AI 通过为 `READY`，驳回为 `REJECTED`，无有效结论为 `PENDING_AUDIT` |
 | `description` | string | 否 | 商品描述 |
-| `images` | file[] | 否 | 可重复提交的图片文件字段；单张图片不超过 2MB，后端上传对象存储后保存 URL 数组 |
+| `images` | file[] | 否 | 可重复提交的图片文件字段；单张图片不超过 2MB，后端上传私有对象存储后保存图片代理 URL 数组 |
 
 - 请求示例：
 
@@ -328,11 +328,34 @@ curl -X POST 'https://api.example.com/api/v1/items' \
 - Response 示例：
 
 ```json
-{"code":0,"message":"success","data":{"id":1001,"sellerId":"u_2001","title":"孤品手作陶瓷杯","category":"home","brand":"DemoBrand","conditionGrade":"NEW","images":["https://aieas.tos-cn-boe.volces.com/abc.png"],"description":"直播间限量拍卖款","status":"DRAFT"},"trace_id":"trc_item_create"}
+{"code":0,"message":"success","data":{"id":1001,"sellerId":"u_2001","title":"孤品手作陶瓷杯","category":"home","brand":"DemoBrand","conditionGrade":"NEW","images":["/api/v1/images/abc.png"],"description":"直播间限量拍卖款","status":"READY"},"trace_id":"trc_item_create"}
 ```
 
 - 常见错误码：`10003`、`20001`、`90004`
-- 备注：接口不接收图片 URL。图片必须以二进制文件提交，单张图片大小限制 2MB 以内，响应中的 `images` 为对象存储访问 URL。
+- 备注：接口不接收图片 URL。图片必须以二进制文件提交，单张图片大小限制 2MB 以内，响应中的 `images` 为后端图片代理 URL，浏览器不直接访问对象存储桶。
+
+#### POST /api/v1/items/description/optimize
+
+- 用途：AI 优化商品描述
+- Header：`Authorization`、`Content-Type: multipart/form-data`
+- FormData 字段：
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `image` | file | 否 | 商品图片文件，单张不超过 2MB；创建页或编辑页选择新图片时使用 |
+| `imageUrl` | string | 否 | 已保存商品图片代理 URL；编辑页未选择新图片时使用 |
+| `title` | string | 是 | 商品标题 |
+| `category` | string | 是 | 商品类目 |
+| `condition` | string | 是 | 商品成色文案，例如 `九成新` |
+
+- Response 示例：
+
+```json
+{"code":0,"message":"success","data":{"title":"机械键盘 87键","category":"电脑外设/键盘","description":"200字以内的商品描述"},"trace_id":"trc_item_desc_ai"}
+```
+
+- 常见错误码：`10002`、`10003`、`20001`、`90001`
+- 备注：`image` 与 `imageUrl` 至少提交一个，同时提交时优先使用 `image`。后端会调用 Agent 服务 `POST /api/v1/product-description`，再将返回的 `title`、`category`、`description` 返回给前端。
 
 #### GET /api/v1/items
 
@@ -370,7 +393,7 @@ curl 'https://api.example.com/api/v1/items/item_1001' \
 - Response 示例：
 
 ```json
-{"code":0,"message":"success","data":{"id":"item_1001","title":"孤品手作陶瓷杯","description":"直播间限量拍卖款","images":["https://aieas.tos-cn-boe.volces.com/abc.png"],"category":"home","marketPrice":12900,"status":"ACTIVE"},"trace_id":"trc_item_get"}
+{"code":0,"message":"success","data":{"id":"item_1001","title":"孤品手作陶瓷杯","description":"直播间限量拍卖款","images":["/api/v1/images/abc.png"],"category":"home","marketPrice":12900,"status":"ACTIVE"},"trace_id":"trc_item_get"}
 ```
 
 - 常见错误码：`30001`、`30002`
@@ -380,7 +403,7 @@ curl 'https://api.example.com/api/v1/items/item_1001' \
 
 - 用途：更新商品信息
 - Header：`Authorization`、`Content-Type: multipart/form-data`、`Idempotency-Key`
-- Body：同创建接口的 FormData 字段，全部字段均可选；提交新的 `images` 文件时会替换原图片 URL 数组，不提交 `images` 则保持原图片不变；单张图片不超过 2MB。
+- Body：同创建接口的 FormData 字段，全部字段均可选；提交新的 `images` 文件时会替换原图片 URL 数组，不提交 `images` 则保持原图片不变；单张图片不超过 2MB。商家提交后会重新调用 AI 审核，AI 通过为 `READY`，驳回为 `REJECTED`，无有效结论为 `PENDING_AUDIT`。
 
 - 请求示例：
 
@@ -396,11 +419,20 @@ curl -X PATCH 'https://api.example.com/api/v1/items/item_1001' \
 - Response 示例：
 
 ```json
-{"code":0,"message":"success","data":{"id":1001,"title":"孤品手作陶瓷杯升级款","images":["https://aieas.tos-cn-boe.volces.com/new.png"],"status":"DRAFT"},"trace_id":"trc_item_patch"}
+{"code":0,"message":"success","data":{"id":1001,"title":"孤品手作陶瓷杯升级款","images":["/api/v1/images/new.png"],"status":"READY"},"trace_id":"trc_item_patch"}
 ```
 
 - 常见错误码：`30001`、`30002`、`30003`
 - 备注：已进入拍卖流程的商品仅允许修改非关键展示字段。
+
+#### GET /api/v1/images/{key}
+
+- 用途：公开读取商品图片，由后端代理访问私有对象存储
+- Header：无
+- Path：`key`，由商品接口 `images` 字段返回，例如 `/api/v1/images/abc.png`
+- Response：图片二进制流，`Content-Type` 按对象元数据或文件扩展名返回
+- 常见错误码：`20001`、`20004`、`90001`
+- 备注：该接口不需要登录；浏览器只访问后端代理 URL，不直接访问对象存储桶域名。
 
 #### DELETE /api/v1/items/{id}
 
@@ -1415,7 +1447,7 @@ wscat -c 'wss://api.example.com/ws/auctions/1001?token=<jwt>&lastSeq=102'
 | merchantId | string | 是 | 商家 ID |
 | title | string | 是 | 商品标题 |
 | description | string | 否 | 商品描述 |
-| images | string[] | 否 | 商品图片 URL 列表 |
+| images | string[] | 否 | 商品图片代理 URL 列表 |
 | category | string | 否 | 商品类目 |
 | marketPrice | int64 | 否 | 市场价，单位分 |
 | status | string | 是 | 商品状态：`ACTIVE`、`DELETED` |

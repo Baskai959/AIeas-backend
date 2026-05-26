@@ -45,7 +45,7 @@ CREATE TABLE IF NOT EXISTS `item` (
   `condition_grade` VARCHAR(16)     NOT NULL DEFAULT 'NEW'  COMMENT '成色：NEW/LIKE_NEW/GOOD/FAIR',
   `images`          JSON            NOT NULL                COMMENT '图片 URL 数组（JSON）',
   `description`     TEXT            DEFAULT NULL            COMMENT '商品描述',
-  `status`          VARCHAR(16)     NOT NULL DEFAULT 'DRAFT' COMMENT '状态：DRAFT/READY/LISTED/OFFLINE',
+  `status`          VARCHAR(16)     NOT NULL DEFAULT 'PENDING_AUDIT' COMMENT '状态：DRAFT/PENDING_AUDIT/READY/REJECTED/LISTED/OFFLINE',
   `created_at`      DATETIME(3)     NOT NULL DEFAULT CURRENT_TIMESTAMP(3) COMMENT '创建时间',
   `updated_at`      DATETIME(3)     NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3) COMMENT '更新时间',
   PRIMARY KEY (`id`),
@@ -62,6 +62,8 @@ CREATE TABLE IF NOT EXISTS `auction_lot` (
   `auction_id`       BIGINT          NOT NULL                  COMMENT '拍品 ID（后端雪花 ID，非自增）',
   `item_id`          BIGINT          NOT NULL                  COMMENT '关联商品 ID（item.id）',
   `seller_id`        BIGINT          NOT NULL                  COMMENT '卖家 ID（user.id）',
+  `live_room_id`     BIGINT UNSIGNED NOT NULL DEFAULT 0        COMMENT '所属直播间 ID（0=未归属）',
+  `live_session_id`  BIGINT UNSIGNED DEFAULT NULL              COMMENT '所属直播场次 ID（NULL=未关联场次）',
   `auction_type`     VARCHAR(16)     NOT NULL DEFAULT 'ENGLISH' COMMENT '拍卖类型，MVP 仅支持 ENGLISH',
   `start_price`      BIGINT          NOT NULL                  COMMENT '起拍价（分），允许为 0（0 元起拍）',
   `reserve_price`    BIGINT          NOT NULL DEFAULT 0        COMMENT '保留价（分），0 表示无保留价',
@@ -82,6 +84,8 @@ CREATE TABLE IF NOT EXISTS `auction_lot` (
   PRIMARY KEY (`auction_id`),
   KEY `idx_item_id` (`item_id`),
   KEY `idx_seller_id` (`seller_id`),
+  KEY `idx_live_room_status` (`live_room_id`, `status`),
+  KEY `idx_live_session` (`live_session_id`),
   KEY `idx_status_end_time` (`status`, `end_time`),
   KEY `idx_winner_id` (`winner_id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='拍品（拍卖实例）表';
@@ -94,6 +98,7 @@ CREATE TABLE IF NOT EXISTS `bid_record` (
   `id`            BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '出价记录 ID',
   `request_id`    VARCHAR(64)     NOT NULL                COMMENT '客户端幂等键（UUID）',
   `auction_id`    BIGINT          NOT NULL                COMMENT '拍品 ID（auction_lot.auction_id）',
+  `live_session_id` BIGINT UNSIGNED DEFAULT NULL          COMMENT '所属直播场次 ID（NULL=非场次内出价）',
   `bidder_id`     BIGINT UNSIGNED NOT NULL                COMMENT '出价人 ID（user.id）',
   `bid_price`     BIGINT          NOT NULL                COMMENT '出价金额（分）',
   `bid_ts_ms`     BIGINT          NOT NULL                COMMENT '服务端受理时间戳（毫秒）',
@@ -104,6 +109,7 @@ CREATE TABLE IF NOT EXISTS `bid_record` (
   PRIMARY KEY (`id`),
   UNIQUE KEY `uk_request_id` (`request_id`),
   KEY `idx_auction_bid_ts` (`auction_id`, `bid_ts_ms`),
+  KEY `idx_live_session` (`live_session_id`),
   KEY `idx_bidder_id` (`bidder_id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='出价记录表';
 
@@ -114,6 +120,7 @@ CREATE TABLE IF NOT EXISTS `bid_record` (
 CREATE TABLE IF NOT EXISTS `order_deal` (
   `id`             BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '订单 ID（成交订单由后端雪花 ID 写入，保留自增兜底）',
   `auction_id`     BIGINT          NOT NULL                COMMENT '拍品 ID（auction_lot.auction_id）',
+  `live_session_id` BIGINT UNSIGNED DEFAULT NULL           COMMENT '所属直播场次 ID（NULL=非场次内成交）',
   `winner_id`      BIGINT UNSIGNED NOT NULL                COMMENT '中拍人 ID（user.id）',
   `seller_id`      BIGINT UNSIGNED NOT NULL                COMMENT '卖家 ID（user.id）',
   `deal_price`     BIGINT          NOT NULL                COMMENT '成交价（分）',
@@ -129,6 +136,7 @@ CREATE TABLE IF NOT EXISTS `order_deal` (
   UNIQUE KEY `uk_auction_id` (`auction_id`),
   KEY `idx_winner_id` (`winner_id`),
   KEY `idx_seller_id` (`seller_id`),
+  KEY `idx_live_session` (`live_session_id`),
   KEY `idx_status_pay_deadline` (`status`, `pay_deadline`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='成交订单表';
 
@@ -216,6 +224,32 @@ CREATE TABLE IF NOT EXISTS `config_item` (
   `updated_at`   DATETIME(3)     NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3) COMMENT '更新时间',
   PRIMARY KEY (`config_key`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='平台级配置项';
+
+-- ---------------------------------------------------------------------
+-- 11. live_session 直播场次表
+--     一次 "开播-闭播" 周期；与 auction_lot/bid_record/order_deal 通过 live_session_id 关联
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS `live_session` (
+  `id`            BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '直播场次 ID',
+  `live_room_id`  BIGINT UNSIGNED NOT NULL                COMMENT '所属直播间 ID（live_room.id）',
+  `merchant_id`   VARCHAR(64)     NOT NULL                COMMENT '商家 ID（冗余便于查询）',
+  `title`         VARCHAR(255)    DEFAULT NULL            COMMENT '开播时直播间标题快照',
+  `status`        VARCHAR(16)     NOT NULL                COMMENT '状态：LIVE/ENDED',
+  `opened_at`     DATETIME(3)     NOT NULL                COMMENT '开播时间',
+  `closed_at`     DATETIME(3)     DEFAULT NULL            COMMENT '闭播时间',
+  `lots_total`    INT             NOT NULL DEFAULT 0      COMMENT '本场上架/挂载过的拍品数',
+  `lots_sold`     INT             NOT NULL DEFAULT 0      COMMENT '本场成交数',
+  `lots_unsold`   INT             NOT NULL DEFAULT 0      COMMENT '本场流拍数',
+  `bid_count`     INT             NOT NULL DEFAULT 0      COMMENT '本场出价次数',
+  `gmv_cent`      BIGINT          NOT NULL DEFAULT 0      COMMENT '本场成交总金额（分）',
+  `viewer_peak`   INT             NOT NULL DEFAULT 0      COMMENT '峰值在线',
+  `viewer_total`  INT             NOT NULL DEFAULT 0      COMMENT '累计观看人次（去重以 user_id）',
+  `created_at`    DATETIME(3)     NOT NULL DEFAULT CURRENT_TIMESTAMP(3) COMMENT '创建时间',
+  `updated_at`    DATETIME(3)     NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3) COMMENT '更新时间',
+  PRIMARY KEY (`id`),
+  KEY `idx_room_status` (`live_room_id`, `status`),
+  KEY `idx_merchant_opened` (`merchant_id`, `opened_at`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='直播场次（一次开播-闭播）';
 
 -- =====================================================================
 -- 演示数据（Demo Seed），仅供本地启动验证使用

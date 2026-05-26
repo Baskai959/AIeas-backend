@@ -44,16 +44,21 @@ websocket:
 
 objectStorage:
   enabled: false
-  endpoint: "https://tos-cn-boe.volces.com"
-  region: "cn-guilin-boe"
+  endpoint: "https://tos-cn-beijing.volces.com"
+  region: "cn-beijing"
   bucket: "aieas"
-  bucketURL: "https://aieas.tos-cn-boe.volces.com"
+  bucketURL: "https://aieas.tos-cn-beijing.volces.com"
   accessKey: ""
   secretKey: ""
   objectPrefix: ""
 
+agent:
+  productDescriptionURL: "http://127.0.0.1:8000/api/v1/product-description"
+  productAuditURL: "http://127.0.0.1:8000/api/v1/product-audit"
+  timeout: 30s
+
 observability:
-  logLevel: "info"
+  logLevel: "dev"
   metricsPath: "/metrics"
   # format: text → 控制台彩色对齐文本 (dev)；json → 一行一条 JSON (prod)
   format: "text"

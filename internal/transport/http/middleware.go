@@ -344,12 +344,6 @@ func AuditMiddleware(sink AuditSink, logger *slog.Logger) app.HandlerFunc {
 			UserAgent:    string(c.GetHeader("User-Agent")),
 			CreatedAt:    time.Now().UTC(),
 		}
-		if log.OperatorID == "" {
-			log.OperatorID = "anonymous"
-		}
-		if log.OperatorRole == "" {
-			log.OperatorRole = "anonymous"
-		}
 		if err := sink.Create(ctx, log); err != nil {
 			logger.Warn("write audit log failed", "request_id", RequestID(c), "error", err)
 		}
@@ -359,6 +353,12 @@ func AuditMiddleware(sink AuditSink, logger *slog.Logger) app.HandlerFunc {
 func shouldSkipAudit(c *app.RequestContext) bool {
 	method := string(c.Method())
 	if method == consts.MethodGet || method == consts.MethodHead || method == consts.MethodOptions {
+		return true
+	}
+	if c.Response.StatusCode() == consts.StatusUnauthorized {
+		return true
+	}
+	if strings.TrimSpace(AuthUserID(c)) == "" || strings.TrimSpace(string(AuthRole(c))) == "" {
 		return true
 	}
 	path := string(c.Path())

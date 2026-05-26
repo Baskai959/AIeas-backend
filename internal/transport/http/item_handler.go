@@ -2,9 +2,12 @@ package http
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"io"
 	"mime"
 	"mime/multipart"
+	"net/url"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -14,21 +17,25 @@ import (
 	"aieas_backend/internal/service"
 
 	"github.com/cloudwego/hertz/pkg/app"
+	"github.com/cloudwego/hertz/pkg/protocol/consts"
 )
 
 const maxImageUploadSizeBytes int64 = 2 * 1024 * 1024
 
 type ItemHandler struct {
-	items    *service.ItemService
-	uploader objectstorage.Uploader
+	items          *service.ItemService
+	uploader       objectstorage.Uploader
+	descriptionGen service.ProductDescriptionGenerator
 }
 
-func NewItemHandler(items *service.ItemService, uploaders ...objectstorage.Uploader) *ItemHandler {
-	var uploader objectstorage.Uploader = objectstorage.DisabledUploader{}
-	if len(uploaders) > 0 && uploaders[0] != nil {
-		uploader = uploaders[0]
+func NewItemHandler(items *service.ItemService, uploader objectstorage.Uploader, descriptionGen service.ProductDescriptionGenerator) *ItemHandler {
+	if uploader == nil {
+		uploader = objectstorage.DisabledUploader{}
 	}
-	return &ItemHandler{items: items, uploader: uploader}
+	if descriptionGen == nil {
+		descriptionGen = service.DisabledProductDescriptionGenerator{}
+	}
+	return &ItemHandler{items: items, uploader: uploader, descriptionGen: descriptionGen}
 }
 
 type itemCreateRequest struct {
@@ -57,16 +64,25 @@ func (h *ItemHandler) Create(ctx context.Context, c *app.RequestContext) {
 		WriteError(c, 400, 20001, "参数不合法", nil)
 		return
 	}
+	var auditImage *service.ProductAuditImage
 	if len(files) > 0 {
+		auditImage, err = productAuditImageFromFile(files[0])
+		if err != nil {
+			writeServiceError(c, err)
+			return
+		}
 		images, err := h.uploadImages(ctx, files)
 		if err != nil {
 			writeServiceError(c, err)
 			return
 		}
 		req.Images = images
+	} else if len(req.Images) > 0 {
+		auditImage = h.productAuditImageFromURL(ctx, req.Images[0])
 	}
 	item, err := h.items.Create(ctx, service.CreateItemInput{
 		SellerID:       AuthUserID(c),
+		ActorRole:      AuthRole(c),
 		Title:          req.Title,
 		Category:       req.Category,
 		Brand:          req.Brand,
@@ -74,6 +90,7 @@ func (h *ItemHandler) Create(ctx context.Context, c *app.RequestContext) {
 		Images:         req.Images,
 		Description:    req.Description,
 		Status:         req.Status,
+		AuditImage:     auditImage,
 	})
 	if err != nil {
 		writeItemError(c, err)
@@ -123,13 +140,26 @@ func (h *ItemHandler) Update(ctx context.Context, c *app.RequestContext) {
 		WriteError(c, 400, 20001, "参数不合法", nil)
 		return
 	}
+	var auditImage *service.ProductAuditImage
 	if len(files) > 0 {
+		auditImage, err = productAuditImageFromFile(files[0])
+		if err != nil {
+			writeServiceError(c, err)
+			return
+		}
 		images, err := h.uploadImages(ctx, files)
 		if err != nil {
 			writeServiceError(c, err)
 			return
 		}
 		req.Images = &images
+	} else if req.Images != nil && len(*req.Images) > 0 {
+		auditImage = h.productAuditImageFromURL(ctx, (*req.Images)[0])
+	} else {
+		current, err := h.items.Get(ctx, id, AuthUserID(c), AuthRole(c))
+		if err == nil {
+			auditImage = h.productAuditImageFromItem(ctx, current)
+		}
 	}
 	item, err := h.items.Update(ctx, id, service.UpdateItemInput{
 		ActorID:        AuthUserID(c),
@@ -141,6 +171,7 @@ func (h *ItemHandler) Update(ctx context.Context, c *app.RequestContext) {
 		Images:         req.Images,
 		Description:    req.Description,
 		Status:         req.Status,
+		AuditImage:     auditImage,
 	})
 	if err != nil {
 		writeItemError(c, err)
@@ -159,6 +190,226 @@ func (h *ItemHandler) Delete(ctx context.Context, c *app.RequestContext) {
 		return
 	}
 	WriteSuccess(c, map[string]bool{"deleted": true})
+}
+
+func (h *ItemHandler) Image(ctx context.Context, c *app.RequestContext) {
+	key := strings.TrimLeft(strings.TrimSpace(c.Param("key")), "/")
+	if key == "" || strings.Contains(key, "..") {
+		WriteError(c, 400, 20001, "参数不合法", nil)
+		return
+	}
+	out, err := h.uploader.Download(ctx, key)
+	if err != nil {
+		switch {
+		case errors.Is(err, objectstorage.ErrInvalidObjectKey):
+			WriteError(c, 400, 20001, "参数不合法", nil)
+		case errors.Is(err, objectstorage.ErrObjectNotFound):
+			WriteError(c, 404, 20004, "资源不存在", nil)
+		default:
+			WriteError(c, 500, 90001, "系统内部错误", nil)
+		}
+		return
+	}
+	contentType := strings.TrimSpace(out.ContentType)
+	if contentType == "" {
+		contentType = mime.TypeByExtension(strings.ToLower(filepath.Ext(key)))
+	}
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
+	bodySize := -1
+	if out.ContentLength >= 0 && out.ContentLength <= int64(^uint(0)>>1) {
+		bodySize = int(out.ContentLength)
+	}
+	c.Response.SetStatusCode(consts.StatusOK)
+	c.Response.Header.Set("Content-Type", contentType)
+	c.Response.Header.Set("Cache-Control", "private, max-age=300")
+	c.Response.SetBodyStream(out.Content, bodySize)
+}
+
+func (h *ItemHandler) OptimizeDescription(ctx context.Context, c *app.RequestContext) {
+	if !isMultipartRequest(c) {
+		WriteError(c, 400, 20001, "参数不合法", nil)
+		return
+	}
+	title := strings.TrimSpace(c.PostForm("title"))
+	category := strings.TrimSpace(c.PostForm("category"))
+	condition := strings.TrimSpace(c.PostForm("condition"))
+	if title == "" || category == "" || condition == "" {
+		WriteError(c, 400, 20001, "参数不合法", nil)
+		return
+	}
+
+	input, closer, err := h.bindDescriptionImage(ctx, c)
+	if err != nil {
+		writeServiceError(c, err)
+		return
+	}
+	if len(input.Image) == 0 {
+		WriteError(c, 400, 20001, "参数不合法", nil)
+		return
+	}
+	input.Title = title
+	input.Category = category
+	input.Condition = condition
+	result, genErr := h.descriptionGen.GenerateProductDescription(ctx, service.ProductDescriptionInput{
+		Title:       input.Title,
+		Category:    input.Category,
+		Condition:   input.Condition,
+		ImageName:   input.ImageName,
+		ContentType: input.ContentType,
+		ImageSize:   input.ImageSize,
+		Image:       input.Image,
+	})
+	closeErr := closer()
+	if genErr != nil {
+		writeServiceError(c, genErr)
+		return
+	}
+	if closeErr != nil {
+		writeServiceError(c, closeErr)
+		return
+	}
+	WriteSuccess(c, result)
+}
+
+func (h *ItemHandler) bindDescriptionImage(ctx context.Context, c *app.RequestContext) (service.ProductDescriptionInput, func() error, error) {
+	fileHeader, err := c.FormFile("image")
+	if err == nil && fileHeader != nil {
+		if fileHeader.Size > maxImageUploadSizeBytes {
+			return service.ProductDescriptionInput{}, noopClose, domain.ErrInvalidArgument
+		}
+		file, err := fileHeader.Open()
+		if err != nil {
+			return service.ProductDescriptionInput{}, noopClose, err
+		}
+		imageBytes, readErr := io.ReadAll(file)
+		closeErr := file.Close()
+		if readErr != nil {
+			return service.ProductDescriptionInput{}, noopClose, readErr
+		}
+		if closeErr != nil {
+			return service.ProductDescriptionInput{}, noopClose, closeErr
+		}
+		return service.ProductDescriptionInput{
+			ImageName:   fileHeader.Filename,
+			ContentType: imageContentType(fileHeader),
+			ImageSize:   fileHeader.Size,
+			Image:       imageBytes,
+		}, noopClose, nil
+	}
+
+	imageURL := strings.TrimSpace(c.PostForm("imageUrl"))
+	if imageURL == "" {
+		return service.ProductDescriptionInput{}, noopClose, nil
+	}
+	key, err := objectKeyFromImageURL(imageURL)
+	if err != nil {
+		return service.ProductDescriptionInput{}, noopClose, err
+	}
+	out, err := h.uploader.Download(ctx, key)
+	if err != nil {
+		return service.ProductDescriptionInput{}, noopClose, err
+	}
+	imageBytes, readErr := io.ReadAll(out.Content)
+	closeErr := out.Content.Close()
+	if readErr != nil {
+		return service.ProductDescriptionInput{}, noopClose, readErr
+	}
+	if closeErr != nil {
+		return service.ProductDescriptionInput{}, noopClose, closeErr
+	}
+	return service.ProductDescriptionInput{
+		ImageName:   filepath.Base(key),
+		ContentType: out.ContentType,
+		ImageSize:   out.ContentLength,
+		Image:       imageBytes,
+	}, noopClose, nil
+}
+
+func productAuditImageFromFile(fileHeader *multipart.FileHeader) (*service.ProductAuditImage, error) {
+	if fileHeader == nil {
+		return nil, nil
+	}
+	if fileHeader.Size > maxImageUploadSizeBytes {
+		return nil, domain.ErrInvalidArgument
+	}
+	file, err := fileHeader.Open()
+	if err != nil {
+		return nil, err
+	}
+	imageBytes, readErr := io.ReadAll(file)
+	closeErr := file.Close()
+	if readErr != nil {
+		return nil, readErr
+	}
+	if closeErr != nil {
+		return nil, closeErr
+	}
+	if len(imageBytes) == 0 {
+		return nil, domain.ErrInvalidArgument
+	}
+	return &service.ProductAuditImage{
+		ImageName:   fileHeader.Filename,
+		ContentType: imageContentType(fileHeader),
+		ImageSize:   fileHeader.Size,
+		Image:       imageBytes,
+	}, nil
+}
+
+func (h *ItemHandler) productAuditImageFromItem(ctx context.Context, item domain.Item) *service.ProductAuditImage {
+	var images []string
+	if err := json.Unmarshal(item.Images, &images); err != nil || len(images) == 0 {
+		return nil
+	}
+	return h.productAuditImageFromURL(ctx, images[0])
+}
+
+func (h *ItemHandler) productAuditImageFromURL(ctx context.Context, imageURL string) *service.ProductAuditImage {
+	key, err := objectKeyFromImageURL(imageURL)
+	if err != nil {
+		return nil
+	}
+	out, err := h.uploader.Download(ctx, key)
+	if err != nil {
+		return nil
+	}
+	imageBytes, readErr := io.ReadAll(out.Content)
+	closeErr := out.Content.Close()
+	if readErr != nil || closeErr != nil || len(imageBytes) == 0 {
+		return nil
+	}
+	return &service.ProductAuditImage{
+		ImageName:   filepath.Base(key),
+		ContentType: out.ContentType,
+		ImageSize:   out.ContentLength,
+		Image:       imageBytes,
+	}
+}
+
+func objectKeyFromImageURL(value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", domain.ErrInvalidArgument
+	}
+	if strings.HasPrefix(value, objectstorage.ProxyPathPrefix()) {
+		return strings.TrimLeft(strings.TrimPrefix(value, objectstorage.ProxyPathPrefix()), "/"), nil
+	}
+	parsed, err := url.Parse(value)
+	if err != nil {
+		return "", domain.ErrInvalidArgument
+	}
+	if parsed.Path == "" || parsed.Path == "/" {
+		return "", domain.ErrInvalidArgument
+	}
+	if strings.HasPrefix(parsed.Path, objectstorage.ProxyPathPrefix()) {
+		return strings.TrimLeft(strings.TrimPrefix(parsed.Path, objectstorage.ProxyPathPrefix()), "/"), nil
+	}
+	return strings.TrimLeft(parsed.Path, "/"), nil
+}
+
+func noopClose() error {
+	return nil
 }
 
 func (h *ItemHandler) bindCreateRequest(c *app.RequestContext) (itemCreateRequest, []*multipart.FileHeader, error) {
@@ -300,6 +551,18 @@ func parseQueryInt(c *app.RequestContext, name string, fallback int) int {
 }
 
 func writeServiceError(c *app.RequestContext, err error) {
+	if errors.Is(err, io.ErrUnexpectedEOF) {
+		WriteError(c, 400, 20001, "参数不合法", nil)
+		return
+	}
+	if errors.Is(err, objectstorage.ErrInvalidObjectKey) {
+		WriteError(c, 400, 20001, "参数不合法", nil)
+		return
+	}
+	if errors.Is(err, objectstorage.ErrObjectNotFound) {
+		WriteError(c, 404, 20004, "资源不存在", nil)
+		return
+	}
 	status, code, msg := service.HTTPStatusAndCode(err)
 	WriteError(c, status, code, msg, nil)
 }

@@ -54,6 +54,7 @@ type Config struct {
 	Auction       AuctionConfig       `yaml:"auction"`
 	WebSocket     WebSocketConfig     `yaml:"websocket"`
 	ObjectStorage ObjectStorageConfig `yaml:"objectStorage"`
+	Agent         AgentConfig         `yaml:"agent"`
 	Observability ObservabilityConfig `yaml:"observability"`
 }
 
@@ -120,11 +121,17 @@ type ObjectStorageConfig struct {
 	ObjectPrefix string `yaml:"objectPrefix"`
 }
 
+type AgentConfig struct {
+	ProductDescriptionURL string   `yaml:"productDescriptionURL"`
+	ProductAuditURL       string   `yaml:"productAuditURL"`
+	Timeout               Duration `yaml:"timeout"`
+}
+
 type ObservabilityConfig struct {
-	LogLevel            string `yaml:"logLevel"`
-	MetricsPath         string `yaml:"metricsPath"`
-	Format              string `yaml:"format"`
-	SlowSQLThresholdMs  int    `yaml:"slowSQLThresholdMs"`
+	LogLevel           string `yaml:"logLevel"`
+	MetricsPath        string `yaml:"metricsPath"`
+	Format             string `yaml:"format"`
+	SlowSQLThresholdMs int    `yaml:"slowSQLThresholdMs"`
 }
 
 func Default() Config {
@@ -180,6 +187,11 @@ func Default() Config {
 			Bucket:       "aieas",
 			BucketURL:    "https://aieas.tos-cn-boe.volces.com",
 			ObjectPrefix: "",
+		},
+		Agent: AgentConfig{
+			ProductDescriptionURL: "http://127.0.0.1:8000/api/v1/product-description",
+			ProductAuditURL:       "http://127.0.0.1:8000/api/v1/product-audit",
+			Timeout:               Duration(30 * time.Second),
 		},
 		Observability: ObservabilityConfig{
 			LogLevel:           "info",
@@ -255,6 +267,21 @@ func (c Config) Validate() error {
 	}
 	if c.Observability.SlowSQLThresholdMs < 0 {
 		return fmt.Errorf("observability.slowSQLThresholdMs must be non-negative")
+	}
+	if strings.TrimSpace(c.Agent.ProductDescriptionURL) == "" {
+		return fmt.Errorf("agent.productDescriptionURL is required")
+	}
+	if err := validateHTTPURL(c.Agent.ProductDescriptionURL, "agent.productDescriptionURL"); err != nil {
+		return err
+	}
+	if strings.TrimSpace(c.Agent.ProductAuditURL) == "" {
+		return fmt.Errorf("agent.productAuditURL is required")
+	}
+	if err := validateHTTPURL(c.Agent.ProductAuditURL, "agent.productAuditURL"); err != nil {
+		return err
+	}
+	if c.Agent.Timeout.Std() <= 0 {
+		return fmt.Errorf("agent.timeout must be positive")
 	}
 	if c.ObjectStorage.Enabled {
 		if strings.TrimSpace(c.ObjectStorage.Endpoint) == "" {
@@ -371,6 +398,12 @@ func (c *Config) applyEnv() error {
 	setString("OBJECT_STORAGE_SECRET_KEY", &c.ObjectStorage.SecretKey)
 	setString("OBJECT_STORAGE_OBJECT_PREFIX", &c.ObjectStorage.ObjectPrefix)
 
+	setString("AGENT_PRODUCT_DESCRIPTION_URL", &c.Agent.ProductDescriptionURL)
+	setString("AGENT_PRODUCT_AUDIT_URL", &c.Agent.ProductAuditURL)
+	if err := setDuration("AGENT_TIMEOUT", &c.Agent.Timeout); err != nil {
+		return err
+	}
+
 	setString("OBSERVABILITY_LOG_LEVEL", &c.Observability.LogLevel)
 	setString("OBSERVABILITY_METRICS_PATH", &c.Observability.MetricsPath)
 	setString("OBSERVABILITY_FORMAT", &c.Observability.Format)
@@ -479,18 +512,31 @@ func findUp(startDir, name string) string {
 }
 
 func validateBucketURL(bucketURL, redisAddr string) error {
-	parsed, err := url.Parse(strings.TrimSpace(bucketURL))
-	if err != nil || parsed.Scheme == "" || parsed.Hostname() == "" {
-		return fmt.Errorf("objectStorage.bucketURL must be a valid http or https URL")
-	}
-	if parsed.Scheme != "http" && parsed.Scheme != "https" {
-		return fmt.Errorf("objectStorage.bucketURL must use http or https")
+	parsed, err := parseHTTPURL(bucketURL, "objectStorage.bucketURL")
+	if err != nil {
+		return err
 	}
 	redisHostname := redisHost(redisAddr)
 	if redisHostname != "" && strings.EqualFold(parsed.Hostname(), redisHostname) {
 		return fmt.Errorf("objectStorage.bucketURL must not point to redis addr")
 	}
 	return nil
+}
+
+func validateHTTPURL(rawURL, field string) error {
+	_, err := parseHTTPURL(rawURL, field)
+	return err
+}
+
+func parseHTTPURL(rawURL, field string) (*url.URL, error) {
+	parsed, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil || parsed.Scheme == "" || parsed.Hostname() == "" {
+		return nil, fmt.Errorf("%s must be a valid http or https URL", field)
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return nil, fmt.Errorf("%s must use http or https", field)
+	}
+	return parsed, nil
 }
 
 func redisHost(addr string) string {

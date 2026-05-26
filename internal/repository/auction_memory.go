@@ -104,6 +104,7 @@ func (r *MemoryAuctionRepository) Delete(ctx context.Context, id uint64) error {
 func cloneAuction(auction domain.AuctionLot) domain.AuctionLot {
 	auction.IncrementRule = append([]byte(nil), auction.IncrementRule...)
 	auction.RuleSnapshot = append([]byte(nil), auction.RuleSnapshot...)
+	auction.LiveSessionID = cloneUint64Ptr(auction.LiveSessionID)
 	return auction
 }
 

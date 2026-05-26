@@ -1,0 +1,160 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "商品图片代理读取接口",
+    "version": "v1",
+    "description": "商品图片由后端从私有对象存储读取并转发给浏览器。该接口不需要登录，浏览器不直接访问对象存储桶域名。"
+  },
+  "servers": [
+    {
+      "url": "http://localhost:8888",
+      "description": "Local"
+    }
+  ],
+  "tags": [
+    {
+      "name": "ItemImage",
+      "description": "商品图片代理读取"
+    }
+  ],
+  "paths": {
+    "/api/v1/images/{key}": {
+      "get": {
+        "tags": [
+          "ItemImage"
+        ],
+        "summary": "读取商品图片",
+        "description": "公开接口。key 来自商品接口返回的 images 代理 URL，后端使用服务端对象存储凭证读取私有对象并返回图片二进制流。",
+        "operationId": "getItemImage",
+        "parameters": [
+          {
+            "name": "key",
+            "in": "path",
+            "required": true,
+            "description": "对象 key，例如 abc.png；如果配置了对象前缀，key 可包含前缀路径。",
+            "schema": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "图片二进制流",
+            "content": {
+              "image/jpeg": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              },
+              "image/png": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              },
+              "application/octet-stream": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/ParamInvalid"
+          },
+          "404": {
+            "$ref": "#/components/responses/ImageNotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        },
+        "security": []
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "ErrorResponse": {
+        "type": "object",
+        "required": [
+          "code",
+          "message",
+          "data",
+          "trace_id"
+        ],
+        "properties": {
+          "code": {
+            "type": "integer",
+            "example": 20001
+          },
+          "message": {
+            "type": "string",
+            "example": "参数不合法"
+          },
+          "data": {
+            "nullable": true,
+            "example": null
+          },
+          "trace_id": {
+            "type": "string",
+            "example": "req_1710000000000000000"
+          }
+        }
+      }
+    },
+    "responses": {
+      "ParamInvalid": {
+        "description": "参数不合法",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            },
+            "example": {
+              "code": 20001,
+              "message": "参数不合法",
+              "data": null,
+              "trace_id": "req_1710000000000000000"
+            }
+          }
+        }
+      },
+      "ImageNotFound": {
+        "description": "图片不存在",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            },
+            "example": {
+              "code": 20004,
+              "message": "资源不存在",
+              "data": null,
+              "trace_id": "req_1710000000000000000"
+            }
+          }
+        }
+      },
+      "InternalError": {
+        "description": "系统内部错误",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            },
+            "example": {
+              "code": 90001,
+              "message": "系统内部错误",
+              "data": null,
+              "trace_id": "req_1710000000000000000"
+            }
+          }
+        }
+      }
+    }
+  }
+}
