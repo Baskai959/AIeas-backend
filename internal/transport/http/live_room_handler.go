@@ -3,20 +3,26 @@ package http
 import (
 	"context"
 	"errors"
+	"mime/multipart"
 	"strings"
 
 	"aieas_backend/internal/domain"
+	"aieas_backend/internal/infra/objectstorage"
 	"aieas_backend/internal/service"
 
 	"github.com/cloudwego/hertz/pkg/app"
 )
 
 type LiveRoomHandler struct {
-	rooms *service.LiveRoomService
+	rooms    *service.LiveRoomService
+	uploader objectstorage.Uploader
 }
 
-func NewLiveRoomHandler(rooms *service.LiveRoomService) *LiveRoomHandler {
-	return &LiveRoomHandler{rooms: rooms}
+func NewLiveRoomHandler(rooms *service.LiveRoomService, uploader objectstorage.Uploader) *LiveRoomHandler {
+	if uploader == nil {
+		uploader = objectstorage.DisabledUploader{}
+	}
+	return &LiveRoomHandler{rooms: rooms, uploader: uploader}
 }
 
 type liveRoomCreateRequest struct {
@@ -42,6 +48,10 @@ type liveRoomActivateRequest struct {
 
 type liveRoomMountRequest struct {
 	AuctionID uint64 `json:"auctionId"`
+}
+
+type liveAgentHookPatchRequest struct {
+	Enabled *bool `json:"enabled"`
 }
 
 func (h *LiveRoomHandler) Create(ctx context.Context, c *app.RequestContext) {
@@ -113,6 +123,42 @@ func (h *LiveRoomHandler) Update(ctx context.Context, c *app.RequestContext) {
 		Description: req.Description,
 		CoverURL:    req.CoverURL,
 		Status:      req.Status,
+	})
+	if err != nil {
+		writeLiveRoomError(c, err)
+		return
+	}
+	WriteSuccess(c, room)
+}
+
+// UploadCover 上传直播间封面图，成功后写回 live_room.cover_url。
+func (h *LiveRoomHandler) UploadCover(ctx context.Context, c *app.RequestContext) {
+	id, ok := parseUintParam(c, "id")
+	if !ok {
+		return
+	}
+	if _, err := h.rooms.CheckManageAccess(ctx, id, AuthUserID(c), AuthRole(c)); err != nil {
+		writeLiveRoomError(c, err)
+		return
+	}
+	if !isMultipartRequest(c) {
+		WriteError(c, 400, 20001, "参数不合法", nil)
+		return
+	}
+	fileHeader, err := c.FormFile("image")
+	if err != nil {
+		WriteError(c, 400, 20001, "参数不合法", nil)
+		return
+	}
+	coverURL, err := h.uploadCover(ctx, fileHeader)
+	if err != nil {
+		writeServiceError(c, err)
+		return
+	}
+	room, err := h.rooms.Update(ctx, id, service.UpdateLiveRoomInput{
+		ActorID:   AuthUserID(c),
+		ActorRole: AuthRole(c),
+		CoverURL:  &coverURL,
 	})
 	if err != nil {
 		writeLiveRoomError(c, err)
@@ -231,6 +277,63 @@ func (h *LiveRoomHandler) Stats(ctx context.Context, c *app.RequestContext) {
 		return
 	}
 	WriteSuccess(c, stats)
+}
+
+// AgentHookConfig 返回当前直播间所属商家的直播拍卖 AI Agent hook 开关。
+func (h *LiveRoomHandler) AgentHookConfig(ctx context.Context, c *app.RequestContext) {
+	id, ok := parseUintParam(c, "id")
+	if !ok {
+		return
+	}
+	cfg, err := h.rooms.AgentHookConfig(ctx, id, AuthUserID(c), AuthRole(c))
+	if err != nil {
+		writeLiveRoomError(c, err)
+		return
+	}
+	WriteSuccess(c, cfg)
+}
+
+// UpdateAgentHookConfig 设置当前直播间所属商家的直播拍卖 AI Agent hook 开关。
+func (h *LiveRoomHandler) UpdateAgentHookConfig(ctx context.Context, c *app.RequestContext) {
+	id, ok := parseUintParam(c, "id")
+	if !ok {
+		return
+	}
+	var req liveAgentHookPatchRequest
+	if err := c.BindJSON(&req); err != nil || req.Enabled == nil {
+		WriteError(c, 400, 20001, "参数不合法", nil)
+		return
+	}
+	cfg, err := h.rooms.UpdateAgentHookConfig(ctx, id, AuthUserID(c), AuthRole(c), *req.Enabled)
+	if err != nil {
+		writeLiveRoomError(c, err)
+		return
+	}
+	WriteSuccess(c, cfg)
+}
+
+func (h *LiveRoomHandler) uploadCover(ctx context.Context, fileHeader *multipart.FileHeader) (string, error) {
+	if fileHeader == nil || fileHeader.Size <= 0 || fileHeader.Size > maxImageUploadSizeBytes {
+		return "", domain.ErrInvalidArgument
+	}
+	file, err := fileHeader.Open()
+	if err != nil {
+		return "", err
+	}
+	coverURL, uploadErr := h.uploader.Upload(ctx, objectstorage.UploadInput{
+		Filename:    fileHeader.Filename,
+		ContentType: imageContentType(fileHeader),
+		Size:        fileHeader.Size,
+		Body:        file,
+	})
+	closeErr := file.Close()
+	if uploadErr != nil {
+		return "", uploadErr
+	}
+	if closeErr != nil {
+		return "", closeErr
+	}
+	return coverURL, nil
 }
 
 func writeLiveRoomError(c *app.RequestContext, err error) {

@@ -11,15 +11,17 @@ import (
 )
 
 type MemoryRealtimeStore struct {
-	mu        sync.RWMutex
-	auctions  map[uint64]*memoryRealtimeAuction
-	blacklist map[string]struct{}
+	mu       sync.RWMutex
+	auctions map[uint64]*memoryRealtimeAuction
 }
 
 type memoryRealtimeAuction struct {
 	state         domain.AuctionState
 	minIncrement  int64
 	incrementRule json.RawMessage
+	startPrice    int64
+	capPrice      int64
+	rule          domain.IncrementRule
 	enrolled      map[string]struct{}
 	deposits      map[string]struct{}
 	ranking       map[string]memoryRankingEntry
@@ -42,8 +44,7 @@ type memoryFrequency struct {
 
 func NewMemoryRealtimeStore() *MemoryRealtimeStore {
 	return &MemoryRealtimeStore{
-		auctions:  make(map[uint64]*memoryRealtimeAuction),
-		blacklist: make(map[string]struct{}),
+		auctions: make(map[uint64]*memoryRealtimeAuction),
 	}
 }
 
@@ -51,6 +52,14 @@ func (s *MemoryRealtimeStore) InitAuction(ctx context.Context, auction domain.Au
 	_ = ctx
 	if minIncrement <= 0 {
 		minIncrement = 1
+	}
+	rule, err := domain.ParseIncrementRule(auction.IncrementRule)
+	if err != nil {
+		rule = domain.IncrementRule{Type: domain.IncrementRuleTypeFixed, Amount: minIncrement, MaxBidSteps: 1}
+	} else {
+		if amount := rule.AmountForPrice(auction.StartPrice); amount > 0 {
+			minIncrement = amount
+		}
 	}
 	state := domain.AuctionState{
 		AuctionID:    auction.AuctionID,
@@ -77,6 +86,9 @@ func (s *MemoryRealtimeStore) InitAuction(ctx context.Context, auction domain.Au
 	existing.state = state
 	existing.minIncrement = minIncrement
 	existing.incrementRule = append([]byte(nil), auction.IncrementRule...)
+	existing.startPrice = auction.StartPrice
+	existing.capPrice = auction.CapPrice
+	existing.rule = rule
 	return state, nil
 }
 
@@ -154,11 +166,6 @@ func (s *MemoryRealtimeStore) PlaceBid(ctx context.Context, input domain.BidInpu
 		auction.storeBidResult(input.RequestID, result)
 		return result, nil
 	}
-	if _, ok := s.blacklist[input.BidderID]; ok {
-		result := rejectBid(input, "BLACKLIST", state.CurrentPrice, state.LeaderBidderID, state.EndTime, state.ExtendCount)
-		auction.storeBidResult(input.RequestID, result)
-		return result, nil
-	}
 	if _, ok := auction.enrolled[input.BidderID]; !ok {
 		result := rejectBid(input, "NOT_ENROLLED", state.CurrentPrice, state.LeaderBidderID, state.EndTime, state.ExtendCount)
 		auction.storeBidResult(input.RequestID, result)
@@ -166,6 +173,16 @@ func (s *MemoryRealtimeStore) PlaceBid(ctx context.Context, input domain.BidInpu
 	}
 	if _, ok := auction.deposits[input.BidderID]; !ok {
 		result := rejectBid(input, "DEPOSIT_NOT_READY", state.CurrentPrice, state.LeaderBidderID, state.EndTime, state.ExtendCount)
+		auction.storeBidResult(input.RequestID, result)
+		return result, nil
+	}
+	if input.ExpectedCurrentPrice != nil && *input.ExpectedCurrentPrice != state.CurrentPrice {
+		result := rejectBid(input, domain.BidRejectStaleAuctionState, state.CurrentPrice, state.LeaderBidderID, state.EndTime, state.ExtendCount)
+		auction.storeBidResult(input.RequestID, result)
+		return result, nil
+	}
+	if input.ExpectedVersion != nil && *input.ExpectedVersion != state.Version {
+		result := rejectBid(input, domain.BidRejectStaleAuctionState, state.CurrentPrice, state.LeaderBidderID, state.EndTime, state.ExtendCount)
 		auction.storeBidResult(input.RequestID, result)
 		return result, nil
 	}
@@ -183,29 +200,44 @@ func (s *MemoryRealtimeStore) PlaceBid(ctx context.Context, input domain.BidInpu
 			return result, nil
 		}
 	}
-	minIncrement := input.MinIncrement
-	if minIncrement <= 0 {
-		minIncrement = auction.minIncrement
+	rule := input.IncrementRule
+	if rule.Type == "" || rule.MaxBidSteps <= 0 || rule.AmountForPrice(state.CurrentPrice) <= 0 {
+		rule = auction.rule
 	}
-	minIncrement = domain.MinIncrementForPrice(auction.incrementRule, state.CurrentPrice, minIncrement)
-	isTieBid := state.LeaderBidderID != "" && input.BidderID != state.LeaderBidderID && input.Price == state.CurrentPrice
-	if !isTieBid && input.Price < state.CurrentPrice+minIncrement {
-		result := rejectBid(input, "BELOW_MIN_INCREMENT", state.CurrentPrice, state.LeaderBidderID, state.EndTime, state.ExtendCount)
+	if rule.AmountForPrice(state.CurrentPrice) <= 0 {
+		rule = domain.IncrementRule{Type: domain.IncrementRuleTypeFixed, Amount: auction.minIncrement, MaxBidSteps: 1}
+	}
+	startPrice := input.StartPrice
+	if startPrice == 0 {
+		startPrice = auction.startPrice
+	}
+	capPrice := input.CapPrice
+	if capPrice == 0 {
+		capPrice = auction.capPrice
+	}
+	if reason := domain.ValidateBidPrice(startPrice, state.CurrentPrice, capPrice, input.Price, rule); reason != "" {
+		result := rejectBid(input, reason, state.CurrentPrice, state.LeaderBidderID, state.EndTime, state.ExtendCount)
 		auction.storeBidResult(input.RequestID, result)
 		return result, nil
 	}
 
-	if !isTieBid {
-		state.CurrentPrice = input.Price
-		state.LeaderBidderID = input.BidderID
-	}
+	state.CurrentPrice = input.Price
+	state.LeaderBidderID = input.BidderID
 	state.LastBidTSMS = nowMS
 	state.Version++
 	extended := false
-	if !isTieBid && input.AntiSnipingMS > 0 && input.AntiExtendMS > 0 && input.MaxExtendCount > state.ExtendCount {
+	autoClosed := capPrice > 0 && input.Price == capPrice
+	if autoClosed {
+		state.Status = domain.AuctionStatusClosedWon
+		state.EndTime = now
+	} else if input.AntiSnipingMS > 0 && input.AntiExtendMS > 0 && input.MaxExtendCount > state.ExtendCount {
 		endMS := state.EndTime.UnixMilli()
 		if endMS-nowMS <= input.AntiSnipingMS {
-			state.EndTime = time.UnixMilli(endMS + input.AntiExtendMS).UTC()
+			if domain.NormalizeAuctionExtendMode(input.AntiExtendMode) == domain.AuctionExtendModeReset {
+				state.EndTime = time.UnixMilli(nowMS + input.AntiExtendMS).UTC()
+			} else {
+				state.EndTime = time.UnixMilli(endMS + input.AntiExtendMS).UTC()
+			}
 			state.ExtendCount++
 			state.Status = domain.AuctionStatusExtended
 			extended = true
@@ -228,6 +260,8 @@ func (s *MemoryRealtimeStore) PlaceBid(ctx context.Context, input domain.BidInpu
 		Version:        state.Version,
 		Event:          "bid.accepted",
 		RiskResult:     domain.BidRiskAllow,
+		AuctionStatus:  state.Status,
+		AutoClosed:     autoClosed,
 	}
 	auction.storeBidResult(input.RequestID, result)
 	return result, nil
@@ -311,26 +345,6 @@ func (s *MemoryRealtimeStore) TopN(ctx context.Context, auctionID uint64, limit 
 		entries[i].Rank = i + 1
 	}
 	return entries, nil
-}
-
-func (s *MemoryRealtimeStore) IsBlacklisted(ctx context.Context, userID string) (bool, error) {
-	_ = ctx
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	_, ok := s.blacklist[userID]
-	return ok, nil
-}
-
-func (s *MemoryRealtimeStore) SetBlacklisted(ctx context.Context, userID string, blacklisted bool) error {
-	_ = ctx
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if blacklisted {
-		s.blacklist[userID] = struct{}{}
-		return nil
-	}
-	delete(s.blacklist, userID)
-	return nil
 }
 
 func (s *MemoryRealtimeStore) getOrCreateAuctionLocked(auctionID uint64) *memoryRealtimeAuction {

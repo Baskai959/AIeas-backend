@@ -146,3 +146,71 @@ type ConfigItem struct {
 	UpdatedBy   string
 	UpdatedAt   time.Time
 }
+
+type AdminDashboardMetricsFilter struct {
+	StartTime time.Time
+	EndTime   time.Time
+	Bucket    string
+}
+
+type AdminDashboardMetrics struct {
+	StartTime   time.Time                  `json:"startTime"`
+	EndTime     time.Time                  `json:"endTime"`
+	Bucket      string                     `json:"bucket"`
+	GeneratedAt time.Time                  `json:"generatedAt"`
+	Summary     AdminDashboardSummary      `json:"summary"`
+	Current     AdminDashboardCurrent      `json:"current"`
+	Breakdowns  AdminDashboardBreakdowns   `json:"breakdowns"`
+	Trend       []AdminDashboardTrendPoint `json:"trend"`
+}
+
+type AdminDashboardSummary struct {
+	DealGMVCent              int64 `json:"dealGmvCent"`
+	PaidGMVCent              int64 `json:"paidGmvCent"`
+	OrderCreatedCount        int64 `json:"orderCreatedCount"`
+	PaidOrderCount           int64 `json:"paidOrderCount"`
+	UnpaidOrderCount         int64 `json:"unpaidOrderCount"`
+	TimeoutOrderCount        int64 `json:"timeoutOrderCount"`
+	CancelledOrderCount      int64 `json:"cancelledOrderCount"`
+	AuctionCreatedCount      int64 `json:"auctionCreatedCount"`
+	ClosedWonAuctionCount    int64 `json:"closedWonAuctionCount"`
+	ClosedFailedAuctionCount int64 `json:"closedFailedAuctionCount"`
+	LiveSessionCount         int64 `json:"liveSessionCount"`
+	LotsTotal                int64 `json:"lotsTotal"`
+	LotsSold                 int64 `json:"lotsSold"`
+	LotsUnsold               int64 `json:"lotsUnsold"`
+	BidCount                 int64 `json:"bidCount"`
+	ActiveBidderCount        int64 `json:"activeBidderCount"`
+	RiskEventCount           int64 `json:"riskEventCount"`
+	ViewerPeak               int64 `json:"viewerPeak"`
+	ViewerTotal              int64 `json:"viewerTotal"`
+}
+
+type AdminDashboardCurrent struct {
+	LiveRoomCount          int64 `json:"liveRoomCount"`
+	LiveRoomLiveCount      int64 `json:"liveRoomLiveCount"`
+	RunningAuctionCount    int64 `json:"runningAuctionCount"`
+	ActiveLiveSessionCount int64 `json:"activeLiveSessionCount"`
+	PendingRiskEventCount  int64 `json:"pendingRiskEventCount"`
+}
+
+type AdminDashboardBreakdowns struct {
+	AuctionStatus []AdminStatusCount `json:"auctionStatus"`
+	OrderStatus   []AdminStatusCount `json:"orderStatus"`
+	PayStatus     []AdminStatusCount `json:"payStatus"`
+	RiskStatus    []AdminStatusCount `json:"riskStatus"`
+}
+
+type AdminStatusCount struct {
+	Status string `json:"status"`
+	Count  int64  `json:"count"`
+}
+
+type AdminDashboardTrendPoint struct {
+	BucketStart    time.Time `json:"bucketStart"`
+	DealGMVCent    int64     `json:"dealGmvCent"`
+	PaidGMVCent    int64     `json:"paidGmvCent"`
+	PaidOrderCount int64     `json:"paidOrderCount"`
+	BidCount       int64     `json:"bidCount"`
+	RiskEventCount int64     `json:"riskEventCount"`
+}

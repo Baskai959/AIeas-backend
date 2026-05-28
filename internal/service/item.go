@@ -3,16 +3,37 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"strconv"
 	"strings"
 
 	"aieas_backend/internal/domain"
 	"aieas_backend/internal/repository"
 )
 
+// ItemCache 是 ItemService 期望的 Item 缓存接口；
+// 通过接口而不是直接持有 *cache.LayeredCache 让 service 包不反向依赖 infra/cache，
+// 同时也便于测试注入 mock。
+//
+// 语义约束：
+//   - GetOrLoad 必须负责合并并发回源（singleflight）+ 三道防护；这里不做要求。
+//   - GetOrLoad 在 loader 返回 found=false 时应返回 ErrItemNotCached（即 cache.ErrNegativeHit），
+//     由 ItemService 转换为 domain.ErrNotFound。
+//   - Invalidate 失败不应阻塞业务；调用方仅记日志。
+type ItemCache interface {
+	GetOrLoad(ctx context.Context, key string, loader func(ctx context.Context) (domain.Item, bool, error)) (domain.Item, error)
+	Invalidate(ctx context.Context, keys ...string) error
+}
+
+// ErrItemNotCached 由 ItemCache 实现返回，表示缓存层已经知道该 key 在数据库中也不存在。
+// service 层据此转 domain.ErrNotFound，避免反复回源。
+var ErrItemNotCached = errors.New("service: item not cached (negative hit)")
+
 type ItemService struct {
 	items    repository.ItemRepository
 	auctions repository.AuctionRepository
 	auditor  ProductAuditor
+	cache    ItemCache
 }
 
 type CreateItemInput struct {
@@ -58,6 +79,18 @@ func (s *ItemService) SetAuctionRepository(auctions repository.AuctionRepository
 
 func (s *ItemService) SetProductAuditor(auditor ProductAuditor) {
 	s.auditor = auditor
+}
+
+// SetCache 注入 Item 缓存；nil 表示禁用缓存（直接走 repo）。
+// 调用方一般通过 server.go 在装配阶段一次性设置。
+func (s *ItemService) SetCache(c ItemCache) {
+	s.cache = c
+}
+
+// itemCacheKey 返回 Item 在缓存层的 key（仅按 ID 维度）；当前只缓存 FindByID 这条
+// 最热的查询，不缓存 List（List 受 filter 影响，命中率低且失效复杂）。
+func itemCacheKey(id uint64) string {
+	return strconv.FormatUint(id, 10)
 }
 
 func (s *ItemService) Create(ctx context.Context, in CreateItemInput) (domain.Item, error) {
@@ -108,12 +141,37 @@ func (s *ItemService) Create(ctx context.Context, in CreateItemInput) (domain.It
 }
 
 func (s *ItemService) Get(ctx context.Context, id uint64, actorID string, actorRole domain.Role) (domain.Item, error) {
-	item, err := s.items.FindByID(ctx, id)
+	item, err := s.findByID(ctx, id)
 	if err != nil {
 		return domain.Item{}, err
 	}
 	if !canAccessSellerOwned(actorID, actorRole, item.SellerID) {
 		return domain.Item{}, domain.ErrForbidden
+	}
+	return item, nil
+}
+
+// findByID 优先走缓存（如果已注入），缓存层负责合并并发回源 + 三道防护；
+// 缓存未注入时退化为直接 repo 查询。授权判定在更上层做，缓存里只放 raw 实体。
+func (s *ItemService) findByID(ctx context.Context, id uint64) (domain.Item, error) {
+	if s.cache == nil {
+		return s.items.FindByID(ctx, id)
+	}
+	item, err := s.cache.GetOrLoad(ctx, itemCacheKey(id), func(ctx context.Context) (domain.Item, bool, error) {
+		got, err := s.items.FindByID(ctx, id)
+		if err != nil {
+			if errors.Is(err, domain.ErrNotFound) {
+				return domain.Item{}, false, nil
+			}
+			return domain.Item{}, false, err
+		}
+		return got, true, nil
+	})
+	if err != nil {
+		if errors.Is(err, ErrItemNotCached) {
+			return domain.Item{}, domain.ErrNotFound
+		}
+		return domain.Item{}, err
 	}
 	return item, nil
 }
@@ -183,6 +241,7 @@ func (s *ItemService) Update(ctx context.Context, id uint64, in UpdateItemInput)
 	if err := s.items.Update(ctx, &item); err != nil {
 		return domain.Item{}, err
 	}
+	s.invalidateCache(ctx, id)
 	return item, nil
 }
 
@@ -234,7 +293,20 @@ func (s *ItemService) Delete(ctx context.Context, id uint64, actorID string, act
 	} else if hasActiveAuction {
 		return domain.ErrInvalidState
 	}
-	return s.items.Delete(ctx, id)
+	if err := s.items.Delete(ctx, id); err != nil {
+		return err
+	}
+	s.invalidateCache(ctx, id)
+	return nil
+}
+
+// invalidateCache 在写路径成功后异步式失效；失败仅吞掉，避免业务被缓存层拖累。
+// （cache.Invalidate 内部已经先清 L1 即时生效，再清 L2；L2 失败不会让进程数据错误。）
+func (s *ItemService) invalidateCache(ctx context.Context, id uint64) {
+	if s.cache == nil {
+		return
+	}
+	_ = s.cache.Invalidate(ctx, itemCacheKey(id))
 }
 
 func (s *ItemService) hasActiveAuction(ctx context.Context, itemID uint64) (bool, error) {

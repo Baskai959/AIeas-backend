@@ -2,6 +2,7 @@ package domain
 
 import (
 	"encoding/json"
+	"strings"
 	"time"
 )
 
@@ -29,6 +30,25 @@ const (
 	AuctionStatusClosedFailed  AuctionStatus = "CLOSED_FAILED"
 	AuctionStatusSettled       AuctionStatus = "SETTLED"
 )
+
+type AuctionExtendMode string
+
+const (
+	AuctionExtendModeAdd   AuctionExtendMode = "ADD"
+	AuctionExtendModeReset AuctionExtendMode = "RESET"
+)
+
+func (m AuctionExtendMode) Valid() bool {
+	return m == AuctionExtendModeAdd || m == AuctionExtendModeReset
+}
+
+func NormalizeAuctionExtendMode(m AuctionExtendMode) AuctionExtendMode {
+	normalized := strings.ToUpper(strings.TrimSpace(string(m)))
+	if normalized == "" {
+		return AuctionExtendModeAdd
+	}
+	return AuctionExtendMode(normalized)
+}
 
 func (s AuctionStatus) Valid() bool {
 	switch s {
@@ -78,28 +98,31 @@ func CanTransitionAuction(from, to AuctionStatus) bool {
 }
 
 type AuctionLot struct {
-	AuctionID      uint64          `json:"auctionId"`
-	ItemID         uint64          `json:"itemId"`
-	SellerID       string          `json:"sellerId"`
-	LiveRoomID     uint64          `json:"liveRoomId,omitempty"`
-	LiveSessionID  *uint64         `json:"liveSessionId,omitempty"`
-	AuctionType    AuctionType     `json:"auctionType"`
-	StartPrice     int64           `json:"startPrice"`
-	ReservePrice   int64           `json:"reservePrice"`
-	IncrementRule  json.RawMessage `json:"incrementRule"`
-	AntiSnipingSec int             `json:"antiSnipingSec"`
-	AntiExtendSec  int             `json:"antiExtendSec"`
-	DepositAmount  int64           `json:"depositAmount"`
-	Status         AuctionStatus   `json:"status"`
-	RuleSnapshot   json.RawMessage `json:"ruleSnapshot"`
-	StartTime      time.Time       `json:"startTime"`
-	EndTime        time.Time       `json:"endTime"`
-	WinnerID       *string         `json:"winnerId,omitempty"`
-	DealPrice      *int64          `json:"dealPrice,omitempty"`
-	ClosedAt       *time.Time      `json:"closedAt,omitempty"`
-	ClosedBy       string          `json:"closedBy,omitempty"`
-	CreatedAt      time.Time       `json:"createdAt"`
-	UpdatedAt      time.Time       `json:"updatedAt"`
+	AuctionID      uint64            `json:"auctionId"`
+	ItemID         uint64            `json:"itemId"`
+	SellerID       string            `json:"sellerId"`
+	LiveRoomID     uint64            `json:"liveRoomId,omitempty"`
+	LiveSessionID  *uint64           `json:"liveSessionId,omitempty"`
+	AuctionType    AuctionType       `json:"auctionType"`
+	StartPrice     int64             `json:"startPrice"`
+	ReservePrice   int64             `json:"reservePrice"`
+	CapPrice       int64             `json:"capPrice"`
+	IncrementRule  json.RawMessage   `json:"incrementRule"`
+	AntiSnipingSec int               `json:"antiSnipingSec"`
+	AntiExtendSec  int               `json:"antiExtendSec"`
+	AntiExtendMode AuctionExtendMode `json:"antiExtendMode"`
+	DepositAmount  int64             `json:"depositAmount"`
+	Status         AuctionStatus     `json:"status"`
+	RuleSnapshot   json.RawMessage   `json:"ruleSnapshot"`
+	StartTime      time.Time         `json:"startTime"`
+	EndTime        time.Time         `json:"endTime"`
+	DurationSec    int               `json:"durationSec,omitempty"`
+	WinnerID       *string           `json:"winnerId,omitempty"`
+	DealPrice      *int64            `json:"dealPrice,omitempty"`
+	ClosedAt       *time.Time        `json:"closedAt,omitempty"`
+	ClosedBy       string            `json:"closedBy,omitempty"`
+	CreatedAt      time.Time         `json:"createdAt"`
+	UpdatedAt      time.Time         `json:"updatedAt"`
 }
 
 type AuctionFilter struct {
@@ -114,13 +137,16 @@ type AuctionFilter struct {
 type AuctionPatch struct {
 	StartPrice     *int64
 	ReservePrice   *int64
+	CapPrice       *int64
 	IncrementRule  *json.RawMessage
 	AntiSnipingSec *int
 	AntiExtendSec  *int
+	AntiExtendMode *AuctionExtendMode
 	DepositAmount  *int64
 	Status         *AuctionStatus
 	StartTime      *time.Time
 	EndTime        *time.Time
+	DurationSec    *int
 }
 
 type AuctionState struct {
@@ -159,19 +185,25 @@ type BidRecord struct {
 }
 
 type BidInput struct {
-	RequestID      string
-	AuctionID      uint64
-	BidderID       string
-	Price          int64
-	Now            time.Time
-	Source         string
-	MinIncrement   int64
-	AntiSnipingMS  int64
-	AntiExtendMS   int64
-	MaxExtendCount int
-	FreqLimitCount int
-	FreqWindowMS   int64
-	IdempotencyTTL time.Duration
+	RequestID            string
+	AuctionID            uint64
+	BidderID             string
+	Price                int64
+	ExpectedCurrentPrice *int64
+	ExpectedVersion      *int64
+	Now                  time.Time
+	Source               string
+	MinIncrement         int64
+	AntiSnipingMS        int64
+	AntiExtendMS         int64
+	AntiExtendMode       AuctionExtendMode
+	MaxExtendCount       int
+	FreqLimitCount       int
+	FreqWindowMS         int64
+	IdempotencyTTL       time.Duration
+	StartPrice           int64
+	CapPrice             int64
+	IncrementRule        IncrementRule
 }
 
 type BidResult struct {
@@ -192,6 +224,8 @@ type BidResult struct {
 	StreamID       string        `json:"streamId,omitempty"`
 	Event          string        `json:"event,omitempty"`
 	RiskResult     BidRiskResult `json:"riskResult"`
+	AuctionStatus  AuctionStatus `json:"auctionStatus,omitempty"`
+	AutoClosed     bool          `json:"autoClosed,omitempty"`
 }
 
 type RankingEntry struct {

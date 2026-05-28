@@ -246,10 +246,12 @@ func (h *WSHandler) handleBidPlace(ctx context.Context, client *corews.Client, e
 		return []corews.Envelope{jsonEnvelope("bid.ack", env.RequestID, map[string]interface{}{"accepted": false, "reason": "BID_SERVICE_UNAVAILABLE"})}
 	}
 	var payload struct {
-		AuctionID  uint64 `json:"auctionId"`
-		Price      int64  `json:"price"`
-		RequestID  string `json:"requestId"`
-		Idempotent string `json:"idempotencyKey"`
+		AuctionID            uint64 `json:"auctionId"`
+		Price                int64  `json:"price"`
+		ExpectedCurrentPrice *int64 `json:"expectedCurrentPrice"`
+		ExpectedVersion      *int64 `json:"expectedVersion"`
+		RequestID            string `json:"requestId"`
+		Idempotent           string `json:"idempotencyKey"`
 	}
 	if err := json.Unmarshal(env.Payload, &payload); err != nil {
 		return []corews.Envelope{jsonEnvelope("bid.ack", env.RequestID, map[string]interface{}{"accepted": false, "reason": "INVALID_PAYLOAD"})}
@@ -264,13 +266,18 @@ func (h *WSHandler) handleBidPlace(ctx context.Context, client *corews.Client, e
 	if requestID == "" {
 		requestID = strings.TrimSpace(payload.Idempotent)
 	}
+	if payload.ExpectedCurrentPrice == nil && payload.ExpectedVersion == nil {
+		return []corews.Envelope{jsonEnvelope("bid.ack", requestID, map[string]interface{}{"accepted": false, "reason": "MISSING_EXPECTED_STATE"})}
+	}
 	result, err := h.bids.Place(ctx, service.PlaceBidInput{
-		RequestID: requestID,
-		AuctionID: payload.AuctionID,
-		BidderID:  client.UserID,
-		UserRole:  domain.RoleBuyer,
-		Price:     payload.Price,
-		Source:    "live_ws",
+		RequestID:            requestID,
+		AuctionID:            payload.AuctionID,
+		BidderID:             client.UserID,
+		UserRole:             domain.RoleBuyer,
+		Price:                payload.Price,
+		ExpectedCurrentPrice: payload.ExpectedCurrentPrice,
+		ExpectedVersion:      payload.ExpectedVersion,
+		Source:               "live_ws",
 	})
 	if err != nil {
 		_, code, message := service.HTTPStatusAndCode(err)

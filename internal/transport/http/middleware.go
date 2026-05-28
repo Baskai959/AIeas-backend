@@ -285,6 +285,10 @@ func NewRateLimiter(limit int, window time.Duration) *RateLimiter {
 
 func (l *RateLimiter) Middleware() app.HandlerFunc {
 	return func(ctx context.Context, c *app.RequestContext) {
+		if IsObservabilitySkipPath(string(c.Path())) {
+			c.Next(ctx)
+			return
+		}
 		key := clientIP(c) + ":" + string(c.Method()) + ":" + string(c.Path())
 		if !l.allow(key, time.Now()) {
 			AbortError(c, consts.StatusTooManyRequests, 20029, "请求过于频繁", nil)
@@ -362,6 +366,9 @@ func shouldSkipAudit(c *app.RequestContext) bool {
 		return true
 	}
 	path := string(c.Path())
+	if IsObservabilitySkipPath(path) {
+		return true
+	}
 	return path == "/ping"
 }
 

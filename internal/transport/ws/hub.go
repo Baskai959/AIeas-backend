@@ -25,6 +25,15 @@ type ReplaySource interface {
 	ReplaySince(ctx context.Context, auctionID uint64, lastSeq int64) ([]Envelope, bool, error)
 }
 
+// HubMetrics 是 Hub 在打点路径上依赖的最小指标接口，避免 ws 包反向依赖
+// 具体的 metrics.Registry 类型，便于测试与可观测后端替换。
+type HubMetrics interface {
+	IncWSConnect()
+	IncWSDisconnect(reason string)
+	ObserveWSBroadcast(elapsed time.Duration, fanout int)
+	IncWSSlowClientDisconnect()
+}
+
 type Hub struct {
 	mu             sync.RWMutex
 	rooms          map[uint64]*Room
@@ -34,12 +43,20 @@ type Hub struct {
 	replaySource   ReplaySource
 	onlineTimeout  time.Duration
 	instancePrefix string
+	metrics        HubMetrics
 }
 
 func (h *Hub) SetReplaySource(source ReplaySource) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.replaySource = source
+}
+
+// SetMetrics 注入观测性指标实现。nil 安全：传 nil 等同于关闭打点。
+func (h *Hub) SetMetrics(m HubMetrics) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.metrics = m
 }
 
 type Room struct {
@@ -143,6 +160,9 @@ func (h *Hub) Subscribe(auctionID uint64, client *Client) error {
 	room.Add(client)
 	h.registerSessionClient(client)
 	h.broadcastPresence(room, h.joinOnline(auctionID, client.ID, room.ClientCount()))
+	if reg := h.metricsSnapshot(); reg != nil {
+		reg.IncWSConnect()
+	}
 	return nil
 }
 
@@ -156,12 +176,24 @@ func (h *Hub) Unsubscribe(auctionID uint64, clientID string) {
 			h.unregisterSessionClient(sessionID, clientID)
 		}
 		h.broadcastPresence(room, h.leaveOnline(auctionID, clientID, room.ClientCount()))
+		if reg := h.metricsSnapshot(); reg != nil {
+			reg.IncWSDisconnect("unsubscribe")
+		}
 	}
 }
 
 func (h *Hub) Broadcast(auctionID uint64, env Envelope) int {
 	room := h.GetOrCreateRoom(auctionID)
+	start := time.Now()
 	delivered, removed := room.Broadcast(env)
+	elapsed := time.Since(start)
+	if reg := h.metricsSnapshot(); reg != nil {
+		reg.ObserveWSBroadcast(elapsed, delivered)
+		for range removed {
+			reg.IncWSSlowClientDisconnect()
+			reg.IncWSDisconnect("slow_consumer")
+		}
+	}
 	if len(removed) > 0 {
 		for _, clientID := range removed {
 			_ = h.leaveOnline(auctionID, clientID, room.ClientCount())
@@ -170,6 +202,16 @@ func (h *Hub) Broadcast(auctionID uint64, env Envelope) int {
 		h.broadcastPresence(room, h.onlineCount(auctionID, room.ClientCount()))
 	}
 	return delivered
+}
+
+// metricsSnapshot 在锁内拷贝当前 metrics 指针，避免在打点路径长期持有锁。
+func (h *Hub) metricsSnapshot() HubMetrics {
+	if h == nil {
+		return nil
+	}
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.metrics
 }
 
 // BroadcastSessionEnd 把 LiveSessionEnded 事件推送给所有订阅了该 liveSessionId 的客户端，

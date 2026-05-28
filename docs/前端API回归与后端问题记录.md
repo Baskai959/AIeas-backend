@@ -100,6 +100,7 @@
   "depositAmount": 0,
   "incrementRule": {
     "type": "ladder",
+    "maxBidSteps": 5,
     "steps": [
       { "min": 0, "max": 1000, "amount": 100 },
       { "min": 1000, "amount": 200 }

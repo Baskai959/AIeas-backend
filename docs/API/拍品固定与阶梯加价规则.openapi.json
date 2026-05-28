@@ -1,0 +1,618 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "拍品固定与阶梯加价规则",
+    "version": "v1",
+    "description": "拍品创建、编辑接口的 incrementRule 统一格式。支持 fixed 固定加价与 ladder 阶梯加价；金额单位均为分。"
+  },
+  "servers": [
+    {
+      "url": "http://localhost:8888",
+      "description": "Local"
+    }
+  ],
+  "tags": [
+    {
+      "name": "Auction",
+      "description": "拍品与拍卖管理"
+    }
+  ],
+  "paths": {
+    "/api/v1/auctions": {
+      "post": {
+        "tags": [
+          "Auction"
+        ],
+        "summary": "创建拍品",
+        "description": "需要 merchant 或 admin 角色。status 只能传 DRAFT 或 PENDING_AUDIT。incrementRule 必须传统一格式，type=fixed 表示固定加价，type=ladder 表示阶梯加价。",
+        "operationId": "createAuctionWithIncrementRule",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AuctionCreateRequest"
+              },
+              "examples": {
+                "fixed": {
+                  "summary": "固定加价",
+                  "value": {
+                    "itemId": 1001,
+                    "auctionType": "ENGLISH",
+                    "startPrice": 1000,
+                    "reservePrice": 5000,
+                    "capPrice": 12000,
+                    "depositAmount": 2000,
+                    "incrementRule": {
+                      "type": "fixed",
+                      "amount": 100,
+                      "maxBidSteps": 5
+                    },
+                    "antiSnipingSec": 15,
+                    "antiExtendSec": 30,
+                    "antiExtendMode": "RESET",
+                    "durationSec": 172800,
+                    "status": "PENDING_AUDIT",
+                    "startTime": "2026-06-01T05:57:54.000Z"
+                  }
+                },
+                "ladder": {
+                  "summary": "阶梯加价",
+                  "value": {
+                    "itemId": 1001,
+                    "auctionType": "ENGLISH",
+                    "startPrice": 1000,
+                    "reservePrice": 5000,
+                    "capPrice": 12000,
+                    "depositAmount": 2000,
+                    "incrementRule": {
+                      "type": "ladder",
+                      "maxBidSteps": 5,
+                      "steps": [
+                        {
+                          "min": 0,
+                          "max": 10000,
+                          "amount": 100
+                        },
+                        {
+                          "min": 10000,
+                          "amount": 500
+                        }
+                      ]
+                    },
+                    "antiSnipingSec": 15,
+                    "antiExtendSec": 30,
+                    "antiExtendMode": "ADD",
+                    "durationSec": 172800,
+                    "status": "PENDING_AUDIT"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/AuctionLotResponse"
+          },
+          "400": {
+            "$ref": "#/components/responses/ParamInvalid"
+          },
+          "401": {
+            "$ref": "#/components/responses/AuthTokenInvalid"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          }
+        }
+      }
+    },
+    "/api/v1/auctions/{id}": {
+      "patch": {
+        "tags": [
+          "Auction"
+        ],
+        "summary": "编辑拍品",
+        "description": "需要 merchant 或 admin 角色。只有草稿或待审核拍品允许修改价格与加价规则字段。若传 incrementRule，必须传完整 fixed 或 ladder 规则。",
+        "operationId": "updateAuctionWithIncrementRule",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "uint64"
+            },
+            "description": "拍品 ID"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AuctionUpdateRequest"
+              },
+              "examples": {
+                "changeToLadder": {
+                  "summary": "改为阶梯加价",
+                  "value": {
+                    "capPrice": 12000,
+                    "incrementRule": {
+                      "type": "ladder",
+                      "maxBidSteps": 8,
+                      "steps": [
+                        {
+                          "min": 0,
+                          "max": 10000,
+                          "amount": 100
+                        },
+                        {
+                          "min": 10000,
+                          "amount": 500
+                        }
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/AuctionLotResponse"
+          },
+          "400": {
+            "$ref": "#/components/responses/ParamInvalid"
+          },
+          "401": {
+            "$ref": "#/components/responses/AuthTokenInvalid"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "409": {
+            "$ref": "#/components/responses/InvalidState"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT"
+      }
+    },
+    "schemas": {
+      "ApiResponse": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "integer"
+          },
+          "message": {
+            "type": "string"
+          },
+          "data": {
+            "nullable": true
+          }
+        }
+      },
+      "AuctionCreateRequest": {
+        "type": "object",
+        "required": [
+          "itemId",
+          "startPrice",
+          "reservePrice",
+          "depositAmount",
+          "incrementRule"
+        ],
+        "properties": {
+          "itemId": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 1
+          },
+          "auctionType": {
+            "type": "string",
+            "enum": [
+              "ENGLISH"
+            ],
+            "default": "ENGLISH"
+          },
+          "startPrice": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "reservePrice": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "capPrice": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "description": "封顶价，0 或不传表示无封顶价；设置时必须大于 startPrice。"
+          },
+          "depositAmount": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "incrementRule": {
+            "$ref": "#/components/schemas/IncrementRule"
+          },
+          "antiSnipingSec": {
+            "type": "integer",
+            "minimum": 1,
+            "default": 15
+          },
+          "antiExtendSec": {
+            "type": "integer",
+            "minimum": 1,
+            "default": 30
+          },
+          "antiExtendMode": {
+            "$ref": "#/components/schemas/AntiExtendMode"
+          },
+          "status": {
+            "$ref": "#/components/schemas/AuctionEditableStatus"
+          },
+          "startTime": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "endTime": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "durationSec": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "拍卖时长，单位秒；可不传。"
+          }
+        },
+        "additionalProperties": false
+      },
+      "AuctionUpdateRequest": {
+        "type": "object",
+        "properties": {
+          "startPrice": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "reservePrice": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "capPrice": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "depositAmount": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "incrementRule": {
+            "$ref": "#/components/schemas/IncrementRule"
+          },
+          "antiSnipingSec": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "antiExtendSec": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "antiExtendMode": {
+            "$ref": "#/components/schemas/AntiExtendMode"
+          },
+          "status": {
+            "$ref": "#/components/schemas/AuctionEditableStatus"
+          },
+          "startTime": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "endTime": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "durationSec": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
+      "IncrementRule": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/FixedIncrementRule"
+          },
+          {
+            "$ref": "#/components/schemas/LadderIncrementRule"
+          }
+        ],
+        "description": "加价规则。普通出价按 Redis 当前价匹配当前步长；封顶价允许不按步长对齐。"
+      },
+      "FixedIncrementRule": {
+        "type": "object",
+        "required": [
+          "type",
+          "amount",
+          "maxBidSteps"
+        ],
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "fixed"
+            ]
+          },
+          "amount": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 1,
+            "description": "固定加价金额，单位分。"
+          },
+          "maxBidSteps": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "单次最高加价步数。"
+          }
+        },
+        "additionalProperties": false
+      },
+      "LadderIncrementRule": {
+        "type": "object",
+        "required": [
+          "type",
+          "maxBidSteps",
+          "steps"
+        ],
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "ladder"
+            ]
+          },
+          "maxBidSteps": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "单次最高加价步数。"
+          },
+          "steps": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 50,
+            "description": "阶梯必须从 min=0 开始连续覆盖；每一档 min 含、max 不含；最后一档必须不传 max。",
+            "items": {
+              "$ref": "#/components/schemas/LadderIncrementStep"
+            }
+          }
+        },
+        "additionalProperties": false
+      },
+      "LadderIncrementStep": {
+        "type": "object",
+        "required": [
+          "min",
+          "amount"
+        ],
+        "properties": {
+          "min": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "description": "当前价下界，包含，单位分。"
+          },
+          "max": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 1,
+            "description": "当前价上界，不包含；最后一档不传。"
+          },
+          "amount": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 1,
+            "description": "该阶梯加价金额，单位分。"
+          }
+        },
+        "additionalProperties": false
+      },
+      "AntiExtendMode": {
+        "type": "string",
+        "enum": [
+          "ADD",
+          "RESET"
+        ],
+        "default": "ADD"
+      },
+      "AuctionEditableStatus": {
+        "type": "string",
+        "enum": [
+          "DRAFT",
+          "PENDING_AUDIT"
+        ]
+      },
+      "AuctionStatus": {
+        "type": "string",
+        "enum": [
+          "DRAFT",
+          "PENDING_AUDIT",
+          "READY",
+          "WARMING_UP",
+          "RUNNING",
+          "EXTENDED",
+          "HAMMER_PENDING",
+          "CLOSED_WON",
+          "CLOSED_FAILED",
+          "SETTLED"
+        ]
+      },
+      "AuctionLot": {
+        "type": "object",
+        "properties": {
+          "auctionId": {
+            "type": "integer",
+            "format": "uint64"
+          },
+          "itemId": {
+            "type": "integer",
+            "format": "uint64"
+          },
+          "sellerId": {
+            "type": "string"
+          },
+          "liveRoomId": {
+            "type": "integer",
+            "format": "uint64"
+          },
+          "auctionType": {
+            "type": "string",
+            "enum": [
+              "ENGLISH"
+            ]
+          },
+          "startPrice": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "reservePrice": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "capPrice": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "incrementRule": {
+            "$ref": "#/components/schemas/IncrementRule"
+          },
+          "antiSnipingSec": {
+            "type": "integer"
+          },
+          "antiExtendSec": {
+            "type": "integer"
+          },
+          "antiExtendMode": {
+            "$ref": "#/components/schemas/AntiExtendMode"
+          },
+          "depositAmount": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "status": {
+            "$ref": "#/components/schemas/AuctionStatus"
+          },
+          "ruleSnapshot": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "startTime": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "endTime": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "durationSec": {
+            "type": "integer"
+          },
+          "winnerId": {
+            "type": "string",
+            "nullable": true
+          },
+          "dealPrice": {
+            "type": "integer",
+            "format": "int64",
+            "nullable": true
+          },
+          "closedAt": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "closedBy": {
+            "type": "string"
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "updatedAt": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      }
+    },
+    "responses": {
+      "AuctionLotResponse": {
+        "description": "拍品详情",
+        "content": {
+          "application/json": {
+            "schema": {
+              "allOf": [
+                {
+                  "$ref": "#/components/schemas/ApiResponse"
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/AuctionLot"
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        }
+      },
+      "ParamInvalid": {
+        "description": "参数不合法"
+      },
+      "AuthTokenInvalid": {
+        "description": "认证失败或 Token 无效"
+      },
+      "Forbidden": {
+        "description": "无权限"
+      },
+      "InvalidState": {
+        "description": "拍品状态不允许当前操作"
+      }
+    }
+  }
+}

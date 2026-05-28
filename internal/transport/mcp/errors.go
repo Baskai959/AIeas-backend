@@ -66,3 +66,27 @@ func protocolError(code int, message, traceID, detail string) *rpcError {
 		},
 	}
 }
+
+// mcpStatusFromError 把 service / domain error 折算成低基数的 metric label，
+// 用于 agent_tool_call_total{status} 维度。返回值固定在 ok / not_found /
+// forbidden / unauthorized / invalid_params / conflict / error 七类，避免
+// label 基数爆炸。
+func mcpStatusFromError(err error) string {
+	if err == nil {
+		return "ok"
+	}
+	switch {
+	case errors.Is(err, domain.ErrTokenMissing), errors.Is(err, domain.ErrTokenInvalid):
+		return "unauthorized"
+	case errors.Is(err, domain.ErrForbidden):
+		return "forbidden"
+	case errors.Is(err, domain.ErrInvalidArgument):
+		return "invalid_params"
+	case errors.Is(err, domain.ErrUserNotFound), errors.Is(err, domain.ErrNotFound):
+		return "not_found"
+	case errors.Is(err, domain.ErrConflict), errors.Is(err, domain.ErrInvalidState):
+		return "conflict"
+	default:
+		return "error"
+	}
+}

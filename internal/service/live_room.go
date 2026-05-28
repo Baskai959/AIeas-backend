@@ -35,6 +35,7 @@ type LiveRoomService struct {
 	auction  *AuctionService
 	sessions *LiveSessionService
 	hammer   *HammerService
+	hook     *LiveAgentHookService
 
 	// 以下为 Stats 接口可选依赖，通过 SetStatsDeps 注入。
 	bids     repository.BidRepository
@@ -66,6 +67,11 @@ func (s *LiveRoomService) SetLiveSessionService(sessions *LiveSessionService) {
 // 未注入时退化为旧行为：仅释放房间锁、不动 auction 状态。
 func (s *LiveRoomService) SetHammerService(hammer *HammerService) {
 	s.hammer = hammer
+}
+
+// SetLiveAgentHookService 注入直播拍卖事件 hook。
+func (s *LiveRoomService) SetLiveAgentHookService(hook *LiveAgentHookService) {
+	s.hook = hook
 }
 
 // SetStatsDeps 注入 Stats 接口所需依赖（可选）。
@@ -149,6 +155,34 @@ func (s *LiveRoomService) Create(ctx context.Context, in CreateLiveRoomInput) (d
 	return room, nil
 }
 
+func (s *LiveRoomService) AgentHookConfig(ctx context.Context, roomID uint64, actorID string, actorRole domain.Role) (LiveAgentHookConfig, error) {
+	room, err := s.rooms.FindByID(ctx, roomID)
+	if err != nil {
+		return LiveAgentHookConfig{}, err
+	}
+	if !canAccessSellerOwned(actorID, actorRole, room.MerchantID) {
+		return LiveAgentHookConfig{}, domain.ErrForbidden
+	}
+	if s.hook == nil {
+		return LiveAgentHookConfig{}, nil
+	}
+	return s.hook.GetConfig(ctx, room.MerchantID)
+}
+
+func (s *LiveRoomService) UpdateAgentHookConfig(ctx context.Context, roomID uint64, actorID string, actorRole domain.Role, enabled bool) (LiveAgentHookConfig, error) {
+	room, err := s.rooms.FindByID(ctx, roomID)
+	if err != nil {
+		return LiveAgentHookConfig{}, err
+	}
+	if !canAccessSellerOwned(actorID, actorRole, room.MerchantID) {
+		return LiveAgentHookConfig{}, domain.ErrForbidden
+	}
+	if s.hook == nil {
+		return LiveAgentHookConfig{}, domain.ErrInvalidState
+	}
+	return s.hook.SetConfig(ctx, room.MerchantID, actorID, enabled)
+}
+
 func (s *LiveRoomService) Get(ctx context.Context, id uint64) (domain.LiveRoom, error) {
 	return s.rooms.FindByID(ctx, id)
 }
@@ -206,6 +240,17 @@ func (s *LiveRoomService) Update(ctx context.Context, id uint64, in UpdateLiveRo
 	return updated, nil
 }
 
+func (s *LiveRoomService) CheckManageAccess(ctx context.Context, id uint64, actorID string, actorRole domain.Role) (domain.LiveRoom, error) {
+	room, err := s.rooms.FindByID(ctx, id)
+	if err != nil {
+		return domain.LiveRoom{}, err
+	}
+	if !canAccessSellerOwned(actorID, actorRole, room.MerchantID) {
+		return domain.LiveRoom{}, domain.ErrForbidden
+	}
+	return room, nil
+}
+
 func (s *LiveRoomService) Delete(ctx context.Context, id uint64, actorID string, actorRole domain.Role) error {
 	return s.tx.WithinTx(ctx, func(txCtx context.Context) error {
 		room, err := s.rooms.FindByID(txCtx, id)
@@ -258,11 +303,23 @@ func (s *LiveRoomService) ActivateAuctionWithOptions(ctx context.Context, in Act
 		return domain.AuctionLot{}, domain.ErrInvalidState
 	}
 	var startTime, endTime time.Time
+	now := time.Now().UTC()
 	if in.DurationSec > 0 {
-		startTime = time.Now().UTC()
+		startTime = now
 		endTime = startTime.Add(time.Duration(in.DurationSec) * time.Second)
 		auction.StartTime = startTime
 		auction.EndTime = endTime
+	} else if auction.DurationSec > 0 && (auction.EndTime.IsZero() || !auction.EndTime.After(now)) {
+		startTime = now
+		endTime = startTime.Add(time.Duration(auction.DurationSec) * time.Second)
+		auction.StartTime = startTime
+		auction.EndTime = endTime
+	} else if auction.EndTime.IsZero() || !auction.EndTime.After(now) {
+		return domain.AuctionLot{}, domain.ErrInvalidArgument
+	} else if auction.StartTime.IsZero() {
+		startTime = now
+		endTime = auction.EndTime
+		auction.StartTime = startTime
 	}
 	ttl := lockTTLForAuction(auction)
 	acquired, holder, err := s.lock.Acquire(ctx, in.RoomID, in.AuctionID, ttl)
@@ -467,6 +524,9 @@ func (s *LiveRoomService) MountAuction(ctx context.Context, roomID, auctionID ui
 	if err := s.auctions.Update(ctx, &auction); err != nil {
 		return domain.AuctionLot{}, err
 	}
+	if s.hook != nil {
+		s.hook.EmitLotMounted(ctx, room.MerchantID, roomID, auctionID)
+	}
 	return auction, nil
 }
 
@@ -496,6 +556,9 @@ func (s *LiveRoomService) UnmountAuction(ctx context.Context, roomID, auctionID 
 	auction.LiveRoomID = 0
 	if err := s.auctions.Update(ctx, &auction); err != nil {
 		return err
+	}
+	if s.hook != nil {
+		s.hook.EmitLotUnmounted(ctx, room.MerchantID, roomID, auctionID)
 	}
 	return nil
 }

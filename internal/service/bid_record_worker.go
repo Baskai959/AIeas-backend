@@ -8,8 +8,12 @@ import (
 	"time"
 
 	"aieas_backend/internal/domain"
+	"aieas_backend/internal/infra/observability/tracing"
 	redisinfra "aieas_backend/internal/infra/redis"
 	"aieas_backend/internal/repository"
+
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 )
 
 type BidRecordWriter struct {
@@ -23,7 +27,9 @@ type BidRecordWriter struct {
 
 type bidRecordEventLog interface {
 	Enabled() bool
+	ShardCount() int
 	ActiveAuctions(ctx context.Context) ([]uint64, error)
+	ActiveAuctionsOnShard(ctx context.Context, shardIdx int) ([]uint64, error)
 	ClaimStaleBidRecordEvents(ctx context.Context, auctionID uint64, consumer string, minIdle time.Duration, max int64) ([]redisinfra.BidEvent, error)
 	ReadBidRecordGroup(ctx context.Context, auctionID uint64, consumer string, count int64, block time.Duration) ([]redisinfra.BidEvent, error)
 	AckBidRecord(ctx context.Context, auctionID uint64, ids ...string) error
@@ -37,35 +43,78 @@ func NewBidRecordWriter(repo repository.BidRepository, log *redisinfra.EventLog,
 	return &BidRecordWriter{repo: repo, log: log, consumer: consumer, maxRetries: 5, claimIdle: 30 * time.Second, interval: time.Second}
 }
 
+// Start 为每个 RT shard 启动一个独立的 worker goroutine：
+// 每个 goroutine 只巡检自己那一片的 active_streams，避免跨 shard 故障互相放大。
+// shardCount<=1（含 fallback 单实例）时退化为单 goroutine 巡检全集合。
 func (w *BidRecordWriter) Start(ctx context.Context) {
 	if w == nil || w.repo == nil || w.log == nil || !w.log.Enabled() {
 		return
 	}
-	go func() {
-		ticker := time.NewTicker(w.interval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				w.runOnce(ctx)
-			}
-		}
-	}()
+	shardCount := w.log.ShardCount()
+	if shardCount <= 1 {
+		go w.loopAllShards(ctx)
+		return
+	}
+	for shardIdx := 0; shardIdx < shardCount; shardIdx++ {
+		idx := shardIdx
+		go w.loopShard(ctx, idx)
+	}
 }
 
-func (w *BidRecordWriter) runOnce(ctx context.Context) {
+func (w *BidRecordWriter) loopAllShards(ctx context.Context) {
+	ticker := time.NewTicker(w.interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			w.runOnceAll(ctx)
+		}
+	}
+}
+
+func (w *BidRecordWriter) loopShard(ctx context.Context, shardIdx int) {
+	ticker := time.NewTicker(w.interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			w.runOnceShard(ctx, shardIdx)
+		}
+	}
+}
+
+// consumerForShard 把 shard 索引拼到 consumer 名上，便于在 Redis XINFO 中识别归属。
+func (w *BidRecordWriter) consumerForShard(shardIdx int) string {
+	return fmt.Sprintf("%s-s%d", w.consumer, shardIdx)
+}
+
+func (w *BidRecordWriter) runOnceAll(ctx context.Context) {
 	auctions, err := w.log.ActiveAuctions(ctx)
 	if err != nil {
 		return
 	}
+	w.processAuctions(ctx, auctions, w.consumer)
+}
+
+func (w *BidRecordWriter) runOnceShard(ctx context.Context, shardIdx int) {
+	auctions, err := w.log.ActiveAuctionsOnShard(ctx, shardIdx)
+	if err != nil {
+		return
+	}
+	w.processAuctions(ctx, auctions, w.consumerForShard(shardIdx))
+}
+
+func (w *BidRecordWriter) processAuctions(ctx context.Context, auctions []uint64, consumer string) {
 	for _, auctionID := range auctions {
-		claimed, err := w.log.ClaimStaleBidRecordEvents(ctx, auctionID, w.consumer, w.claimIdle, 32)
+		claimed, err := w.log.ClaimStaleBidRecordEvents(ctx, auctionID, consumer, w.claimIdle, 32)
 		if err == nil {
 			w.handleEvents(ctx, claimed)
 		}
-		events, err := w.log.ReadBidRecordGroup(ctx, auctionID, w.consumer, 64, 10*time.Millisecond)
+		events, err := w.log.ReadBidRecordGroup(ctx, auctionID, consumer, 64, 10*time.Millisecond)
 		if err == nil {
 			w.handleEvents(ctx, events)
 		}
@@ -74,27 +123,57 @@ func (w *BidRecordWriter) runOnce(ctx context.Context) {
 
 func (w *BidRecordWriter) handleEvents(ctx context.Context, events []redisinfra.BidEvent) {
 	for _, event := range events {
-		if event.EventType != "bid.accepted" && event.EventType != "bid.rejected" {
-			_ = w.log.AckBidRecord(ctx, event.AuctionID, event.StreamID)
-			continue
+		w.handleEvent(ctx, event)
+	}
+}
+
+func (w *BidRecordWriter) handleEvent(parentCtx context.Context, event redisinfra.BidEvent) {
+	ctx := tracing.ExtractMap(parentCtx, event.TraceCarrier())
+	ctx, span := tracing.StartSpan(ctx, "bid_record.consume",
+		attribute.Int64("auction.id", int64(event.AuctionID)),
+		attribute.String("event.type", event.EventType),
+		attribute.Int64("event.seq", event.Seq),
+		attribute.String("event.stream_id", event.StreamID),
+	)
+	defer span.End()
+
+	if event.EventType != "bid.accepted" && event.EventType != "bid.rejected" {
+		_ = w.log.AckBidRecord(ctx, event.AuctionID, event.StreamID)
+		span.SetAttributes(attribute.String("bid_record.result", "skip"))
+		return
+	}
+	if event.Deliveries >= w.maxRetries {
+		_ = w.log.WriteBidRecordDLQ(ctx, event, "MAX_RETRIES")
+		_ = w.log.AckBidRecord(ctx, event.AuctionID, event.StreamID)
+		span.SetAttributes(attribute.String("bid_record.result", "dlq_max_retries"))
+		return
+	}
+	result, err := WriteBidRecordIdempotent(ctx, w.repo, event)
+	switch result {
+	case BidRecordWriteOK, BidRecordWriteDuplicateConsistent:
+		_ = w.log.AckBidRecord(ctx, event.AuctionID, event.StreamID)
+		if result == BidRecordWriteOK {
+			span.SetAttributes(attribute.String("bid_record.result", "ok"))
+		} else {
+			span.SetAttributes(attribute.String("bid_record.result", "duplicate_consistent"))
 		}
-		if event.Deliveries >= w.maxRetries {
+	case BidRecordWriteDuplicateConflict:
+		_ = w.log.WriteBidRecordDLQ(ctx, event, "DUPLICATE_CONFLICT")
+		_ = w.log.AckBidRecord(ctx, event.AuctionID, event.StreamID)
+		span.SetAttributes(attribute.String("bid_record.result", "duplicate_conflict"))
+		if err != nil {
+			span.RecordError(err)
+		}
+	default:
+		span.SetAttributes(attribute.String("bid_record.result", "temporary_failure"))
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		if err != nil && event.Deliveries+1 >= w.maxRetries {
 			_ = w.log.WriteBidRecordDLQ(ctx, event, "MAX_RETRIES")
 			_ = w.log.AckBidRecord(ctx, event.AuctionID, event.StreamID)
-			continue
-		}
-		result, err := WriteBidRecordIdempotent(ctx, w.repo, event)
-		switch result {
-		case BidRecordWriteOK, BidRecordWriteDuplicateConsistent:
-			_ = w.log.AckBidRecord(ctx, event.AuctionID, event.StreamID)
-		case BidRecordWriteDuplicateConflict:
-			_ = w.log.WriteBidRecordDLQ(ctx, event, "DUPLICATE_CONFLICT")
-			_ = w.log.AckBidRecord(ctx, event.AuctionID, event.StreamID)
-		default:
-			if err != nil && event.Deliveries+1 >= w.maxRetries {
-				_ = w.log.WriteBidRecordDLQ(ctx, event, "MAX_RETRIES")
-				_ = w.log.AckBidRecord(ctx, event.AuctionID, event.StreamID)
-			}
+			span.SetAttributes(attribute.String("bid_record.result", "dlq_max_retries"))
 		}
 	}
 }
@@ -149,7 +228,9 @@ type BidRecordReconciler struct {
 
 type bidRecordReconcileLog interface {
 	Enabled() bool
+	ShardCount() int
 	ActiveAuctions(ctx context.Context) ([]uint64, error)
+	ActiveAuctionsOnShard(ctx context.Context, shardIdx int) ([]uint64, error)
 	ReconcileCheckpoint(ctx context.Context, auctionID uint64) (int64, error)
 	ReplayBidEvents(ctx context.Context, auctionID uint64, lastSeq int64, limit int64) ([]redisinfra.BidEvent, bool, error)
 	SetReconcileCheckpoint(ctx context.Context, auctionID uint64, seq int64) error
@@ -160,6 +241,8 @@ func NewBidRecordReconciler(repo repository.BidRepository, log *redisinfra.Event
 	return &BidRecordReconciler{repo: repo, log: log}
 }
 
+// Start 为每个 RT shard 起一个独立的 reconcile goroutine。
+// shardCount<=1 时退化为单 goroutine 巡检全集合，行为与未分片时一致。
 func (r *BidRecordReconciler) Start(ctx context.Context, interval time.Duration) {
 	if r == nil || r.repo == nil || r.log == nil || !r.log.Enabled() {
 		return
@@ -167,19 +250,43 @@ func (r *BidRecordReconciler) Start(ctx context.Context, interval time.Duration)
 	if interval <= 0 {
 		interval = time.Minute
 	}
-	go func() {
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
-		_ = r.RunOnce(ctx)
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				_ = r.RunOnce(ctx)
-			}
+	shardCount := r.log.ShardCount()
+	if shardCount <= 1 {
+		go r.loopAll(ctx, interval)
+		return
+	}
+	for shardIdx := 0; shardIdx < shardCount; shardIdx++ {
+		idx := shardIdx
+		go r.loopShard(ctx, idx, interval)
+	}
+}
+
+func (r *BidRecordReconciler) loopAll(ctx context.Context, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	_ = r.RunOnce(ctx)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			_ = r.RunOnce(ctx)
 		}
-	}()
+	}
+}
+
+func (r *BidRecordReconciler) loopShard(ctx context.Context, shardIdx int, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	_ = r.RunOnceShard(ctx, shardIdx)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			_ = r.RunOnceShard(ctx, shardIdx)
+		}
+	}
 }
 
 func (r *BidRecordReconciler) RunOnce(ctx context.Context) error {
@@ -190,6 +297,23 @@ func (r *BidRecordReconciler) RunOnce(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	return r.reconcileAuctions(ctx, auctions)
+}
+
+// RunOnceShard 对单个 shard 上的 active_streams 跑一轮 reconcile；
+// 错误立即向上冒泡（与 RunOnce 行为一致）。
+func (r *BidRecordReconciler) RunOnceShard(ctx context.Context, shardIdx int) error {
+	if r == nil || r.repo == nil || r.log == nil || !r.log.Enabled() {
+		return nil
+	}
+	auctions, err := r.log.ActiveAuctionsOnShard(ctx, shardIdx)
+	if err != nil {
+		return err
+	}
+	return r.reconcileAuctions(ctx, auctions)
+}
+
+func (r *BidRecordReconciler) reconcileAuctions(ctx context.Context, auctions []uint64) error {
 	for _, auctionID := range auctions {
 		lastSeq, err := r.log.ReconcileCheckpoint(ctx, auctionID)
 		if err != nil {

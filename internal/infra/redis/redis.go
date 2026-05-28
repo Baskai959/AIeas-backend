@@ -10,7 +10,7 @@ import (
 	redisgo "github.com/redis/go-redis/v9"
 )
 
-func Open(ctx context.Context, cfg config.RedisConfig) (*redisgo.Client, error) {
+func Open(ctx context.Context, cfg config.RedisInstanceConfig) (*redisgo.Client, error) {
 	client := redisgo.NewClient(&redisgo.Options{
 		Addr:     cfg.Addr,
 		Username: cfg.Username,

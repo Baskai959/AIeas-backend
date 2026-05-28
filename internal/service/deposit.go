@@ -7,7 +7,12 @@ import (
 	"time"
 
 	"aieas_backend/internal/domain"
+	"aieas_backend/internal/infra/observability/metrics"
+	"aieas_backend/internal/infra/observability/tracing"
 	"aieas_backend/internal/repository"
+
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 )
 
 type DepositService struct {
@@ -16,6 +21,7 @@ type DepositService struct {
 	realtime repository.AuctionRealtimeStore
 	risk     *RiskService
 	tx       repository.TxManager
+	metrics  *metrics.Registry
 }
 
 type EnrollInput struct {
@@ -34,7 +40,48 @@ func NewDepositService(deposits repository.DepositRepository, auctions repositor
 	return &DepositService{deposits: deposits, auctions: auctions, realtime: realtime, risk: risk, tx: tx}
 }
 
+// SetMetrics 注入观测性 Registry。nil 安全。
+func (s *DepositService) SetMetrics(reg *metrics.Registry) {
+	s.metrics = reg
+}
+
 func (s *DepositService) Enroll(ctx context.Context, in EnrollInput) (domain.DepositLedger, error) {
+	ctx, span := tracing.StartSpan(ctx, "deposit.enroll",
+		attribute.Int64("auction.id", int64(in.AuctionID)),
+		attribute.String("user.id", in.UserID),
+	)
+	defer span.End()
+	start := time.Now()
+	deposit, err := s.enroll(ctx, in)
+	elapsed := time.Since(start)
+	span.SetAttributes(attribute.String("deposit.status", string(deposit.Status)))
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+	}
+	if s.metrics != nil {
+		switch {
+		case err == nil:
+			s.metrics.ObserveEnroll("ok", elapsed)
+			if deposit.Status == domain.DepositStatusReady {
+				s.metrics.IncDepositReady()
+			}
+		case errors.Is(err, domain.ErrInvalidArgument):
+			s.metrics.ObserveEnroll("invalid_argument", elapsed)
+		case errors.Is(err, domain.ErrForbidden):
+			s.metrics.ObserveEnroll("forbidden", elapsed)
+		case errors.Is(err, domain.ErrInvalidState):
+			s.metrics.ObserveEnroll("invalid_state", elapsed)
+		case errors.Is(err, domain.ErrNotFound):
+			s.metrics.ObserveEnroll("not_found", elapsed)
+		default:
+			s.metrics.ObserveEnroll("error", elapsed)
+		}
+	}
+	return deposit, err
+}
+
+func (s *DepositService) enroll(ctx context.Context, in EnrollInput) (domain.DepositLedger, error) {
 	in.UserID = strings.TrimSpace(in.UserID)
 	if in.AuctionID == 0 || in.UserID == "" || in.UserRole != domain.RoleBuyer {
 		return domain.DepositLedger{}, domain.ErrInvalidArgument

@@ -1,0 +1,259 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "直播间封面上传接口",
+    "version": "v1",
+    "description": "商家上传直播间封面图片，后端上传对象存储后将代理 URL 写回 live_room.cover_url，并返回更新后的直播间。图片读取继续复用 GET /api/v1/images/{key}。"
+  },
+  "servers": [
+    {
+      "url": "http://localhost:8888",
+      "description": "Local"
+    }
+  ],
+  "tags": [
+    {
+      "name": "LiveRoom",
+      "description": "直播间"
+    }
+  ],
+  "paths": {
+    "/api/v1/live-rooms/{id}/cover": {
+      "post": {
+        "tags": [
+          "LiveRoom"
+        ],
+        "summary": "上传直播间封面图片",
+        "description": "需要 merchant 或 admin 角色。merchant 只能上传自己直播间的封面；admin 可上传任意直播间封面。请求体为 multipart/form-data，文件字段名固定为 image，单张图片不超过 2MB。上传成功后，后端会把返回的 /api/v1/images/{key} 代理 URL 写入 live_room.cover_url。",
+        "operationId": "uploadLiveRoomCover",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "直播间 ID。",
+            "schema": {
+              "type": "integer",
+              "format": "uint64",
+              "example": 90001
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": true,
+            "description": "幂等键，同一次上传请求保持一致。",
+            "schema": {
+              "type": "string",
+              "example": "live-room-cover-90001-001"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "image": {
+                    "type": "string",
+                    "format": "binary",
+                    "description": "直播间封面图片文件，字段名固定为 image，单张不超过 2MB。"
+                  }
+                },
+                "required": [
+                  "image"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "上传成功，返回更新后的直播间。",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/ApiResponse"
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "data": {
+                          "$ref": "#/components/schemas/LiveRoom"
+                        }
+                      }
+                    }
+                  ]
+                },
+                "example": {
+                  "code": 0,
+                  "message": "success",
+                  "data": {
+                    "id": 90001,
+                    "merchantId": "u_2001",
+                    "title": "商家直播间",
+                    "description": "",
+                    "coverUrl": "/api/v1/images/2026/05/28/abc123.jpg",
+                    "status": "OFFLINE",
+                    "activeAuctionId": 0,
+                    "createdAt": "2026-05-28T10:00:00Z",
+                    "updatedAt": "2026-05-28T10:01:00Z"
+                  },
+                  "trace_id": "req_1710000000000000000"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT"
+      }
+    },
+    "schemas": {
+      "ApiResponse": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "integer",
+            "example": 0
+          },
+          "message": {
+            "type": "string",
+            "example": "success"
+          },
+          "trace_id": {
+            "type": "string",
+            "example": "req_1710000000000000000"
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ]
+      },
+      "LiveRoom": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer",
+            "format": "uint64",
+            "example": 90001
+          },
+          "merchantId": {
+            "type": "string",
+            "example": "u_2001"
+          },
+          "title": {
+            "type": "string",
+            "example": "商家直播间"
+          },
+          "description": {
+            "type": "string",
+            "example": ""
+          },
+          "coverUrl": {
+            "type": "string",
+            "description": "后端图片代理 URL，前端可直接 GET 该地址展示图片。",
+            "example": "/api/v1/images/2026/05/28/abc123.jpg"
+          },
+          "status": {
+            "type": "string",
+            "example": "OFFLINE"
+          },
+          "activeAuctionId": {
+            "type": "integer",
+            "format": "uint64",
+            "example": 0
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "updatedAt": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "ErrorResponse": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "integer",
+            "example": 20001
+          },
+          "message": {
+            "type": "string",
+            "example": "参数不合法"
+          },
+          "trace_id": {
+            "type": "string",
+            "example": "req_1710000000000000000"
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ]
+      }
+    },
+    "responses": {
+      "BadRequest": {
+        "description": "请求参数错误，例如未传 image、文件为空、文件超过 2MB 或缺少 Idempotency-Key。",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            }
+          }
+        }
+      },
+      "Forbidden": {
+        "description": "无权限操作该直播间。",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            }
+          }
+        }
+      },
+      "NotFound": {
+        "description": "直播间不存在。",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            }
+          }
+        }
+      }
+    }
+  }
+}
+

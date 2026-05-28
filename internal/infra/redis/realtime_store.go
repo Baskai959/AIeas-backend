@@ -8,26 +8,50 @@ import (
 	"time"
 
 	"aieas_backend/internal/domain"
+	"aieas_backend/internal/infra/observability/tracing"
 
 	redisgo "github.com/redis/go-redis/v9"
 )
 
+// AuctionRealtimeStore 是 RT 路径上拍卖状态 / 出价 / 落槌 / 排名的 Redis 实现。
+//
+// v2 起按 auctionID 走分片：所有 auction:<id>:* key 通过 sharded.ForAuction 路由到
+// 同一 shard，确保 Lua EVAL（multi-key）成立。脚本注册由 ScriptRegistry 在每个
+// shard 上 LoadAll 并按 shard 索引返回 SHA。
 type AuctionRealtimeStore struct {
-	client  *redisgo.Client
+	sharded *ShardedRTClient
 	scripts *ScriptRegistry
 	keys    KeyBuilder
 }
 
-func NewAuctionRealtimeStore(client *redisgo.Client, scripts *ScriptRegistry, keys KeyBuilder) *AuctionRealtimeStore {
+func NewAuctionRealtimeStore(sharded *ShardedRTClient, scripts *ScriptRegistry, keys KeyBuilder) *AuctionRealtimeStore {
 	if scripts == nil {
-		scripts = NewScriptRegistry(client, DefaultScripts())
+		scripts = NewShardedScriptRegistry(sharded, DefaultScripts())
 	}
-	return &AuctionRealtimeStore{client: client, scripts: scripts, keys: keys}
+	return &AuctionRealtimeStore{sharded: sharded, scripts: scripts, keys: keys}
+}
+
+// shardForAuction 返回该 auctionID 落到的 shard 客户端 + 索引。
+func (s *AuctionRealtimeStore) shardForAuction(auctionID uint64) (*RedisRTClient, int) {
+	idx := s.sharded.IndexAuction(auctionID)
+	return s.sharded.ForIndex(idx), idx
 }
 
 func (s *AuctionRealtimeStore) InitAuction(ctx context.Context, auction domain.AuctionLot, minIncrement int64) (domain.AuctionState, error) {
 	if minIncrement <= 0 {
 		minIncrement = 1
+	}
+	rule, err := domain.ParseIncrementRule(auction.IncrementRule)
+	if err != nil {
+		rule = domain.IncrementRule{Type: domain.IncrementRuleTypeFixed, Amount: minIncrement, MaxBidSteps: 1}
+	} else {
+		if amount := rule.AmountForPrice(auction.StartPrice); amount > 0 {
+			minIncrement = amount
+		}
+	}
+	incrementAmount := rule.AmountForPrice(auction.StartPrice)
+	if incrementAmount <= 0 {
+		incrementAmount = minIncrement
 	}
 	state := domain.AuctionState{
 		AuctionID:    auction.AuctionID,
@@ -38,10 +62,13 @@ func (s *AuctionRealtimeStore) InitAuction(ctx context.Context, auction domain.A
 		Version:      time.Now().UTC().UnixMilli(),
 		Source:       "redis",
 	}
-	err := s.client.HSet(ctx, s.keys.AuctionState(auction.AuctionID),
+	client, _ := s.shardForAuction(auction.AuctionID)
+	err = client.HSet(ctx, s.keys.AuctionState(auction.AuctionID),
 		"auction_id", auction.AuctionID,
 		"status", string(auction.Status),
+		"start_price", auction.StartPrice,
 		"current_price", auction.StartPrice,
+		"cap_price", auction.CapPrice,
 		"leader_bidder_id", "",
 		"start_ts_ms", auction.StartTime.UnixMilli(),
 		"end_ts_ms", auction.EndTime.UnixMilli(),
@@ -49,13 +76,17 @@ func (s *AuctionRealtimeStore) InitAuction(ctx context.Context, auction domain.A
 		"extend_count", 0,
 		"version", state.Version,
 		"min_increment", minIncrement,
+		"increment_amount", incrementAmount,
+		"max_bid_steps", rule.MaxBidSteps,
 		"increment_rule", string(auction.IncrementRule),
+		"anti_extend_mode", string(domain.NormalizeAuctionExtendMode(auction.AntiExtendMode)),
 	).Err()
 	return state, err
 }
 
 func (s *AuctionRealtimeStore) GetAuctionState(ctx context.Context, auctionID uint64) (domain.AuctionState, bool, error) {
-	values, err := s.client.HGetAll(ctx, s.keys.AuctionState(auctionID)).Result()
+	client, _ := s.shardForAuction(auctionID)
+	values, err := client.HGetAll(ctx, s.keys.AuctionState(auctionID)).Result()
 	if err != nil {
 		return domain.AuctionState{}, false, err
 	}
@@ -78,7 +109,8 @@ func (s *AuctionRealtimeStore) GetAuctionState(ctx context.Context, auctionID ui
 }
 
 func (s *AuctionRealtimeStore) MarkEnrollment(ctx context.Context, auctionID uint64, userID string) error {
-	pipe := s.client.Pipeline()
+	client, _ := s.shardForAuction(auctionID)
+	pipe := client.Pipeline()
 	pipe.SAdd(ctx, s.keys.AuctionEnrolled(auctionID), userID)
 	pipe.SAdd(ctx, s.keys.AuctionDeposits(auctionID), userID)
 	_, err := pipe.Exec(ctx)
@@ -90,7 +122,8 @@ func (s *AuctionRealtimeStore) BidResultByRequestID(ctx context.Context, auction
 	if requestID == "" {
 		return domain.BidResult{}, false, nil
 	}
-	raw, err := s.client.Get(ctx, s.keys.AuctionIdempotency(auctionID, requestID)).Result()
+	client, _ := s.shardForAuction(auctionID)
+	raw, err := client.Get(ctx, s.keys.AuctionIdempotency(auctionID, requestID)).Result()
 	if err != nil {
 		if err == redisgo.Nil {
 			return domain.BidResult{}, false, nil
@@ -105,7 +138,8 @@ func (s *AuctionRealtimeStore) BidResultByRequestID(ctx context.Context, auction
 }
 
 func (s *AuctionRealtimeStore) BidPrerequisites(ctx context.Context, auctionID uint64, userID string) (bool, bool, error) {
-	pipe := s.client.Pipeline()
+	client, _ := s.shardForAuction(auctionID)
+	pipe := client.Pipeline()
 	enrolled := pipe.SIsMember(ctx, s.keys.AuctionEnrolled(auctionID), userID)
 	depositReady := pipe.SIsMember(ctx, s.keys.AuctionDeposits(auctionID), userID)
 	_, err := pipe.Exec(ctx)
@@ -123,20 +157,32 @@ func (s *AuctionRealtimeStore) PlaceBid(ctx context.Context, input domain.BidInp
 	if input.IdempotencyTTL <= 0 {
 		input.IdempotencyTTL = 24 * time.Hour
 	}
+	expectedCurrentPrice := ""
+	if input.ExpectedCurrentPrice != nil {
+		expectedCurrentPrice = strconv.FormatInt(*input.ExpectedCurrentPrice, 10)
+	}
+	expectedVersion := ""
+	if input.ExpectedVersion != nil {
+		expectedVersion = strconv.FormatInt(*input.ExpectedVersion, 10)
+	}
 	keys := []string{
 		s.keys.AuctionState(input.AuctionID),
 		s.keys.AuctionBids(input.AuctionID),
 		s.keys.AuctionIdempotency(input.AuctionID, input.RequestID),
 		s.keys.AuctionEnrolled(input.AuctionID),
 		s.keys.AuctionDeposits(input.AuctionID),
-		s.keys.UserBlacklist(),
 		s.keys.BidFrequency(input.BidderID, input.AuctionID),
 		s.keys.AuctionUserBids(input.AuctionID),
 		s.keys.AuctionStream(input.AuctionID),
 		s.keys.AuctionSeq(input.AuctionID),
 		s.keys.ActiveStreams(),
 	}
-	raw, err := s.scripts.Eval(ctx, ScriptBidPlace, keys,
+	traceCarrier := map[string]string{}
+	tracing.InjectMap(ctx, traceCarrier)
+	traceParent := traceCarrier["traceparent"]
+	traceState := traceCarrier["tracestate"]
+	_, shardIdx := s.shardForAuction(input.AuctionID)
+	raw, err := s.scripts.EvalOnShard(ctx, shardIdx, ScriptBidPlace, keys,
 		input.RequestID,
 		input.AuctionID,
 		input.BidderID,
@@ -150,6 +196,11 @@ func (s *AuctionRealtimeStore) PlaceBid(ctx context.Context, input domain.BidInp
 		input.FreqWindowMS,
 		input.IdempotencyTTL.Milliseconds(),
 		input.Source,
+		string(domain.NormalizeAuctionExtendMode(input.AntiExtendMode)),
+		expectedCurrentPrice,
+		expectedVersion,
+		traceParent,
+		traceState,
 	)
 	if err != nil {
 		return domain.BidResult{}, err
@@ -165,7 +216,8 @@ func (s *AuctionRealtimeStore) Hammer(ctx context.Context, input domain.HammerIn
 	if input.IdempotencyTTL <= 0 {
 		input.IdempotencyTTL = 24 * time.Hour
 	}
-	raw, err := s.scripts.Eval(ctx, ScriptHammer, []string{
+	_, shardIdx := s.shardForAuction(input.AuctionID)
+	raw, err := s.scripts.EvalOnShard(ctx, shardIdx, ScriptHammer, []string{
 		s.keys.AuctionState(input.AuctionID),
 		s.keys.AuctionBids(input.AuctionID),
 		s.keys.AuctionCloseLock(input.AuctionID),
@@ -190,7 +242,8 @@ func (s *AuctionRealtimeStore) TopN(ctx context.Context, auctionID uint64, limit
 	if limit <= 0 || limit > 100 {
 		limit = 10
 	}
-	rows, err := s.client.ZRevRangeWithScores(ctx, s.keys.AuctionBids(auctionID), 0, int64(limit-1)).Result()
+	client, _ := s.shardForAuction(auctionID)
+	rows, err := client.ZRevRangeWithScores(ctx, s.keys.AuctionBids(auctionID), 0, int64(limit-1)).Result()
 	if err != nil {
 		return nil, err
 	}
@@ -211,17 +264,6 @@ func (s *AuctionRealtimeStore) TopN(ctx context.Context, auctionID uint64, limit
 	return entries, nil
 }
 
-func (s *AuctionRealtimeStore) IsBlacklisted(ctx context.Context, userID string) (bool, error) {
-	return s.client.SIsMember(ctx, s.keys.UserBlacklist(), userID).Result()
-}
-
-func (s *AuctionRealtimeStore) SetBlacklisted(ctx context.Context, userID string, blacklisted bool) error {
-	if blacklisted {
-		return s.client.SAdd(ctx, s.keys.UserBlacklist(), userID).Err()
-	}
-	return s.client.SRem(ctx, s.keys.UserBlacklist(), userID).Err()
-}
-
 type luaBidResult struct {
 	RequestID      string               `json:"requestId"`
 	AuctionID      uint64               `json:"auctionId"`
@@ -240,6 +282,8 @@ type luaBidResult struct {
 	StreamID       string               `json:"streamId"`
 	Event          string               `json:"event"`
 	RiskResult     domain.BidRiskResult `json:"riskResult"`
+	AuctionStatus  domain.AuctionStatus `json:"auctionStatus"`
+	AutoClosed     bool                 `json:"autoClosed"`
 }
 
 func decodeBidResult(raw interface{}) (domain.BidResult, error) {
@@ -271,11 +315,13 @@ func decodeBidResult(raw interface{}) (domain.BidResult, error) {
 		StreamID:       decoded.StreamID,
 		Event:          decoded.Event,
 		RiskResult:     decoded.RiskResult,
+		AuctionStatus:  decoded.AuctionStatus,
+		AutoClosed:     decoded.AutoClosed,
 	}, nil
 }
 
 func (s *AuctionRealtimeStore) StreamEnabled() bool {
-	return s != nil && s.client != nil
+	return s != nil && s.sharded != nil && s.sharded.Len() > 0
 }
 
 type luaHammerResult struct {

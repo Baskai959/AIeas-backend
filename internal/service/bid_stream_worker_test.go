@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 	"time"
@@ -16,7 +17,7 @@ import (
 func TestBidServiceStreamEnabledDoesNotPersistOrBroadcastDirectly(t *testing.T) {
 	ctx := context.Background()
 	auctionRepo := repository.NewMemoryAuctionRepository()
-	auction := domain.AuctionLot{AuctionID: 10001, SellerID: "u_2001", AuctionType: domain.AuctionTypeEnglish, StartPrice: 1000, ReservePrice: 1000, Status: domain.AuctionStatusRunning, StartTime: time.Now().Add(-time.Minute), EndTime: time.Now().Add(time.Hour)}
+	auction := domain.AuctionLot{AuctionID: 10001, SellerID: "u_2001", AuctionType: domain.AuctionTypeEnglish, StartPrice: 1000, ReservePrice: 1000, CapPrice: 2000, IncrementRule: json.RawMessage(`{"type":"fixed","amount":100,"maxBidSteps":10}`), Status: domain.AuctionStatusRunning, StartTime: time.Now().Add(-time.Minute), EndTime: time.Now().Add(time.Hour)}
 	if err := auctionRepo.Create(ctx, &auction); err != nil {
 		t.Fatalf("create auction: %v", err)
 	}
@@ -229,17 +230,6 @@ func (s *streamEnabledRealtime) TopN(ctx context.Context, auctionID uint64, limi
 	_ = limit
 	return nil, nil
 }
-func (s *streamEnabledRealtime) IsBlacklisted(ctx context.Context, userID string) (bool, error) {
-	_ = ctx
-	_ = userID
-	return false, nil
-}
-func (s *streamEnabledRealtime) SetBlacklisted(ctx context.Context, userID string, blacklisted bool) error {
-	_ = ctx
-	_ = userID
-	_ = blacklisted
-	return nil
-}
 
 type trackingPublisher struct{ broadcasts int }
 
@@ -263,8 +253,17 @@ type trackingBidLog struct {
 
 func (l *trackingBidLog) Enabled() bool { return true }
 
+func (l *trackingBidLog) ShardCount() int { return 1 }
+
 func (l *trackingBidLog) ActiveAuctions(ctx context.Context) ([]uint64, error) {
 	_ = ctx
+	l.activeCalls++
+	return l.auctions, nil
+}
+
+func (l *trackingBidLog) ActiveAuctionsOnShard(ctx context.Context, shardIdx int) ([]uint64, error) {
+	_ = ctx
+	_ = shardIdx
 	l.activeCalls++
 	return l.auctions, nil
 }

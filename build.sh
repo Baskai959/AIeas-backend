@@ -84,8 +84,10 @@ else
   cat > "${OUTPUT_DIR}/.env" <<'EOF'
 # 上线前请替换为真实值；含特殊字符（() & ? 空格 等）的值请用单引号包裹
 MYSQL_DSN='auction:PASSWORD@tcp(rds-host:3306)/auction?charset=utf8mb4&parseTime=true&loc=Local'
-REDIS_ADDR='redis-host:6379'
-REDIS_PASSWORD=''
+REDIS_RT_PRIMARY_ADDR='redis-rt-host:6379'
+REDIS_RT_PRIMARY_PASSWORD=''
+REDIS_CACHE_ADDR='redis-cache-host:6379'
+REDIS_CACHE_PASSWORD=''
 JWT_SECRET='CHANGE_ME'
 OBSERVABILITY_FORMAT='json'
 EOF

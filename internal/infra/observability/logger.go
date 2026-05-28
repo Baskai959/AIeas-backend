@@ -48,7 +48,10 @@ func newLogger(level, format string, tty bool, out io.Writer) *slog.Logger {
 	switch strings.ToLower(strings.TrimSpace(format)) {
 	case "json":
 		// JSON handler 关闭 AddSource，避免与 GORM source 字段重复。
-		return slog.New(slog.NewJSONHandler(out, &slog.HandlerOptions{Level: lv}))
+		// 仅在 JSON 模式下叠加 trace_id/span_id 注入：text 模式偏向人读的开发态，
+		// 多两个 hex 字段会显著降低可读性（参见 traceContextHandler 注释）。
+		base := slog.NewJSONHandler(out, &slog.HandlerOptions{Level: lv})
+		return slog.New(WithTraceContext(base))
 	default:
 		// text 模式 → charmbracelet/log 提供的 slog handler
 		handler := charmlog.NewWithOptions(out, charmlog.Options{

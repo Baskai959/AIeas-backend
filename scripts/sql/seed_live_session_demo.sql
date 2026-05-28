@@ -116,7 +116,7 @@ VALUES
   -- Lot 1: 成交 → SETTLED
   (90000001, 90000001, 90000001, 90000001, 90000001,
    'ENGLISH', 10000, 15000,
-   '{"type":"ladder","steps":[{"min":0,"max":50000,"amount":1000},{"min":50000,"max":200000,"amount":5000},{"min":200000,"max":1000000,"amount":20000},{"min":1000000,"amount":50000}]}',
+   '{"type":"ladder","maxBidSteps":5,"steps":[{"min":0,"max":50000,"amount":1000},{"min":50000,"max":200000,"amount":5000},{"min":200000,"max":1000000,"amount":20000},{"min":1000000,"amount":50000}]}',
    15, 30, 5000,
    'SETTLED',
    '{"startPriceCent":10000,"reservePriceCent":15000,"depositAmountCent":5000,"antiSnipingSec":15,"antiExtendSec":30,"incrementRule":[{"stepCent":1000,"maxPriceCent":50000},{"stepCent":5000,"maxPriceCent":200000},{"stepCent":20000,"maxPriceCent":1000000},{"stepCent":50000}]}',
@@ -127,7 +127,7 @@ VALUES
   -- Lot 2: 流拍 → CLOSED_FAILED
   (90000002, 90000002, 90000001, 90000001, 90000001,
    'ENGLISH', 50000, 80000,
-   '{"type":"ladder","steps":[{"min":0,"max":50000,"amount":1000},{"min":50000,"max":200000,"amount":5000},{"min":200000,"max":1000000,"amount":20000},{"min":1000000,"amount":50000}]}',
+   '{"type":"ladder","maxBidSteps":5,"steps":[{"min":0,"max":50000,"amount":1000},{"min":50000,"max":200000,"amount":5000},{"min":200000,"max":1000000,"amount":20000},{"min":1000000,"amount":50000}]}',
    15, 30, 20000,
    'CLOSED_FAILED',
    '{"startPriceCent":50000,"reservePriceCent":80000,"depositAmountCent":20000,"antiSnipingSec":15,"antiExtendSec":30,"incrementRule":[{"stepCent":1000,"maxPriceCent":50000},{"stepCent":5000,"maxPriceCent":200000},{"stepCent":20000,"maxPriceCent":1000000},{"stepCent":50000}]}',
@@ -138,7 +138,7 @@ VALUES
   -- Lot 3: 成交 → SETTLED
   (90000003, 90000003, 90000001, 90000001, 90000001,
    'ENGLISH', 30000, 40000,
-   '{"type":"ladder","steps":[{"min":0,"max":50000,"amount":1000},{"min":50000,"max":200000,"amount":5000},{"min":200000,"max":1000000,"amount":20000},{"min":1000000,"amount":50000}]}',
+   '{"type":"ladder","maxBidSteps":5,"steps":[{"min":0,"max":50000,"amount":1000},{"min":50000,"max":200000,"amount":5000},{"min":200000,"max":1000000,"amount":20000},{"min":1000000,"amount":50000}]}',
    15, 30, 10000,
    'SETTLED',
    '{"startPriceCent":30000,"reservePriceCent":40000,"depositAmountCent":10000,"antiSnipingSec":15,"antiExtendSec":30,"incrementRule":[{"stepCent":1000,"maxPriceCent":50000},{"stepCent":5000,"maxPriceCent":200000},{"stepCent":20000,"maxPriceCent":1000000},{"stepCent":50000}]}',

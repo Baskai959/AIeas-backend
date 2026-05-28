@@ -1,0 +1,98 @@
+# Local Redis topology for separating cache from realtime Redis.
+#
+# Services:
+#   redis-cache: idempotency/session/cache-style data
+#   redis-rt-1: realtime shard 1
+#   redis-rt-2: realtime shard 2
+#
+# This file starts two independent RT shards. It does not create a Redis Cluster;
+# backend code must route realtime keys to redis-rt-1 or redis-rt-2 by shard key.
+#
+# Eviction policy:
+#   redis-cache uses allkeys-lfu, suitable only for disposable cache keys.
+#   redis-rt-* uses noeviction because auction state, locks, streams, and counters
+#   must not disappear under memory pressure.
+
+x-redis-common: &redis-common
+  image: redis:7.2-alpine
+  restart: unless-stopped
+  networks:
+    - aieas-redis
+  healthcheck:
+    test: ["CMD", "redis-cli", "ping"]
+    interval: 5s
+    timeout: 3s
+    retries: 20
+
+services:
+  redis-cache:
+    <<: *redis-common
+    container_name: aieas-redis-cache
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --save
+      - "60"
+      - "1000"
+      - --maxmemory
+      - 512mb
+      - --maxmemory-policy
+      - allkeys-lfu
+    ports:
+      - "127.0.0.1:6380:6379"
+    volumes:
+      - redis-cache-data:/data
+
+  redis-rt-1:
+    <<: *redis-common
+    container_name: aieas-redis-rt-1
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --save
+      - "60"
+      - "1000"
+      - --maxmemory
+      - 1gb
+      - --maxmemory-policy
+      - noeviction
+    ports:
+      - "127.0.0.1:6381:6379"
+    volumes:
+      - redis-rt-1-data:/data
+
+  redis-rt-2:
+    <<: *redis-common
+    container_name: aieas-redis-rt-2
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --save
+      - "60"
+      - "1000"
+      - --maxmemory
+      - 1gb
+      - --maxmemory-policy
+      - noeviction
+    ports:
+      - "127.0.0.1:6382:6379"
+    volumes:
+      - redis-rt-2-data:/data
+
+networks:
+  aieas-redis:
+    name: aieas-redis
+
+volumes:
+  redis-cache-data:
+  redis-rt-1-data:
+  redis-rt-2-data:

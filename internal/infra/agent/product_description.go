@@ -14,6 +14,8 @@ import (
 	appconfig "aieas_backend/internal/config"
 	"aieas_backend/internal/domain"
 	"aieas_backend/internal/service"
+
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 )
 
 type ProductDescriptionClient struct {
@@ -26,12 +28,24 @@ type ProductAuditClient struct {
 	client   *http.Client
 }
 
+type LiveAnalysisClient struct {
+	endpoint string
+	client   *http.Client
+}
+
+type LiveAuctionHookClient struct {
+	endpoint string
+	apiKey   string
+	client   *http.Client
+}
+
 func NewProductDescriptionClient(cfg appconfig.AgentConfig) *ProductDescriptionClient {
 	timeout := cfg.Timeout.Std()
 	return &ProductDescriptionClient{
 		endpoint: strings.TrimSpace(cfg.ProductDescriptionURL),
 		client: &http.Client{
-			Timeout: timeout,
+			Timeout:   timeout,
+			Transport: newAgentTransport("agent.product_description"),
 		},
 	}
 }
@@ -41,9 +55,45 @@ func NewProductAuditClient(cfg appconfig.AgentConfig) *ProductAuditClient {
 	return &ProductAuditClient{
 		endpoint: strings.TrimSpace(cfg.ProductAuditURL),
 		client: &http.Client{
-			Timeout: timeout,
+			Timeout:   timeout,
+			Transport: newAgentTransport("agent.product_audit"),
 		},
 	}
+}
+
+func NewLiveAnalysisClient(cfg appconfig.AgentConfig) *LiveAnalysisClient {
+	timeout := cfg.Timeout.Std()
+	return &LiveAnalysisClient{
+		endpoint: strings.TrimSpace(cfg.LiveAnalysisURL),
+		client: &http.Client{
+			Timeout:   timeout,
+			Transport: newAgentTransport("agent.live_analysis"),
+		},
+	}
+}
+
+func NewLiveAuctionHookClient(cfg appconfig.AgentConfig) *LiveAuctionHookClient {
+	timeout := cfg.Timeout.Std()
+	return &LiveAuctionHookClient{
+		endpoint: strings.TrimSpace(cfg.LiveAuctionHookURL),
+		apiKey:   strings.TrimSpace(cfg.LiveAuctionHookAPIKey),
+		client: &http.Client{
+			Timeout:   timeout,
+			Transport: newAgentTransport("agent.live_auction_hook"),
+		},
+	}
+}
+
+// newAgentTransport 用 otelhttp.NewTransport 包裹 http.DefaultTransport，
+// 让所有 outbound agent 调用自动产生 client kind span，并注入 W3C traceparent
+// 头实现跨进程追踪。spanName 在每次请求作为 span 名稳定上报（不混入 URL，
+// 避免高基数）。
+func newAgentTransport(spanName string) http.RoundTripper {
+	return otelhttp.NewTransport(http.DefaultTransport,
+		otelhttp.WithSpanNameFormatter(func(_ string, _ *http.Request) string {
+			return spanName
+		}),
+	)
 }
 
 func (c *ProductDescriptionClient) GenerateProductDescription(ctx context.Context, in service.ProductDescriptionInput) (service.ProductDescriptionResult, error) {
@@ -152,6 +202,112 @@ func (c *ProductAuditClient) AuditProduct(ctx context.Context, in service.Produc
 		}
 	}
 	return result, nil
+}
+
+func (c *LiveAnalysisClient) RequestLiveAnalysis(ctx context.Context, in service.LiveAnalysisAsyncInput) (service.LiveAnalysisAsyncResult, error) {
+	if c == nil || c.client == nil || c.endpoint == "" {
+		return service.LiveAnalysisAsyncResult{}, service.ErrLiveAnalysisUnavailable
+	}
+	prompt := strings.TrimSpace(in.Prompt)
+	callbackURL := strings.TrimSpace(in.CallbackURL)
+	if prompt == "" || callbackURL == "" {
+		return service.LiveAnalysisAsyncResult{}, domain.ErrInvalidArgument
+	}
+	payload, err := json.Marshal(liveAnalysisAsyncRequest{
+		Prompt:          prompt,
+		CallbackURL:     callbackURL,
+		CallbackHeaders: in.CallbackHeaders,
+		CallbackContext: in.CallbackContext,
+		ToolName:        strings.TrimSpace(in.ToolName),
+		ToolArguments:   in.ToolArguments,
+	})
+	if err != nil {
+		return service.LiveAnalysisAsyncResult{}, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint, bytes.NewReader(payload))
+	if err != nil {
+		return service.LiveAnalysisAsyncResult{}, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return service.LiveAnalysisAsyncResult{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		preview, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return service.LiveAnalysisAsyncResult{}, fmt.Errorf("agent live analysis async status %d: %s", resp.StatusCode, strings.TrimSpace(string(preview)))
+	}
+
+	var result struct {
+		Success   bool   `json:"success"`
+		RequestID string `json:"request_id"`
+		Status    string `json:"status"`
+		Message   string `json:"message"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 2<<20)).Decode(&result); err != nil {
+		return service.LiveAnalysisAsyncResult{}, err
+	}
+	if !result.Success {
+		message := strings.TrimSpace(result.Message)
+		if message == "" {
+			message = "unknown error"
+		}
+		return service.LiveAnalysisAsyncResult{}, fmt.Errorf("agent live analysis async failed: %s", message)
+	}
+	if strings.TrimSpace(result.RequestID) == "" {
+		return service.LiveAnalysisAsyncResult{}, fmt.Errorf("agent live analysis async response missing request_id")
+	}
+	return service.LiveAnalysisAsyncResult{
+		RequestID: strings.TrimSpace(result.RequestID),
+		Status:    strings.TrimSpace(result.Status),
+		Message:   strings.TrimSpace(result.Message),
+	}, nil
+}
+
+func (c *LiveAuctionHookClient) InvokeLiveAgentHook(ctx context.Context, message string) error {
+	if c == nil || c.client == nil || c.endpoint == "" {
+		return nil
+	}
+	message = strings.TrimSpace(message)
+	if message == "" {
+		return domain.ErrInvalidArgument
+	}
+	payload, err := json.Marshal(liveAuctionHookRequest{Message: message})
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint, bytes.NewReader(payload))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if c.apiKey != "" {
+		req.Header.Set("X-Agent-Hook-Key", c.apiKey)
+	}
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		preview, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return fmt.Errorf("agent live auction hook status %d: %s", resp.StatusCode, strings.TrimSpace(string(preview)))
+	}
+	return nil
+}
+
+type liveAnalysisAsyncRequest struct {
+	Prompt          string                 `json:"prompt"`
+	CallbackURL     string                 `json:"callback_url"`
+	CallbackHeaders map[string]string      `json:"callback_headers,omitempty"`
+	CallbackContext map[string]interface{} `json:"callback_context,omitempty"`
+	ToolName        string                 `json:"tool_name,omitempty"`
+	ToolArguments   map[string]interface{} `json:"tool_arguments,omitempty"`
+}
+
+type liveAuctionHookRequest struct {
+	Message string `json:"message"`
 }
 
 func writeImagePart(writer *multipart.Writer, fieldName, imageName, contentType string, image io.Reader) error {

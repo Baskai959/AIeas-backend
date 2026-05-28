@@ -39,8 +39,8 @@ func TestBidServiceIdempotencyMinimumIncrementAndTopN(t *testing.T) {
 	if err != nil {
 		t.Fatalf("low bid: %v", err)
 	}
-	if tooLow.Accepted || tooLow.Reason != "BELOW_MIN_INCREMENT" {
-		t.Fatalf("expected BELOW_MIN_INCREMENT rejection, got %+v", tooLow)
+	if tooLow.Accepted || tooLow.Reason != domain.BidRejectStepMismatch {
+		t.Fatalf("expected PRICE_STEP_MISMATCH rejection, got %+v", tooLow)
 	}
 
 	accepted, err := fixture.bids.Place(ctx, PlaceBidInput{RequestID: "bid-ok", AuctionID: fixture.auctionID, BidderID: "u_1001", UserRole: domain.RoleBuyer, Price: 1100})
@@ -66,7 +66,31 @@ func TestBidServiceIdempotencyMinimumIncrementAndTopN(t *testing.T) {
 	}
 }
 
-func TestBidServiceTopNOrdersEqualPriceByFirstAcceptedBid(t *testing.T) {
+func TestBidServiceRejectsStaleExpectedState(t *testing.T) {
+	ctx := context.Background()
+	cfg := appconfig.Default().Auction
+	cfg.FreqLimitCount = 100
+	fixture := newRealtimeAuctionFixture(t, cfg)
+	mustEnroll(t, fixture, "u_1001")
+
+	expected := int64(900)
+	result, err := fixture.bids.Place(ctx, PlaceBidInput{
+		RequestID:            "bid-stale",
+		AuctionID:            fixture.auctionID,
+		BidderID:             "u_1001",
+		UserRole:             domain.RoleBuyer,
+		Price:                1100,
+		ExpectedCurrentPrice: &expected,
+	})
+	if err != nil {
+		t.Fatalf("stale bid: %v", err)
+	}
+	if result.Accepted || result.Reason != domain.BidRejectStaleAuctionState || result.CurrentPrice != 1000 {
+		t.Fatalf("expected stale state rejection, got %+v", result)
+	}
+}
+
+func TestBidServiceRejectsEqualPriceAfterLeader(t *testing.T) {
 	ctx := context.Background()
 	cfg := appconfig.Default().Auction
 	cfg.FreqLimitCount = 100
@@ -80,8 +104,11 @@ func TestBidServiceTopNOrdersEqualPriceByFirstAcceptedBid(t *testing.T) {
 		t.Fatalf("first bid result=%+v err=%v", first, err)
 	}
 	second, err := fixture.bids.Place(ctx, PlaceBidInput{RequestID: "tie-second", AuctionID: fixture.auctionID, BidderID: "u_1002", UserRole: domain.RoleBuyer, Price: 1100})
-	if err != nil || !second.Accepted || second.LeaderBidderID != "u_1001" || second.CurrentPrice != 1100 {
-		t.Fatalf("expected equal-price later bid accepted without replacing leader, result=%+v err=%v", second, err)
+	if err != nil {
+		t.Fatalf("second equal-price bid: %v", err)
+	}
+	if second.Accepted || second.Reason != domain.BidRejectBelowMinIncrement {
+		t.Fatalf("expected equal-price bid rejected, result=%+v", second)
 	}
 	third, err := fixture.bids.Place(ctx, PlaceBidInput{RequestID: "tie-higher", AuctionID: fixture.auctionID, BidderID: "u_1003", UserRole: domain.RoleBuyer, Price: 1300})
 	if err != nil || !third.Accepted || third.LeaderBidderID != "u_1003" {
@@ -96,7 +123,7 @@ func TestBidServiceTopNOrdersEqualPriceByFirstAcceptedBid(t *testing.T) {
 		bidder string
 		price  int64
 		rank   int
-	}{{"u_1003", 1300, 1}, {"u_1001", 1100, 2}, {"u_1002", 1100, 3}}
+	}{{"u_1003", 1300, 1}, {"u_1001", 1100, 2}}
 	if len(top) != len(want) {
 		t.Fatalf("expected %d entries, got %+v", len(want), top)
 	}
@@ -107,39 +134,64 @@ func TestBidServiceTopNOrdersEqualPriceByFirstAcceptedBid(t *testing.T) {
 	}
 }
 
-func TestBidServiceTieredIncrementRulePrecheck(t *testing.T) {
+func TestBidServiceFixedRulePrecheck(t *testing.T) {
 	ctx := context.Background()
 	cfg := appconfig.Default().Auction
 	cfg.FreqLimitCount = 100
-	rule := json.RawMessage(`{"type":"ladder","steps":[{"min":0,"max":5000,"amount":500},{"min":5000,"max":10000,"amount":800},{"min":10000,"amount":1000}]}`)
+	rule := json.RawMessage(`{"type":"fixed","amount":100,"maxBidSteps":3}`)
 	fixture := newRealtimeAuctionFixtureWithRule(t, cfg, -2*time.Minute, 1000, rule)
 	mustEnroll(t, fixture, "u_1001")
 	mustEnroll(t, fixture, "u_1002")
 
-	tooLowFirstTier, err := fixture.bids.Place(ctx, PlaceBidInput{RequestID: "tier-low-1", AuctionID: fixture.auctionID, BidderID: "u_1001", UserRole: domain.RoleBuyer, Price: 1400})
+	mismatch, err := fixture.bids.Place(ctx, PlaceBidInput{RequestID: "fixed-mismatch", AuctionID: fixture.auctionID, BidderID: "u_1001", UserRole: domain.RoleBuyer, Price: 1150})
 	if err != nil {
-		t.Fatalf("first-tier low bid: %v", err)
+		t.Fatalf("step mismatch bid: %v", err)
 	}
-	if tooLowFirstTier.Accepted || tooLowFirstTier.Reason != "BELOW_MIN_INCREMENT" {
-		t.Fatalf("expected first-tier BELOW_MIN_INCREMENT, got %+v", tooLowFirstTier)
+	if mismatch.Accepted || mismatch.Reason != domain.BidRejectStepMismatch {
+		t.Fatalf("expected step mismatch, got %+v", mismatch)
 	}
-	firstTier, err := fixture.bids.Place(ctx, PlaceBidInput{RequestID: "tier-ok-1", AuctionID: fixture.auctionID, BidderID: "u_1001", UserRole: domain.RoleBuyer, Price: 1500})
-	if err != nil || !firstTier.Accepted || firstTier.CurrentPrice != 1500 {
-		t.Fatalf("expected first-tier bid accepted, result=%+v err=%v", firstTier, err)
-	}
-	if jump, err := fixture.bids.Place(ctx, PlaceBidInput{RequestID: "tier-jump", AuctionID: fixture.auctionID, BidderID: "u_1002", UserRole: domain.RoleBuyer, Price: 5000}); err != nil || !jump.Accepted {
-		t.Fatalf("jump to second tier result=%+v err=%v", jump, err)
-	}
-	tooLowSecondTier, err := fixture.bids.Place(ctx, PlaceBidInput{RequestID: "tier-low-2", AuctionID: fixture.auctionID, BidderID: "u_1001", UserRole: domain.RoleBuyer, Price: 5700})
+	tooHigh, err := fixture.bids.Place(ctx, PlaceBidInput{RequestID: "fixed-too-high", AuctionID: fixture.auctionID, BidderID: "u_1001", UserRole: domain.RoleBuyer, Price: 1500})
 	if err != nil {
-		t.Fatalf("second-tier low bid: %v", err)
+		t.Fatalf("too high bid: %v", err)
 	}
-	if tooLowSecondTier.Accepted || tooLowSecondTier.Reason != "BELOW_MIN_INCREMENT" {
-		t.Fatalf("expected second-tier BELOW_MIN_INCREMENT, got %+v", tooLowSecondTier)
+	if tooHigh.Accepted || tooHigh.Reason != domain.BidRejectAboveMaxBidSteps {
+		t.Fatalf("expected max-steps rejection, got %+v", tooHigh)
 	}
-	secondTier, err := fixture.bids.Place(ctx, PlaceBidInput{RequestID: "tier-ok-2", AuctionID: fixture.auctionID, BidderID: "u_1001", UserRole: domain.RoleBuyer, Price: 5800})
-	if err != nil || !secondTier.Accepted || secondTier.CurrentPrice != 5800 {
-		t.Fatalf("expected second-tier bid accepted, result=%+v err=%v", secondTier, err)
+	okBid, err := fixture.bids.Place(ctx, PlaceBidInput{RequestID: "fixed-ok", AuctionID: fixture.auctionID, BidderID: "u_1001", UserRole: domain.RoleBuyer, Price: 1300})
+	if err != nil || !okBid.Accepted || okBid.CurrentPrice != 1300 {
+		t.Fatalf("expected fixed bid accepted, result=%+v err=%v", okBid, err)
+	}
+	aboveCap, err := fixture.bids.Place(ctx, PlaceBidInput{RequestID: "fixed-above-cap", AuctionID: fixture.auctionID, BidderID: "u_1002", UserRole: domain.RoleBuyer, Price: 10100})
+	if err != nil {
+		t.Fatalf("above cap bid: %v", err)
+	}
+	if aboveCap.Accepted || aboveCap.Reason != domain.BidRejectAboveCapPrice {
+		t.Fatalf("expected cap rejection, got %+v", aboveCap)
+	}
+}
+
+func TestBidServiceCapPriceAutoClosesAndCreatesOrder(t *testing.T) {
+	ctx := context.Background()
+	cfg := appconfig.Default().Auction
+	cfg.FreqLimitCount = 100
+	rule := json.RawMessage(`{"type":"fixed","amount":100,"maxBidSteps":10}`)
+	fixture := newRealtimeAuctionFixtureWithRule(t, cfg, -2*time.Minute, 1000, rule)
+	fixture.hammers.SetOrderIDGenerator(fixedAuctionIDGenerator{id: 567890123})
+	mustEnroll(t, fixture, "u_1001")
+
+	result, err := fixture.bids.Place(ctx, PlaceBidInput{RequestID: "cap-bid", AuctionID: fixture.auctionID, BidderID: "u_1001", UserRole: domain.RoleBuyer, Price: 2000})
+	if err != nil {
+		t.Fatalf("cap bid: %v", err)
+	}
+	if !result.Accepted || !result.AutoClosed || result.AuctionStatus != domain.AuctionStatusClosedWon {
+		t.Fatalf("expected cap bid accepted and auto closed, got %+v", result)
+	}
+	order, err := fixture.orderRepo.FindByAuctionID(ctx, fixture.auctionID)
+	if err != nil {
+		t.Fatalf("expected cap bid to create order: %v", err)
+	}
+	if order.ID != 567890123 || order.WinnerID != "u_1001" || order.DealPrice != 2000 {
+		t.Fatalf("unexpected cap order: %+v", order)
 	}
 }
 
@@ -329,7 +381,7 @@ func newRealtimeAuctionFixture(t *testing.T, cfg appconfig.AuctionConfig) realti
 
 func newRealtimeAuctionFixtureWithTiming(t *testing.T, cfg appconfig.AuctionConfig, endOffset time.Duration, reservePrice int64) realtimeAuctionFixture {
 	t.Helper()
-	rule, _ := json.Marshal(map[string]interface{}{"type": "fixed", "amount": 100})
+	rule, _ := json.Marshal(map[string]interface{}{"type": "fixed", "amount": 100, "maxBidSteps": 10})
 	return newRealtimeAuctionFixtureWithRule(t, cfg, endOffset, reservePrice, rule)
 }
 
@@ -351,6 +403,7 @@ func newRealtimeAuctionFixtureWithRule(t *testing.T, cfg appconfig.AuctionConfig
 	auctionSvc.SetRealtime(realtime)
 	auctionSvc.SetAuctionConfig(cfg)
 	bidSvc := NewBidService(bidRepo, auctionRepo, realtime, riskSvc, nil, cfg)
+	bidSvc.SetHammerService(hammerSvc)
 
 	item := domain.Item{SellerID: "u_2001", Title: "Watch", Category: "luxury", ConditionGrade: domain.ConditionNew, Status: domain.ItemStatusReady}
 	if err := itemRepo.Create(ctx, &item); err != nil {
@@ -369,6 +422,7 @@ func newRealtimeAuctionFixtureWithRule(t *testing.T, cfg appconfig.AuctionConfig
 		AuctionType:       domain.AuctionTypeEnglish,
 		StartPrice:        1000,
 		ReservePrice:      reservePrice,
+		CapPrice:          2000,
 		IncrementRule:     rule,
 		AntiSnipingSec:    60,
 		AntiExtendSec:     30,
@@ -381,8 +435,23 @@ func newRealtimeAuctionFixtureWithRule(t *testing.T, cfg appconfig.AuctionConfig
 	if err != nil {
 		t.Fatalf("create auction: %v", err)
 	}
-	if _, err := auctionSvc.Start(ctx, auction.AuctionID, "u_2001", domain.RoleMerchant); err != nil {
+	startEndTime := endTime
+	if !startEndTime.After(now) {
+		startEndTime = now.Add(time.Hour)
+	}
+	if _, err := auctionSvc.StartWithTiming(ctx, auction.AuctionID, "u_2001", domain.RoleMerchant, startTime, startEndTime); err != nil {
 		t.Fatalf("start auction: %v", err)
+	}
+	if !endTime.After(now) {
+		auction.Status = domain.AuctionStatusRunning
+		auction.StartTime = startTime
+		auction.EndTime = endTime
+		if err := auctionRepo.Update(ctx, &auction); err != nil {
+			t.Fatalf("expire auction: %v", err)
+		}
+		if _, err := realtime.InitAuction(ctx, auction, 100); err != nil {
+			t.Fatalf("expire realtime auction: %v", err)
+		}
 	}
 	return realtimeAuctionFixture{auctionID: auction.AuctionID, deposits: depositSvc, bids: bidSvc, hammers: hammerSvc, orders: orderSvc, depositRepo: depositRepo, orderRepo: orderRepo}
 }

@@ -5,9 +5,14 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
 	"aieas_backend/internal/domain"
+	"aieas_backend/internal/infra/observability/tracing"
 	"aieas_backend/internal/service"
+
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 )
 
 type resourcesReadParams struct {
@@ -18,12 +23,37 @@ func (h *Handler) readResource(ctx context.Context, rawURI string, actor service
 	if h.read == nil {
 		return resourceReadResult{}, domain.ErrNotFound
 	}
-	data, err := h.resourceData(ctx, rawURI, actor)
+	uri := strings.TrimSpace(rawURI)
+	ctx, span := tracing.StartSpan(ctx, "mcp.resource.read",
+		attribute.String("mcp.uri", uri),
+		attribute.String("mcp.actor.id", actor.ID),
+		attribute.String("mcp.actor.role", string(actor.Role)),
+	)
+	if traceID != "" {
+		span.SetAttributes(attribute.String("trace.request_id", traceID))
+	}
+	start := time.Now()
+	defer span.End()
+
+	data, err := h.resourceData(ctx, uri, actor)
+	elapsed := time.Since(start)
+	status := "ok"
+	if err != nil {
+		status = mcpStatusFromError(err)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+	}
+	span.SetAttributes(attribute.String("mcp.result", status))
+	if h.metrics != nil {
+		h.metrics.ObserveAgentToolCall("resources/read", status, elapsed)
+	}
 	if err != nil {
 		return resourceReadResult{}, err
 	}
 	text, err := payloadText(traceID, data)
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
 		return resourceReadResult{}, err
 	}
 	return resourceReadResult{Contents: []resourceContent{{

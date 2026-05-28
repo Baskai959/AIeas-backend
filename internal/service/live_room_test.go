@@ -581,7 +581,7 @@ func TestMountAuctionAllowedWhenRoomOffline(t *testing.T) {
 // TestDeactivateWithHammerClosesActiveLot 验证 DeactivateAuction 在有 HammerService 时，
 // 会先通过 Hammer 把 RUNNING 的 lot 关闭（Force=true），再释放房间锁。
 func TestDeactivateWithHammerClosesActiveLot(t *testing.T) {
-	svc, auctionRepo, _, _ := newLiveRoomFixture(t)
+	svc, auctionRepo, _, roomRepo := newLiveRoomFixture(t)
 	ctx := context.Background()
 
 	// 构建完整 HammerService（需要 deposit/order/realtime）
@@ -609,8 +609,10 @@ func TestDeactivateWithHammerClosesActiveLot(t *testing.T) {
 	if _, err := realtime.InitAuction(ctx, a, 100); err != nil {
 		t.Fatalf("init realtime auction: %v", err)
 	}
-	if _, err := svc.ActivateAuction(ctx, room.ID, a.AuctionID, "m_1", domain.RoleMerchant); err != nil {
-		t.Fatalf("activate: %v", err)
+	room.ActiveAuctionID = a.AuctionID
+	room.Status = domain.LiveRoomStatusLive
+	if err := roomRepo.Update(ctx, &room); err != nil {
+		t.Fatalf("mark active room: %v", err)
 	}
 
 	deactivated, err := svc.DeactivateAuction(ctx, room.ID, "m_1", domain.RoleMerchant)
@@ -633,7 +635,7 @@ func TestDeactivateWithHammerClosesActiveLot(t *testing.T) {
 // TestDeactivateNoHammerStillReleasesLock 验证当 HammerService 未注入时，
 // DeactivateAuction 仍然能释放房间锁（兜底路径）。
 func TestDeactivateNoHammerStillReleasesLock(t *testing.T) {
-	svc, auctionRepo, _, _ := newLiveRoomFixture(t)
+	svc, auctionRepo, _, roomRepo := newLiveRoomFixture(t)
 	ctx := context.Background()
 	// 不 SetHammerService — 测试兜底
 
@@ -650,8 +652,10 @@ func TestDeactivateNoHammerStillReleasesLock(t *testing.T) {
 	if err := auctionRepo.Create(ctx, &a); err != nil {
 		t.Fatalf("create auction: %v", err)
 	}
-	if _, err := svc.ActivateAuction(ctx, room.ID, a.AuctionID, "m_1", domain.RoleMerchant); err != nil {
-		t.Fatalf("activate: %v", err)
+	room.ActiveAuctionID = a.AuctionID
+	room.Status = domain.LiveRoomStatusLive
+	if err := roomRepo.Update(ctx, &room); err != nil {
+		t.Fatalf("mark active room: %v", err)
 	}
 
 	deactivated, err := svc.DeactivateAuction(ctx, room.ID, "m_1", domain.RoleMerchant)

@@ -41,6 +41,7 @@
                 "depositAmount": 20000,
                 "incrementRule": {
                   "type": "ladder",
+                  "maxBidSteps": 5,
                   "steps": [
                     {
                       "min": 0,

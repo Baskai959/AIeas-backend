@@ -10,31 +10,65 @@ import (
 	"aieas_backend/internal/repository"
 )
 
+// BlacklistCache 是黑名单查询的缓存层抽象（L1+L2+singleflight）。nil 安全：
+// RiskService 在 cache 为空时直接走 repo。
+type BlacklistCache interface {
+	GetOrLoad(ctx context.Context, userID string, loader func(ctx context.Context) (bool, bool, error)) (bool, error)
+	Invalidate(ctx context.Context, userIDs ...string) error
+}
+
 type RiskService struct {
 	repo      repository.RiskRepository
-	realtime  repository.AuctionRealtimeStore
 	publisher EventPublisher
+	cache     BlacklistCache
 }
 
 func NewRiskService(repo repository.RiskRepository, realtime repository.AuctionRealtimeStore, publisher EventPublisher) *RiskService {
-	if realtime == nil {
-		realtime = repository.NoopRealtimeStore{}
-	}
-	return &RiskService{repo: repo, realtime: realtime, publisher: publisher}
+	// v2 起 RiskService 不再持有 realtime；保留入参签名以兼容现有 wiring（server.go / 测试）。
+	// 黑名单的真源是 MySQL（repo），叠加可选 LayeredCache。
+	_ = realtime
+	return &RiskService{repo: repo, publisher: publisher}
 }
 
+// SetBlacklistCache 注入黑名单缓存层；nil 时回退到直接读 repo。
+func (s *RiskService) SetBlacklistCache(cache BlacklistCache) {
+	if s == nil {
+		return
+	}
+	s.cache = cache
+}
+
+// IsBlacklisted 仅以 MySQL 为唯一真源。失败时采用 fail-open（视为非黑名单）：
+// 黑名单是否决性约束，但读不到时允许出价能避免短暂的 MySQL 抖动直接打挂出价路径。
+// 真正的拒绝由后续 Lua 脚本中的入场/押金等门面共同保证业务正确性。
 func (s *RiskService) IsBlacklisted(ctx context.Context, userID string) (bool, error) {
 	userID = strings.TrimSpace(userID)
 	if userID == "" {
 		return false, domain.ErrInvalidArgument
 	}
-	if s.repo != nil {
-		ok, err := s.repo.IsBlacklisted(ctx, userID, time.Now().UTC())
-		if err != nil || ok {
-			return ok, err
-		}
+	if s.repo == nil {
+		return false, nil
 	}
-	return s.realtime.IsBlacklisted(ctx, userID)
+	if s.cache != nil {
+		ok, err := s.cache.GetOrLoad(ctx, userID, func(loadCtx context.Context) (bool, bool, error) {
+			hit, err := s.repo.IsBlacklisted(loadCtx, userID, time.Now().UTC())
+			if err != nil {
+				return false, false, err
+			}
+			// found=true 时把布尔值缓存到 L1+L2；found=false 触发负缓存（视为 false）。
+			return hit, hit, nil
+		})
+		if err != nil {
+			// 默认放行：缓存层 / repo 故障时不阻断业务。上层 BidService 决定如何上报。
+			return false, nil
+		}
+		return ok, nil
+	}
+	ok, err := s.repo.IsBlacklisted(ctx, userID, time.Now().UTC())
+	if err != nil {
+		return false, nil
+	}
+	return ok, nil
 }
 
 func (s *RiskService) AddBlacklist(ctx context.Context, userID, reason, actorID string, expiresAt *time.Time) error {
@@ -57,7 +91,10 @@ func (s *RiskService) AddBlacklist(ctx context.Context, userID, reason, actorID 
 			return err
 		}
 	}
-	return s.realtime.SetBlacklisted(ctx, userID, true)
+	if s.cache != nil {
+		_ = s.cache.Invalidate(ctx, userID)
+	}
+	return nil
 }
 
 func (s *RiskService) RemoveBlacklist(ctx context.Context, userID string) error {
@@ -70,7 +107,10 @@ func (s *RiskService) RemoveBlacklist(ctx context.Context, userID string) error 
 			return err
 		}
 	}
-	return s.realtime.SetBlacklisted(ctx, userID, false)
+	if s.cache != nil {
+		_ = s.cache.Invalidate(ctx, userID)
+	}
+	return nil
 }
 
 func (s *RiskService) ListBlacklist(ctx context.Context, limit, offset int) ([]domain.Blacklist, error) {

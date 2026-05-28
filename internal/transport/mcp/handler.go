@@ -54,7 +54,7 @@ func (h *Handler) Get(ctx context.Context, c *app.RequestContext) {
 	c.JSON(consts.StatusMethodNotAllowed, rpcResponse{
 		JSONRPC: "2.0",
 		ID:      json.RawMessage("null"),
-		Error:   protocolError(rpcMethodNotFound, "streaming GET is not enabled", traceID, "use POST /mcp for read-only MCP calls"),
+		Error:   protocolError(rpcMethodNotFound, "streaming GET is not enabled", traceID, "use POST /mcp for MCP calls"),
 	})
 }
 

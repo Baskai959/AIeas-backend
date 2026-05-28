@@ -7,7 +7,12 @@ import (
 	"time"
 
 	"aieas_backend/internal/domain"
+	"aieas_backend/internal/infra/observability/metrics"
+	"aieas_backend/internal/infra/observability/tracing"
 	"aieas_backend/internal/repository"
+
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 )
 
 type HammerService struct {
@@ -20,6 +25,8 @@ type HammerService struct {
 	orderID   OrderIDGenerator
 	sessions  *LiveSessionService
 	onClose   func(ctx context.Context, auctionID uint64)
+	metrics   *metrics.Registry
+	hook      *LiveAgentHookService
 }
 
 type OrderIDGenerator interface {
@@ -50,7 +57,57 @@ func (s *HammerService) SetLiveSessionService(sessions *LiveSessionService) {
 	s.sessions = sessions
 }
 
+// SetLiveAgentHookService 注入直播拍卖事件 hook。
+func (s *HammerService) SetLiveAgentHookService(hook *LiveAgentHookService) {
+	s.hook = hook
+}
+
+// SetMetrics 注入观测性 Registry。nil 安全。
+func (s *HammerService) SetMetrics(reg *metrics.Registry) {
+	s.metrics = reg
+}
+
+// Hammer 触发拍卖落槌，根据结果返回 hammer result + 可选成交订单。
+// 包装 hammerInternal 在外层统一打点：result label 取自落槌结果或错误分类。
 func (s *HammerService) Hammer(ctx context.Context, in domain.HammerInput) (domain.HammerResult, *domain.OrderDeal, error) {
+	ctx, span := tracing.StartSpan(ctx, "hammer.close",
+		attribute.Int64("auction.id", int64(in.AuctionID)),
+		attribute.String("hammer.request_id", in.RequestID),
+		attribute.String("actor.id", in.ActorID),
+		attribute.Bool("hammer.force", in.Force),
+	)
+	defer span.End()
+	start := time.Now()
+	result, order, err := s.hammerInternal(ctx, in)
+	elapsed := time.Since(start)
+	span.SetAttributes(
+		attribute.String("auction.status", string(result.Status)),
+		attribute.Bool("hammer.duplicate", result.Duplicate),
+		attribute.Int64("hammer.price", result.Price),
+	)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+	}
+	if s.metrics != nil {
+		switch {
+		case err != nil:
+			s.metrics.ObserveHammer("error", elapsed)
+		case result.Duplicate:
+			s.metrics.IncHammerDuplicate()
+			s.metrics.ObserveHammer("duplicate", elapsed)
+		case result.Status == domain.AuctionStatusClosedWon:
+			s.metrics.ObserveHammer("won", elapsed)
+		case result.Status == domain.AuctionStatusClosedFailed:
+			s.metrics.ObserveHammer("failed", elapsed)
+		default:
+			s.metrics.ObserveHammer("other", elapsed)
+		}
+	}
+	return result, order, err
+}
+
+func (s *HammerService) hammerInternal(ctx context.Context, in domain.HammerInput) (domain.HammerResult, *domain.OrderDeal, error) {
 	in.RequestID = strings.TrimSpace(in.RequestID)
 	if in.RequestID == "" {
 		in.RequestID = "hammer-" + strconvFormatTime(time.Now().UTC())
@@ -189,6 +246,9 @@ func (s *HammerService) Hammer(ctx context.Context, in domain.HammerInput) (doma
 		payload["orderId"] = order.ID
 	}
 	broadcastJSON(s.publisher, result.AuctionID, "auction.closed", payload)
+	if s.hook != nil && result.Status == domain.AuctionStatusClosedWon && auction.LiveRoomID != 0 {
+		s.hook.EmitHammerWon(ctx, auction.SellerID, auction.LiveRoomID, auction.AuctionID, result.Price)
+	}
 	if s.onClose != nil {
 		s.onClose(ctx, result.AuctionID)
 	}

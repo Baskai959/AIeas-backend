@@ -47,6 +47,7 @@ func TestAuctionServiceCreateGeneratesAuctionID(t *testing.T) {
 		ItemID:        item.ID,
 		StartPrice:    1000,
 		ReservePrice:  5000,
+		CapPrice:      6000,
 		Status:        domain.AuctionStatusPendingAudit,
 		StartTime:     start,
 		EndTime:       start.Add(time.Hour),
@@ -95,6 +96,7 @@ func TestAuctionServiceCreatePreservesProvidedAuctionID(t *testing.T) {
 		ItemID:        item.ID,
 		StartPrice:    1000,
 		ReservePrice:  5000,
+		CapPrice:      6000,
 		Status:        domain.AuctionStatusPendingAudit,
 		StartTime:     start,
 		EndTime:       start.Add(time.Hour),
@@ -106,6 +108,58 @@ func TestAuctionServiceCreatePreservesProvidedAuctionID(t *testing.T) {
 	}
 	if auction.AuctionID != 987654321 {
 		t.Fatalf("expected provided auction ID, got %d", auction.AuctionID)
+	}
+}
+
+func TestAuctionServiceCreateAllowsOptionalTiming(t *testing.T) {
+	ctx := context.Background()
+	itemRepo := repository.NewMemoryItemRepository()
+	auctionRepo := repository.NewMemoryAuctionRepository()
+	svc := NewAuctionService(auctionRepo, itemRepo, repository.NoopTxManager{})
+
+	item := domain.Item{SellerID: "u_2001", Title: "Watch", Category: "luxury", ConditionGrade: domain.ConditionNew, Status: domain.ItemStatusReady}
+	if err := itemRepo.Create(ctx, &item); err != nil {
+		t.Fatalf("create item: %v", err)
+	}
+
+	auction, err := svc.Create(ctx, CreateAuctionInput{
+		ActorID:       "u_2001",
+		ActorRole:     domain.RoleMerchant,
+		ItemID:        item.ID,
+		StartPrice:    1000,
+		ReservePrice:  5000,
+		CapPrice:      6000,
+		Status:        domain.AuctionStatusPendingAudit,
+		AuctionType:   domain.AuctionTypeEnglish,
+		DepositAmount: 100,
+		DurationSec:   600,
+	})
+	if err != nil {
+		t.Fatalf("create auction without start/end: %v", err)
+	}
+	if !auction.StartTime.IsZero() || !auction.EndTime.IsZero() || auction.DurationSec != 600 {
+		t.Fatalf("expected optional schedule to remain unset with stored duration, got %+v", auction)
+	}
+
+	start := time.Now().UTC().Add(time.Hour)
+	scheduled, err := svc.Create(ctx, CreateAuctionInput{
+		ActorID:       "u_2001",
+		ActorRole:     domain.RoleMerchant,
+		ItemID:        item.ID,
+		StartPrice:    1000,
+		ReservePrice:  5000,
+		CapPrice:      6000,
+		Status:        domain.AuctionStatusPendingAudit,
+		StartTime:     start,
+		DurationSec:   300,
+		AuctionType:   domain.AuctionTypeEnglish,
+		DepositAmount: 100,
+	})
+	if err != nil {
+		t.Fatalf("create scheduled auction: %v", err)
+	}
+	if !scheduled.EndTime.Equal(start.Add(300 * time.Second)) {
+		t.Fatalf("expected end time derived from duration, got %s", scheduled.EndTime)
 	}
 }
 
@@ -127,6 +181,7 @@ func TestAuctionServiceCreateRejectsApprovedStatus(t *testing.T) {
 		ItemID:        item.ID,
 		StartPrice:    1000,
 		ReservePrice:  5000,
+		CapPrice:      6000,
 		Status:        domain.AuctionStatusReady,
 		StartTime:     start,
 		EndTime:       start.Add(time.Hour),
@@ -156,6 +211,7 @@ func TestAuctionServiceUpdateRejectsApprovedStatusOutsideAudit(t *testing.T) {
 		ItemID:        item.ID,
 		StartPrice:    1000,
 		ReservePrice:  5000,
+		CapPrice:      6000,
 		Status:        domain.AuctionStatusPendingAudit,
 		StartTime:     start,
 		EndTime:       start.Add(time.Hour),

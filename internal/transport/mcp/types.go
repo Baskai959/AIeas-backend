@@ -3,23 +3,42 @@ package mcp
 import (
 	"encoding/json"
 
+	"aieas_backend/internal/infra/observability/metrics"
 	"aieas_backend/internal/service"
 )
 
 const (
 	protocolVersion = "2025-06-18"
-	serverName      = "aieas-readonly-mcp"
-	serverVersion   = "1.0.0"
-	schemaVersion   = "aieas.mcp.readonly.v1"
+	serverName      = "aieas-live-control-mcp"
+	serverVersion   = "1.1.0"
+	schemaVersion   = "aieas.mcp.live-control.v1"
 )
 
 type Handler struct {
-	auth *service.AuthService
-	read *service.MCPReadService
+	read     *service.MCPReadService
+	control  *service.MCPControlService
+	apiKey   string
+	apiActor service.MCPActor
+	metrics  *metrics.Registry
 }
 
-func NewHandler(auth *service.AuthService, read *service.MCPReadService) *Handler {
-	return &Handler{auth: auth, read: read}
+type APIKeyAuthConfig struct {
+	APIKey string
+	Actor  service.MCPActor
+}
+
+func NewHandler(read *service.MCPReadService, control *service.MCPControlService, auth APIKeyAuthConfig) *Handler {
+	return &Handler{read: read, control: control, apiKey: auth.APIKey, apiActor: auth.Actor, metrics: metrics.Default()}
+}
+
+// SetMetrics 注入业务指标 Registry，用于上报 MCP tool/resource 调用情况。
+// 传入 nil 时回退到 noop，确保 handler 在未启用 metrics 时仍可使用。
+func (h *Handler) SetMetrics(reg *metrics.Registry) {
+	if reg == nil {
+		h.metrics = metrics.Default()
+		return
+	}
+	h.metrics = reg
 }
 
 type rpcRequest struct {

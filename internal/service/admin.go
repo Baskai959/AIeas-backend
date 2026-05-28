@@ -10,16 +10,21 @@ import (
 )
 
 type AdminService struct {
-	users    repository.UserRepository
-	auctions *AuctionService
-	hammers  *HammerService
-	orders   *OrderService
-	risk     *RiskService
-	audits   repository.AuditRepository
+	users     repository.UserRepository
+	auctions  *AuctionService
+	hammers   *HammerService
+	orders    *OrderService
+	risk      *RiskService
+	audits    repository.AuditRepository
+	dashboard repository.AdminDashboardRepository
 }
 
 func NewAdminService(users repository.UserRepository, auctions *AuctionService, hammers *HammerService, orders *OrderService, risk *RiskService, audits repository.AuditRepository) *AdminService {
 	return &AdminService{users: users, auctions: auctions, hammers: hammers, orders: orders, risk: risk, audits: audits}
+}
+
+func (s *AdminService) SetDashboardRepository(repo repository.AdminDashboardRepository) {
+	s.dashboard = repo
 }
 
 func (s *AdminService) ListAuctions(ctx context.Context, filter domain.AuctionFilter) ([]domain.AuctionLot, error) {
@@ -96,4 +101,50 @@ func (s *AdminService) ListRiskEvents(ctx context.Context, filter domain.RiskEve
 
 func (s *AdminService) HandleRiskEvent(ctx context.Context, eventID uint64, status domain.RiskEventStatus, actorID string) (domain.RiskEvent, error) {
 	return s.risk.HandleEvent(ctx, eventID, status, actorID)
+}
+
+func (s *AdminService) DashboardMetrics(ctx context.Context, startTime, endTime *time.Time, bucket string) (domain.AdminDashboardMetrics, error) {
+	if s.dashboard == nil {
+		return domain.AdminDashboardMetrics{}, domain.ErrInvalidState
+	}
+	filter, err := normalizeDashboardMetricsFilter(startTime, endTime, bucket)
+	if err != nil {
+		return domain.AdminDashboardMetrics{}, err
+	}
+	return s.dashboard.DashboardMetrics(ctx, filter)
+}
+
+func normalizeDashboardMetricsFilter(startTime, endTime *time.Time, bucket string) (domain.AdminDashboardMetricsFilter, error) {
+	const (
+		defaultRange = 24 * time.Hour
+		maxRange     = 90 * 24 * time.Hour
+	)
+	now := time.Now().UTC()
+	end := now
+	if endTime != nil {
+		end = endTime.UTC()
+	}
+	start := end.Add(-defaultRange)
+	if startTime != nil {
+		start = startTime.UTC()
+	}
+	if !start.Before(end) {
+		return domain.AdminDashboardMetricsFilter{}, domain.ErrInvalidArgument
+	}
+	if end.Sub(start) > maxRange {
+		return domain.AdminDashboardMetricsFilter{}, domain.ErrInvalidArgument
+	}
+	bucket = strings.ToLower(strings.TrimSpace(bucket))
+	switch bucket {
+	case "":
+		if end.Sub(start) <= 72*time.Hour {
+			bucket = "hour"
+		} else {
+			bucket = "day"
+		}
+	case "hour", "day":
+	default:
+		return domain.AdminDashboardMetricsFilter{}, domain.ErrInvalidArgument
+	}
+	return domain.AdminDashboardMetricsFilter{StartTime: start, EndTime: end, Bucket: bucket}, nil
 }

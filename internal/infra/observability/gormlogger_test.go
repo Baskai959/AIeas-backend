@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	gormlogger "gorm.io/gorm/logger"
 )
 
@@ -142,5 +143,56 @@ func TestGormSlogLogger_LogModeSilentSuppresses(t *testing.T) {
 	)
 	if buf.Len() != 0 {
 		t.Fatalf("silent mode should suppress output, got %q", buf.String())
+	}
+}
+
+// TestGormSlogLogger_TraceContextInjectsTraceID 验证 G7：当 ctx 中带有 active
+// span 时，gormlogger 输出（经过 WithTraceContext 装饰）会注入 trace_id /
+// span_id 字段，方便日志与 trace 串联。
+func TestGormSlogLogger_TraceContextInjectsTraceID(t *testing.T) {
+	buf := &bytes.Buffer{}
+	jsonHandler := slog.NewJSONHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug})
+	base := slog.New(WithTraceContext(jsonHandler))
+	logger := NewGormLogger(base, 200*time.Millisecond, true).LogMode(gormlogger.Info)
+
+	tp := sdktrace.NewTracerProvider()
+	defer func() { _ = tp.Shutdown(context.Background()) }()
+	ctx, span := tp.Tracer("aieas_backend.test").Start(context.Background(), "select-test")
+	defer span.End()
+
+	logger.Trace(ctx, time.Now().Add(-5*time.Millisecond),
+		func() (string, int64) { return "SELECT 1", 1 },
+		nil,
+	)
+
+	got := decodeOnly(t, buf)
+	traceID, ok := got["trace_id"].(string)
+	if !ok || traceID == "" {
+		t.Fatalf("expected trace_id in JSON output, got %v", got["trace_id"])
+	}
+	if traceID != span.SpanContext().TraceID().String() {
+		t.Fatalf("trace_id mismatch: got %q want %q", traceID, span.SpanContext().TraceID().String())
+	}
+	spanID, ok := got["span_id"].(string)
+	if !ok || spanID == "" {
+		t.Fatalf("expected span_id in JSON output, got %v", got["span_id"])
+	}
+}
+
+// TestGormSlogLogger_TraceContextOmitsTraceIDWithoutSpan 验证无 span 时不写入
+// 空 trace_id（避免污染日志）。
+func TestGormSlogLogger_TraceContextOmitsTraceIDWithoutSpan(t *testing.T) {
+	buf := &bytes.Buffer{}
+	jsonHandler := slog.NewJSONHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug})
+	base := slog.New(WithTraceContext(jsonHandler))
+	logger := NewGormLogger(base, 200*time.Millisecond, true).LogMode(gormlogger.Info)
+
+	logger.Trace(context.Background(), time.Now().Add(-5*time.Millisecond),
+		func() (string, int64) { return "SELECT 1", 1 },
+		nil,
+	)
+	got := decodeOnly(t, buf)
+	if _, ok := got["trace_id"]; ok {
+		t.Fatalf("expected no trace_id without active span, got %v", got["trace_id"])
 	}
 }

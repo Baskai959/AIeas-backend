@@ -1,0 +1,474 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "管理员业务统计接口",
+    "version": "1.0.0",
+    "description": "管理员监控看板使用的强业务统计接口。数据直接来自业务库聚合，不依赖 Prometheus。"
+  },
+  "servers": [
+    {
+      "url": "http://localhost:8888",
+      "description": "本地开发环境"
+    }
+  ],
+  "paths": {
+    "/api/v1/admin/dashboard/metrics": {
+      "get": {
+        "summary": "获取管理员业务统计",
+        "description": "按时间范围返回成交、支付、拍品、订单、直播场次、出价、风控等业务统计。仅 admin 角色可访问。",
+        "operationId": "adminGetDashboardMetrics",
+        "tags": [
+          "Admin Dashboard"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "startTime",
+            "in": "query",
+            "required": false,
+            "description": "统计开始时间，RFC3339 格式。为空时默认为 endTime 往前 24 小时。",
+            "schema": {
+              "type": "string",
+              "format": "date-time",
+              "example": "2026-05-27T00:00:00+08:00"
+            }
+          },
+          {
+            "name": "endTime",
+            "in": "query",
+            "required": false,
+            "description": "统计结束时间，RFC3339 格式。为空时默认为当前时间。",
+            "schema": {
+              "type": "string",
+              "format": "date-time",
+              "example": "2026-05-27T23:59:59+08:00"
+            }
+          },
+          {
+            "name": "bucket",
+            "in": "query",
+            "required": false,
+            "description": "趋势聚合粒度。为空时服务端按范围自动选择：72 小时内为 hour，否则为 day。",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "hour",
+                "day"
+              ],
+              "example": "hour"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "统计成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminDashboardMetricsResponse"
+                },
+                "example": {
+                  "code": 0,
+                  "message": "success",
+                  "data": {
+                    "startTime": "2026-05-26T16:00:00Z",
+                    "endTime": "2026-05-27T15:59:59Z",
+                    "bucket": "hour",
+                    "generatedAt": "2026-05-27T16:00:05Z",
+                    "summary": {
+                      "dealGmvCent": 986000,
+                      "paidGmvCent": 912000,
+                      "orderCreatedCount": 96,
+                      "paidOrderCount": 88,
+                      "unpaidOrderCount": 8,
+                      "timeoutOrderCount": 2,
+                      "cancelledOrderCount": 1,
+                      "auctionCreatedCount": 42,
+                      "closedWonAuctionCount": 31,
+                      "closedFailedAuctionCount": 6,
+                      "liveSessionCount": 5,
+                      "lotsTotal": 58,
+                      "lotsSold": 31,
+                      "lotsUnsold": 6,
+                      "bidCount": 720,
+                      "activeBidderCount": 156,
+                      "riskEventCount": 3,
+                      "viewerPeak": 420,
+                      "viewerTotal": 2800
+                    },
+                    "current": {
+                      "liveRoomCount": 12,
+                      "liveRoomLiveCount": 4,
+                      "runningAuctionCount": 2,
+                      "activeLiveSessionCount": 4,
+                      "pendingRiskEventCount": 1
+                    },
+                    "breakdowns": {
+                      "auctionStatus": [
+                        {
+                          "status": "CLOSED_WON",
+                          "count": 31
+                        }
+                      ],
+                      "orderStatus": [
+                        {
+                          "status": "PAID",
+                          "count": 88
+                        }
+                      ],
+                      "payStatus": [
+                        {
+                          "status": "PAID",
+                          "count": 88
+                        }
+                      ],
+                      "riskStatus": [
+                        {
+                          "status": "PENDING",
+                          "count": 1
+                        }
+                      ]
+                    },
+                    "trend": [
+                      {
+                        "bucketStart": "2026-05-27T08:00:00Z",
+                        "dealGmvCent": 120000,
+                        "paidGmvCent": 96000,
+                        "paidOrderCount": 8,
+                        "bidCount": 65,
+                        "riskEventCount": 0
+                      }
+                    ]
+                  },
+                  "trace_id": "req_1780000000000000000"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "参数不合法，例如时间格式错误、startTime 不早于 endTime、范围超过 90 天或 bucket 非法",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "缺少或无效访问令牌",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "非管理员角色访问",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT"
+      }
+    },
+    "schemas": {
+      "AdminDashboardMetricsResponse": {
+        "type": "object",
+        "required": [
+          "code",
+          "message",
+          "data",
+          "trace_id"
+        ],
+        "properties": {
+          "code": {
+            "type": "integer",
+            "example": 0
+          },
+          "message": {
+            "type": "string",
+            "example": "success"
+          },
+          "data": {
+            "$ref": "#/components/schemas/AdminDashboardMetrics"
+          },
+          "trace_id": {
+            "type": "string",
+            "example": "req_1780000000000000000"
+          }
+        }
+      },
+      "AdminDashboardMetrics": {
+        "type": "object",
+        "required": [
+          "startTime",
+          "endTime",
+          "bucket",
+          "generatedAt",
+          "summary",
+          "current",
+          "breakdowns",
+          "trend"
+        ],
+        "properties": {
+          "startTime": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "endTime": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "bucket": {
+            "type": "string",
+            "enum": [
+              "hour",
+              "day"
+            ]
+          },
+          "generatedAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "summary": {
+            "$ref": "#/components/schemas/AdminDashboardSummary"
+          },
+          "current": {
+            "$ref": "#/components/schemas/AdminDashboardCurrent"
+          },
+          "breakdowns": {
+            "$ref": "#/components/schemas/AdminDashboardBreakdowns"
+          },
+          "trend": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AdminDashboardTrendPoint"
+            }
+          }
+        }
+      },
+      "AdminDashboardSummary": {
+        "type": "object",
+        "properties": {
+          "dealGmvCent": {
+            "type": "integer",
+            "format": "int64",
+            "description": "统计范围内 CLOSED_WON 拍品成交价合计，单位分。"
+          },
+          "paidGmvCent": {
+            "type": "integer",
+            "format": "int64",
+            "description": "统计范围内已支付订单金额合计，单位分。"
+          },
+          "orderCreatedCount": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "paidOrderCount": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "unpaidOrderCount": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "timeoutOrderCount": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "cancelledOrderCount": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "auctionCreatedCount": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "closedWonAuctionCount": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "closedFailedAuctionCount": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "liveSessionCount": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "lotsTotal": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "lotsSold": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "lotsUnsold": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "bidCount": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "activeBidderCount": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "riskEventCount": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "viewerPeak": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "viewerTotal": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
+      "AdminDashboardCurrent": {
+        "type": "object",
+        "properties": {
+          "liveRoomCount": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "liveRoomLiveCount": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "runningAuctionCount": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "activeLiveSessionCount": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "pendingRiskEventCount": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
+      "AdminDashboardBreakdowns": {
+        "type": "object",
+        "properties": {
+          "auctionStatus": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AdminStatusCount"
+            }
+          },
+          "orderStatus": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AdminStatusCount"
+            }
+          },
+          "payStatus": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AdminStatusCount"
+            }
+          },
+          "riskStatus": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AdminStatusCount"
+            }
+          }
+        }
+      },
+      "AdminStatusCount": {
+        "type": "object",
+        "required": [
+          "status",
+          "count"
+        ],
+        "properties": {
+          "status": {
+            "type": "string"
+          },
+          "count": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
+      "AdminDashboardTrendPoint": {
+        "type": "object",
+        "properties": {
+          "bucketStart": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "dealGmvCent": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "paidGmvCent": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "paidOrderCount": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "bidCount": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "riskEventCount": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
+      "ErrorResponse": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "integer",
+            "example": 20001
+          },
+          "message": {
+            "type": "string",
+            "example": "参数不合法"
+          },
+          "data": {
+            "nullable": true
+          },
+          "trace_id": {
+            "type": "string",
+            "example": "req_1780000000000000000"
+          }
+        }
+      }
+    }
+  }
+}

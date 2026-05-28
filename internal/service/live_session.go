@@ -20,6 +20,7 @@ type LiveSessionService struct {
 	orders   repository.OrderRepository
 	realtime repository.LiveSessionRealtimeStore
 	onEnded  func(ctx context.Context, session domain.LiveSession)
+	hook     *LiveAgentHookService
 
 	mu sync.Mutex // 保护场次开关与闭播计数 flush 的临界区
 }
@@ -45,6 +46,14 @@ func (s *LiveSessionService) SetRealtimeStore(rt repository.LiveSessionRealtimeS
 		return
 	}
 	s.realtime = rt
+}
+
+// SetLiveAgentHookService 注入直播拍卖事件 hook。
+func (s *LiveSessionService) SetLiveAgentHookService(hook *LiveAgentHookService) {
+	if s == nil {
+		return
+	}
+	s.hook = hook
 }
 
 // SetOnEnded 注入场次闭播完成后的回调（典型用法是 Hub.BroadcastSessionEnd）。
@@ -86,6 +95,9 @@ func (s *LiveSessionService) OpenSession(ctx context.Context, roomID uint64, mer
 	}
 	if err := s.sessions.Create(ctx, &session); err != nil {
 		return domain.LiveSession{}, err
+	}
+	if s.hook != nil {
+		s.hook.EmitLiveStarted(ctx, session.MerchantID, session.LiveRoomID, session.ID)
 	}
 	return session, nil
 }

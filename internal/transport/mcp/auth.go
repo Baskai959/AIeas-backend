@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"crypto/subtle"
 	"strings"
 
 	"aieas_backend/internal/domain"
@@ -10,28 +11,18 @@ import (
 )
 
 func (h *Handler) actorFromRequest(c *app.RequestContext) (service.MCPActor, error) {
-	if h.auth == nil {
+	if strings.TrimSpace(h.apiKey) == "" {
 		return service.MCPActor{}, domain.ErrTokenInvalid
 	}
-	authHeader := strings.TrimSpace(string(c.GetHeader("Authorization")))
-	if authHeader == "" {
+	provided := strings.TrimSpace(string(c.GetHeader("X-API-Key")))
+	if provided == "" {
 		return service.MCPActor{}, domain.ErrTokenMissing
 	}
-	const prefix = "Bearer "
-	if !strings.HasPrefix(authHeader, prefix) {
+	if subtle.ConstantTimeCompare([]byte(provided), []byte(h.apiKey)) != 1 {
 		return service.MCPActor{}, domain.ErrTokenInvalid
 	}
-	token := strings.TrimSpace(strings.TrimPrefix(authHeader, prefix))
-	if token == "" {
-		return service.MCPActor{}, domain.ErrTokenMissing
-	}
-	claims, err := h.auth.ParseAccessToken(token)
-	if err != nil {
-		return service.MCPActor{}, err
-	}
-	role := domain.Role(claims.Role)
-	if claims.Subject == "" || !role.Valid() {
+	if strings.TrimSpace(h.apiActor.ID) == "" || !h.apiActor.Role.Valid() {
 		return service.MCPActor{}, domain.ErrTokenInvalid
 	}
-	return service.MCPActor{ID: claims.Subject, Role: role}, nil
+	return h.apiActor, nil
 }

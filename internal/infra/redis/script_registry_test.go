@@ -20,9 +20,6 @@ func TestKeyBuilder(t *testing.T) {
 	if got := keys.AuctionEnrolled(10001); got != "app:auction:10001:enrolled" {
 		t.Fatalf("unexpected enrolled key %q", got)
 	}
-	if got := keys.UserBlacklist(); got != "app:risk:blacklist:user" {
-		t.Fatalf("unexpected blacklist key %q", got)
-	}
 	if got := keys.AuctionSeq(10001); got != "app:auction:10001:seq" {
 		t.Fatalf("unexpected seq key %q", got)
 	}

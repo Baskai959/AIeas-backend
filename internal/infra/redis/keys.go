@@ -89,10 +89,6 @@ func (b KeyBuilder) BidFrequency(userID string, auctionID uint64) string {
 	return b.key("risk:freq:bid:%s:%d", userID, auctionID)
 }
 
-func (b KeyBuilder) UserBlacklist() string {
-	return b.key("risk:blacklist:user")
-}
-
 func (b KeyBuilder) ConfigItem(configKey string) string {
 	return b.key("config:item:%s", configKey)
 }

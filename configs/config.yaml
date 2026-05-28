@@ -11,11 +11,29 @@ mysql:
   connMaxLifetime: 1h
 
 redis:
-  addr: "127.0.0.1:6379"
-  username: "default"
-  password: ""
-  db: 0
-  poolSize: 100
+  # RT 实例：实时路径（拍卖状态/出价/Stream/锁/在线计数等强一致+低延迟操作）。
+  # 多 shard 时由应用层按聚合根（auctionID/sessionID/roomID）的 fnv32 哈希
+  # 路由到单个 shard，保证同一聚合根的所有 key 落同 shard，满足 Lua EVAL 与
+  # multi-key 命令的同 slot 约束。全局 key（如 ws:instances）固定到 shard 0。
+  rt:
+    shards:
+      - addr: "127.0.0.1:6381"
+        username: "default"
+        password: ""
+        db: 0
+        poolSize: 100
+      - addr: "127.0.0.1:6382"
+        username: "default"
+        password: ""
+        db: 0
+        poolSize: 100
+  # Cache 实例：查询缓存层（L2 + 幂等记录等可丢失/可重建数据）。
+  cache:
+    addr: "127.0.0.1:6380"
+    username: "default"
+    password: ""
+    db: 0
+    poolSize: 100
 
 idempotency:
   ttl: 24h
@@ -55,12 +73,49 @@ objectStorage:
 agent:
   productDescriptionURL: "http://127.0.0.1:8000/api/v1/product-description"
   productAuditURL: "http://127.0.0.1:8000/api/v1/product-audit"
+  liveAnalysisURL: "http://127.0.0.1:8000/api/v1/live-analysis/async"
+  liveAnalysisCallbackURL: "http://127.0.0.1:8888/api/v1/live-analysis/callback"
+  liveAnalysisCallbackAPIKey: "change-me-in-local-dev-live-analysis-callback"
+  liveAuctionHookURL: ""
+  liveAuctionHookAPIKey: ""
   timeout: 30s
+
+mcp:
+  apiKey: "change-me-in-local-dev-mcp"
+  actorID: "u_9001"
+  actorRole: "admin"
 
 observability:
   logLevel: "dev"
+  # 兼容历史字段；新部署请使用 metrics.path
   metricsPath: "/metrics"
   # format: text → 控制台彩色对齐文本 (dev)；json → 一行一条 JSON (prod)
   format: "text"
   # GORM 慢 SQL 阈值（毫秒），<=0 关闭慢 SQL 检测
   slowSQLThresholdMs: 200
+
+  # Prometheus /metrics 端点。
+  # path 为空时回退到上面的 metricsPath。
+  # authToken 非空时要求请求带 Authorization: Bearer <token> 或 X-Metrics-Token: <token>。
+  metrics:
+    enabled: true
+    path: "/metrics"
+    namespace: "aieas"
+    authToken: ""
+
+  # OpenTelemetry trace 链路（默认禁用）。
+  # exporter: otlphttp | otlpgrpc | stdout | noop
+  # sampler:  always_on | always_off | traceidratio | parent_based_always_on | parent_based_traceid_ratio
+  tracing:
+    enabled: false
+    exporter: "otlphttp"
+    endpoint: ""
+    insecure: true
+    serviceName: "aieas-backend"
+    sampler: "parent_based_traceid_ratio"
+    sampleRatio: 1.0
+
+  # 健康检查端点路径。
+  health:
+    livenessPath: "/healthz"
+    readinessPath: "/readyz"

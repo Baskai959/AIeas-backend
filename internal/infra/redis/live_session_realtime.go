@@ -16,13 +16,16 @@ import (
 //	lots_total / lots_sold / lots_unsold / bid_count / gmv_cent / viewer_total
 //
 // viewer_peak 单独放 STRING key live_session:%d:viewer_peak，使用 Lua CAS 取 max。
+//
+// v2 起按 sessionID 走分片：所有 live_session:<id>:* 落到 ForSession(id) 的 shard，
+// 同一场次的计数 / 峰值在同一 shard 上原子可见。
 type LiveSessionRealtimeStore struct {
-	client *redisgo.Client
-	keys   KeyBuilder
+	sharded *ShardedRTClient
+	keys    KeyBuilder
 }
 
-func NewLiveSessionRealtimeStore(client *redisgo.Client, keys KeyBuilder) *LiveSessionRealtimeStore {
-	return &LiveSessionRealtimeStore{client: client, keys: keys}
+func NewLiveSessionRealtimeStore(sharded *ShardedRTClient, keys KeyBuilder) *LiveSessionRealtimeStore {
+	return &LiveSessionRealtimeStore{sharded: sharded, keys: keys}
 }
 
 const liveSessionViewerPeakLua = `
@@ -35,13 +38,24 @@ end
 return cur
 `
 
+func (s *LiveSessionRealtimeStore) shardForSession(sessionID uint64) *RedisRTClient {
+	if s == nil || s.sharded == nil {
+		return nil
+	}
+	return s.sharded.ForSession(sessionID)
+}
+
 // IncrCounters 对场次计数 HASH 多字段做 HINCRBY；零字段跳过。
 func (s *LiveSessionRealtimeStore) IncrCounters(ctx context.Context, sessionID uint64, c domain.LiveSessionCounters) error {
-	if s == nil || s.client == nil || sessionID == 0 {
+	if s == nil || s.sharded == nil || sessionID == 0 {
+		return nil
+	}
+	client := s.shardForSession(sessionID)
+	if client == nil {
 		return nil
 	}
 	key := s.keys.LiveSessionCounters(sessionID)
-	pipe := s.client.Pipeline()
+	pipe := client.Pipeline()
 	wrote := false
 	if c.LotsTotalDelta != 0 {
 		pipe.HIncrBy(ctx, key, "lots_total", int64(c.LotsTotalDelta))
@@ -76,11 +90,15 @@ func (s *LiveSessionRealtimeStore) IncrCounters(ctx context.Context, sessionID u
 
 // BumpViewerPeak 通过 Lua CAS 把 viewer_peak 推高到 max(cur, value)，并返回最新值。
 func (s *LiveSessionRealtimeStore) BumpViewerPeak(ctx context.Context, sessionID uint64, value int) (int, error) {
-	if s == nil || s.client == nil || sessionID == 0 {
+	if s == nil || s.sharded == nil || sessionID == 0 {
+		return 0, nil
+	}
+	client := s.shardForSession(sessionID)
+	if client == nil {
 		return 0, nil
 	}
 	key := s.keys.LiveSessionViewerPeak(sessionID)
-	res, err := s.client.Eval(ctx, liveSessionViewerPeakLua, []string{key}, value).Result()
+	res, err := client.Eval(ctx, liveSessionViewerPeakLua, []string{key}, value).Result()
 	if err != nil {
 		return 0, err
 	}
@@ -100,10 +118,14 @@ func (s *LiveSessionRealtimeStore) BumpViewerPeak(ctx context.Context, sessionID
 
 // LoadCounters 读取计数 HASH 与 viewer_peak 的当前值。
 func (s *LiveSessionRealtimeStore) LoadCounters(ctx context.Context, sessionID uint64) (domain.LiveSessionCounters, int, error) {
-	if s == nil || s.client == nil || sessionID == 0 {
+	if s == nil || s.sharded == nil || sessionID == 0 {
 		return domain.LiveSessionCounters{}, 0, nil
 	}
-	values, err := s.client.HGetAll(ctx, s.keys.LiveSessionCounters(sessionID)).Result()
+	client := s.shardForSession(sessionID)
+	if client == nil {
+		return domain.LiveSessionCounters{}, 0, nil
+	}
+	values, err := client.HGetAll(ctx, s.keys.LiveSessionCounters(sessionID)).Result()
 	if err != nil {
 		return domain.LiveSessionCounters{}, 0, err
 	}
@@ -115,7 +137,7 @@ func (s *LiveSessionRealtimeStore) LoadCounters(ctx context.Context, sessionID u
 		GMVCentDelta:    parseInt(values["gmv_cent"], 0),
 		ViewerTotalAdd:  int(parseInt(values["viewer_total"], 0)),
 	}
-	peakRaw, err := s.client.Get(ctx, s.keys.LiveSessionViewerPeak(sessionID)).Result()
+	peakRaw, err := client.Get(ctx, s.keys.LiveSessionViewerPeak(sessionID)).Result()
 	if err != nil && err != redisgo.Nil {
 		return counters, 0, err
 	}
@@ -125,10 +147,14 @@ func (s *LiveSessionRealtimeStore) LoadCounters(ctx context.Context, sessionID u
 
 // Reset 在场次关闭后清理 redis key。
 func (s *LiveSessionRealtimeStore) Reset(ctx context.Context, sessionID uint64) error {
-	if s == nil || s.client == nil || sessionID == 0 {
+	if s == nil || s.sharded == nil || sessionID == 0 {
 		return nil
 	}
-	return s.client.Del(ctx,
+	client := s.shardForSession(sessionID)
+	if client == nil {
+		return nil
+	}
+	return client.Del(ctx,
 		s.keys.LiveSessionCounters(sessionID),
 		s.keys.LiveSessionViewerPeak(sessionID),
 	).Err()

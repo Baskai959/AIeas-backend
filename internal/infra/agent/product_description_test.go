@@ -1,0 +1,100 @@
+package agent
+
+import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	appconfig "aieas_backend/internal/config"
+	"aieas_backend/internal/service"
+)
+
+func TestLiveAnalysisClientRequestsAsyncReport(t *testing.T) {
+	var gotReq struct {
+		Prompt          string                 `json:"prompt"`
+		CallbackURL     string                 `json:"callback_url"`
+		CallbackHeaders map[string]string      `json:"callback_headers"`
+		CallbackContext map[string]interface{} `json:"callback_context"`
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Fatalf("expected POST, got %s", r.Method)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&gotReq); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"success":true,"request_id":"agent-1","status":"ACCEPTED","message":"直播总结任务已受理，完成后将通过 callback_url 回调。"}`))
+	}))
+	defer server.Close()
+
+	client := NewLiveAnalysisClient(appconfig.AgentConfig{LiveAnalysisURL: server.URL, Timeout: appconfig.Duration(time.Second)})
+	got, err := client.RequestLiveAnalysis(t.Context(), service.LiveAnalysisAsyncInput{
+		Prompt:      "帮我总结商家id为u_2001最近一场直播情况。",
+		CallbackURL: "http://backend/api/v1/live-analysis/callback",
+		CallbackHeaders: map[string]string{
+			"X-Callback-Key": "callback-key",
+		},
+		CallbackContext: map[string]interface{}{
+			"taskId": "lar_1",
+		},
+	})
+	if err != nil {
+		t.Fatalf("request live analysis: %v", err)
+	}
+	if got.RequestID != "agent-1" || got.Status != "ACCEPTED" {
+		t.Fatalf("unexpected accepted result: %+v", got)
+	}
+	if gotReq.Prompt != "帮我总结商家id为u_2001最近一场直播情况。" ||
+		gotReq.CallbackURL != "http://backend/api/v1/live-analysis/callback" ||
+		gotReq.CallbackHeaders["X-Callback-Key"] != "callback-key" ||
+		gotReq.CallbackContext["taskId"] != "lar_1" {
+		t.Fatalf("unexpected request payload: %+v", gotReq)
+	}
+}
+
+func TestLiveAnalysisClientReturnsAsyncAgentErrorMessage(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"success":false,"request_id":"","status":"FAILED","message":"模型服务超时"}`))
+	}))
+	defer server.Close()
+
+	client := NewLiveAnalysisClient(appconfig.AgentConfig{LiveAnalysisURL: server.URL, Timeout: appconfig.Duration(time.Second)})
+	if _, err := client.RequestLiveAnalysis(t.Context(), service.LiveAnalysisAsyncInput{Prompt: "prompt", CallbackURL: "http://backend/callback"}); err == nil || !strings.Contains(err.Error(), "模型服务超时") {
+		t.Fatal("expected agent error")
+	}
+}
+
+func TestLiveAuctionHookClientPostsMessage(t *testing.T) {
+	var gotMessage string
+	var gotKey string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotKey = r.Header.Get("X-Agent-Hook-Key")
+		var req struct {
+			Message string `json:"message"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode hook request: %v", err)
+		}
+		gotMessage = req.Message
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"success":true}`))
+	}))
+	defer server.Close()
+
+	client := NewLiveAuctionHookClient(appconfig.AgentConfig{
+		LiveAuctionHookURL:    server.URL,
+		LiveAuctionHookAPIKey: "hook-key",
+		Timeout:               appconfig.Duration(time.Second),
+	})
+	if err := client.InvokeLiveAgentHook(t.Context(), "直播间70001开播了"); err != nil {
+		t.Fatalf("invoke live auction hook: %v", err)
+	}
+	if gotMessage != "直播间70001开播了" || gotKey != "hook-key" {
+		t.Fatalf("unexpected hook request message=%q key=%q", gotMessage, gotKey)
+	}
+}

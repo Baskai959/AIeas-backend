@@ -1,6 +1,7 @@
 package domain
 
 import (
+	"bytes"
 	"encoding/json"
 	"strings"
 )
@@ -9,71 +10,156 @@ const (
 	IncrementRuleTypeFixed  = "fixed"
 	IncrementRuleTypeLadder = "ladder"
 
-	maxIncrementRuleSteps = 50
+	defaultIncrementAmount = int64(100)
+	defaultMaxBidSteps     = 10
+	maxIncrementRuleSteps  = 50
+
+	BidRejectBelowStartPrice   = "BELOW_START_PRICE"
+	BidRejectStepMismatch      = "PRICE_STEP_MISMATCH"
+	BidRejectBelowMinIncrement = "BELOW_MIN_INCREMENT"
+	BidRejectAboveMaxBidSteps  = "ABOVE_MAX_BID_STEPS"
+	BidRejectAboveCapPrice     = "ABOVE_CAP_PRICE"
+	BidRejectStaleAuctionState = "STALE_AUCTION_STATE"
 )
 
-// Min is inclusive; Max is exclusive. The last step must omit Max.
+// IncrementRule supports fixed increment and ladder increment.
+// MaxBidSteps limits a single bid to currentPrice + currentStepAmount*MaxBidSteps.
+type IncrementRule struct {
+	Type        string          `json:"type"`
+	Amount      int64           `json:"amount,omitempty"`
+	MaxBidSteps int             `json:"maxBidSteps"`
+	Steps       []IncrementStep `json:"steps,omitempty"`
+}
+
+// IncrementStep is a ladder increment band. Min is inclusive, Max is exclusive.
+// The last step must omit Max.
 type IncrementStep struct {
 	Min    int64  `json:"min"`
 	Max    *int64 `json:"max,omitempty"`
 	Amount int64  `json:"amount"`
 }
 
-type incrementRulePayload struct {
-	Type   string          `json:"type"`
-	Amount int64           `json:"amount"`
-	Steps  []IncrementStep `json:"steps"`
-}
-
 // DefaultIncrementRule returns the default fixed-increment rule.
 func DefaultIncrementRule() json.RawMessage {
-	return json.RawMessage(`{"type":"fixed","amount":100}`)
+	raw, _ := json.Marshal(IncrementRule{Type: IncrementRuleTypeFixed, Amount: defaultIncrementAmount, MaxBidSteps: defaultMaxBidSteps})
+	return json.RawMessage(raw)
 }
 
-// ValidateIncrementRule validates seller-defined increment rules.
+// ValidateIncrementRule validates seller-defined fixed or ladder increment rules.
 func ValidateIncrementRule(raw json.RawMessage) error {
-	if len(raw) == 0 || !json.Valid(raw) {
-		return ErrInvalidArgument
-	}
-	var rule incrementRulePayload
-	if err := json.Unmarshal(raw, &rule); err != nil {
-		return ErrInvalidArgument
-	}
-	switch normalizeIncrementRuleType(rule.Type) {
-	case IncrementRuleTypeFixed:
-		if fixedIncrementAmount(rule) <= 0 {
-			return ErrInvalidArgument
-		}
-		return nil
-	case IncrementRuleTypeLadder:
-		return validateLadderIncrementRule(rule.Steps)
-	default:
-		return ErrInvalidArgument
-	}
+	_, err := ParseIncrementRule(raw)
+	return err
 }
 
-// MinIncrementForPrice returns the minimum increment required at currentPrice.
-// Invalid or unsupported persisted rules fall back to fallback so older data
-// does not make running auctions unusable.
+func ParseIncrementRule(raw json.RawMessage) (IncrementRule, error) {
+	if len(raw) == 0 || !json.Valid(raw) {
+		return IncrementRule{}, ErrInvalidArgument
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return IncrementRule{}, ErrInvalidArgument
+	}
+	_, hasType := fields["type"]
+	_, hasAmount := fields["amount"]
+	_, hasMaxBidSteps := fields["maxBidSteps"]
+	_, hasSteps := fields["steps"]
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	var rule IncrementRule
+	if err := decoder.Decode(&rule); err != nil {
+		return IncrementRule{}, ErrInvalidArgument
+	}
+	rule.Type = strings.ToLower(strings.TrimSpace(rule.Type))
+	if !hasType || !hasMaxBidSteps || rule.MaxBidSteps <= 0 {
+		return IncrementRule{}, ErrInvalidArgument
+	}
+	switch rule.Type {
+	case IncrementRuleTypeFixed:
+		if !hasAmount || hasSteps || rule.Amount <= 0 {
+			return IncrementRule{}, ErrInvalidArgument
+		}
+	case IncrementRuleTypeLadder:
+		if hasAmount || !hasSteps || validateLadderSteps(rule.Steps) != nil {
+			return IncrementRule{}, ErrInvalidArgument
+		}
+	default:
+		return IncrementRule{}, ErrInvalidArgument
+	}
+	return rule, nil
+}
+
+// MinIncrementForPrice returns the current minimum increment for currentPrice.
 func MinIncrementForPrice(raw json.RawMessage, currentPrice int64, fallback int64) int64 {
 	if fallback <= 0 {
 		fallback = 1
 	}
-	if len(raw) == 0 || !json.Valid(raw) {
+	rule, err := ParseIncrementRule(raw)
+	if err != nil {
 		return fallback
 	}
-	var rule incrementRulePayload
-	if err := json.Unmarshal(raw, &rule); err != nil {
+	amount := rule.AmountForPrice(currentPrice)
+	if amount <= 0 {
 		return fallback
 	}
-	switch normalizeIncrementRuleType(rule.Type) {
-	case IncrementRuleTypeFixed:
-		if amount := fixedIncrementAmount(rule); amount > 0 {
-			return amount
+	return amount
+}
+
+func ValidateAuctionPricing(startPrice, reservePrice, capPrice int64, raw json.RawMessage) error {
+	if startPrice < 0 || reservePrice < 0 || capPrice < 0 {
+		return ErrInvalidArgument
+	}
+	if capPrice > 0 && capPrice <= startPrice {
+		return ErrInvalidArgument
+	}
+	if capPrice > 0 && reservePrice > 0 && reservePrice > capPrice {
+		return ErrInvalidArgument
+	}
+	_, err := ParseIncrementRule(raw)
+	return err
+}
+
+func ValidateBidPrice(startPrice, currentPrice, capPrice, price int64, rule IncrementRule) string {
+	if rule.MaxBidSteps <= 0 {
+		return BidRejectStepMismatch
+	}
+	amount := rule.AmountForPrice(currentPrice)
+	if amount <= 0 {
+		return BidRejectStepMismatch
+	}
+	if price <= startPrice {
+		return BidRejectBelowStartPrice
+	}
+	if capPrice > 0 && price > capPrice {
+		return BidRejectAboveCapPrice
+	}
+	isCapBid := capPrice > 0 && price == capPrice
+	if !isCapBid && (price-currentPrice)%amount != 0 {
+		return BidRejectStepMismatch
+	}
+	if isCapBid {
+		if price <= currentPrice {
+			return BidRejectBelowMinIncrement
 		}
+	} else if price < currentPrice+amount {
+		return BidRejectBelowMinIncrement
+	}
+	maxAllowed := currentPrice + amount*int64(rule.MaxBidSteps)
+	if capPrice > 0 && maxAllowed > capPrice {
+		maxAllowed = capPrice
+	}
+	if price > maxAllowed {
+		return BidRejectAboveMaxBidSteps
+	}
+	return ""
+}
+
+func (r IncrementRule) AmountForPrice(currentPrice int64) int64 {
+	switch r.Type {
+	case IncrementRuleTypeFixed:
+		return r.Amount
 	case IncrementRuleTypeLadder:
-		for _, step := range rule.Steps {
-			if step.Amount <= 0 || currentPrice < step.Min {
+		for _, step := range r.Steps {
+			if currentPrice < step.Min {
 				continue
 			}
 			if step.Max == nil || currentPrice < *step.Max {
@@ -81,36 +167,32 @@ func MinIncrementForPrice(raw json.RawMessage, currentPrice int64, fallback int6
 			}
 		}
 	}
-	return fallback
+	return 0
 }
 
-func normalizeIncrementRuleType(ruleType string) string {
-	return strings.ToLower(strings.TrimSpace(ruleType))
-}
-
-func fixedIncrementAmount(rule incrementRulePayload) int64 {
-	return rule.Amount
-}
-
-func validateLadderIncrementRule(steps []IncrementStep) error {
+func validateLadderSteps(steps []IncrementStep) error {
 	if len(steps) == 0 || len(steps) > maxIncrementRuleSteps {
 		return ErrInvalidArgument
 	}
-	expectedMin := int64(0)
+	if steps[0].Min != 0 {
+		return ErrInvalidArgument
+	}
 	for i, step := range steps {
-		if step.Min != expectedMin || step.Amount <= 0 {
+		if step.Min < 0 || step.Amount <= 0 {
 			return ErrInvalidArgument
 		}
-		if step.Max == nil {
-			if i != len(steps)-1 {
+		if i < len(steps)-1 {
+			if step.Max == nil || *step.Max <= step.Min {
 				return ErrInvalidArgument
 			}
-			return nil
+			if steps[i+1].Min != *step.Max {
+				return ErrInvalidArgument
+			}
+			continue
 		}
-		if *step.Max <= step.Min {
+		if step.Max != nil {
 			return ErrInvalidArgument
 		}
-		expectedMin = *step.Max
 	}
-	return ErrInvalidArgument
+	return nil
 }

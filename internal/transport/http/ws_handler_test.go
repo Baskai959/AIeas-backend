@@ -27,7 +27,7 @@ func TestWSHandlerBidPlaceAckAndBroadcast(t *testing.T) {
 	if err := hub.Subscribe(auctionID, client); err != nil {
 		t.Fatalf("subscribe: %v", err)
 	}
-	payload, _ := json.Marshal(map[string]interface{}{"price": 1100})
+	payload, _ := json.Marshal(map[string]interface{}{"price": 1100, "expectedCurrentPrice": 1000})
 	responses := handler.handleInbound(ctx, client, corews.Envelope{Type: "bid.place", RequestID: "ws-bid-1", Payload: payload})
 	if len(responses) != 1 || responses[0].Type != "bid.ack" {
 		t.Fatalf("expected bid.ack, got %+v", responses)
@@ -52,6 +52,32 @@ func TestWSHandlerBidPlaceAckAndBroadcast(t *testing.T) {
 	}
 	if !seenAccepted {
 		t.Fatal("expected bid.accepted broadcast")
+	}
+}
+
+func TestWSHandlerBidPlaceRequiresExpectedState(t *testing.T) {
+	ctx := context.Background()
+	cfg := appconfig.Default().Auction
+	cfg.FreqLimitCount = 100
+	hub := corews.NewHub()
+	bidSvc, auctionID := newWSBidFixture(t, cfg, hub)
+	handler := NewWSHandler(hub, bidSvc, 8, 65536, time.Second, 2*time.Second)
+	client := corews.NewClient("c1", "u_1001", auctionID, 8)
+
+	payload, _ := json.Marshal(map[string]interface{}{"price": 1100})
+	responses := handler.handleInbound(ctx, client, corews.Envelope{Type: "bid.place", RequestID: "ws-bid-missing-state", Payload: payload})
+	if len(responses) != 1 || responses[0].Type != "bid.ack" {
+		t.Fatalf("expected bid.ack, got %+v", responses)
+	}
+	var ack struct {
+		Accepted bool   `json:"accepted"`
+		Reason   string `json:"reason"`
+	}
+	if err := json.Unmarshal(responses[0].Payload, &ack); err != nil {
+		t.Fatalf("decode ack: %v", err)
+	}
+	if ack.Accepted || ack.Reason != "MISSING_EXPECTED_STATE" {
+		t.Fatalf("expected missing expected state rejection, got %+v", ack)
 	}
 }
 
@@ -85,7 +111,7 @@ func newWSBidFixture(t *testing.T, cfg appconfig.AuctionConfig, hub *corews.Hub)
 	if err := itemRepo.Create(ctx, &item); err != nil {
 		t.Fatalf("create item: %v", err)
 	}
-	rule, _ := json.Marshal(map[string]interface{}{"type": "fixed", "amount": 100})
+	rule, _ := json.Marshal(map[string]interface{}{"type": "fixed", "amount": 100, "maxBidSteps": 10})
 	auction, err := auctionSvc.Create(ctx, service.CreateAuctionInput{
 		ActorID:        "u_2001",
 		ActorRole:      domain.RoleMerchant,
@@ -93,6 +119,7 @@ func newWSBidFixture(t *testing.T, cfg appconfig.AuctionConfig, hub *corews.Hub)
 		AuctionType:    domain.AuctionTypeEnglish,
 		StartPrice:     1000,
 		ReservePrice:   1000,
+		CapPrice:       2000,
 		IncrementRule:  rule,
 		AntiSnipingSec: 60,
 		AntiExtendSec:  30,

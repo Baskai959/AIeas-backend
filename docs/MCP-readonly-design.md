@@ -1,5 +1,7 @@
 # 只读 MCP 服务设计与上游对接文档
 
+> 说明：本文档保留第一阶段只读 MCP 的设计背景。当前已新增直播控制 MCP 能力，商家直播控制类工具请以 [MCP-live-control.md](./MCP-live-control.md) 为准。
+
 ## 1. 目标与边界
 
 本文档定义 `aieas_backend` 第一阶段只读 MCP 服务的代码分层、MCP 资源/工具接口、权限边界和上游对接方式。
@@ -70,7 +72,7 @@ internal/
       registry.go
         # RegisterResources、RegisterTools、RegisterPrompts
       auth.go
-        # Authorization Bearer -> actorID/actorRole
+        # X-API-Key -> 配置的 MCP actorID/actorRole
       context.go
         # MCP request context、traceID、pagination defaults
       resources.go
@@ -91,7 +93,7 @@ internal/
 - `newServerWithServices(...)` 增加 `mcpReadService` 或由已有 service 构造 `mcp.Handler`。
 - `/mcp` 与 `/api/v1` 同级挂载，不放在 `/api/v1` 下。
 - 继续复用全局 `RecoveryMiddleware`、`RequestIDMiddleware`、`RateLimiter`、`AuditMiddleware`。
-- MCP 自己解析 `Authorization`，但 token 解析逻辑复用 `AuthService.ParseAccessToken`，不要复制 JWT 实现。
+- MCP 自己校验 `X-API-Key`，不复用用户 `accessToken`。鉴权成功后使用配置中的 `mcp.actorID` / `mcp.actorRole` 作为 service 层调用身份。
 
 ### 2.3 建议新增 read model
 
@@ -136,11 +138,22 @@ Headers：
 
 | Header | 必填 | 说明 |
 |---|---|---|
-| `Authorization: Bearer <accessToken>` | 是 | 复用现有登录接口签发的 JWT access token。 |
+| `X-API-Key: <apiKey>` | 是 | MCP 专用 API Key，来自 `mcp.apiKey` 或 `MCP_API_KEY`。 |
 | `MCP-Protocol-Version: 2025-06-18` | 建议 | 上游声明协议版本。缺失时服务端按当前兼容版本处理。 |
 | `Content-Type: application/json` | POST 必填 | JSON-RPC 请求体。 |
 | `Accept: application/json, text/event-stream` | 建议 | Streamable HTTP 客户端建议同时支持 JSON 与 SSE。 |
 | `X-Trace-Id` | 可选 | 透传链路追踪 ID。 |
+
+服务端配置：
+
+```yaml
+mcp:
+  apiKey: "change-me-in-local-dev-mcp"
+  actorID: "u_9001"
+  actorRole: "admin"
+```
+
+可通过环境变量覆盖：`MCP_API_KEY`、`MCP_ACTOR_ID`、`MCP_ACTOR_ROLE`。`actorRole` 可取 `buyer`、`merchant`、`admin`；生产环境建议使用 `admin` 或专门的只读服务账号，并把 API Key 放在密钥管理系统或运行时环境变量中。
 
 ### 3.2 初始化示例
 
@@ -214,7 +227,7 @@ Response：
 
 - 用户与商家输出使用 `domain.SafeUser` 风格，不暴露 `account`、`passwordHash`、token、手机号等敏感字段。
 - buyer 侧不输出其他用户的账号信息；出价列表默认不对 buyer 开放。
-- MCP 不接受 `actorId`、`actorRole` 参数，调用身份只来自 JWT。
+- MCP 不接受请求参数里的 `actorId`、`actorRole`，调用身份只来自后端配置的 `mcp.actorID` / `mcp.actorRole`。
 
 ## 5. 返回格式
 
@@ -622,18 +635,13 @@ MCP 传输层使用 JSON-RPC error。业务错误放入 `error.data`，便于上
 
 ## 10. 上游接入流程
 
-1. 通过现有 REST 登录接口获取 `accessToken`。
+1. 从后端配置方获取 MCP 专用 API Key。该 Key 不等同于用户登录 `accessToken`，也不需要调用登录接口。
 
-```http
-POST /api/v1/auth/login
-Content-Type: application/json
-```
-
-2. 初始化 MCP。
+2. 初始化 MCP，推荐使用 `X-API-Key` 请求头。
 
 ```http
 POST /mcp
-Authorization: Bearer <accessToken>
+X-API-Key: <apiKey>
 Content-Type: application/json
 Accept: application/json, text/event-stream
 MCP-Protocol-Version: 2025-06-18

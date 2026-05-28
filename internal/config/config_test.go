@@ -17,8 +17,15 @@ server:
 mysql:
   maxOpenConns: 12
 redis:
-  addr: "127.0.0.1:6379"
-  db: 2
+  rt:
+    shards:
+      - addr: "127.0.0.1:6381"
+        db: 2
+      - addr: "127.0.0.1:6382"
+        db: 2
+  cache:
+    addr: "127.0.0.1:6380"
+    db: 1
 idempotency:
   ttl: 2h
 jwt:
@@ -30,7 +37,7 @@ jwt:
 	}
 	t.Setenv("SERVER_ADDR", ":7070")
 	t.Setenv("JWT_SECRET", "from-env")
-	t.Setenv("REDIS_DB", "3")
+	t.Setenv("REDIS_RT_SHARD_0_DB", "3")
 	t.Setenv("IDEMPOTENCY_TTL", "30m")
 	t.Setenv("OBJECT_STORAGE_ENABLED", "true")
 	t.Setenv("OBJECT_STORAGE_ENDPOINT", "https://tos-cn-boe.volces.com")
@@ -41,7 +48,15 @@ jwt:
 	t.Setenv("OBJECT_STORAGE_SECRET_KEY", "sk")
 	t.Setenv("AGENT_PRODUCT_DESCRIPTION_URL", "http://127.0.0.1:9000/api/v1/product-description")
 	t.Setenv("AGENT_PRODUCT_AUDIT_URL", "http://127.0.0.1:9000/api/v1/product-audit")
+	t.Setenv("AGENT_LIVE_ANALYSIS_URL", "http://127.0.0.1:9000/api/v1/live-analysis/async")
+	t.Setenv("AGENT_LIVE_ANALYSIS_CALLBACK_URL", "http://127.0.0.1:7070/api/v1/live-analysis/callback")
+	t.Setenv("AGENT_LIVE_ANALYSIS_CALLBACK_API_KEY", "callback-from-env")
+	t.Setenv("AGENT_LIVE_AUCTION_HOOK_URL", "http://127.0.0.1:9000/api/v1/live-auction-hook")
+	t.Setenv("AGENT_LIVE_AUCTION_HOOK_API_KEY", "hook-from-env")
 	t.Setenv("AGENT_TIMEOUT", "5s")
+	t.Setenv("MCP_API_KEY", "mcp-from-env")
+	t.Setenv("MCP_ACTOR_ID", "u_9001")
+	t.Setenv("MCP_ACTOR_ROLE", "admin")
 
 	cfg, err := Load(path)
 	if err != nil {
@@ -57,8 +72,14 @@ jwt:
 	if cfg.MySQL.MaxOpenConns != 12 {
 		t.Fatalf("expected mysql max open conns 12, got %d", cfg.MySQL.MaxOpenConns)
 	}
-	if cfg.Redis.Addr != "127.0.0.1:6379" || cfg.Redis.DB != 3 {
-		t.Fatalf("unexpected redis config: %+v", cfg.Redis)
+	if cfg.Redis.RT.Shards[0].Addr != "127.0.0.1:6381" || cfg.Redis.RT.Shards[0].DB != 3 {
+		t.Fatalf("unexpected redis rt shard[0] config: %+v", cfg.Redis.RT.Shards[0])
+	}
+	if len(cfg.Redis.RT.Shards) < 2 || cfg.Redis.RT.Shards[1].Addr != "127.0.0.1:6382" {
+		t.Fatalf("unexpected redis rt shard[1] config: %+v", cfg.Redis.RT.Shards)
+	}
+	if cfg.Redis.Cache.Addr != "127.0.0.1:6380" || cfg.Redis.Cache.DB != 1 {
+		t.Fatalf("unexpected redis cache config: %+v", cfg.Redis.Cache)
 	}
 	if cfg.JWT.Secret != "from-env" || cfg.JWT.AccessTokenTTL.Std() != 30*time.Minute {
 		t.Fatalf("unexpected jwt config: %+v", cfg.JWT)
@@ -69,8 +90,18 @@ jwt:
 	if !cfg.ObjectStorage.Enabled || cfg.ObjectStorage.Bucket != "aieas" || cfg.ObjectStorage.BucketURL != "https://aieas.tos-cn-boe.volces.com" {
 		t.Fatalf("unexpected object storage config: %+v", cfg.ObjectStorage)
 	}
-	if cfg.Agent.ProductDescriptionURL != "http://127.0.0.1:9000/api/v1/product-description" || cfg.Agent.ProductAuditURL != "http://127.0.0.1:9000/api/v1/product-audit" || cfg.Agent.Timeout.Std() != 5*time.Second {
+	if cfg.Agent.ProductDescriptionURL != "http://127.0.0.1:9000/api/v1/product-description" ||
+		cfg.Agent.ProductAuditURL != "http://127.0.0.1:9000/api/v1/product-audit" ||
+		cfg.Agent.LiveAnalysisURL != "http://127.0.0.1:9000/api/v1/live-analysis/async" ||
+		cfg.Agent.LiveAnalysisCallbackURL != "http://127.0.0.1:7070/api/v1/live-analysis/callback" ||
+		cfg.Agent.LiveAnalysisCallbackAPIKey != "callback-from-env" ||
+		cfg.Agent.LiveAuctionHookURL != "http://127.0.0.1:9000/api/v1/live-auction-hook" ||
+		cfg.Agent.LiveAuctionHookAPIKey != "hook-from-env" ||
+		cfg.Agent.Timeout.Std() != 5*time.Second {
 		t.Fatalf("unexpected agent config: %+v", cfg.Agent)
+	}
+	if cfg.MCP.APIKey != "mcp-from-env" || cfg.MCP.ActorID != "u_9001" || cfg.MCP.ActorRole != "admin" {
+		t.Fatalf("unexpected mcp config: %+v", cfg.MCP)
 	}
 }
 
@@ -82,21 +113,26 @@ jwt:
   secret: "from-file"
   accessTokenTTL: 30m
 redis:
-  password: "from-file"
+  rt:
+    shards:
+      - addr: "127.0.0.1:6381"
+        password: "from-file"
+      - addr: "127.0.0.1:6382"
+        password: "from-file"
 `)
 	if err := os.WriteFile(path, data, 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, ".env"), []byte("JWT_SECRET=from-dotenv\nREDIS_PASSWORD=redis-from-dotenv\n"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, ".env"), []byte("JWT_SECRET=from-dotenv\nREDIS_RT_SHARD_0_PASSWORD=redis-from-dotenv\n"), 0o600); err != nil {
 		t.Fatalf("write .env: %v", err)
 	}
 	t.Setenv("JWT_SECRET", "")
-	t.Setenv("REDIS_PASSWORD", "")
+	t.Setenv("REDIS_RT_SHARD_0_PASSWORD", "")
 	os.Unsetenv("JWT_SECRET")
-	os.Unsetenv("REDIS_PASSWORD")
+	os.Unsetenv("REDIS_RT_SHARD_0_PASSWORD")
 	t.Cleanup(func() {
 		os.Unsetenv("JWT_SECRET")
-		os.Unsetenv("REDIS_PASSWORD")
+		os.Unsetenv("REDIS_RT_SHARD_0_PASSWORD")
 	})
 
 	cfg, err := Load(path)
@@ -107,8 +143,8 @@ redis:
 	if cfg.JWT.Secret != "from-dotenv" {
 		t.Fatalf("expected JWT secret from .env, got %q", cfg.JWT.Secret)
 	}
-	if cfg.Redis.Password != "redis-from-dotenv" {
-		t.Fatalf("expected Redis password from .env, got %q", cfg.Redis.Password)
+	if cfg.Redis.RT.Shards[0].Password != "redis-from-dotenv" {
+		t.Fatalf("expected Redis password from .env, got %q", cfg.Redis.RT.Shards[0].Password)
 	}
 }
 
@@ -126,7 +162,9 @@ func TestLoadRejectsInvalidDuration(t *testing.T) {
 
 func TestValidateRejectsObjectStorageBucketURLPointingToRedis(t *testing.T) {
 	cfg := Default()
-	cfg.Redis.Addr = "redis-sy01vax76anstnm7a.redis.cn-guilin-boe.volces.com:6379"
+	cfg.Redis.RT.Shards[0].Addr = "redis-sy01vax76anstnm7a.redis.cn-guilin-boe.volces.com:6379"
+	cfg.Redis.RT.Shards[1].Addr = "redis-sy01vax76anstnm7a.redis.cn-guilin-boe.volces.com:6380"
+	cfg.Redis.Cache.Addr = "redis-cache.example.com:6379"
 	cfg.ObjectStorage.Enabled = true
 	cfg.ObjectStorage.Endpoint = "https://tos-cn-boe.volces.com"
 	cfg.ObjectStorage.Region = "cn-guilin-boe"
@@ -187,10 +225,135 @@ func TestObservabilityValidateRejectsNegativeSlowThreshold(t *testing.T) {
 	}
 }
 
+// TestObservabilityDefaultsTracing 锁定 tracing 默认值：
+// 默认 disabled、sampler=parent_based_traceid_ratio、sampleRatio=0.1。
+// 这是 G11 的契约：默认配置不应在导入项目时引入 OTel 依赖或采样全量。
+func TestObservabilityDefaultsTracing(t *testing.T) {
+	cfg := Default()
+	if cfg.Observability.Tracing.Enabled {
+		t.Fatalf("expected tracing disabled by default, got enabled=true")
+	}
+	if cfg.Observability.Tracing.Sampler != "parent_based_traceid_ratio" {
+		t.Fatalf("expected default sampler parent_based_traceid_ratio, got %q", cfg.Observability.Tracing.Sampler)
+	}
+	if cfg.Observability.Tracing.SampleRatio != 0.1 {
+		t.Fatalf("expected default sampleRatio=0.1, got %v", cfg.Observability.Tracing.SampleRatio)
+	}
+	if cfg.Observability.Tracing.ServiceName != "aieas-backend" {
+		t.Fatalf("expected default serviceName=aieas-backend, got %q", cfg.Observability.Tracing.ServiceName)
+	}
+}
+
+// TestObservabilityNormalizeFillsSampleRatio 验证 normalize 在 SampleRatio==0
+// 时回填 0.1，避免 0 比例导致 trace 全部被 drop 而误以为采样工作正常。
+func TestObservabilityNormalizeFillsSampleRatio(t *testing.T) {
+	o := ObservabilityConfig{}
+	o.normalize()
+	if o.Tracing.SampleRatio != 0.1 {
+		t.Fatalf("expected normalize to fill sampleRatio=0.1, got %v", o.Tracing.SampleRatio)
+	}
+}
+
+// TestObservabilityValidateRequiresEndpointWhenTracingEnabled 验证 G11：
+// 启用 tracing 且 exporter 是 otlphttp 时，endpoint 必填。
+func TestObservabilityValidateRequiresEndpointWhenTracingEnabled(t *testing.T) {
+	cfg := Default()
+	cfg.Observability.Tracing.Enabled = true
+	cfg.Observability.Tracing.Exporter = "otlphttp"
+	cfg.Observability.Tracing.Endpoint = ""
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected validate to reject otlphttp tracing with empty endpoint")
+	}
+}
+
+// TestObservabilityValidateAcceptsStdoutExporterWithoutEndpoint 验证
+// stdout / noop exporter 不要求 endpoint（本地调试场景）。
+func TestObservabilityValidateAcceptsStdoutExporterWithoutEndpoint(t *testing.T) {
+	for _, exporter := range []string{"stdout", "noop"} {
+		cfg := Default()
+		cfg.Observability.Tracing.Enabled = true
+		cfg.Observability.Tracing.Exporter = exporter
+		cfg.Observability.Tracing.Endpoint = ""
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("expected %s exporter without endpoint to validate, got %v", exporter, err)
+		}
+	}
+}
+
+// TestObservabilityValidateRejectsInvalidExporter 验证未知 exporter 名拒绝。
+func TestObservabilityValidateRejectsInvalidExporter(t *testing.T) {
+	cfg := Default()
+	cfg.Observability.Tracing.Enabled = true
+	cfg.Observability.Tracing.Exporter = "jaeger"
+	cfg.Observability.Tracing.Endpoint = "http://collector:4318"
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected unknown exporter to be rejected")
+	}
+}
+
+// TestObservabilityValidateRejectsOutOfRangeSampleRatio 验证 ratio 必须 ∈ [0,1]。
+func TestObservabilityValidateRejectsOutOfRangeSampleRatio(t *testing.T) {
+	cfg := Default()
+	cfg.Observability.Tracing.Enabled = true
+	cfg.Observability.Tracing.Endpoint = "http://collector:4318"
+	cfg.Observability.Tracing.SampleRatio = 1.5
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected sampleRatio>1 to be rejected")
+	}
+}
+
+func TestValidateRejectsMissingMCPAPIKey(t *testing.T) {
+	cfg := Default()
+	cfg.MCP.APIKey = ""
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected missing mcp.apiKey to be rejected")
+	}
+}
+
+func TestValidateRejectsInvalidMCPActorRole(t *testing.T) {
+	cfg := Default()
+	cfg.MCP.ActorRole = "operator"
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected invalid mcp.actorRole to be rejected")
+	}
+}
+
 func TestValidateRejectsInvalidAgentProductDescriptionURL(t *testing.T) {
 	cfg := Default()
 	cfg.Agent.ProductDescriptionURL = "127.0.0.1:8000/api/v1/product-description"
 	if err := cfg.Validate(); err == nil {
 		t.Fatal("expected invalid agent.productDescriptionURL to be rejected")
+	}
+}
+
+func TestValidateRejectsInvalidAgentLiveAnalysisURL(t *testing.T) {
+	cfg := Default()
+	cfg.Agent.LiveAnalysisURL = "127.0.0.1:8000/api/v1/live-analysis"
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected invalid agent.liveAnalysisURL to be rejected")
+	}
+}
+
+func TestValidateRejectsInvalidAgentLiveAnalysisCallbackURL(t *testing.T) {
+	cfg := Default()
+	cfg.Agent.LiveAnalysisCallbackURL = "127.0.0.1:8080/api/v1/live-analysis/callback"
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected invalid agent.liveAnalysisCallbackURL to be rejected")
+	}
+}
+
+func TestValidateRejectsMissingAgentLiveAnalysisCallbackAPIKey(t *testing.T) {
+	cfg := Default()
+	cfg.Agent.LiveAnalysisCallbackAPIKey = ""
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected missing agent.liveAnalysisCallbackAPIKey to be rejected")
+	}
+}
+
+func TestValidateRejectsInvalidAgentLiveAuctionHookURL(t *testing.T) {
+	cfg := Default()
+	cfg.Agent.LiveAuctionHookURL = "127.0.0.1:8000/api/v1/live-auction-hook"
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected invalid agent.liveAuctionHookURL to be rejected")
 	}
 }

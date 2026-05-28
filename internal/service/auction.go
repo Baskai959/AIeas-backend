@@ -8,7 +8,11 @@ import (
 
 	appconfig "aieas_backend/internal/config"
 	"aieas_backend/internal/domain"
+	"aieas_backend/internal/infra/observability/tracing"
 	"aieas_backend/internal/repository"
+
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 )
 
 type AuctionService struct {
@@ -37,13 +41,16 @@ type CreateAuctionInput struct {
 	AuctionType       domain.AuctionType
 	StartPrice        int64
 	ReservePrice      int64
+	CapPrice          int64
 	IncrementRule     json.RawMessage
 	AntiSnipingSec    int
 	AntiExtendSec     int
+	AntiExtendMode    domain.AuctionExtendMode
 	DepositAmount     int64
 	Status            domain.AuctionStatus
 	StartTime         time.Time
 	EndTime           time.Time
+	DurationSec       int
 	allowSystemStatus bool
 }
 
@@ -52,13 +59,16 @@ type UpdateAuctionInput struct {
 	ActorRole         domain.Role
 	StartPrice        *int64
 	ReservePrice      *int64
+	CapPrice          *int64
 	IncrementRule     *json.RawMessage
 	AntiSnipingSec    *int
 	AntiExtendSec     *int
+	AntiExtendMode    *domain.AuctionExtendMode
 	DepositAmount     *int64
 	Status            *domain.AuctionStatus
 	StartTime         *time.Time
 	EndTime           *time.Time
+	DurationSec       *int
 	allowSystemStatus bool
 }
 
@@ -120,7 +130,7 @@ func (s *AuctionService) Create(ctx context.Context, in CreateAuctionInput) (dom
 	if !canAccessSellerOwned(in.ActorID, in.ActorRole, sellerID) || item.SellerID != sellerID {
 		return domain.AuctionLot{}, domain.ErrForbidden
 	}
-	if in.StartPrice < 0 || in.ReservePrice < 0 || in.DepositAmount < 0 {
+	if in.DepositAmount < 0 {
 		return domain.AuctionLot{}, domain.ErrInvalidArgument
 	}
 	if in.AntiSnipingSec <= 0 {
@@ -129,10 +139,17 @@ func (s *AuctionService) Create(ctx context.Context, in CreateAuctionInput) (dom
 	if in.AntiExtendSec <= 0 {
 		in.AntiExtendSec = 30
 	}
+	in.AntiExtendMode = domain.NormalizeAuctionExtendMode(in.AntiExtendMode)
+	if !in.AntiExtendMode.Valid() || in.DurationSec < 0 {
+		return domain.AuctionLot{}, domain.ErrInvalidArgument
+	}
 	if len(in.IncrementRule) == 0 {
 		in.IncrementRule = domain.DefaultIncrementRule()
 	}
 	if err := domain.ValidateIncrementRule(in.IncrementRule); err != nil {
+		return domain.AuctionLot{}, domain.ErrInvalidArgument
+	}
+	if err := domain.ValidateAuctionPricing(in.StartPrice, in.ReservePrice, in.CapPrice, in.IncrementRule); err != nil {
 		return domain.AuctionLot{}, domain.ErrInvalidArgument
 	}
 	if in.Status == "" {
@@ -144,16 +161,13 @@ func (s *AuctionService) Create(ctx context.Context, in CreateAuctionInput) (dom
 	if !in.allowSystemStatus && !isEditableAuctionStatus(in.Status) {
 		return domain.AuctionLot{}, domain.ErrInvalidArgument
 	}
-	now := time.Now().UTC()
-	if in.StartTime.IsZero() {
-		in.StartTime = now.Add(time.Minute)
-	}
-	if in.EndTime.IsZero() {
-		in.EndTime = in.StartTime.Add(time.Hour)
-	}
-	if !in.EndTime.After(in.StartTime) {
+	startTime, endTime, durationSec, err := normalizeAuctionTiming(in.StartTime, in.EndTime, in.DurationSec)
+	if err != nil {
 		return domain.AuctionLot{}, domain.ErrInvalidArgument
 	}
+	in.StartTime = startTime
+	in.EndTime = endTime
+	in.DurationSec = durationSec
 	snapshot, err := buildRuleSnapshot(in)
 	if err != nil {
 		return domain.AuctionLot{}, err
@@ -173,14 +187,17 @@ func (s *AuctionService) Create(ctx context.Context, in CreateAuctionInput) (dom
 		AuctionType:    in.AuctionType,
 		StartPrice:     in.StartPrice,
 		ReservePrice:   in.ReservePrice,
+		CapPrice:       in.CapPrice,
 		IncrementRule:  append([]byte(nil), in.IncrementRule...),
 		AntiSnipingSec: in.AntiSnipingSec,
 		AntiExtendSec:  in.AntiExtendSec,
+		AntiExtendMode: in.AntiExtendMode,
 		DepositAmount:  in.DepositAmount,
 		Status:         in.Status,
 		RuleSnapshot:   snapshot,
 		StartTime:      in.StartTime,
 		EndTime:        in.EndTime,
+		DurationSec:    in.DurationSec,
 	}
 	if err := s.tx.WithinTx(ctx, func(txCtx context.Context) error {
 		return s.auctions.Create(txCtx, &auction)
@@ -223,6 +240,9 @@ func (s *AuctionService) Update(ctx context.Context, id uint64, in UpdateAuction
 				return domain.ErrInvalidState
 			}
 		}
+		if !in.allowSystemStatus && !isEditableAuctionStatus(current.Status) && hasAuctionContentPatch(in) {
+			return domain.ErrInvalidState
+		}
 		if in.StartPrice != nil {
 			if *in.StartPrice < 0 {
 				return domain.ErrInvalidArgument
@@ -234,6 +254,9 @@ func (s *AuctionService) Update(ctx context.Context, id uint64, in UpdateAuction
 				return domain.ErrInvalidArgument
 			}
 			current.ReservePrice = *in.ReservePrice
+		}
+		if in.CapPrice != nil {
+			current.CapPrice = *in.CapPrice
 		}
 		if in.IncrementRule != nil {
 			if err := domain.ValidateIncrementRule(*in.IncrementRule); err != nil {
@@ -253,6 +276,13 @@ func (s *AuctionService) Update(ctx context.Context, id uint64, in UpdateAuction
 			}
 			current.AntiExtendSec = *in.AntiExtendSec
 		}
+		if in.AntiExtendMode != nil {
+			mode := domain.NormalizeAuctionExtendMode(*in.AntiExtendMode)
+			if !mode.Valid() {
+				return domain.ErrInvalidArgument
+			}
+			current.AntiExtendMode = mode
+		}
 		if in.DepositAmount != nil {
 			if *in.DepositAmount < 0 {
 				return domain.ErrInvalidArgument
@@ -265,9 +295,27 @@ func (s *AuctionService) Update(ctx context.Context, id uint64, in UpdateAuction
 		if in.EndTime != nil {
 			current.EndTime = *in.EndTime
 		}
-		if !current.EndTime.After(current.StartTime) {
-			return domain.ErrInvalidArgument
+		if in.DurationSec != nil {
+			if *in.DurationSec < 0 {
+				return domain.ErrInvalidArgument
+			}
+			current.DurationSec = *in.DurationSec
 		}
+		if hasAuctionTimingPatch(in) {
+			startTime, endTime, durationSec, err := normalizeAuctionTiming(current.StartTime, current.EndTime, current.DurationSec)
+			if err != nil {
+				return domain.ErrInvalidArgument
+			}
+			current.StartTime = startTime
+			current.EndTime = endTime
+			current.DurationSec = durationSec
+		}
+		if hasAuctionPricingPatch(in) {
+			if err := domain.ValidateAuctionPricing(current.StartPrice, current.ReservePrice, current.CapPrice, current.IncrementRule); err != nil {
+				return domain.ErrInvalidArgument
+			}
+		}
+		current.AntiExtendMode = domain.NormalizeAuctionExtendMode(current.AntiExtendMode)
 		if in.Status != nil {
 			if !in.allowSystemStatus && !isEditableAuctionStatus(*in.Status) {
 				return domain.ErrInvalidArgument
@@ -314,6 +362,49 @@ func (s *AuctionService) Start(ctx context.Context, id uint64, actorID string, a
 }
 
 func (s *AuctionService) StartWithTiming(ctx context.Context, id uint64, actorID string, actorRole domain.Role, startTime, endTime time.Time) (domain.AuctionLot, error) {
+	ctx, span := tracing.StartSpan(ctx, "auction.start",
+		attribute.Int64("auction.id", int64(id)),
+		attribute.String("actor.id", actorID),
+		attribute.String("actor.role", string(actorRole)),
+	)
+	defer span.End()
+	auction, err := s.startWithTiming(ctx, id, actorID, actorRole, startTime, endTime)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		return domain.AuctionLot{}, err
+	}
+	span.SetAttributes(
+		attribute.String("auction.status", string(auction.Status)),
+		attribute.Int64("auction.start_time_ms", auction.StartTime.UnixMilli()),
+		attribute.Int64("auction.end_time_ms", auction.EndTime.UnixMilli()),
+	)
+	return auction, nil
+}
+
+func (s *AuctionService) startWithTiming(ctx context.Context, id uint64, actorID string, actorRole domain.Role, startTime, endTime time.Time) (domain.AuctionLot, error) {
+	current, err := s.auctions.FindByID(ctx, id)
+	if err != nil {
+		return domain.AuctionLot{}, err
+	}
+	if !canAccessSellerOwned(actorID, actorRole, current.SellerID) {
+		return domain.AuctionLot{}, domain.ErrForbidden
+	}
+	now := time.Now().UTC()
+	if startTime.IsZero() && endTime.IsZero() {
+		switch {
+		case current.DurationSec > 0 && (current.EndTime.IsZero() || !current.EndTime.After(now)):
+			startTime = now
+			endTime = now.Add(time.Duration(current.DurationSec) * time.Second)
+		case current.EndTime.IsZero():
+			startTime = now
+			endTime = now.Add(time.Hour)
+		case current.StartTime.IsZero():
+			startTime = now
+		}
+	} else if startTime.IsZero() || endTime.IsZero() || !endTime.After(startTime) {
+		return domain.AuctionLot{}, domain.ErrInvalidArgument
+	}
 	status := domain.AuctionStatusRunning
 	input := UpdateAuctionInput{ActorID: actorID, ActorRole: actorRole, Status: &status, allowSystemStatus: true}
 	if !startTime.IsZero() {
@@ -327,6 +418,9 @@ func (s *AuctionService) StartWithTiming(ctx context.Context, id uint64, actorID
 	auction, err := s.Update(ctx, id, input)
 	if err != nil {
 		return domain.AuctionLot{}, err
+	}
+	if auction.EndTime.IsZero() || !auction.EndTime.After(now) {
+		return domain.AuctionLot{}, domain.ErrInvalidArgument
 	}
 	minIncrement := domain.MinIncrementForPrice(auction.IncrementRule, auction.StartPrice, s.cfg.MinIncrementCent)
 	state, err := s.realtime.InitAuction(ctx, auction, minIncrement)
@@ -344,11 +438,20 @@ func (s *AuctionService) StartWithTiming(ctx context.Context, id uint64, actorID
 }
 
 func (s *AuctionService) Cancel(ctx context.Context, id uint64, actorID string, actorRole domain.Role) (domain.AuctionLot, error) {
+	ctx, span := tracing.StartSpan(ctx, "auction.cancel",
+		attribute.Int64("auction.id", int64(id)),
+		attribute.String("actor.id", actorID),
+		attribute.String("actor.role", string(actorRole)),
+	)
+	defer span.End()
 	status := domain.AuctionStatusClosedFailed
 	auction, err := s.Update(ctx, id, UpdateAuctionInput{ActorID: actorID, ActorRole: actorRole, Status: &status, allowSystemStatus: true})
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
 		return domain.AuctionLot{}, err
 	}
+	span.SetAttributes(attribute.String("auction.status", string(auction.Status)))
 	if s.onClose != nil {
 		s.onClose(ctx, id)
 	}
@@ -390,9 +493,14 @@ func (s *AuctionService) State(ctx context.Context, id uint64, actorID string, a
 func buildRuleSnapshot(in CreateAuctionInput) (json.RawMessage, error) {
 	payload := map[string]interface{}{
 		"auctionType":    in.AuctionType,
+		"startPrice":     in.StartPrice,
+		"reservePrice":   in.ReservePrice,
+		"capPrice":       in.CapPrice,
 		"incrementRule":  json.RawMessage(in.IncrementRule),
 		"antiSnipingSec": in.AntiSnipingSec,
 		"antiExtendSec":  in.AntiExtendSec,
+		"antiExtendMode": domain.NormalizeAuctionExtendMode(in.AntiExtendMode),
+		"durationSec":    in.DurationSec,
 		"depositPolicy": map[string]interface{}{
 			"amount": in.DepositAmount,
 		},
@@ -403,9 +511,14 @@ func buildRuleSnapshot(in CreateAuctionInput) (json.RawMessage, error) {
 func snapshotFromAuction(auction domain.AuctionLot) (json.RawMessage, error) {
 	payload := map[string]interface{}{
 		"auctionType":    auction.AuctionType,
+		"startPrice":     auction.StartPrice,
+		"reservePrice":   auction.ReservePrice,
+		"capPrice":       auction.CapPrice,
 		"incrementRule":  json.RawMessage(auction.IncrementRule),
 		"antiSnipingSec": auction.AntiSnipingSec,
 		"antiExtendSec":  auction.AntiExtendSec,
+		"antiExtendMode": domain.NormalizeAuctionExtendMode(auction.AntiExtendMode),
+		"durationSec":    auction.DurationSec,
 		"depositPolicy": map[string]interface{}{
 			"amount": auction.DepositAmount,
 		},
@@ -418,7 +531,37 @@ func isEditableAuctionStatus(status domain.AuctionStatus) bool {
 }
 
 func hasAuctionContentPatch(in UpdateAuctionInput) bool {
-	return in.StartPrice != nil || in.ReservePrice != nil || in.IncrementRule != nil ||
-		in.AntiSnipingSec != nil || in.AntiExtendSec != nil || in.DepositAmount != nil ||
-		in.StartTime != nil || in.EndTime != nil
+	return in.StartPrice != nil || in.ReservePrice != nil || in.CapPrice != nil || in.IncrementRule != nil ||
+		in.AntiSnipingSec != nil || in.AntiExtendSec != nil || in.AntiExtendMode != nil || in.DepositAmount != nil ||
+		in.StartTime != nil || in.EndTime != nil || in.DurationSec != nil
+}
+
+func hasAuctionPricingPatch(in UpdateAuctionInput) bool {
+	return in.StartPrice != nil || in.ReservePrice != nil || in.CapPrice != nil || in.IncrementRule != nil
+}
+
+func hasAuctionTimingPatch(in UpdateAuctionInput) bool {
+	return in.StartTime != nil || in.EndTime != nil || in.DurationSec != nil
+}
+
+func normalizeAuctionTiming(startTime, endTime time.Time, durationSec int) (time.Time, time.Time, int, error) {
+	if durationSec < 0 {
+		return time.Time{}, time.Time{}, 0, domain.ErrInvalidArgument
+	}
+	if !startTime.IsZero() {
+		startTime = startTime.UTC()
+	}
+	if !endTime.IsZero() {
+		endTime = endTime.UTC()
+	}
+	if startTime.IsZero() && !endTime.IsZero() {
+		return time.Time{}, time.Time{}, 0, domain.ErrInvalidArgument
+	}
+	if !startTime.IsZero() && durationSec > 0 {
+		endTime = startTime.Add(time.Duration(durationSec) * time.Second)
+	}
+	if !startTime.IsZero() && !endTime.IsZero() && !endTime.After(startTime) {
+		return time.Time{}, time.Time{}, 0, domain.ErrInvalidArgument
+	}
+	return startTime, endTime, durationSec, nil
 }

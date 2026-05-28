@@ -95,14 +95,17 @@ func (r *MySQLAuctionRepository) Update(ctx context.Context, auction *domain.Auc
 		"auction_type":     row.AuctionType,
 		"start_price":      row.StartPrice,
 		"reserve_price":    row.ReservePrice,
+		"cap_price":        row.CapPrice,
 		"increment_rule":   row.IncrementRule,
 		"anti_sniping_sec": row.AntiSnipingSec,
 		"anti_extend_sec":  row.AntiExtendSec,
+		"anti_extend_mode": row.AntiExtendMode,
 		"deposit_amount":   row.DepositAmount,
 		"status":           row.Status,
 		"rule_snapshot":    row.RuleSnapshot,
 		"start_time":       row.StartTime,
 		"end_time":         row.EndTime,
+		"duration_sec":     row.DurationSec,
 		"winner_id":        row.WinnerID,
 		"deal_price":       row.DealPrice,
 		"closed_at":        row.ClosedAt,
@@ -136,28 +139,31 @@ func (r *MySQLAuctionRepository) Delete(ctx context.Context, id uint64) error {
 }
 
 type auctionRow struct {
-	AuctionID      uint64               `gorm:"column:auction_id;primaryKey"`
-	ItemID         uint64               `gorm:"column:item_id"`
-	SellerID       string               `gorm:"column:seller_id"`
-	LiveRoomID     uint64               `gorm:"column:live_room_id"`
-	LiveSessionID  *uint64              `gorm:"column:live_session_id"`
-	AuctionType    domain.AuctionType   `gorm:"column:auction_type"`
-	StartPrice     int64                `gorm:"column:start_price"`
-	ReservePrice   int64                `gorm:"column:reserve_price"`
-	IncrementRule  []byte               `gorm:"column:increment_rule"`
-	AntiSnipingSec int                  `gorm:"column:anti_sniping_sec"`
-	AntiExtendSec  int                  `gorm:"column:anti_extend_sec"`
-	DepositAmount  int64                `gorm:"column:deposit_amount"`
-	Status         domain.AuctionStatus `gorm:"column:status"`
-	RuleSnapshot   []byte               `gorm:"column:rule_snapshot"`
-	StartTime      time.Time            `gorm:"column:start_time"`
-	EndTime        time.Time            `gorm:"column:end_time"`
-	WinnerID       *string              `gorm:"column:winner_id"`
-	DealPrice      *int64               `gorm:"column:deal_price"`
-	ClosedAt       *time.Time           `gorm:"column:closed_at"`
-	ClosedBy       string               `gorm:"column:closed_by"`
-	CreatedAt      time.Time            `gorm:"column:created_at"`
-	UpdatedAt      time.Time            `gorm:"column:updated_at"`
+	AuctionID      uint64                   `gorm:"column:auction_id;primaryKey"`
+	ItemID         uint64                   `gorm:"column:item_id"`
+	SellerID       string                   `gorm:"column:seller_id"`
+	LiveRoomID     uint64                   `gorm:"column:live_room_id"`
+	LiveSessionID  *uint64                  `gorm:"column:live_session_id"`
+	AuctionType    domain.AuctionType       `gorm:"column:auction_type"`
+	StartPrice     int64                    `gorm:"column:start_price"`
+	ReservePrice   int64                    `gorm:"column:reserve_price"`
+	CapPrice       int64                    `gorm:"column:cap_price"`
+	IncrementRule  []byte                   `gorm:"column:increment_rule"`
+	AntiSnipingSec int                      `gorm:"column:anti_sniping_sec"`
+	AntiExtendSec  int                      `gorm:"column:anti_extend_sec"`
+	AntiExtendMode domain.AuctionExtendMode `gorm:"column:anti_extend_mode"`
+	DepositAmount  int64                    `gorm:"column:deposit_amount"`
+	Status         domain.AuctionStatus     `gorm:"column:status"`
+	RuleSnapshot   []byte                   `gorm:"column:rule_snapshot"`
+	StartTime      *time.Time               `gorm:"column:start_time"`
+	EndTime        *time.Time               `gorm:"column:end_time"`
+	DurationSec    int                      `gorm:"column:duration_sec"`
+	WinnerID       *string                  `gorm:"column:winner_id"`
+	DealPrice      *int64                   `gorm:"column:deal_price"`
+	ClosedAt       *time.Time               `gorm:"column:closed_at"`
+	ClosedBy       string                   `gorm:"column:closed_by"`
+	CreatedAt      time.Time                `gorm:"column:created_at"`
+	UpdatedAt      time.Time                `gorm:"column:updated_at"`
 }
 
 func auctionRowFromDomain(auction domain.AuctionLot) auctionRow {
@@ -170,14 +176,17 @@ func auctionRowFromDomain(auction domain.AuctionLot) auctionRow {
 		AuctionType:    auction.AuctionType,
 		StartPrice:     auction.StartPrice,
 		ReservePrice:   auction.ReservePrice,
+		CapPrice:       auction.CapPrice,
 		IncrementRule:  []byte(auction.IncrementRule),
 		AntiSnipingSec: auction.AntiSnipingSec,
 		AntiExtendSec:  auction.AntiExtendSec,
+		AntiExtendMode: domain.NormalizeAuctionExtendMode(auction.AntiExtendMode),
 		DepositAmount:  auction.DepositAmount,
 		Status:         auction.Status,
 		RuleSnapshot:   []byte(auction.RuleSnapshot),
-		StartTime:      auction.StartTime,
-		EndTime:        auction.EndTime,
+		StartTime:      timePtrOrNil(auction.StartTime),
+		EndTime:        timePtrOrNil(auction.EndTime),
+		DurationSec:    auction.DurationSec,
 		WinnerID:       normalizeOptionalUserIDForDB(auction.WinnerID),
 		DealPrice:      auction.DealPrice,
 		ClosedAt:       auction.ClosedAt,
@@ -195,6 +204,21 @@ func normalizeOptionalUserIDForDB(id *string) *string {
 	return &normalized
 }
 
+func timePtrOrNil(t time.Time) *time.Time {
+	if t.IsZero() {
+		return nil
+	}
+	t = t.UTC()
+	return &t
+}
+
+func timeValueOrZero(t *time.Time) time.Time {
+	if t == nil {
+		return time.Time{}
+	}
+	return t.UTC()
+}
+
 func (r auctionRow) toDomain() domain.AuctionLot {
 	return domain.AuctionLot{
 		AuctionID:      r.AuctionID,
@@ -205,14 +229,17 @@ func (r auctionRow) toDomain() domain.AuctionLot {
 		AuctionType:    r.AuctionType,
 		StartPrice:     r.StartPrice,
 		ReservePrice:   r.ReservePrice,
+		CapPrice:       r.CapPrice,
 		IncrementRule:  append([]byte(nil), r.IncrementRule...),
 		AntiSnipingSec: r.AntiSnipingSec,
 		AntiExtendSec:  r.AntiExtendSec,
+		AntiExtendMode: domain.NormalizeAuctionExtendMode(r.AntiExtendMode),
 		DepositAmount:  r.DepositAmount,
 		Status:         r.Status,
 		RuleSnapshot:   append([]byte(nil), r.RuleSnapshot...),
-		StartTime:      r.StartTime,
-		EndTime:        r.EndTime,
+		StartTime:      timeValueOrZero(r.StartTime),
+		EndTime:        timeValueOrZero(r.EndTime),
+		DurationSec:    r.DurationSec,
 		WinnerID:       r.WinnerID,
 		DealPrice:      r.DealPrice,
 		ClosedAt:       r.ClosedAt,

@@ -23,32 +23,38 @@ func NewAuctionHandler(auctions *service.AuctionService, deposits *service.Depos
 }
 
 type auctionCreateRequest struct {
-	AuctionID      uint64               `json:"auctionId"`
-	ItemID         uint64               `json:"itemId"`
-	SellerID       string               `json:"sellerId"`
-	LiveRoomID     uint64               `json:"liveRoomId"`
-	AuctionType    domain.AuctionType   `json:"auctionType"`
-	StartPrice     int64                `json:"startPrice"`
-	ReservePrice   int64                `json:"reservePrice"`
-	IncrementRule  json.RawMessage      `json:"incrementRule"`
-	AntiSnipingSec int                  `json:"antiSnipingSec"`
-	AntiExtendSec  int                  `json:"antiExtendSec"`
-	DepositAmount  int64                `json:"depositAmount"`
-	Status         domain.AuctionStatus `json:"status"`
-	StartTime      time.Time            `json:"startTime"`
-	EndTime        time.Time            `json:"endTime"`
+	AuctionID      uint64                   `json:"auctionId"`
+	ItemID         uint64                   `json:"itemId"`
+	SellerID       string                   `json:"sellerId"`
+	LiveRoomID     uint64                   `json:"liveRoomId"`
+	AuctionType    domain.AuctionType       `json:"auctionType"`
+	StartPrice     int64                    `json:"startPrice"`
+	ReservePrice   int64                    `json:"reservePrice"`
+	CapPrice       int64                    `json:"capPrice"`
+	IncrementRule  json.RawMessage          `json:"incrementRule"`
+	AntiSnipingSec int                      `json:"antiSnipingSec"`
+	AntiExtendSec  int                      `json:"antiExtendSec"`
+	AntiExtendMode domain.AuctionExtendMode `json:"antiExtendMode"`
+	DepositAmount  int64                    `json:"depositAmount"`
+	Status         domain.AuctionStatus     `json:"status"`
+	StartTime      time.Time                `json:"startTime"`
+	EndTime        time.Time                `json:"endTime"`
+	DurationSec    int                      `json:"durationSec"`
 }
 
 type auctionPatchRequest struct {
-	StartPrice     *int64                `json:"startPrice"`
-	ReservePrice   *int64                `json:"reservePrice"`
-	IncrementRule  *json.RawMessage      `json:"incrementRule"`
-	AntiSnipingSec *int                  `json:"antiSnipingSec"`
-	AntiExtendSec  *int                  `json:"antiExtendSec"`
-	DepositAmount  *int64                `json:"depositAmount"`
-	Status         *domain.AuctionStatus `json:"status"`
-	StartTime      *time.Time            `json:"startTime"`
-	EndTime        *time.Time            `json:"endTime"`
+	StartPrice     *int64                    `json:"startPrice"`
+	ReservePrice   *int64                    `json:"reservePrice"`
+	CapPrice       *int64                    `json:"capPrice"`
+	IncrementRule  *json.RawMessage          `json:"incrementRule"`
+	AntiSnipingSec *int                      `json:"antiSnipingSec"`
+	AntiExtendSec  *int                      `json:"antiExtendSec"`
+	AntiExtendMode *domain.AuctionExtendMode `json:"antiExtendMode"`
+	DepositAmount  *int64                    `json:"depositAmount"`
+	Status         *domain.AuctionStatus     `json:"status"`
+	StartTime      *time.Time                `json:"startTime"`
+	EndTime        *time.Time                `json:"endTime"`
+	DurationSec    *int                      `json:"durationSec"`
 }
 
 func (h *AuctionHandler) Create(ctx context.Context, c *app.RequestContext) {
@@ -67,13 +73,16 @@ func (h *AuctionHandler) Create(ctx context.Context, c *app.RequestContext) {
 		AuctionType:    req.AuctionType,
 		StartPrice:     req.StartPrice,
 		ReservePrice:   req.ReservePrice,
+		CapPrice:       req.CapPrice,
 		IncrementRule:  req.IncrementRule,
 		AntiSnipingSec: req.AntiSnipingSec,
 		AntiExtendSec:  req.AntiExtendSec,
+		AntiExtendMode: req.AntiExtendMode,
 		DepositAmount:  req.DepositAmount,
 		Status:         req.Status,
 		StartTime:      req.StartTime,
 		EndTime:        req.EndTime,
+		DurationSec:    req.DurationSec,
 	})
 	if err != nil {
 		writeServiceError(c, err)
@@ -133,13 +142,16 @@ func (h *AuctionHandler) Update(ctx context.Context, c *app.RequestContext) {
 		ActorRole:      AuthRole(c),
 		StartPrice:     req.StartPrice,
 		ReservePrice:   req.ReservePrice,
+		CapPrice:       req.CapPrice,
 		IncrementRule:  req.IncrementRule,
 		AntiSnipingSec: req.AntiSnipingSec,
 		AntiExtendSec:  req.AntiExtendSec,
+		AntiExtendMode: req.AntiExtendMode,
 		DepositAmount:  req.DepositAmount,
 		Status:         req.Status,
 		StartTime:      req.StartTime,
 		EndTime:        req.EndTime,
+		DurationSec:    req.DurationSec,
 	})
 	if err != nil {
 		writeServiceError(c, err)

@@ -44,7 +44,8 @@
                     "depositAmount": 20000,
                     "incrementRule": {
                       "type": "fixed",
-                      "amount": 1000
+                      "amount": 1000,
+                      "maxBidSteps": 5
                     },
                     "antiSnipingSec": 15,
                     "antiExtendSec": 30,
@@ -63,6 +64,7 @@
                     "depositAmount": 20000,
                     "incrementRule": {
                       "type": "ladder",
+                      "maxBidSteps": 5,
                       "steps": [
                         {
                           "min": 0,
@@ -152,6 +154,7 @@
               "example": {
                 "incrementRule": {
                   "type": "ladder",
+                  "maxBidSteps": 5,
                   "steps": [
                     {
                       "min": 0,
@@ -377,7 +380,8 @@
         "type": "object",
         "required": [
           "type",
-          "amount"
+          "amount",
+          "maxBidSteps"
         ],
         "properties": {
           "type": {
@@ -391,6 +395,11 @@
             "format": "int64",
             "minimum": 1,
             "description": "固定最低加价金额，单位分"
+          },
+          "maxBidSteps": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "单次最高加价步数"
           }
         },
         "additionalProperties": false
@@ -399,6 +408,7 @@
         "type": "object",
         "required": [
           "type",
+          "maxBidSteps",
           "steps"
         ],
         "properties": {
@@ -407,6 +417,11 @@
             "enum": [
               "ladder"
             ]
+          },
+          "maxBidSteps": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "单次最高加价步数"
           },
           "steps": {
             "type": "array",

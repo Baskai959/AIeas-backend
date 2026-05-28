@@ -67,14 +67,17 @@ CREATE TABLE IF NOT EXISTS `auction_lot` (
   `auction_type`     VARCHAR(16)     NOT NULL DEFAULT 'ENGLISH' COMMENT '拍卖类型，MVP 仅支持 ENGLISH',
   `start_price`      BIGINT          NOT NULL                  COMMENT '起拍价（分），允许为 0（0 元起拍）',
   `reserve_price`    BIGINT          NOT NULL DEFAULT 0        COMMENT '保留价（分），0 表示无保留价',
-  `increment_rule`   JSON            NOT NULL                  COMMENT '增价规则（阶梯加价）JSON',
+  `cap_price`        BIGINT          NOT NULL DEFAULT 0        COMMENT '封顶价（分），0 表示无封顶价；达到该价格自动成交',
+  `increment_rule`   JSON            NOT NULL                  COMMENT '加价规则 JSON：fixed 固定加价；ladder 阶梯加价；maxBidSteps 单次最高加价步数',
   `anti_sniping_sec` INT             NOT NULL DEFAULT 15       COMMENT '反狙击触发窗口（秒）',
   `anti_extend_sec`  INT             NOT NULL DEFAULT 30       COMMENT '反狙击延长时长（秒）',
+  `anti_extend_mode` VARCHAR(16)     NOT NULL DEFAULT 'ADD'    COMMENT '反狙击延时模式：ADD=结束时间增加 anti_extend_sec；RESET=倒计时重置为 anti_extend_sec',
   `deposit_amount`   BIGINT          NOT NULL                  COMMENT '保证金金额（分）',
   `status`           VARCHAR(32)     NOT NULL                  COMMENT '状态：DRAFT/PENDING_AUDIT/READY/WARMING_UP/RUNNING/EXTENDED/HAMMER_PENDING/CLOSED_WON/CLOSED_FAILED/SETTLED',
   `rule_snapshot`    JSON            NOT NULL                  COMMENT '规则快照（不可变）JSON',
-  `start_time`       DATETIME(3)     NOT NULL                  COMMENT '开拍时间',
-  `end_time`         DATETIME(3)     NOT NULL                  COMMENT '计划结束时间（可被反狙击延长）',
+  `start_time`       DATETIME(3)     DEFAULT NULL              COMMENT '开拍时间；NULL 表示未设置定时开拍',
+  `end_time`         DATETIME(3)     DEFAULT NULL              COMMENT '计划结束时间（可被反狙击延长）；NULL 表示启动时按时长计算',
+  `duration_sec`     INT             NOT NULL DEFAULT 0        COMMENT '拍卖时长（秒），0 表示未预设，可在上架/激活时指定',
   `winner_id`        BIGINT UNSIGNED DEFAULT NULL              COMMENT '中拍用户 ID（user.id）',
   `deal_price`       BIGINT          DEFAULT NULL              COMMENT '成交价（分）',
   `closed_at`        DATETIME(3)     DEFAULT NULL              COMMENT '实际落锤时间',
@@ -251,6 +254,30 @@ CREATE TABLE IF NOT EXISTS `live_session` (
   KEY `idx_merchant_opened` (`merchant_id`, `opened_at`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='直播场次（一次开播-闭播）';
 
+-- ---------------------------------------------------------------------
+-- 12. live_analysis_report 直播总结报告表
+--     商家闭播后自动发起 AI 直播总结，按直播场次持久化任务状态、prompt、报告结果与失败原因
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS `live_analysis_report` (
+  `task_id`       VARCHAR(64)   NOT NULL                COMMENT '报告生成任务 ID（lar_xxx）',
+  `agent_request_id` VARCHAR(128) DEFAULT NULL           COMMENT 'Agent 异步任务 ID，用于回调兜底定位',
+  `merchant_id`   VARCHAR(64)   NOT NULL                COMMENT '商家 ID（冗余便于按商家查询）',
+  `live_session_id` BIGINT UNSIGNED DEFAULT NULL         COMMENT '直播场次 ID，与 live_session.id 对应',
+  `status`        VARCHAR(16)   NOT NULL                COMMENT '任务状态：PENDING/RUNNING/SUCCEEDED/FAILED',
+  `attempt_count` INT           NOT NULL DEFAULT 0       COMMENT '已请求 Agent 生成次数，最多 3 次',
+  `prompt`        TEXT          NOT NULL                COMMENT '发送给 Agent 的提示词',
+  `report`        MEDIUMTEXT    DEFAULT NULL            COMMENT 'AI 生成的直播总结内容',
+  `error_message` VARCHAR(1024) DEFAULT NULL            COMMENT '失败原因',
+  `created_at`    DATETIME(3)   NOT NULL DEFAULT CURRENT_TIMESTAMP(3) COMMENT '创建时间',
+  `updated_at`    DATETIME(3)   NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3) COMMENT '更新时间',
+  PRIMARY KEY (`task_id`),
+  UNIQUE KEY `uk_live_session` (`live_session_id`),
+  KEY `idx_agent_request` (`agent_request_id`),
+  KEY `idx_merchant_created` (`merchant_id`, `created_at`),
+  KEY `idx_session_status` (`live_session_id`, `status`),
+  KEY `idx_status_updated` (`status`, `updated_at`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='直播 AI 总结报告';
+
 -- =====================================================================
 -- 演示数据（Demo Seed），仅供本地启动验证使用
 -- =====================================================================
@@ -270,23 +297,20 @@ INSERT INTO `item` (`id`, `seller_id`, `title`, `category`, `brand`, `condition_
 
 -- 演示拍品（0 元起拍 + 反狙击 15s/30s + 保证金 100 元）
 INSERT INTO `auction_lot`
-  (`auction_id`, `item_id`, `seller_id`, `auction_type`, `start_price`, `reserve_price`,
+  (`auction_id`, `item_id`, `seller_id`, `auction_type`, `start_price`, `reserve_price`, `cap_price`,
    `increment_rule`, `anti_sniping_sec`, `anti_extend_sec`, `deposit_amount`,
    `status`, `rule_snapshot`, `start_time`, `end_time`)
 VALUES
-  (90001, 1001, 2, 'ENGLISH', 0, 0,
-   JSON_OBJECT('type','STEP','steps', JSON_ARRAY(
-     JSON_OBJECT('lt', 10000, 'inc', 100),
-     JSON_OBJECT('lt', 100000, 'inc', 500),
-     JSON_OBJECT('lt', 1000000, 'inc', 2000)
-   )),
+  (90001, 1001, 2, 'ENGLISH', 0, 0, 50000,
+   JSON_OBJECT('type', 'fixed', 'amount', 100, 'maxBidSteps', 10),
    15, 30, 10000,
    'READY',
    JSON_OBJECT(
      'auctionType','ENGLISH',
      'startPrice', 0,
      'reservePrice', 0,
-     'incrementStrategy', JSON_OBJECT('type','STEP'),
+     'capPrice', 50000,
+     'incrementRule', JSON_OBJECT('type', 'fixed', 'amount', 100, 'maxBidSteps', 10),
      'antiSniping', JSON_OBJECT('triggerSec',15,'extendSec',30),
      'depositPolicy', JSON_OBJECT('amount',10000)
    ),
@@ -297,4 +321,5 @@ VALUES
 INSERT INTO `config_item` (`config_key`, `config_value`, `description`) VALUES
   ('default.deposit_ratio',   JSON_OBJECT('ratio', 0.1, 'min', 1000, 'max', 100000), '默认保证金比例（按起拍价 10%，最小 10 元最大 1000 元）'),
   ('default.anti_sniping',    JSON_OBJECT('triggerSec', 15, 'extendSec', 30),         '默认反狙击参数'),
-  ('order.pay_timeout_sec',   JSON_OBJECT('value', 1800),                              '订单支付超时（秒）');
+  ('order.pay_timeout_sec',   JSON_OBJECT('value', 1800),                              '订单支付超时（秒）'),
+  ('live.agent_hook.default', JSON_OBJECT('enabled', false),                           '直播拍卖 AI Agent hook 默认开关');

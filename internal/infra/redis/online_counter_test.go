@@ -15,7 +15,9 @@ func TestOnlineCounterTouchHeartbeatIndexJanitorAndFallback(t *testing.T) {
 	client := redisgo.NewClient(&redisgo.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { _ = client.Close() })
 	keys := NewKeyBuilder("test")
-	counter := NewOnlineCounter(client, keys, 100*time.Millisecond)
+	rt := &RedisRTClient{Client: client}
+	sharded := NewShardedRTClientFromShards([]*RedisRTClient{rt})
+	counter := NewOnlineCounter(sharded, keys, 100*time.Millisecond)
 
 	count, err := counter.Touch(ctx, 10001, "conn-1")
 	if err != nil || count != 1 {

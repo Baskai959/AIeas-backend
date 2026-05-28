@@ -196,6 +196,23 @@ func (h *AdminHandler) ListOrders(ctx context.Context, c *app.RequestContext) {
 	WriteSuccess(c, adminPageData("items", orders, c))
 }
 
+func (h *AdminHandler) DashboardMetrics(ctx context.Context, c *app.RequestContext) {
+	startTime, ok := parseDashboardTimeQuery(c, "startTime")
+	if !ok {
+		return
+	}
+	endTime, ok := parseDashboardTimeQuery(c, "endTime")
+	if !ok {
+		return
+	}
+	metrics, err := h.admin.DashboardMetrics(ctx, startTime, endTime, strings.TrimSpace(c.Query("bucket")))
+	if err != nil {
+		writeServiceError(c, err)
+		return
+	}
+	WriteSuccess(c, metrics)
+}
+
 func (h *AdminHandler) ListAuditLogs(ctx context.Context, c *app.RequestContext) {
 	filter := domain.AuditFilter{OperatorID: strings.TrimSpace(c.Query("operatorId")), Action: strings.TrimSpace(c.Query("action")), Limit: adminPageSize(c), Offset: adminOffset(c)}
 	if start, ok := parseTimeQuery(c, "startTime"); ok {
@@ -315,6 +332,19 @@ func parseTimeQuery(c *app.RequestContext, name string) (time.Time, bool) {
 		return time.Time{}, false
 	}
 	return parsed, true
+}
+
+func parseDashboardTimeQuery(c *app.RequestContext, name string) (*time.Time, bool) {
+	value := strings.TrimSpace(c.Query(name))
+	if value == "" {
+		return nil, true
+	}
+	parsed, err := time.Parse(time.RFC3339, value)
+	if err != nil {
+		WriteError(c, 400, 20001, "参数不合法", nil)
+		return nil, false
+	}
+	return &parsed, true
 }
 
 func normalizeRiskEventStatus(status string) domain.RiskEventStatus {
