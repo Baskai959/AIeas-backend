@@ -1,10 +1,14 @@
-.env
-.env.*
-!.env.example
-docker/prod.env
-
+.git
+.gitignore
 .DS_Store
 
+.env
+.env.*
+docker/prod.env
+
 bin/
+dist/
 tmp/
 coverage.out
+
+*.log

@@ -1,0 +1,107 @@
+services:
+  mysql:
+    image: mysql:8.4
+    restart: unless-stopped
+    env_file:
+      - ./docker/prod.env
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_0900_ai_ci
+      - --default-time-zone=+08:00
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ./docs/ddl.sql:/docker-entrypoint-initdb.d/001_aieas.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u\"$${MYSQL_USER}\" -p\"$${MYSQL_PASSWORD}\" --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  redis-rt-1:
+    image: redis:7.4-alpine
+    restart: unless-stopped
+    env_file:
+      - ./docker/prod.env
+    command:
+      - sh
+      - -c
+      - |
+        if [ -n "$$REDIS_RT_SHARD_0_PASSWORD" ]; then
+          exec redis-server --appendonly yes --appendfsync everysec --save 60 1000 --maxmemory-policy noeviction --requirepass "$$REDIS_RT_SHARD_0_PASSWORD"
+        fi
+        exec redis-server --appendonly yes --appendfsync everysec --save 60 1000 --maxmemory-policy noeviction
+    volumes:
+      - redis-rt-1-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "if [ -n \"$${REDIS_RT_SHARD_0_PASSWORD}\" ]; then REDISCLI_AUTH=\"$${REDIS_RT_SHARD_0_PASSWORD}\" redis-cli ping; else redis-cli ping; fi"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  redis-rt-2:
+    image: redis:7.4-alpine
+    restart: unless-stopped
+    env_file:
+      - ./docker/prod.env
+    command:
+      - sh
+      - -c
+      - |
+        if [ -n "$$REDIS_RT_SHARD_1_PASSWORD" ]; then
+          exec redis-server --appendonly yes --appendfsync everysec --save 60 1000 --maxmemory-policy noeviction --requirepass "$$REDIS_RT_SHARD_1_PASSWORD"
+        fi
+        exec redis-server --appendonly yes --appendfsync everysec --save 60 1000 --maxmemory-policy noeviction
+    volumes:
+      - redis-rt-2-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "if [ -n \"$${REDIS_RT_SHARD_1_PASSWORD}\" ]; then REDISCLI_AUTH=\"$${REDIS_RT_SHARD_1_PASSWORD}\" redis-cli ping; else redis-cli ping; fi"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  redis-cache:
+    image: redis:7.4-alpine
+    restart: unless-stopped
+    env_file:
+      - ./docker/prod.env
+    command:
+      - sh
+      - -c
+      - |
+        if [ -n "$$REDIS_CACHE_PASSWORD" ]; then
+          exec redis-server --appendonly yes --appendfsync everysec --save 60 1000 --maxmemory-policy allkeys-lfu --requirepass "$$REDIS_CACHE_PASSWORD"
+        fi
+        exec redis-server --appendonly yes --appendfsync everysec --save 60 1000 --maxmemory-policy allkeys-lfu
+    volumes:
+      - redis-cache-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "if [ -n \"$${REDIS_CACHE_PASSWORD}\" ]; then REDISCLI_AUTH=\"$${REDIS_CACHE_PASSWORD}\" redis-cli ping; else redis-cli ping; fi"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: aieas-backend:latest
+    restart: unless-stopped
+    env_file:
+      - ./docker/prod.env
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis-rt-1:
+        condition: service_healthy
+      redis-rt-2:
+        condition: service_healthy
+      redis-cache:
+        condition: service_healthy
+    ports:
+      - "0.0.0.0:8888:8888"
+
+volumes:
+  mysql-data:
+  redis-rt-1-data:
+  redis-rt-2-data:
+  redis-cache-data:
