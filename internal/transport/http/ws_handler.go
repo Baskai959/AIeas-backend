@@ -95,7 +95,9 @@ func (h *WSHandler) LiveSession(ctx context.Context, c *app.RequestContext) {
 	if userID == "" {
 		userID = "anonymous"
 	}
+	role := AuthRole(c)
 	client := corews.NewClientWithSession(clientID, userID, auctionID, liveSessionID, h.sendBufferSize)
+	client.CountOnline = role == domain.RoleBuyer
 	lastSeq := parseLastSeq(c)
 	if err := h.hub.Subscribe(auctionID, client); err != nil {
 		WriteError(c, consts.StatusInternalServerError, 90001, "系统内部错误", nil)
@@ -119,7 +121,9 @@ func (h *WSHandler) Auction(ctx context.Context, c *app.RequestContext) {
 	if userID == "" {
 		userID = "anonymous"
 	}
+	role := AuthRole(c)
 	client := corews.NewClient(clientID, userID, auctionID, h.sendBufferSize)
+	client.CountOnline = role == domain.RoleBuyer
 	lastSeq := parseLastSeq(c)
 	if err := h.hub.Subscribe(auctionID, client); err != nil {
 		WriteError(c, consts.StatusInternalServerError, 90001, "系统内部错误", nil)
@@ -287,7 +291,9 @@ func (h *WSHandler) handleInbound(ctx context.Context, client *corews.Client, en
 		h.hub.Unsubscribe(payload.AuctionID, client.ID)
 		return []corews.Envelope{jsonEnvelope("room.unsubscribed", env.RequestID, map[string]interface{}{"auctionId": payload.AuctionID})}
 	case "heartbeat":
-		h.hub.Touch(client.AuctionID, client.ID)
+		if client.CountOnline {
+			h.hub.Touch(client.AuctionID, client.ID)
+		}
 		return []corews.Envelope{jsonEnvelope("heartbeat.ack", env.RequestID, map[string]interface{}{"ts": time.Now().UTC().UnixMilli()})}
 	default:
 		return h.hub.HandleInbound(ctx, client, env)

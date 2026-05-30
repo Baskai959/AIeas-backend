@@ -32,6 +32,7 @@ type LiveSessionService struct {
 	auction         *AuctionService
 	bids            repository.BidRepository
 	orders          repository.OrderRepository
+	users           repository.UserRepository
 	auctionRealtime repository.AuctionRealtimeStore
 	hub             OnlineCounter
 	sessionRealtime repository.LiveSessionRealtimeStore
@@ -67,6 +68,13 @@ func (s *LiveSessionService) SetReadDeps(bids repository.BidRepository, orders r
 	}
 	s.bids = bids
 	s.orders = orders
+}
+
+func (s *LiveSessionService) SetUserRepository(users repository.UserRepository) {
+	if s == nil {
+		return
+	}
+	s.users = users
 }
 
 // SetRealtimeStore 注入跨实例的实时计数存储。注入后 IncrCounters 不再 RMW MySQL，
@@ -538,7 +546,42 @@ func (s *LiveSessionService) ListBidsPaged(ctx context.Context, sessionID uint64
 	if offset < 0 {
 		offset = 0
 	}
-	return s.bids.ListByLiveSession(ctx, sessionID, normalizeBidSort(sortBy), limit, offset)
+	records, err := s.bids.ListByLiveSession(ctx, sessionID, normalizeBidSort(sortBy), limit, offset)
+	if err != nil {
+		return nil, err
+	}
+	return s.enrichBidderNicknames(ctx, records), nil
+}
+
+func (s *LiveSessionService) ListAuctionBids(ctx context.Context, sessionID, auctionID uint64, limit int, actorID string, actorRole domain.Role) ([]domain.BidRecord, error) {
+	if s == nil || s.sessions == nil || s.auctions == nil {
+		return nil, domain.ErrNotFound
+	}
+	if sessionID == 0 || auctionID == 0 {
+		return nil, domain.ErrInvalidArgument
+	}
+	session, err := s.sessions.Get(ctx, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	if !canAccessSellerOwned(actorID, actorRole, session.MerchantID) {
+		return nil, domain.ErrForbidden
+	}
+	auction, err := s.auctions.FindByID(ctx, auctionID)
+	if err != nil {
+		return nil, err
+	}
+	if auction.LiveSessionID == nil || *auction.LiveSessionID != sessionID {
+		return nil, domain.ErrInvalidArgument
+	}
+	if s.bids == nil {
+		return []domain.BidRecord{}, nil
+	}
+	records, err := s.bids.ListByAuction(ctx, auctionID, limit)
+	if err != nil {
+		return nil, err
+	}
+	return s.enrichBidderNicknames(ctx, records), nil
 }
 
 // ListOrders 返回某场次产生的订单。
@@ -912,6 +955,34 @@ func lockTTLForAuction(auction domain.AuctionLot) time.Duration {
 		return time.Hour
 	}
 	return d
+}
+
+func (s *LiveSessionService) enrichBidderNicknames(ctx context.Context, records []domain.BidRecord) []domain.BidRecord {
+	if len(records) == 0 || s.users == nil {
+		return records
+	}
+	out := make([]domain.BidRecord, len(records))
+	copy(out, records)
+	cache := make(map[string]string, len(out))
+	for i := range out {
+		id := strings.TrimSpace(out[i].BidderID)
+		if id == "" {
+			continue
+		}
+		if nickname, ok := cache[id]; ok {
+			out[i].BidderNickname = nickname
+			continue
+		}
+		user, err := s.users.FindByID(id)
+		if err != nil {
+			cache[id] = ""
+			continue
+		}
+		nickname := strings.TrimSpace(user.Nickname)
+		cache[id] = nickname
+		out[i].BidderNickname = nickname
+	}
+	return out
 }
 
 func (s *LiveSessionService) enrichLots(ctx context.Context, lots []domain.AuctionLot) []domain.AuctionLot {

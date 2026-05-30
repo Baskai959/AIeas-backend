@@ -63,6 +63,10 @@ func (s *AuctionRealtimeStore) InitAuction(ctx context.Context, auction domain.A
 		Source:       "redis",
 	}
 	client, _ := s.shardForAuction(auction.AuctionID)
+	var liveSessionID uint64
+	if auction.LiveSessionID != nil {
+		liveSessionID = *auction.LiveSessionID
+	}
 	pipe := client.Pipeline()
 	pipe.Del(ctx,
 		s.keys.AuctionBids(auction.AuctionID),
@@ -74,6 +78,7 @@ func (s *AuctionRealtimeStore) InitAuction(ctx context.Context, auction domain.A
 	pipe.SRem(ctx, s.keys.ActiveStreams(), strconv.FormatUint(auction.AuctionID, 10))
 	pipe.HSet(ctx, s.keys.AuctionState(auction.AuctionID),
 		"auction_id", auction.AuctionID,
+		"live_session_id", liveSessionID,
 		"status", string(auction.Status),
 		"start_price", auction.StartPrice,
 		"current_price", auction.StartPrice,
@@ -206,6 +211,8 @@ func (s *AuctionRealtimeStore) PlaceBid(ctx context.Context, input domain.BidInp
 		expectedCurrentPrice,
 		traceParent,
 		traceState,
+		input.LiveSessionID,
+		input.BidderNickname,
 	)
 	if err != nil {
 		return domain.BidResult{}, err
@@ -272,7 +279,9 @@ func (s *AuctionRealtimeStore) TopN(ctx context.Context, auctionID uint64, limit
 type luaBidResult struct {
 	RequestID      string               `json:"requestId"`
 	AuctionID      uint64               `json:"auctionId"`
+	LiveSessionID  uint64               `json:"liveSessionId"`
 	BidderID       string               `json:"bidderId"`
+	BidderNickname string               `json:"bidderNickname"`
 	Price          int64                `json:"price"`
 	Accepted       bool                 `json:"accepted"`
 	Duplicate      bool                 `json:"duplicate"`
@@ -305,7 +314,9 @@ func decodeBidResult(raw interface{}) (domain.BidResult, error) {
 	return domain.BidResult{
 		RequestID:      decoded.RequestID,
 		AuctionID:      decoded.AuctionID,
+		LiveSessionID:  decoded.LiveSessionID,
 		BidderID:       decoded.BidderID,
+		BidderNickname: decoded.BidderNickname,
 		Price:          decoded.Price,
 		Accepted:       decoded.Accepted,
 		Duplicate:      decoded.Duplicate,

@@ -17,6 +17,8 @@ type AdminService struct {
 	risk      *RiskService
 	audits    repository.AuditRepository
 	dashboard repository.AdminDashboardRepository
+	items     repository.ItemRepository
+	sessions  repository.LiveSessionRepository
 	configs   repository.ConfigRepository
 	flags     *FeatureFlagService
 }
@@ -27,6 +29,11 @@ func NewAdminService(users repository.UserRepository, auctions *AuctionService, 
 
 func (s *AdminService) SetDashboardRepository(repo repository.AdminDashboardRepository) {
 	s.dashboard = repo
+}
+
+func (s *AdminService) SetLookupRepositories(items repository.ItemRepository, sessions repository.LiveSessionRepository) {
+	s.items = items
+	s.sessions = sessions
 }
 
 func (s *AdminService) SetConfigRepository(repo repository.ConfigRepository) {
@@ -69,6 +76,39 @@ func (s *AdminService) ListUsers(filter domain.UserFilter) ([]domain.SafeUser, e
 	return safe, nil
 }
 
+func (s *AdminService) AuctionByID(ctx context.Context, auctionID uint64) (domain.AuctionLot, error) {
+	if auctionID == 0 || s.auctions == nil {
+		return domain.AuctionLot{}, domain.ErrInvalidArgument
+	}
+	return s.auctions.Get(ctx, auctionID, "admin", domain.RoleAdmin)
+}
+
+func (s *AdminService) ItemByID(ctx context.Context, itemID uint64) (domain.Item, error) {
+	if itemID == 0 || s.items == nil {
+		return domain.Item{}, domain.ErrInvalidArgument
+	}
+	return s.items.FindByID(ctx, itemID)
+}
+
+func (s *AdminService) LiveSessionByID(ctx context.Context, sessionID uint64) (domain.LiveSession, error) {
+	if sessionID == 0 || s.sessions == nil {
+		return domain.LiveSession{}, domain.ErrInvalidArgument
+	}
+	return s.sessions.Get(ctx, sessionID)
+}
+
+func (s *AdminService) UserByID(userID string) (domain.SafeUser, error) {
+	userID = strings.TrimSpace(userID)
+	if userID == "" || s.users == nil {
+		return domain.SafeUser{}, domain.ErrInvalidArgument
+	}
+	user, err := s.users.FindByID(userID)
+	if err != nil {
+		return domain.SafeUser{}, err
+	}
+	return user.Safe(), nil
+}
+
 func (s *AdminService) UpdateUserStatus(userID string, status domain.UserStatus) (domain.SafeUser, error) {
 	userID = strings.TrimSpace(userID)
 	if userID == "" || (status != domain.UserStatusActive && status != domain.UserStatusDisabled) {
@@ -95,6 +135,13 @@ func (s *AdminService) RemoveBlacklist(ctx context.Context, userID string) error
 
 func (s *AdminService) ListBlacklist(ctx context.Context, limit, offset int) ([]domain.Blacklist, error) {
 	return s.risk.ListBlacklist(ctx, limit, offset)
+}
+
+func (s *AdminService) IsBlacklisted(ctx context.Context, userID string) (bool, error) {
+	if s.risk == nil {
+		return false, nil
+	}
+	return s.risk.IsBlacklisted(ctx, userID)
 }
 
 func (s *AdminService) BlacklistStrategyConfig(ctx context.Context) (domain.BlacklistStrategyConfig, error) {

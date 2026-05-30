@@ -31,6 +31,7 @@ type BidService struct {
 	hook      *LiveAgentHookService
 	configs   repository.ConfigRepository
 	controls  *RiskControlService
+	users     repository.UserRepository
 
 	blacklistStrategyMu        sync.RWMutex
 	blacklistStrategyCached    bool
@@ -94,6 +95,10 @@ func (s *BidService) SetConfigRepository(configs repository.ConfigRepository) {
 
 func (s *BidService) SetRiskControlService(controls *RiskControlService) {
 	s.controls = controls
+}
+
+func (s *BidService) SetUserRepository(users repository.UserRepository) {
+	s.users = users
 }
 
 // SetMetrics 注入观测性 Registry。nil 安全：未注入时所有 Observe* 调用走 noop。
@@ -175,6 +180,11 @@ func (s *BidService) place(ctx context.Context, in PlaceBidInput) (domain.BidRes
 	if err != nil {
 		return domain.BidResult{}, err
 	}
+	var liveSessionID uint64
+	if auction.LiveSessionID != nil {
+		liveSessionID = *auction.LiveSessionID
+	}
+	bidderNickname := s.bidderNickname(ctx, in.BidderID)
 	now := time.Now().UTC()
 	if in.Source == "" {
 		in.Source = "live_ws"
@@ -197,17 +207,19 @@ func (s *BidService) place(ctx context.Context, in PlaceBidInput) (domain.BidRes
 		blacklisted = isBlacklisted
 		if blacklisted {
 			result := domain.BidResult{
-				RequestID:    in.RequestID,
-				AuctionID:    in.AuctionID,
-				BidderID:     in.BidderID,
-				Price:        in.Price,
-				Accepted:     false,
-				Reason:       "BLACKLIST",
-				CurrentPrice: auction.StartPrice,
-				EndTime:      auction.EndTime,
-				Event:        "bid.rejected",
-				RiskResult:   domain.BidRiskReject,
+				RequestID:     in.RequestID,
+				AuctionID:     in.AuctionID,
+				LiveSessionID: liveSessionID,
+				BidderID:      in.BidderID,
+				Price:         in.Price,
+				Accepted:      false,
+				Reason:        "BLACKLIST",
+				CurrentPrice:  auction.StartPrice,
+				EndTime:       auction.EndTime,
+				Event:         "bid.rejected",
+				RiskResult:    domain.BidRiskReject,
 			}
+			s.enrichBidResult(ctx, &result, auction.LiveSessionID)
 			s.persistBid(ctx, in, result, now)
 			s.publishBidResult(ctx, result)
 			return result, nil
@@ -243,6 +255,7 @@ func (s *BidService) place(ctx context.Context, in PlaceBidInput) (domain.BidRes
 				reason = "NOT_ENROLLED"
 			}
 			result := rejectBidFromState(in, state, reason)
+			s.enrichBidResult(ctx, &result, auction.LiveSessionID)
 			if riskControlEnabled && blacklistStrategy.Enabled && blacklistStrategy.MissingDepositEnabled && s.risk != nil {
 				s.scheduleAutoBlacklist(ctx, blacklistStrategy, in.BidderID, in.AuctionID, "AUTO_BLACKLIST_"+reason, result)
 			}
@@ -253,12 +266,14 @@ func (s *BidService) place(ctx context.Context, in PlaceBidInput) (domain.BidRes
 		if prerequisitesReady {
 			if reason := validateBidExpectedState(in, state, auction.CapPrice, rule); reason != "" {
 				result := rejectBidFromState(in, state, reason)
+				s.enrichBidResult(ctx, &result, auction.LiveSessionID)
 				s.persistBid(ctx, in, result, now)
 				s.publishBidResult(ctx, result)
 				return result, nil
 			}
 			if reason := domain.ValidateBidPrice(auction.StartPrice, state.CurrentPrice, auction.CapPrice, in.Price, rule); reason != "" {
 				result := rejectBidFromState(in, state, reason)
+				s.enrichBidResult(ctx, &result, auction.LiveSessionID)
 				if riskControlEnabled && blacklistStrategy.Enabled && blacklistStrategy.UnreasonablePriceEnabled && s.risk != nil &&
 					(isAutoBlacklistPriceReason(reason) || bidAboveAllowedMax(auction.StartPrice, state.CurrentPrice, auction.CapPrice, in.Price, rule)) {
 					s.scheduleAutoBlacklist(ctx, blacklistStrategy, in.BidderID, in.AuctionID, "AUTO_BLACKLIST_"+reason, result)
@@ -279,12 +294,14 @@ func (s *BidService) place(ctx context.Context, in PlaceBidInput) (domain.BidRes
 		}
 		if reason := validateBidExpectedState(in, state, auction.CapPrice, rule); reason != "" {
 			result := rejectBidFromState(in, state, reason)
+			s.enrichBidResult(ctx, &result, auction.LiveSessionID)
 			s.persistBid(ctx, in, result, now)
 			s.publishBidResult(ctx, result)
 			return result, nil
 		}
 		if reason := domain.ValidateBidPrice(auction.StartPrice, auction.StartPrice, auction.CapPrice, in.Price, rule); reason != "" {
 			result := rejectBidFromState(in, state, reason)
+			s.enrichBidResult(ctx, &result, auction.LiveSessionID)
 			s.persistBid(ctx, in, result, now)
 			s.publishBidResult(ctx, result)
 			return result, nil
@@ -302,7 +319,9 @@ func (s *BidService) place(ctx context.Context, in PlaceBidInput) (domain.BidRes
 	result, err := s.realtime.PlaceBid(ctx, domain.BidInput{
 		RequestID:            in.RequestID,
 		AuctionID:            in.AuctionID,
+		LiveSessionID:        liveSessionID,
 		BidderID:             in.BidderID,
+		BidderNickname:       bidderNickname,
 		Price:                in.Price,
 		ExpectedCurrentPrice: in.ExpectedCurrentPrice,
 		Now:                  now,
@@ -329,6 +348,7 @@ func (s *BidService) place(ctx context.Context, in PlaceBidInput) (domain.BidRes
 			result.RiskResult = domain.BidRiskReject
 		}
 	}
+	s.enrichBidResult(ctx, &result, auction.LiveSessionID)
 	if result.Accepted && !result.Duplicate && s.hook != nil && auction.LiveSessionID != nil {
 		s.hook.EmitHighestBid(ctx, auction.SellerID, *auction.LiveSessionID, result.BidderID, result.CurrentPrice)
 	}
@@ -568,6 +588,7 @@ func (s *BidService) publishBidResult(ctx context.Context, result domain.BidResu
 	if result.Accepted {
 		broadcastJSONWithSeq(s.publisher, result.AuctionID, "bid.accepted", result.Seq, result)
 		if ranking, err := s.TopN(ctx, result.AuctionID, 10); err == nil {
+			ranking = s.enrichRanking(ctx, ranking)
 			broadcastJSON(s.publisher, result.AuctionID, "ranking.updated", map[string]interface{}{
 				"auctionId": result.AuctionID,
 				"ranking":   ranking,
@@ -585,17 +606,64 @@ func (s *BidService) publishBidResult(ctx context.Context, result domain.BidResu
 	broadcastJSONWithSeq(s.publisher, result.AuctionID, "bid.rejected", result.Seq, result)
 }
 
+func (s *BidService) enrichBidResult(ctx context.Context, result *domain.BidResult, liveSessionID *uint64) {
+	if result == nil {
+		return
+	}
+	if result.LiveSessionID == 0 && liveSessionID != nil {
+		result.LiveSessionID = *liveSessionID
+	}
+	if result.BidderNickname == "" {
+		result.BidderNickname = s.bidderNickname(ctx, result.BidderID)
+	}
+}
+
+func (s *BidService) enrichRanking(ctx context.Context, ranking []domain.RankingEntry) []domain.RankingEntry {
+	if len(ranking) == 0 || s.users == nil {
+		return ranking
+	}
+	out := make([]domain.RankingEntry, len(ranking))
+	copy(out, ranking)
+	cache := make(map[string]string, len(out))
+	for i := range out {
+		id := strings.TrimSpace(out[i].BidderID)
+		if id == "" {
+			continue
+		}
+		if nickname, ok := cache[id]; ok {
+			out[i].BidderNickname = nickname
+			continue
+		}
+		nickname := s.bidderNickname(ctx, id)
+		cache[id] = nickname
+		out[i].BidderNickname = nickname
+	}
+	return out
+}
+
+func (s *BidService) bidderNickname(ctx context.Context, userID string) string {
+	if s == nil || s.users == nil || strings.TrimSpace(userID) == "" {
+		return ""
+	}
+	user, err := s.users.FindByID(userID)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(user.Nickname)
+}
+
 func bidResultFromRecord(record domain.BidRecord) domain.BidResult {
 	accepted := record.RejectReason == ""
 	result := domain.BidResult{
-		RequestID:  record.RequestID,
-		AuctionID:  record.AuctionID,
-		BidderID:   record.BidderID,
-		Price:      record.BidPrice,
-		Accepted:   accepted,
-		Duplicate:  true,
-		Reason:     record.RejectReason,
-		RiskResult: record.RiskResult,
+		RequestID:      record.RequestID,
+		AuctionID:      record.AuctionID,
+		BidderID:       record.BidderID,
+		BidderNickname: record.BidderNickname,
+		Price:          record.BidPrice,
+		Accepted:       accepted,
+		Duplicate:      true,
+		Reason:         record.RejectReason,
+		RiskResult:     record.RiskResult,
 	}
 	if accepted {
 		result.CurrentPrice = record.BidPrice

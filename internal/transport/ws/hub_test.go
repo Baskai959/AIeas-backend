@@ -97,6 +97,8 @@ func TestHubOnlineCountUpdatesOnSubscribeUnsubscribeAndSlowConsumer(t *testing.T
 	hub := NewHub()
 	c1 := NewClient("c1", "u1", 30001, 4)
 	c2 := NewClient("c2", "u2", 30001, 1)
+	merchant := NewClient("merchant", "m1", 30001, 4)
+	merchant.CountOnline = false
 	if err := hub.Subscribe(30001, c1); err != nil {
 		t.Fatalf("subscribe c1: %v", err)
 	}
@@ -104,17 +106,28 @@ func TestHubOnlineCountUpdatesOnSubscribeUnsubscribeAndSlowConsumer(t *testing.T
 	if hub.OnlineCount(30001) != 1 {
 		t.Fatalf("expected online count 1, got %d", hub.OnlineCount(30001))
 	}
+	if err := hub.Subscribe(30001, merchant); err != nil {
+		t.Fatalf("subscribe merchant: %v", err)
+	}
+	if hub.OnlineCount(30001) != 1 {
+		t.Fatalf("expected non-buyer client to be excluded from online count, got %d", hub.OnlineCount(30001))
+	}
+	drainPresence(t, c1, merchant)
 	if err := hub.Subscribe(30001, c2); err != nil {
 		t.Fatalf("subscribe c2: %v", err)
 	}
 	if hub.OnlineCount(30001) != 2 {
 		t.Fatalf("expected online count 2, got %d", hub.OnlineCount(30001))
 	}
-	drainPresence(t, c1, c2)
+	drainPresence(t, c1, c2, merchant)
 	c2.Deliver(Envelope{Type: "prefill"})
 	hub.Broadcast(30001, Envelope{Type: "announcement"})
 	if hub.OnlineCount(30001) != 1 {
 		t.Fatalf("expected slow consumer removed from online count, got %d", hub.OnlineCount(30001))
+	}
+	hub.Unsubscribe(30001, merchant.ID)
+	if hub.OnlineCount(30001) != 1 {
+		t.Fatalf("expected merchant unsubscribe to keep online count 1, got %d", hub.OnlineCount(30001))
 	}
 	hub.Unsubscribe(30001, c1.ID)
 	if hub.OnlineCount(30001) != 0 {

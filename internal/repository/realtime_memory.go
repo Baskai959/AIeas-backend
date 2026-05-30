@@ -254,7 +254,9 @@ func (s *MemoryRealtimeStore) PlaceBid(ctx context.Context, input domain.BidInpu
 	result := domain.BidResult{
 		RequestID:      input.RequestID,
 		AuctionID:      input.AuctionID,
+		LiveSessionID:  input.LiveSessionID,
 		BidderID:       input.BidderID,
+		BidderNickname: input.BidderNickname,
 		Price:          input.Price,
 		Accepted:       true,
 		CurrentPrice:   state.CurrentPrice,
@@ -380,7 +382,9 @@ func rejectBid(input domain.BidInput, reason string, currentPrice int64, leaderI
 	return domain.BidResult{
 		RequestID:      input.RequestID,
 		AuctionID:      input.AuctionID,
+		LiveSessionID:  input.LiveSessionID,
 		BidderID:       input.BidderID,
+		BidderNickname: input.BidderNickname,
 		Price:          input.Price,
 		Accepted:       false,
 		Reason:         reason,

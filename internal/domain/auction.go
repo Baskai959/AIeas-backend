@@ -175,23 +175,26 @@ const (
 )
 
 type BidRecord struct {
-	ID            uint64        `json:"id"`
-	RequestID     string        `json:"requestId"`
-	AuctionID     uint64        `json:"auctionId"`
-	LiveSessionID *uint64       `json:"liveSessionId,omitempty"`
-	BidderID      string        `json:"bidderId"`
-	BidPrice      int64         `json:"bidPrice"`
-	BidTSMS       int64         `json:"bidTsMs"`
-	Source        string        `json:"source"`
-	RiskResult    BidRiskResult `json:"riskResult"`
-	RejectReason  string        `json:"rejectReason,omitempty"`
-	CreatedAt     time.Time     `json:"createdAt"`
+	ID             uint64        `json:"id"`
+	RequestID      string        `json:"requestId"`
+	AuctionID      uint64        `json:"auctionId"`
+	LiveSessionID  *uint64       `json:"liveSessionId,omitempty"`
+	BidderID       string        `json:"bidderId"`
+	BidderNickname string        `json:"bidderNickname,omitempty"`
+	BidPrice       int64         `json:"bidPrice"`
+	BidTSMS        int64         `json:"bidTsMs"`
+	Source         string        `json:"source"`
+	RiskResult     BidRiskResult `json:"riskResult"`
+	RejectReason   string        `json:"rejectReason,omitempty"`
+	CreatedAt      time.Time     `json:"createdAt"`
 }
 
 type BidInput struct {
 	RequestID            string
 	AuctionID            uint64
+	LiveSessionID        uint64
 	BidderID             string
+	BidderNickname       string
 	Price                int64
 	ExpectedCurrentPrice *int64
 	Now                  time.Time
@@ -212,7 +215,9 @@ type BidInput struct {
 type BidResult struct {
 	RequestID      string        `json:"requestId"`
 	AuctionID      uint64        `json:"auctionId"`
+	LiveSessionID  uint64        `json:"liveSessionId,omitempty"`
 	BidderID       string        `json:"bidderId,omitempty"`
+	BidderNickname string        `json:"bidderNickname,omitempty"`
 	Price          int64         `json:"price,omitempty"`
 	Accepted       bool          `json:"accepted"`
 	Duplicate      bool          `json:"duplicate,omitempty"`
@@ -232,9 +237,10 @@ type BidResult struct {
 }
 
 type RankingEntry struct {
-	Rank     int    `json:"rank"`
-	BidderID string `json:"bidderId"`
-	Price    int64  `json:"price"`
+	Rank           int    `json:"rank"`
+	BidderID       string `json:"bidderId"`
+	BidderNickname string `json:"bidderNickname,omitempty"`
+	Price          int64  `json:"price"`
 }
 
 type HammerInput struct {

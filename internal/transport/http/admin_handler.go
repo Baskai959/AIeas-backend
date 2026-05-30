@@ -2,6 +2,8 @@ package http
 
 import (
 	"context"
+	"errors"
+	"strconv"
 	"strings"
 	"time"
 
@@ -64,11 +66,54 @@ type adminRiskEventRequest struct {
 }
 
 type adminUserView struct {
-	ID        string            `json:"id"`
-	Nickname  string            `json:"nickname"`
-	Role      domain.Role       `json:"role"`
-	Status    domain.UserStatus `json:"status,omitempty"`
-	RiskLevel string            `json:"riskLevel"`
+	ID          string            `json:"id"`
+	Nickname    string            `json:"nickname"`
+	Role        domain.Role       `json:"role"`
+	Status      domain.UserStatus `json:"status,omitempty"`
+	RiskLevel   string            `json:"riskLevel"`
+	Blacklisted bool              `json:"blacklisted"`
+}
+
+type adminBlacklistView struct {
+	ID                uint64            `json:"id"`
+	UserID            string            `json:"userId"`
+	Nickname          string            `json:"nickname"`
+	Role              domain.Role       `json:"role,omitempty"`
+	Status            domain.UserStatus `json:"status,omitempty"`
+	Reason            string            `json:"reason"`
+	CreatedBy         string            `json:"createdBy"`
+	CreatedByName     string            `json:"createdByName"`
+	CreatedByNickname string            `json:"createdByNickname"`
+	CreatedAt         time.Time         `json:"createdAt"`
+	ExpiresAt         *time.Time        `json:"expiresAt,omitempty"`
+}
+
+type adminAuctionView struct {
+	domain.AuctionLot
+	ItemName             string `json:"itemName"`
+	ItemTitle            string `json:"itemTitle"`
+	SellerNickname       string `json:"sellerNickname"`
+	LiveSessionName      string `json:"liveSessionName"`
+	LeaderBidderNickname string `json:"leaderBidderNickname"`
+	WinnerNickname       string `json:"winnerNickname"`
+}
+
+type adminOrderView struct {
+	domain.OrderDeal
+	WinnerNickname  string `json:"winnerNickname"`
+	SellerNickname  string `json:"sellerNickname"`
+	LiveSessionName string `json:"liveSessionName"`
+	AuctionName     string `json:"auctionName"`
+	AuctionTitle    string `json:"auctionTitle"`
+	ItemName        string `json:"itemName"`
+	ItemTitle       string `json:"itemTitle"`
+}
+
+type adminAuditLogView struct {
+	domain.AuditLog
+	OperatorName     string `json:"operatorName"`
+	OperatorNickname string `json:"operatorNickname"`
+	TargetName       string `json:"targetName"`
 }
 
 func (h *AdminHandler) ListAuctions(ctx context.Context, c *app.RequestContext) {
@@ -81,7 +126,17 @@ func (h *AdminHandler) ListAuctions(ctx context.Context, c *app.RequestContext) 
 		writeServiceError(c, err)
 		return
 	}
-	WriteSuccess(c, adminPageData("items", auctions, c))
+	resolver := newAdminNameResolver(ctx, h)
+	items := make([]adminAuctionView, 0, len(auctions))
+	for _, auction := range auctions {
+		view, err := resolver.auctionView(auction)
+		if err != nil {
+			writeServiceError(c, err)
+			return
+		}
+		items = append(items, view)
+	}
+	WriteSuccess(c, adminPageData("items", items, c))
 }
 
 func (h *AdminHandler) AuditAuction(ctx context.Context, c *app.RequestContext) {
@@ -138,7 +193,6 @@ func (h *AdminHandler) CloseAuction(ctx context.Context, c *app.RequestContext) 
 }
 
 func (h *AdminHandler) ListUsers(ctx context.Context, c *app.RequestContext) {
-	_ = ctx
 	filter := domain.UserFilter{Role: domain.Role(strings.TrimSpace(c.Query("role"))), Status: domain.UserStatus(strings.TrimSpace(c.Query("status"))), Keyword: strings.TrimSpace(c.Query("keyword")), Limit: adminPageSize(c), Offset: adminOffset(c)}
 	users, err := h.admin.ListUsers(filter)
 	if err != nil {
@@ -147,7 +201,12 @@ func (h *AdminHandler) ListUsers(ctx context.Context, c *app.RequestContext) {
 	}
 	items := make([]adminUserView, 0, len(users))
 	for _, user := range users {
-		items = append(items, adminUserView{ID: user.ID, Nickname: user.Nickname, Role: user.Role, Status: user.Status, RiskLevel: "LOW"})
+		blacklisted, err := h.admin.IsBlacklisted(ctx, user.ID)
+		if err != nil {
+			writeServiceError(c, err)
+			return
+		}
+		items = append(items, adminUserView{ID: user.ID, Nickname: user.Nickname, Role: user.Role, Status: user.Status, RiskLevel: "LOW", Blacklisted: blacklisted})
 	}
 	WriteSuccess(c, adminPageData("items", items, c))
 }
@@ -200,7 +259,42 @@ func (h *AdminHandler) ListBlacklist(ctx context.Context, c *app.RequestContext)
 		writeServiceError(c, err)
 		return
 	}
-	WriteSuccess(c, adminPageData("items", items, c))
+	views := make([]adminBlacklistView, 0, len(items))
+	resolver := newAdminNameResolver(ctx, h)
+	for _, item := range items {
+		user, err := resolver.user(item.UserID)
+		if err != nil {
+			writeServiceError(c, err)
+			return
+		}
+		creator, err := resolver.user(item.CreatedBy)
+		if err != nil {
+			writeServiceError(c, err)
+			return
+		}
+		nickname := user.Nickname
+		if nickname == "" {
+			nickname = item.UserID
+		}
+		createdByName := creator.Nickname
+		if createdByName == "" {
+			createdByName = item.CreatedBy
+		}
+		views = append(views, adminBlacklistView{
+			ID:                item.ID,
+			UserID:            item.UserID,
+			Nickname:          nickname,
+			Role:              user.Role,
+			Status:            user.Status,
+			Reason:            item.Reason,
+			CreatedBy:         item.CreatedBy,
+			CreatedByName:     createdByName,
+			CreatedByNickname: createdByName,
+			CreatedAt:         item.CreatedAt,
+			ExpiresAt:         item.ExpiresAt,
+		})
+	}
+	WriteSuccess(c, adminPageData("items", views, c))
 }
 
 func (h *AdminHandler) BlacklistStrategyConfig(ctx context.Context, c *app.RequestContext) {
@@ -304,7 +398,17 @@ func (h *AdminHandler) ListOrders(ctx context.Context, c *app.RequestContext) {
 		writeServiceError(c, err)
 		return
 	}
-	WriteSuccess(c, adminPageData("items", orders, c))
+	resolver := newAdminNameResolver(ctx, h)
+	items := make([]adminOrderView, 0, len(orders))
+	for _, order := range orders {
+		view, err := resolver.orderView(order)
+		if err != nil {
+			writeServiceError(c, err)
+			return
+		}
+		items = append(items, view)
+	}
+	WriteSuccess(c, adminPageData("items", items, c))
 }
 
 func (h *AdminHandler) DashboardMetrics(ctx context.Context, c *app.RequestContext) {
@@ -337,7 +441,17 @@ func (h *AdminHandler) ListAuditLogs(ctx context.Context, c *app.RequestContext)
 		writeServiceError(c, err)
 		return
 	}
-	WriteSuccess(c, adminPageData("items", logs, c))
+	resolver := newAdminNameResolver(ctx, h)
+	items := make([]adminAuditLogView, 0, len(logs))
+	for _, log := range logs {
+		view, err := resolver.auditLogView(log)
+		if err != nil {
+			writeServiceError(c, err)
+			return
+		}
+		items = append(items, view)
+	}
+	WriteSuccess(c, adminPageData("items", items, c))
 }
 
 func (h *AdminHandler) ListOwnAuditLogs(ctx context.Context, c *app.RequestContext) {
@@ -353,7 +467,17 @@ func (h *AdminHandler) ListOwnAuditLogs(ctx context.Context, c *app.RequestConte
 		writeServiceError(c, err)
 		return
 	}
-	WriteSuccess(c, adminPageData("items", logs, c))
+	resolver := newAdminNameResolver(ctx, h)
+	items := make([]adminAuditLogView, 0, len(logs))
+	for _, log := range logs {
+		view, err := resolver.auditLogView(log)
+		if err != nil {
+			writeServiceError(c, err)
+			return
+		}
+		items = append(items, view)
+	}
+	WriteSuccess(c, adminPageData("items", items, c))
 }
 
 func (h *AdminHandler) ListRiskEvents(ctx context.Context, c *app.RequestContext) {
@@ -382,6 +506,323 @@ func (h *AdminHandler) HandleRiskEvent(ctx context.Context, c *app.RequestContex
 		return
 	}
 	WriteSuccess(c, event)
+}
+
+type adminNameResolver struct {
+	ctx      context.Context
+	handler  *AdminHandler
+	users    map[string]domain.SafeUser
+	items    map[uint64]domain.Item
+	sessions map[uint64]domain.LiveSession
+	auctions map[uint64]domain.AuctionLot
+}
+
+func newAdminNameResolver(ctx context.Context, h *AdminHandler) *adminNameResolver {
+	return &adminNameResolver{
+		ctx:      ctx,
+		handler:  h,
+		users:    make(map[string]domain.SafeUser),
+		items:    make(map[uint64]domain.Item),
+		sessions: make(map[uint64]domain.LiveSession),
+		auctions: make(map[uint64]domain.AuctionLot),
+	}
+}
+
+func (r *adminNameResolver) auctionView(auction domain.AuctionLot) (adminAuctionView, error) {
+	item, err := r.item(auction.ItemID)
+	if err != nil {
+		return adminAuctionView{}, err
+	}
+	seller, err := r.user(auction.SellerID)
+	if err != nil {
+		return adminAuctionView{}, err
+	}
+	var session domain.LiveSession
+	if auction.LiveSessionID != nil {
+		session, err = r.session(*auction.LiveSessionID)
+		if err != nil {
+			return adminAuctionView{}, err
+		}
+	}
+	leader, err := r.user(auction.LeaderBidderID)
+	if err != nil {
+		return adminAuctionView{}, err
+	}
+	var winner domain.SafeUser
+	if auction.WinnerID != nil {
+		winner, err = r.user(*auction.WinnerID)
+		if err != nil {
+			return adminAuctionView{}, err
+		}
+	}
+	return adminAuctionView{
+		AuctionLot:           auction,
+		ItemName:             item.Title,
+		ItemTitle:            item.Title,
+		SellerNickname:       seller.Nickname,
+		LiveSessionName:      session.Title,
+		LeaderBidderNickname: leader.Nickname,
+		WinnerNickname:       winner.Nickname,
+	}, nil
+}
+
+func (r *adminNameResolver) orderView(order domain.OrderDeal) (adminOrderView, error) {
+	winner, err := r.user(order.WinnerID)
+	if err != nil {
+		return adminOrderView{}, err
+	}
+	seller, err := r.user(order.SellerID)
+	if err != nil {
+		return adminOrderView{}, err
+	}
+	var session domain.LiveSession
+	if order.LiveSessionID != nil {
+		session, err = r.session(*order.LiveSessionID)
+		if err != nil {
+			return adminOrderView{}, err
+		}
+	}
+	auction, err := r.auction(order.AuctionID)
+	if err != nil {
+		return adminOrderView{}, err
+	}
+	var item domain.Item
+	if auction.ItemID != 0 {
+		item, err = r.item(auction.ItemID)
+		if err != nil {
+			return adminOrderView{}, err
+		}
+	}
+	return adminOrderView{
+		OrderDeal:       order,
+		WinnerNickname:  winner.Nickname,
+		SellerNickname:  seller.Nickname,
+		LiveSessionName: session.Title,
+		AuctionName:     item.Title,
+		AuctionTitle:    item.Title,
+		ItemName:        item.Title,
+		ItemTitle:       item.Title,
+	}, nil
+}
+
+func (r *adminNameResolver) auditLogView(log domain.AuditLog) (adminAuditLogView, error) {
+	operator, err := r.user(log.OperatorID)
+	if err != nil {
+		return adminAuditLogView{}, err
+	}
+	targetName, err := r.targetName(log)
+	if err != nil {
+		return adminAuditLogView{}, err
+	}
+	return adminAuditLogView{
+		AuditLog:         log,
+		OperatorName:     operator.Nickname,
+		OperatorNickname: operator.Nickname,
+		TargetName:       targetName,
+	}, nil
+}
+
+func (r *adminNameResolver) user(userID string) (domain.SafeUser, error) {
+	userID = strings.TrimSpace(userID)
+	if userID == "" {
+		return domain.SafeUser{}, nil
+	}
+	if user, ok := r.users[userID]; ok {
+		return user, nil
+	}
+	user, err := r.handler.admin.UserByID(userID)
+	if err != nil {
+		if errors.Is(err, domain.ErrUserNotFound) || errors.Is(err, domain.ErrInvalidArgument) {
+			r.users[userID] = domain.SafeUser{}
+			return domain.SafeUser{}, nil
+		}
+		return domain.SafeUser{}, err
+	}
+	r.users[userID] = user
+	return user, nil
+}
+
+func (r *adminNameResolver) item(itemID uint64) (domain.Item, error) {
+	if itemID == 0 {
+		return domain.Item{}, nil
+	}
+	if item, ok := r.items[itemID]; ok {
+		return item, nil
+	}
+	item, err := r.handler.admin.ItemByID(r.ctx, itemID)
+	if err != nil {
+		if errors.Is(err, domain.ErrNotFound) || errors.Is(err, domain.ErrInvalidArgument) {
+			r.items[itemID] = domain.Item{}
+			return domain.Item{}, nil
+		}
+		return domain.Item{}, err
+	}
+	r.items[itemID] = item
+	return item, nil
+}
+
+func (r *adminNameResolver) session(sessionID uint64) (domain.LiveSession, error) {
+	if sessionID == 0 {
+		return domain.LiveSession{}, nil
+	}
+	if session, ok := r.sessions[sessionID]; ok {
+		return session, nil
+	}
+	session, err := r.handler.admin.LiveSessionByID(r.ctx, sessionID)
+	if err != nil {
+		if errors.Is(err, domain.ErrNotFound) || errors.Is(err, domain.ErrInvalidArgument) {
+			r.sessions[sessionID] = domain.LiveSession{}
+			return domain.LiveSession{}, nil
+		}
+		return domain.LiveSession{}, err
+	}
+	r.sessions[sessionID] = session
+	return session, nil
+}
+
+func (r *adminNameResolver) auction(auctionID uint64) (domain.AuctionLot, error) {
+	if auctionID == 0 {
+		return domain.AuctionLot{}, nil
+	}
+	if auction, ok := r.auctions[auctionID]; ok {
+		return auction, nil
+	}
+	auction, err := r.handler.admin.AuctionByID(r.ctx, auctionID)
+	if err != nil {
+		if errors.Is(err, domain.ErrNotFound) || errors.Is(err, domain.ErrInvalidArgument) {
+			r.auctions[auctionID] = domain.AuctionLot{}
+			return domain.AuctionLot{}, nil
+		}
+		return domain.AuctionLot{}, err
+	}
+	r.auctions[auctionID] = auction
+	return auction, nil
+}
+
+func (r *adminNameResolver) targetName(log domain.AuditLog) (string, error) {
+	targetID := strings.TrimSpace(log.TargetID)
+	switch strings.ToUpper(strings.TrimSpace(log.TargetType)) {
+	case "USER":
+		return r.userDisplayName(targetID)
+	case "ITEM":
+		return r.itemDisplayName(targetID)
+	case "AUCTION", "AUCTION_LOT":
+		return r.auctionDisplayName(targetID)
+	case "LIVE_SESSION":
+		return r.sessionDisplayName(targetID)
+	case "HTTP":
+		return r.httpTargetName(targetID)
+	default:
+		if targetID == "" {
+			return strings.TrimSpace(log.Action), nil
+		}
+		return targetID, nil
+	}
+}
+
+func (r *adminNameResolver) httpTargetName(path string) (string, error) {
+	cleanPath := strings.Split(strings.TrimSpace(path), "?")[0]
+	segments := pathSegments(cleanPath)
+	for i, segment := range segments {
+		if i+1 >= len(segments) {
+			continue
+		}
+		next := segments[i+1]
+		switch segment {
+		case "users", "blacklist":
+			return r.userDisplayName(next)
+		case "items":
+			if next != "description" && next != "audit" {
+				return r.itemDisplayName(next)
+			}
+		case "auctions":
+			return r.auctionDisplayName(next)
+		case "live-sessions":
+			return r.sessionDisplayName(next)
+		case "orders":
+			if next != "mine" {
+				return "订单 " + next, nil
+			}
+		}
+	}
+	if cleanPath == "" {
+		return path, nil
+	}
+	return cleanPath, nil
+}
+
+func (r *adminNameResolver) userDisplayName(userID string) (string, error) {
+	user, err := r.user(userID)
+	if err != nil {
+		return "", err
+	}
+	if user.Nickname != "" {
+		return user.Nickname, nil
+	}
+	return strings.TrimSpace(userID), nil
+}
+
+func (r *adminNameResolver) itemDisplayName(itemID string) (string, error) {
+	id, err := strconv.ParseUint(strings.TrimSpace(itemID), 10, 64)
+	if err != nil || id == 0 {
+		return strings.TrimSpace(itemID), nil
+	}
+	item, err := r.item(id)
+	if err != nil {
+		return "", err
+	}
+	if item.Title != "" {
+		return item.Title, nil
+	}
+	return strings.TrimSpace(itemID), nil
+}
+
+func (r *adminNameResolver) auctionDisplayName(auctionID string) (string, error) {
+	id, err := strconv.ParseUint(strings.TrimSpace(auctionID), 10, 64)
+	if err != nil || id == 0 {
+		return strings.TrimSpace(auctionID), nil
+	}
+	auction, err := r.auction(id)
+	if err != nil {
+		return "", err
+	}
+	if auction.ItemID != 0 {
+		item, err := r.item(auction.ItemID)
+		if err != nil {
+			return "", err
+		}
+		if item.Title != "" {
+			return item.Title, nil
+		}
+	}
+	return strings.TrimSpace(auctionID), nil
+}
+
+func (r *adminNameResolver) sessionDisplayName(sessionID string) (string, error) {
+	id, err := strconv.ParseUint(strings.TrimSpace(sessionID), 10, 64)
+	if err != nil || id == 0 {
+		return strings.TrimSpace(sessionID), nil
+	}
+	session, err := r.session(id)
+	if err != nil {
+		return "", err
+	}
+	if session.Title != "" {
+		return session.Title, nil
+	}
+	return strings.TrimSpace(sessionID), nil
+}
+
+func pathSegments(path string) []string {
+	parts := strings.Split(path, "/")
+	segments := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part != "" {
+			segments = append(segments, part)
+		}
+	}
+	return segments
 }
 
 func adminPage(c *app.RequestContext) int {
@@ -418,15 +859,23 @@ func sliceLen(items interface{}) int {
 	switch v := items.(type) {
 	case []domain.AuctionLot:
 		return len(v)
+	case []adminAuctionView:
+		return len(v)
 	case []domain.OrderDeal:
 		return len(v)
+	case []adminOrderView:
+		return len(v)
 	case []domain.AuditLog:
+		return len(v)
+	case []adminAuditLogView:
 		return len(v)
 	case []domain.Blacklist:
 		return len(v)
 	case []domain.RiskEvent:
 		return len(v)
 	case []adminUserView:
+		return len(v)
+	case []adminBlacklistView:
 		return len(v)
 	default:
 		return 0

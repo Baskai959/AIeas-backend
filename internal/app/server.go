@@ -352,6 +352,7 @@ func NewServerWithDependencies(cfg appconfig.Config, deps ServerDependencies) *s
 	hammerService.SetOrderIDGenerator(deps.OrderIDGen)
 	liveSessionService := service.NewLiveSessionService(deps.LiveSessionRepo, deps.AuctionRepo)
 	liveSessionService.SetReadDeps(deps.BidRepo, deps.OrderRepo)
+	liveSessionService.SetUserRepository(deps.UserRepo)
 	liveSessionService.SetWriteDeps(deps.TxManager, deps.LiveSessionLock, auctionService)
 	liveSessionService.SetStatsDeps(deps.BidRepo, deps.RealtimeStore, deps.Hub)
 	liveSessionService.SetRealtimeStore(deps.LiveSessionRealtimeStore)
@@ -378,6 +379,7 @@ func NewServerWithDependencies(cfg appconfig.Config, deps ServerDependencies) *s
 	bidService.SetLiveAgentHookService(liveAgentHookService)
 	bidService.SetConfigRepository(deps.ConfigRepo)
 	bidService.SetRiskControlService(riskControlService)
+	bidService.SetUserRepository(deps.UserRepo)
 	// 业务埋点：把 metrics registry 注入到关键服务/Hub。nil 安全（兜底为 noop）。
 	bidService.SetMetrics(deps.MetricsRegistry)
 	hammerService.SetMetrics(deps.MetricsRegistry)
@@ -421,6 +423,7 @@ func NewServerWithDependencies(cfg appconfig.Config, deps ServerDependencies) *s
 	}
 	adminService := service.NewAdminService(deps.UserRepo, auctionService, hammerService, orderService, riskService, deps.AuditRepo)
 	adminService.SetDashboardRepository(deps.AdminDashboardRepo)
+	adminService.SetLookupRepositories(deps.ItemRepo, deps.LiveSessionRepo)
 	adminService.SetConfigRepository(deps.ConfigRepo)
 	adminService.SetFeatureFlagService(deps.FeatureFlags)
 	mcpReadService := service.NewMCPReadService(service.MCPReadDependencies{
@@ -461,6 +464,7 @@ func NewServerWithDependencies(cfg appconfig.Config, deps ServerDependencies) *s
 
 func NewServerWithAuth(authService *service.AuthService) *server.Hertz {
 	cfg := appconfig.Default()
+	userRepo := repository.NewSeedUserRepository()
 	itemRepo := repository.NewMemoryItemRepository()
 	auctionRepo := repository.NewMemoryAuctionRepository()
 	bidRepo := repository.NewMemoryBidRepository()
@@ -491,10 +495,11 @@ func NewServerWithAuth(authService *service.AuthService) *server.Hertz {
 	bidService.SetConfigRepository(configRepo)
 	bidService.SetRiskControlService(riskControlService)
 	auditRepo := repository.NewMemoryAuditRepository()
-	adminService := service.NewAdminService(repository.NewSeedUserRepository(), auctionService, hammerService, orderService, riskService, auditRepo)
+	adminService := service.NewAdminService(userRepo, auctionService, hammerService, orderService, riskService, auditRepo)
 	adminService.SetConfigRepository(configRepo)
 	liveSessionLock := repository.NewMemoryLiveSessionLock()
 	liveSessionRepo := repository.NewMemoryLiveSessionRepository()
+	adminService.SetLookupRepositories(itemRepo, liveSessionRepo)
 	liveSessionService := service.NewLiveSessionService(liveSessionRepo, auctionRepo)
 	liveSessionService.SetReadDeps(bidRepo, orderRepo)
 	liveSessionService.SetWriteDeps(repository.NoopTxManager{}, liveSessionLock, auctionService)
@@ -503,13 +508,15 @@ func NewServerWithAuth(authService *service.AuthService) *server.Hertz {
 		CallbackURL:    cfg.Agent.LiveAnalysisCallbackURL,
 		CallbackAPIKey: cfg.Agent.LiveAnalysisCallbackAPIKey,
 	})
-	liveAgentHookService := service.NewLiveAgentHookService(repository.NewMemoryConfigRepository(), repository.NewSeedUserRepository(), service.DisabledLiveAgentHookInvoker{})
+	liveAgentHookService := service.NewLiveAgentHookService(repository.NewMemoryConfigRepository(), userRepo, service.DisabledLiveAgentHookInvoker{})
 	liveSessionService.SetOnEnded(buildLiveSessionEndedHook(hub, liveAnalysisService))
 	liveSessionService.SetLiveAgentHookService(liveAgentHookService)
+	liveSessionService.SetUserRepository(userRepo)
 	hammerService.SetLiveSessionService(liveSessionService)
 	hammerService.SetLiveAgentHookService(liveAgentHookService)
 	bidService.SetLiveSessionService(liveSessionService)
 	bidService.SetLiveAgentHookService(liveAgentHookService)
+	bidService.SetUserRepository(userRepo)
 	auctionService.SetOnClose(func(ctx context.Context, auctionID uint64) {
 		liveSessionService.OnAuctionClosed(ctx, auctionID)
 	})

@@ -45,6 +45,8 @@ local anti_extend_mode = ARGV[14]
 local expected_current_price_raw = ARGV[15]
 local trace_parent = ARGV[16]
 local trace_state = ARGV[17]
+local live_session_id_arg = ARGV[18]
+local bidder_nickname = ARGV[19]
 
 if request_id == nil then request_id = "" end
 if bidder_id == nil then bidder_id = "" end
@@ -53,6 +55,7 @@ if anti_extend_mode == nil or anti_extend_mode == "" then anti_extend_mode = "AD
 anti_extend_mode = string.upper(tostring(anti_extend_mode))
 if trace_parent == nil then trace_parent = "" end
 if trace_state == nil then trace_state = "" end
+if bidder_nickname == nil then bidder_nickname = "" end
 
 if auction_id == nil or auction_id <= 0 or bidder_id == "" or price == nil or price <= 0 or now_ms == nil or now_ms <= 0 then
   return redis.error_reply("invalid bid arguments")
@@ -97,11 +100,18 @@ local function string_or_empty(value)
   return value
 end
 
+local live_session_id = number_or_zero(live_session_id_arg)
+if live_session_id == 0 then
+  live_session_id = number_or_zero(redis.call("HGET", state_key, "live_session_id"))
+end
+
 local function build_result(accepted, reason, current_price, leader_id, end_ts, extend_count, extended, version, seq, stream_id, duplicate, auction_status, auto_closed)
   local result = {
     requestId = request_id,
     auctionId = auction_id,
+    liveSessionId = live_session_id,
     bidderId = bidder_id,
+    bidderNickname = bidder_nickname,
     price = price,
     accepted = accepted,
     reason = reason,
@@ -132,7 +142,9 @@ local function append_event(accepted, reason, current_price, leader_id, end_ts, 
   redis.call("XADD", stream_key, stream_id,
     "request_id", request_id,
     "auction_id", tostring(auction_id),
+    "live_session_id", tostring(live_session_id),
     "bidder_id", bidder_id,
+    "bidder_nickname", bidder_nickname,
     "bid_price", tostring(price),
     "bid_ts_ms", tostring(now_ms),
     "source", source,

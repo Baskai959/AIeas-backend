@@ -270,7 +270,9 @@ func decodeBidEventMessage(msg kafkago.Message) (redisinfra.BidEvent, error) {
 	var payload struct {
 		RequestID      string               `json:"requestId"`
 		AuctionID      uint64               `json:"auctionId"`
+		LiveSessionID  uint64               `json:"liveSessionId"`
 		BidderID       string               `json:"bidderId"`
+		BidderNickname string               `json:"bidderNickname"`
 		Price          int64                `json:"price"`
 		Accepted       bool                 `json:"accepted"`
 		Reason         string               `json:"reason"`
@@ -311,10 +313,12 @@ func decodeBidEventMessage(msg kafkago.Message) (redisinfra.BidEvent, error) {
 	}
 	return redisinfra.BidEvent{
 		AuctionID:      payload.AuctionID,
+		LiveSessionID:  payload.LiveSessionID,
 		StreamID:       streamID,
 		Seq:            payload.Seq,
 		RequestID:      payload.RequestID,
 		BidderID:       payload.BidderID,
+		BidderNickname: payload.BidderNickname,
 		BidPrice:       payload.Price,
 		BidTSMS:        payload.BidTSMS,
 		Source:         payload.Source,

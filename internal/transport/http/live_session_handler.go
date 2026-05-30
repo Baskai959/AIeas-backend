@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"mime/multipart"
+	"strconv"
 	"strings"
 	"time"
 
@@ -183,6 +184,20 @@ func (h *LiveSessionHandler) Bids(ctx context.Context, c *app.RequestContext) {
 		return
 	}
 	limit := parseQueryInt(c, "limit", 50)
+	if auctionIDRaw := strings.TrimSpace(c.Query("auctionId")); auctionIDRaw != "" {
+		auctionID, err := strconv.ParseUint(auctionIDRaw, 10, 64)
+		if err != nil || auctionID == 0 {
+			WriteError(c, 400, 20001, "参数不合法", nil)
+			return
+		}
+		bids, err := h.sessions.ListAuctionBids(ctx, id, auctionID, limit, AuthUserID(c), AuthRole(c))
+		if err != nil {
+			writeLiveSessionError(c, err)
+			return
+		}
+		WriteSuccess(c, map[string]interface{}{"bids": bids})
+		return
+	}
 	bids, err := h.sessions.ListBids(ctx, id, limit, AuthUserID(c), AuthRole(c))
 	if err != nil {
 		writeLiveSessionError(c, err)

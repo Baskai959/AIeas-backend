@@ -1169,15 +1169,38 @@ func TestLiveSessionEndedHookStartsLiveAnalysis(t *testing.T) {
 func TestAdminRoutesMinimalClosedLoop(t *testing.T) {
 	cfg := appconfig.Default()
 	userRepo := repository.NewSeedUserRepository()
+	itemRepo := repository.NewMemoryItemRepository()
 	auctionRepo := repository.NewMemoryAuctionRepository()
+	liveSessionRepo := repository.NewMemoryLiveSessionRepository()
 	orderRepo := repository.NewMemoryOrderRepository()
 	riskRepo := repository.NewMemoryRiskRepository()
 	auditRepo := repository.NewMemoryAuditRepository()
 	now := time.Now().UTC()
+	if err := itemRepo.Create(t.Context(), &domain.Item{
+		ID:             1001,
+		SellerID:       "u_2001",
+		Title:          "青瓷花瓶",
+		Category:       "collectible",
+		ConditionGrade: domain.ConditionGood,
+		Images:         json.RawMessage(`[]`),
+		Status:         domain.ItemStatusReady,
+	}); err != nil {
+		t.Fatalf("seed item: %v", err)
+	}
+	liveSessionID := uint64(70001)
+	if err := liveSessionRepo.Create(t.Context(), &domain.LiveSession{
+		ID:         liveSessionID,
+		MerchantID: "u_2001",
+		Title:      "春拍直播",
+		Status:     domain.LiveSessionStatusLive,
+	}); err != nil {
+		t.Fatalf("seed live session: %v", err)
+	}
 	auction := &domain.AuctionLot{
 		AuctionID:      88001,
 		ItemID:         1001,
 		SellerID:       "u_2001",
+		LiveSessionID:  &liveSessionID,
 		AuctionType:    domain.AuctionTypeEnglish,
 		StartPrice:     1000,
 		ReservePrice:   0,
@@ -1194,13 +1217,13 @@ func TestAdminRoutesMinimalClosedLoop(t *testing.T) {
 	if err := auctionRepo.Create(t.Context(), auction); err != nil {
 		t.Fatalf("seed auction: %v", err)
 	}
-	if _, _, err := orderRepo.CreateIfAbsentByAuction(t.Context(), &domain.OrderDeal{AuctionID: 88001, WinnerID: "u_1001", SellerID: "u_2001", DealPrice: 1200, Status: domain.OrderStatusCreated, PayStatus: domain.PayStatusUnpaid}); err != nil {
+	if _, _, err := orderRepo.CreateIfAbsentByAuction(t.Context(), &domain.OrderDeal{AuctionID: 88001, LiveSessionID: &liveSessionID, WinnerID: "u_1001", SellerID: "u_2001", DealPrice: 1200, Status: domain.OrderStatusCreated, PayStatus: domain.PayStatusUnpaid}); err != nil {
 		t.Fatalf("seed order: %v", err)
 	}
 	if err := riskRepo.CreateEvent(t.Context(), &domain.RiskEvent{EventType: "BID_FREQ", UserID: "u_1001", AuctionID: 88001, Severity: domain.RiskSeverityMid, Status: domain.RiskEventPending}); err != nil {
 		t.Fatalf("seed risk event: %v", err)
 	}
-	h := NewServerWithDependencies(cfg, ServerDependencies{UserRepo: userRepo, AuctionRepo: auctionRepo, OrderRepo: orderRepo, RiskRepo: riskRepo, AuditRepo: auditRepo})
+	h := NewServerWithDependencies(cfg, ServerDependencies{UserRepo: userRepo, ItemRepo: itemRepo, AuctionRepo: auctionRepo, LiveSessionRepo: liveSessionRepo, OrderRepo: orderRepo, RiskRepo: riskRepo, AuditRepo: auditRepo})
 	adminToken := loginForToken(t, h.Engine, "admin001", "AdminPassw0rd!", "admin")
 	merchantToken := loginForToken(t, h.Engine, "merchant001", "Passw0rd!", "merchant")
 	buyerToken := loginForToken(t, h.Engine, "buyer001", "Passw0rd!", "buyer")
@@ -1217,6 +1240,18 @@ func TestAdminRoutesMinimalClosedLoop(t *testing.T) {
 	users := doJSONWithHeaders(t, h.Engine, consts.MethodGet, "/api/v1/admin/users?page=1&page_size=20", "", ut.Header{Key: "Authorization", Value: "Bearer " + adminToken})
 	if users.status != 200 || users.body.Code != 0 {
 		t.Fatalf("expected admin users success, got status=%d raw=%s", users.status, users.raw)
+	}
+	var userPage struct {
+		Items []map[string]json.RawMessage `json:"items"`
+	}
+	mustDecodeData(t, users.body.Data, &userPage)
+	if len(userPage.Items) == 0 {
+		t.Fatalf("expected admin users, got raw=%s", users.raw)
+	}
+	for _, item := range userPage.Items {
+		if _, ok := item["blacklisted"]; !ok {
+			t.Fatalf("expected admin user item to include blacklisted, item=%s", item)
+		}
 	}
 
 	patchUser := doJSONWithHeaders(t, h.Engine, consts.MethodPatch, "/api/v1/admin/users/u_1001", `{"status":"DISABLED","reason":"test"}`, ut.Header{Key: "Authorization", Value: "Bearer " + adminToken}, ut.Header{Key: "Idempotency-Key", Value: "admin-user-disable-1"})
@@ -1243,6 +1278,21 @@ func TestAdminRoutesMinimalClosedLoop(t *testing.T) {
 	if auctions.status != 200 || auctions.body.Code != 0 {
 		t.Fatalf("expected admin auctions success, got status=%d raw=%s", auctions.status, auctions.raw)
 	}
+	var auctionPage struct {
+		Items []struct {
+			AuctionID            uint64 `json:"auctionId"`
+			ItemName             string `json:"itemName"`
+			ItemTitle            string `json:"itemTitle"`
+			SellerNickname       string `json:"sellerNickname"`
+			LiveSessionName      string `json:"liveSessionName"`
+			LeaderBidderNickname string `json:"leaderBidderNickname"`
+			WinnerNickname       string `json:"winnerNickname"`
+		} `json:"items"`
+	}
+	mustDecodeData(t, auctions.body.Data, &auctionPage)
+	if len(auctionPage.Items) != 1 || auctionPage.Items[0].ItemName != "青瓷花瓶" || auctionPage.Items[0].ItemTitle != "青瓷花瓶" || auctionPage.Items[0].SellerNickname != "商家001" || auctionPage.Items[0].LiveSessionName != "春拍直播" {
+		t.Fatalf("expected admin auction names, got %+v raw=%s", auctionPage.Items, auctions.raw)
+	}
 	auditAuction := doJSONWithHeaders(t, h.Engine, consts.MethodPost, "/api/v1/admin/auctions/88001/audit", `{"auditResult":"APPROVED","reason":"ok"}`, ut.Header{Key: "Authorization", Value: "Bearer " + adminToken}, ut.Header{Key: "Idempotency-Key", Value: "admin-audit-1"})
 	if auditAuction.status != 200 || auditAuction.body.Code != 0 {
 		t.Fatalf("expected admin auction audit success, got status=%d raw=%s", auditAuction.status, auditAuction.raw)
@@ -1256,9 +1306,35 @@ func TestAdminRoutesMinimalClosedLoop(t *testing.T) {
 	if blacklist.status != 200 || blacklist.body.Code != 0 {
 		t.Fatalf("expected blacklist add success, got status=%d raw=%s", blacklist.status, blacklist.raw)
 	}
+	blacklistedUser := doJSONWithHeaders(t, h.Engine, consts.MethodGet, "/api/v1/admin/users?keyword=u_1002", "", ut.Header{Key: "Authorization", Value: "Bearer " + adminToken})
+	if blacklistedUser.status != 200 || blacklistedUser.body.Code != 0 {
+		t.Fatalf("expected blacklisted user query success, got status=%d raw=%s", blacklistedUser.status, blacklistedUser.raw)
+	}
+	var blacklistedUserPage struct {
+		Items []struct {
+			ID          string `json:"id"`
+			Blacklisted bool   `json:"blacklisted"`
+		} `json:"items"`
+	}
+	mustDecodeData(t, blacklistedUser.body.Data, &blacklistedUserPage)
+	if len(blacklistedUserPage.Items) != 1 || blacklistedUserPage.Items[0].ID != "u_1002" || !blacklistedUserPage.Items[0].Blacklisted {
+		t.Fatalf("expected u_1002 to be blacklisted, got %+v raw=%s", blacklistedUserPage.Items, blacklistedUser.raw)
+	}
 	blacklistList := doJSONWithHeaders(t, h.Engine, consts.MethodGet, "/api/v1/admin/blacklist", "", ut.Header{Key: "Authorization", Value: "Bearer " + adminToken})
 	if blacklistList.status != 200 || blacklistList.body.Code != 0 {
 		t.Fatalf("expected blacklist list success, got status=%d raw=%s", blacklistList.status, blacklistList.raw)
+	}
+	var blacklistPage struct {
+		Items []struct {
+			UserID            string `json:"userId"`
+			Nickname          string `json:"nickname"`
+			CreatedByName     string `json:"createdByName"`
+			CreatedByNickname string `json:"createdByNickname"`
+		} `json:"items"`
+	}
+	mustDecodeData(t, blacklistList.body.Data, &blacklistPage)
+	if len(blacklistPage.Items) != 1 || blacklistPage.Items[0].UserID != "u_1002" || blacklistPage.Items[0].Nickname != "停用用户001" || blacklistPage.Items[0].CreatedByName != "管理员001" || blacklistPage.Items[0].CreatedByNickname != "管理员001" {
+		t.Fatalf("expected blacklist item with nickname, got %+v raw=%s", blacklistPage.Items, blacklistList.raw)
 	}
 	blacklistDelete := doJSONWithHeaders(t, h.Engine, consts.MethodDelete, "/api/v1/admin/blacklist/u_1002", "", ut.Header{Key: "Authorization", Value: "Bearer " + adminToken}, ut.Header{Key: "Idempotency-Key", Value: "blacklist-del-1"})
 	if blacklistDelete.status != 200 || blacklistDelete.body.Code != 0 {
@@ -1269,9 +1345,36 @@ func TestAdminRoutesMinimalClosedLoop(t *testing.T) {
 	if orders.status != 200 || orders.body.Code != 0 {
 		t.Fatalf("expected admin orders success, got status=%d raw=%s", orders.status, orders.raw)
 	}
+	var orderPage struct {
+		Items []struct {
+			AuctionID       uint64 `json:"auctionId"`
+			WinnerNickname  string `json:"winnerNickname"`
+			SellerNickname  string `json:"sellerNickname"`
+			LiveSessionName string `json:"liveSessionName"`
+			AuctionName     string `json:"auctionName"`
+			AuctionTitle    string `json:"auctionTitle"`
+			ItemName        string `json:"itemName"`
+			ItemTitle       string `json:"itemTitle"`
+		} `json:"items"`
+	}
+	mustDecodeData(t, orders.body.Data, &orderPage)
+	if len(orderPage.Items) != 1 || orderPage.Items[0].AuctionID != 88001 || orderPage.Items[0].WinnerNickname != "竞拍用户001" || orderPage.Items[0].SellerNickname != "商家001" || orderPage.Items[0].LiveSessionName != "春拍直播" || orderPage.Items[0].AuctionName != "青瓷花瓶" || orderPage.Items[0].AuctionTitle != "青瓷花瓶" || orderPage.Items[0].ItemName != "青瓷花瓶" || orderPage.Items[0].ItemTitle != "青瓷花瓶" {
+		t.Fatalf("expected admin order names, got %+v raw=%s", orderPage.Items, orders.raw)
+	}
 	auditLogs := doJSONWithHeaders(t, h.Engine, consts.MethodGet, "/api/v1/admin/audit-logs", "", ut.Header{Key: "Authorization", Value: "Bearer " + adminToken})
 	if auditLogs.status != 200 || auditLogs.body.Code != 0 {
 		t.Fatalf("expected admin audit logs success, got status=%d raw=%s", auditLogs.status, auditLogs.raw)
+	}
+	var auditPage struct {
+		Items []struct {
+			OperatorName     string `json:"operatorName"`
+			OperatorNickname string `json:"operatorNickname"`
+			TargetName       string `json:"targetName"`
+		} `json:"items"`
+	}
+	mustDecodeData(t, auditLogs.body.Data, &auditPage)
+	if len(auditPage.Items) == 0 || auditPage.Items[0].OperatorName != "管理员001" || auditPage.Items[0].OperatorNickname != "管理员001" || auditPage.Items[0].TargetName == "" {
+		t.Fatalf("expected admin audit log names, got %+v raw=%s", auditPage.Items, auditLogs.raw)
 	}
 	merchantCreateItem := doMultipartWithHeaders(t, h.Engine, consts.MethodPost, "/api/v1/items", map[string]string{
 		"title":          "Audit Log Item",

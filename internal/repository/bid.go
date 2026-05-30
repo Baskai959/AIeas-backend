@@ -65,7 +65,12 @@ func (r *MySQLBidRepository) ListByAuction(ctx context.Context, auctionID uint64
 		limit = 20
 	}
 	var rows []bidRecordRow
-	if err := r.dbFor(ctx).Table("bid_record").Where("auction_id = ?", auctionID).Order("bid_price DESC, bid_ts_ms ASC").Limit(limit).Find(&rows).Error; err != nil {
+	if err := r.dbFor(ctx).
+		Table("bid_record").
+		Where("auction_id = ? AND risk_result = ? AND reject_reason = ''", auctionID, domain.BidRiskAllow).
+		Order("bid_price DESC, bid_ts_ms ASC").
+		Limit(limit).
+		Find(&rows).Error; err != nil {
 		return nil, err
 	}
 	records := make([]domain.BidRecord, 0, len(rows))
@@ -77,7 +82,10 @@ func (r *MySQLBidRepository) ListByAuction(ctx context.Context, auctionID uint64
 
 func (r *MySQLBidRepository) CountByAuction(ctx context.Context, auctionID uint64) (int, error) {
 	var count int64
-	if err := r.dbFor(ctx).Table("bid_record").Where("auction_id = ?", auctionID).Count(&count).Error; err != nil {
+	if err := r.dbFor(ctx).
+		Table("bid_record").
+		Where("auction_id = ? AND risk_result = ? AND reject_reason = ''", auctionID, domain.BidRiskAllow).
+		Count(&count).Error; err != nil {
 		return 0, err
 	}
 	return int(count), nil
@@ -100,7 +108,7 @@ func (r *MySQLBidRepository) ListByLiveSession(ctx context.Context, sessionID ui
 	var rows []bidRecordRow
 	if err := r.dbFor(ctx).
 		Table("bid_record").
-		Where("live_session_id = ?", sessionID).
+		Where("live_session_id = ? AND risk_result = ? AND reject_reason = ''", sessionID, domain.BidRiskAllow).
 		Order(orderBy).
 		Limit(limit).
 		Offset(offset).
@@ -216,7 +224,7 @@ func (r *MemoryBidRepository) ListByAuction(ctx context.Context, auctionID uint6
 	defer r.mu.RUnlock()
 	records := make([]domain.BidRecord, 0)
 	for _, bid := range r.byID {
-		if bid.AuctionID == auctionID {
+		if bid.AuctionID == auctionID && bid.RiskResult == domain.BidRiskAllow && bid.RejectReason == "" {
 			records = append(records, cloneBidRecord(bid))
 		}
 	}
@@ -238,7 +246,7 @@ func (r *MemoryBidRepository) CountByAuction(ctx context.Context, auctionID uint
 	defer r.mu.RUnlock()
 	count := 0
 	for _, bid := range r.byID {
-		if bid.AuctionID == auctionID {
+		if bid.AuctionID == auctionID && bid.RiskResult == domain.BidRiskAllow && bid.RejectReason == "" {
 			count++
 		}
 	}
@@ -257,7 +265,7 @@ func (r *MemoryBidRepository) ListByLiveSession(ctx context.Context, sessionID u
 	defer r.mu.RUnlock()
 	records := make([]domain.BidRecord, 0)
 	for _, bid := range r.byID {
-		if bid.LiveSessionID != nil && *bid.LiveSessionID == sessionID {
+		if bid.LiveSessionID != nil && *bid.LiveSessionID == sessionID && bid.RiskResult == domain.BidRiskAllow && bid.RejectReason == "" {
 			records = append(records, cloneBidRecord(bid))
 		}
 	}
