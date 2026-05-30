@@ -40,6 +40,23 @@ type adminBlacklistRequest struct {
 	ExpireAt *time.Time `json:"expireAt"`
 }
 
+type adminBlacklistStrategyRequest struct {
+	Enabled                  *bool  `json:"enabled"`
+	FrequencyEnabled         *bool  `json:"frequencyEnabled"`
+	FrequencyWindowMs        *int64 `json:"frequencyWindowMs"`
+	FrequencyMaxRequests     *int   `json:"frequencyMaxRequests"`
+	UnreasonablePriceEnabled *bool  `json:"unreasonablePriceEnabled"`
+	MissingDepositEnabled    *bool  `json:"missingDepositEnabled"`
+	BlacklistDurationSeconds *int64 `json:"blacklistDurationSeconds"`
+}
+
+type adminFeatureFlagRequest struct {
+	Enabled           *bool    `json:"enabled"`
+	RolloutPercentage *int     `json:"rolloutPercentage"`
+	Allowlist         []string `json:"allowlist"`
+	Description       *string  `json:"description"`
+}
+
 type adminRiskEventRequest struct {
 	Status       domain.RiskEventStatus `json:"status"`
 	HandleResult string                 `json:"handleResult"`
@@ -184,6 +201,100 @@ func (h *AdminHandler) ListBlacklist(ctx context.Context, c *app.RequestContext)
 		return
 	}
 	WriteSuccess(c, adminPageData("items", items, c))
+}
+
+func (h *AdminHandler) BlacklistStrategyConfig(ctx context.Context, c *app.RequestContext) {
+	cfg, err := h.admin.BlacklistStrategyConfig(ctx)
+	if err != nil {
+		writeServiceError(c, err)
+		return
+	}
+	WriteSuccess(c, cfg)
+}
+
+func (h *AdminHandler) UpdateBlacklistStrategyConfig(ctx context.Context, c *app.RequestContext) {
+	var req adminBlacklistStrategyRequest
+	if err := c.BindJSON(&req); err != nil {
+		WriteError(c, 400, 20001, "参数不合法", nil)
+		return
+	}
+	base, err := h.admin.BlacklistStrategyConfig(ctx)
+	if err != nil {
+		writeServiceError(c, err)
+		return
+	}
+	cfg, err := h.admin.UpdateBlacklistStrategyConfig(ctx, applyBlacklistStrategyRequest(base, req), AuthUserID(c))
+	if err != nil {
+		writeServiceError(c, err)
+		return
+	}
+	WriteSuccess(c, cfg)
+}
+
+func applyBlacklistStrategyRequest(cfg domain.BlacklistStrategyConfig, req adminBlacklistStrategyRequest) domain.BlacklistStrategyConfig {
+	if req.Enabled != nil {
+		cfg.Enabled = *req.Enabled
+	}
+	if req.FrequencyEnabled != nil {
+		cfg.FrequencyEnabled = *req.FrequencyEnabled
+	}
+	if req.FrequencyWindowMs != nil {
+		cfg.FrequencyWindowMs = *req.FrequencyWindowMs
+	}
+	if req.FrequencyMaxRequests != nil {
+		cfg.FrequencyMaxRequests = *req.FrequencyMaxRequests
+	}
+	if req.UnreasonablePriceEnabled != nil {
+		cfg.UnreasonablePriceEnabled = *req.UnreasonablePriceEnabled
+	}
+	if req.MissingDepositEnabled != nil {
+		cfg.MissingDepositEnabled = *req.MissingDepositEnabled
+	}
+	if req.BlacklistDurationSeconds != nil {
+		cfg.BlacklistDurationSeconds = *req.BlacklistDurationSeconds
+	}
+	return cfg
+}
+
+func (h *AdminHandler) FeatureFlag(ctx context.Context, c *app.RequestContext) {
+	flag, err := h.admin.FeatureFlag(ctx, strings.TrimSpace(c.Param("key")))
+	if err != nil {
+		writeServiceError(c, err)
+		return
+	}
+	WriteSuccess(c, flag)
+}
+
+func (h *AdminHandler) UpdateFeatureFlag(ctx context.Context, c *app.RequestContext) {
+	key := strings.TrimSpace(c.Param("key"))
+	base, err := h.admin.FeatureFlag(ctx, key)
+	if err != nil {
+		writeServiceError(c, err)
+		return
+	}
+	var req adminFeatureFlagRequest
+	if err := c.BindJSON(&req); err != nil {
+		WriteError(c, 400, 20001, "参数不合法", nil)
+		return
+	}
+	if req.Enabled != nil {
+		base.Enabled = *req.Enabled
+	}
+	if req.RolloutPercentage != nil {
+		base.RolloutPercentage = *req.RolloutPercentage
+	}
+	if req.Allowlist != nil {
+		base.Allowlist = req.Allowlist
+	}
+	if req.Description != nil {
+		base.Description = strings.TrimSpace(*req.Description)
+	}
+	flag, err := h.admin.UpdateFeatureFlag(ctx, base, AuthUserID(c))
+	if err != nil {
+		writeServiceError(c, err)
+		return
+	}
+	WriteSuccess(c, flag)
 }
 
 func (h *AdminHandler) ListOrders(ctx context.Context, c *app.RequestContext) {

@@ -14,6 +14,7 @@ import (
 )
 
 const BidRecordConsumerGroup = "bid-record-writers"
+const BidKafkaBridgeConsumerGroup = "bid-kafka-bridge"
 
 type BidEvent struct {
 	AuctionID      uint64
@@ -179,11 +180,19 @@ func (l *EventLog) ShardCount() int {
 }
 
 func (l *EventLog) EnsureBidRecordGroup(ctx context.Context, auctionID uint64) error {
+	return l.EnsureConsumerGroup(ctx, auctionID, BidRecordConsumerGroup)
+}
+
+func (l *EventLog) EnsureConsumerGroup(ctx context.Context, auctionID uint64, group string) error {
 	if !l.Enabled() {
 		return fmt.Errorf("redis event log is not configured")
 	}
+	group = strings.TrimSpace(group)
+	if group == "" {
+		return fmt.Errorf("redis event log consumer group is required")
+	}
 	client := l.shardForAuction(auctionID)
-	err := client.XGroupCreateMkStream(ctx, l.keys.AuctionStream(auctionID), BidRecordConsumerGroup, "0-0").Err()
+	err := client.XGroupCreateMkStream(ctx, l.keys.AuctionStream(auctionID), group, "0-0").Err()
 	if err != nil && !strings.Contains(strings.ToUpper(err.Error()), "BUSYGROUP") {
 		return err
 	}
@@ -191,12 +200,16 @@ func (l *EventLog) EnsureBidRecordGroup(ctx context.Context, auctionID uint64) e
 }
 
 func (l *EventLog) ReadBidRecordGroup(ctx context.Context, auctionID uint64, consumer string, count int64, block time.Duration) ([]BidEvent, error) {
-	if err := l.EnsureBidRecordGroup(ctx, auctionID); err != nil {
+	return l.ReadConsumerGroup(ctx, auctionID, BidRecordConsumerGroup, consumer, count, block)
+}
+
+func (l *EventLog) ReadConsumerGroup(ctx context.Context, auctionID uint64, group, consumer string, count int64, block time.Duration) ([]BidEvent, error) {
+	if err := l.EnsureConsumerGroup(ctx, auctionID, group); err != nil {
 		return nil, err
 	}
 	client := l.shardForAuction(auctionID)
 	streams, err := client.XReadGroup(ctx, &redisgo.XReadGroupArgs{
-		Group:    BidRecordConsumerGroup,
+		Group:    group,
 		Consumer: consumer,
 		Streams:  []string{l.keys.AuctionStream(auctionID), ">"},
 		Count:    count,
@@ -212,12 +225,16 @@ func (l *EventLog) ReadBidRecordGroup(ctx context.Context, auctionID uint64, con
 }
 
 func (l *EventLog) ClaimStaleBidRecordEvents(ctx context.Context, auctionID uint64, consumer string, minIdle time.Duration, max int64) ([]BidEvent, error) {
+	return l.ClaimStaleConsumerEvents(ctx, auctionID, BidRecordConsumerGroup, consumer, minIdle, max)
+}
+
+func (l *EventLog) ClaimStaleConsumerEvents(ctx context.Context, auctionID uint64, group, consumer string, minIdle time.Duration, max int64) ([]BidEvent, error) {
 	if !l.Enabled() {
 		return nil, fmt.Errorf("redis event log is not configured")
 	}
 	client := l.shardForAuction(auctionID)
 	pending, err := client.XPendingExt(ctx, &redisgo.XPendingExtArgs{
-		Stream: l.keys.AuctionStream(auctionID), Group: BidRecordConsumerGroup, Start: "-", End: "+", Count: max,
+		Stream: l.keys.AuctionStream(auctionID), Group: group, Start: "-", End: "+", Count: max,
 	}).Result()
 	if err != nil {
 		return nil, err
@@ -234,7 +251,7 @@ func (l *EventLog) ClaimStaleBidRecordEvents(ctx context.Context, auctionID uint
 		return nil, nil
 	}
 	claimed, err := client.XClaim(ctx, &redisgo.XClaimArgs{
-		Stream: l.keys.AuctionStream(auctionID), Group: BidRecordConsumerGroup, Consumer: consumer, MinIdle: minIdle, Messages: ids,
+		Stream: l.keys.AuctionStream(auctionID), Group: group, Consumer: consumer, MinIdle: minIdle, Messages: ids,
 	}).Result()
 	if err != nil {
 		return nil, err
@@ -247,6 +264,10 @@ func (l *EventLog) ClaimStaleBidRecordEvents(ctx context.Context, auctionID uint
 }
 
 func (l *EventLog) AckBidRecord(ctx context.Context, auctionID uint64, ids ...string) error {
+	return l.AckConsumerGroup(ctx, auctionID, BidRecordConsumerGroup, ids...)
+}
+
+func (l *EventLog) AckConsumerGroup(ctx context.Context, auctionID uint64, group string, ids ...string) error {
 	if len(ids) == 0 {
 		return nil
 	}
@@ -254,7 +275,7 @@ func (l *EventLog) AckBidRecord(ctx context.Context, auctionID uint64, ids ...st
 		return fmt.Errorf("redis event log is not configured")
 	}
 	client := l.shardForAuction(auctionID)
-	return client.XAck(ctx, l.keys.AuctionStream(auctionID), BidRecordConsumerGroup, ids...).Err()
+	return client.XAck(ctx, l.keys.AuctionStream(auctionID), group, ids...).Err()
 }
 
 // WriteBidRecordDLQ 把死信写到全局 shard 上的 DLQ，便于运维统一巡检。

@@ -54,6 +54,9 @@ auction:
   freqLimitCount: 10
   freqWindowMs: 1000
 
+riskControl:
+  enabled: true
+
 websocket:
   readLimitBytes: 65536
   sendBufferSize: 256
@@ -73,17 +76,33 @@ objectStorage:
 agent:
   productDescriptionURL: "http://127.0.0.1:8000/api/v1/product-description"
   productAuditURL: "http://127.0.0.1:8000/api/v1/product-audit"
+  productAuditCallbackURL: "http://127.0.0.1:8888/api/v1/items/audit/callback"
   liveAnalysisURL: "http://127.0.0.1:8000/api/v1/live-analysis/async"
   liveAnalysisCallbackURL: "http://127.0.0.1:8888/api/v1/live-analysis/callback"
   liveAnalysisCallbackAPIKey: "change-me-in-local-dev-live-analysis-callback"
   liveAuctionHookURL: ""
-  liveAuctionHookAPIKey: ""
   timeout: 30s
 
+kafka:
+  enabled: true
+  brokers:
+    - "127.0.0.1:9092"
+  clientID: "aieas-backend"
+  bidEventsTopic: "aieas.bid.events"
+  auctionEventsTopic: "aieas.auction.events"
+  orderEventsTopic: "aieas.order.events"
+  bidBridgeGroup: "aieas-bid-kafka-bridge"
+  bidRecordGroup: "aieas-bid-record-writers"
+
 mcp:
-  apiKey: "change-me-in-local-dev-mcp"
-  actorID: "u_9001"
-  actorRole: "admin"
+  read:
+    apiKey: "change-me-in-local-dev-mcp-read"
+    actorID: "u_9001"
+    actorRole: "admin"
+  control:
+    apiKey: "change-me-in-local-dev-mcp-control"
+    actorID: "u_9001"
+    actorRole: "admin"
 
 observability:
   logLevel: "dev"

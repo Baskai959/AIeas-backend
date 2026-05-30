@@ -99,12 +99,12 @@ func (s *LiveAgentHookService) EmitLiveStarted(ctx context.Context, merchantID s
 	s.Emit(ctx, merchantID, fmt.Sprintf("直播间%d的直播场次%d开播了", roomID, sessionID))
 }
 
-func (s *LiveAgentHookService) EmitLotMounted(ctx context.Context, merchantID string, roomID, auctionID uint64) {
-	s.Emit(ctx, merchantID, fmt.Sprintf("直播间%d的拍品%d上架了", roomID, auctionID))
+func (s *LiveAgentHookService) EmitItemListed(ctx context.Context, merchantID string, itemID uint64) {
+	s.Emit(ctx, merchantID, fmt.Sprintf("商品%d上架了", itemID))
 }
 
-func (s *LiveAgentHookService) EmitLotUnmounted(ctx context.Context, merchantID string, roomID, auctionID uint64) {
-	s.Emit(ctx, merchantID, fmt.Sprintf("直播间%d的拍品%d下架了", roomID, auctionID))
+func (s *LiveAgentHookService) EmitItemOffline(ctx context.Context, merchantID string, itemID uint64) {
+	s.Emit(ctx, merchantID, fmt.Sprintf("商品%d下架了", itemID))
 }
 
 func (s *LiveAgentHookService) EmitHammerWon(ctx context.Context, merchantID string, roomID, auctionID uint64, price int64) {
@@ -121,6 +121,13 @@ func (s *LiveAgentHookService) EmitHighestBid(ctx context.Context, merchantID st
 	s.Emit(ctx, merchantID, fmt.Sprintf("直播间%d用户%s目前最高价格%d分", roomID, name, price))
 }
 
+func (s *LiveAgentHookService) EmitConfigChanged(ctx context.Context, merchantID string, roomID uint64, enabled bool) {
+	if !enabled {
+		return
+	}
+	s.emitDirect(ctx, merchantID, fmt.Sprintf("直播间%dAI直播助手已开启", roomID))
+}
+
 func (s *LiveAgentHookService) Emit(ctx context.Context, merchantID, message string) {
 	if s == nil || s.invoker == nil || strings.TrimSpace(merchantID) == "" || strings.TrimSpace(message) == "" {
 		return
@@ -131,6 +138,13 @@ func (s *LiveAgentHookService) Emit(ctx context.Context, merchantID, message str
 		return
 	}
 	if !enabled {
+		return
+	}
+	s.emitDirect(ctx, merchantID, message)
+}
+
+func (s *LiveAgentHookService) emitDirect(ctx context.Context, merchantID, message string) {
+	if s == nil || s.invoker == nil || strings.TrimSpace(merchantID) == "" || strings.TrimSpace(message) == "" {
 		return
 	}
 	msg := strings.TrimSpace(message)

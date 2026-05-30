@@ -1,0 +1,310 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "商品AI审核回调接口",
+    "version": "1.0.0",
+    "description": "商品创建/编辑后，后端只异步请求 AI 审核任务受理，不在主链路等待审核结论。AI 审核完成后调用本文件定义的回调接口。回调鉴权复用 agent.liveAnalysisCallbackAPIKey，可通过 X-Callback-Key 或 Authorization: Bearer <key> 传入。"
+  },
+  "paths": {
+    "/api/v1/items/audit/callback": {
+      "post": {
+        "tags": [
+          "商品"
+        ],
+        "summary": "商品 AI 审核结果回调",
+        "description": "供 AI 审核服务回传审核结果。后端会重新读取商品，只在商品仍为 PENDING_AUDIT 且 callback_context.snapshot 与当前商品内容一致时，才把商品状态更新为 READY 或 REJECTED；过期回调会返回成功但不修改商品。",
+        "operationId": "postItemAuditCallback",
+        "security": [
+          {
+            "CallbackKey": []
+          },
+          {
+            "CallbackBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "X-Callback-Key",
+            "in": "header",
+            "required": false,
+            "description": "回调密钥，值为后端配置 agent.liveAnalysisCallbackAPIKey。与 Authorization 二选一。",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Authorization",
+            "in": "header",
+            "required": false,
+            "description": "Bearer 回调密钥，与 X-Callback-Key 二选一。",
+            "schema": {
+              "type": "string",
+              "example": "Bearer change-me-in-local-dev-live-analysis-callback"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProductAuditCallbackRequest"
+              },
+              "example": {
+                "request_id": "agent-product-audit-001",
+                "success": true,
+                "is_approved": true,
+                "reject_reason": null,
+                "callback_context": {
+                  "itemId": 1001,
+                  "sellerId": "u_2001",
+                  "snapshot": {
+                    "title": "机械键盘 87键",
+                    "category": "电脑外设/键盘",
+                    "brand": "KeyPro",
+                    "conditionGrade": "GOOD",
+                    "description": "RGB背光，适合办公和游戏",
+                    "images": [
+                      "/api/v1/images/items/u_2001/keyboard.jpg"
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "回调已处理。过期回调也返回 200，但 data.status 会保持当前商品状态。",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ItemResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "参数不合法",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "回调密钥无效或缺失",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "CallbackKey": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-Callback-Key"
+      },
+      "CallbackBearer": {
+        "type": "http",
+        "scheme": "bearer"
+      }
+    },
+    "schemas": {
+      "ProductAuditCallbackRequest": {
+        "type": "object",
+        "required": [
+          "success",
+          "callback_context"
+        ],
+        "properties": {
+          "request_id": {
+            "type": "string",
+            "description": "AI 审核服务生成的请求 ID，便于排查日志。"
+          },
+          "itemId": {
+            "type": "integer",
+            "format": "uint64",
+            "description": "商品 ID。也可以只放在 callback_context.itemId。"
+          },
+          "item_id": {
+            "type": "integer",
+            "format": "uint64",
+            "description": "商品 ID 的 snake_case 兼容字段。"
+          },
+          "success": {
+            "type": "boolean",
+            "description": "AI 审核是否成功产出结论。false 时后端保持商品 PENDING_AUDIT，不自动拒绝。"
+          },
+          "is_approved": {
+            "type": "boolean",
+            "description": "success=true 时有效；true 表示审核通过，false 表示审核拒绝。"
+          },
+          "reject_reason": {
+            "type": "string",
+            "nullable": true,
+            "description": "拒绝原因，当前仅用于回调载荷记录，商品表暂不持久化该字段。"
+          },
+          "callback_context": {
+            "$ref": "#/components/schemas/ProductAuditCallbackContext"
+          }
+        }
+      },
+      "ProductAuditCallbackContext": {
+        "type": "object",
+        "required": [
+          "itemId",
+          "snapshot"
+        ],
+        "properties": {
+          "itemId": {
+            "type": "integer",
+            "format": "uint64"
+          },
+          "sellerId": {
+            "type": "string"
+          },
+          "snapshot": {
+            "$ref": "#/components/schemas/ProductAuditSnapshot"
+          }
+        }
+      },
+      "ProductAuditSnapshot": {
+        "type": "object",
+        "required": [
+          "title",
+          "category",
+          "conditionGrade",
+          "images"
+        ],
+        "properties": {
+          "title": {
+            "type": "string"
+          },
+          "category": {
+            "type": "string"
+          },
+          "brand": {
+            "type": "string"
+          },
+          "conditionGrade": {
+            "type": "string",
+            "enum": [
+              "NEW",
+              "LIKE_NEW",
+              "GOOD",
+              "FAIR"
+            ]
+          },
+          "description": {
+            "type": "string"
+          },
+          "images": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "Item": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer",
+            "format": "uint64"
+          },
+          "sellerId": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "category": {
+            "type": "string"
+          },
+          "brand": {
+            "type": "string"
+          },
+          "conditionGrade": {
+            "type": "string"
+          },
+          "images": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "description": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "DRAFT",
+              "PENDING_AUDIT",
+              "READY",
+              "REJECTED",
+              "LISTED",
+              "OFFLINE"
+            ]
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "updatedAt": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "ItemResponse": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "integer",
+            "example": 0
+          },
+          "message": {
+            "type": "string",
+            "example": "success"
+          },
+          "data": {
+            "$ref": "#/components/schemas/Item"
+          },
+          "trace_id": {
+            "type": "string"
+          }
+        }
+      },
+      "ErrorResponse": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "integer"
+          },
+          "message": {
+            "type": "string"
+          },
+          "data": {
+            "nullable": true
+          },
+          "trace_id": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  }
+}

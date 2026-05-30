@@ -48,15 +48,21 @@ jwt:
 	t.Setenv("OBJECT_STORAGE_SECRET_KEY", "sk")
 	t.Setenv("AGENT_PRODUCT_DESCRIPTION_URL", "http://127.0.0.1:9000/api/v1/product-description")
 	t.Setenv("AGENT_PRODUCT_AUDIT_URL", "http://127.0.0.1:9000/api/v1/product-audit")
+	t.Setenv("AGENT_PRODUCT_AUDIT_CALLBACK_URL", "http://127.0.0.1:7070/api/v1/items/audit/callback")
 	t.Setenv("AGENT_LIVE_ANALYSIS_URL", "http://127.0.0.1:9000/api/v1/live-analysis/async")
 	t.Setenv("AGENT_LIVE_ANALYSIS_CALLBACK_URL", "http://127.0.0.1:7070/api/v1/live-analysis/callback")
 	t.Setenv("AGENT_LIVE_ANALYSIS_CALLBACK_API_KEY", "callback-from-env")
 	t.Setenv("AGENT_LIVE_AUCTION_HOOK_URL", "http://127.0.0.1:9000/api/v1/live-auction-hook")
-	t.Setenv("AGENT_LIVE_AUCTION_HOOK_API_KEY", "hook-from-env")
 	t.Setenv("AGENT_TIMEOUT", "5s")
-	t.Setenv("MCP_API_KEY", "mcp-from-env")
-	t.Setenv("MCP_ACTOR_ID", "u_9001")
-	t.Setenv("MCP_ACTOR_ROLE", "admin")
+	t.Setenv("MCP_READ_API_KEY", "mcp-read-from-env")
+	t.Setenv("MCP_READ_ACTOR_ID", "u_9001")
+	t.Setenv("MCP_READ_ACTOR_ROLE", "admin")
+	t.Setenv("MCP_CONTROL_API_KEY", "mcp-control-from-env")
+	t.Setenv("MCP_CONTROL_ACTOR_ID", "u_9001")
+	t.Setenv("MCP_CONTROL_ACTOR_ROLE", "admin")
+	t.Setenv("KAFKA_ENABLED", "true")
+	t.Setenv("KAFKA_BROKERS", "127.0.0.1:9092,127.0.0.1:9093")
+	t.Setenv("KAFKA_BID_EVENTS_TOPIC", "test.bid.events")
 
 	cfg, err := Load(path)
 	if err != nil {
@@ -92,16 +98,20 @@ jwt:
 	}
 	if cfg.Agent.ProductDescriptionURL != "http://127.0.0.1:9000/api/v1/product-description" ||
 		cfg.Agent.ProductAuditURL != "http://127.0.0.1:9000/api/v1/product-audit" ||
+		cfg.Agent.ProductAuditCallbackURL != "http://127.0.0.1:7070/api/v1/items/audit/callback" ||
 		cfg.Agent.LiveAnalysisURL != "http://127.0.0.1:9000/api/v1/live-analysis/async" ||
 		cfg.Agent.LiveAnalysisCallbackURL != "http://127.0.0.1:7070/api/v1/live-analysis/callback" ||
 		cfg.Agent.LiveAnalysisCallbackAPIKey != "callback-from-env" ||
 		cfg.Agent.LiveAuctionHookURL != "http://127.0.0.1:9000/api/v1/live-auction-hook" ||
-		cfg.Agent.LiveAuctionHookAPIKey != "hook-from-env" ||
 		cfg.Agent.Timeout.Std() != 5*time.Second {
 		t.Fatalf("unexpected agent config: %+v", cfg.Agent)
 	}
-	if cfg.MCP.APIKey != "mcp-from-env" || cfg.MCP.ActorID != "u_9001" || cfg.MCP.ActorRole != "admin" {
+	if cfg.MCP.Read.APIKey != "mcp-read-from-env" || cfg.MCP.Read.ActorID != "u_9001" || cfg.MCP.Read.ActorRole != "admin" ||
+		cfg.MCP.Control.APIKey != "mcp-control-from-env" || cfg.MCP.Control.ActorID != "u_9001" || cfg.MCP.Control.ActorRole != "admin" {
 		t.Fatalf("unexpected mcp config: %+v", cfg.MCP)
+	}
+	if !cfg.Kafka.Enabled || len(cfg.Kafka.Brokers) != 2 || cfg.Kafka.Brokers[0] != "127.0.0.1:9092" || cfg.Kafka.BidEventsTopic != "test.bid.events" {
+		t.Fatalf("unexpected kafka config: %+v", cfg.Kafka)
 	}
 }
 
@@ -304,17 +314,17 @@ func TestObservabilityValidateRejectsOutOfRangeSampleRatio(t *testing.T) {
 
 func TestValidateRejectsMissingMCPAPIKey(t *testing.T) {
 	cfg := Default()
-	cfg.MCP.APIKey = ""
+	cfg.MCP.Read.APIKey = ""
 	if err := cfg.Validate(); err == nil {
-		t.Fatal("expected missing mcp.apiKey to be rejected")
+		t.Fatal("expected missing mcp.read.apiKey to be rejected")
 	}
 }
 
 func TestValidateRejectsInvalidMCPActorRole(t *testing.T) {
 	cfg := Default()
-	cfg.MCP.ActorRole = "operator"
+	cfg.MCP.Control.ActorRole = "operator"
 	if err := cfg.Validate(); err == nil {
-		t.Fatal("expected invalid mcp.actorRole to be rejected")
+		t.Fatal("expected invalid mcp.control.actorRole to be rejected")
 	}
 }
 
@@ -331,6 +341,14 @@ func TestValidateRejectsInvalidAgentLiveAnalysisURL(t *testing.T) {
 	cfg.Agent.LiveAnalysisURL = "127.0.0.1:8000/api/v1/live-analysis"
 	if err := cfg.Validate(); err == nil {
 		t.Fatal("expected invalid agent.liveAnalysisURL to be rejected")
+	}
+}
+
+func TestValidateRejectsInvalidAgentProductAuditCallbackURL(t *testing.T) {
+	cfg := Default()
+	cfg.Agent.ProductAuditCallbackURL = "127.0.0.1:8080/api/v1/items/audit/callback"
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected invalid agent.productAuditCallbackURL to be rejected")
 	}
 }
 
@@ -355,5 +373,14 @@ func TestValidateRejectsInvalidAgentLiveAuctionHookURL(t *testing.T) {
 	cfg.Agent.LiveAuctionHookURL = "127.0.0.1:8000/api/v1/live-auction-hook"
 	if err := cfg.Validate(); err == nil {
 		t.Fatal("expected invalid agent.liveAuctionHookURL to be rejected")
+	}
+}
+
+func TestValidateRejectsEnabledKafkaWithEmptyBroker(t *testing.T) {
+	cfg := Default()
+	cfg.Kafka.Enabled = true
+	cfg.Kafka.Brokers = []string{""}
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected enabled kafka with empty broker to be rejected")
 	}
 }

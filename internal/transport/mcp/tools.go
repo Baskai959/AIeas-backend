@@ -50,7 +50,7 @@ func (h *Handler) callTool(ctx context.Context, name string, arguments json.RawM
 	if err != nil {
 		return toolCallResult{}, err
 	}
-	text, err := payloadText(traceID, data)
+	text, err := h.payloadText(traceID, data)
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(codes.Error, err.Error())

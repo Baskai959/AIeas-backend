@@ -63,6 +63,36 @@ func TestHubReplaySinceAndSnapshotGap(t *testing.T) {
 	}
 }
 
+func TestHubDeduplicatesBidEventsByPubSeq(t *testing.T) {
+	hub := NewHub()
+	client := NewClient("c1", "u1", 21001, 4)
+	if err := hub.Subscribe(21001, client); err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	drainPresence(t, client)
+
+	env := Envelope{Type: "bid.accepted", Seq: 9, Payload: []byte(`{"seq":9}`)}
+	if delivered := hub.Broadcast(21001, env); delivered != 1 {
+		t.Fatalf("expected first delivery, got %d", delivered)
+	}
+	select {
+	case got := <-client.Outbound():
+		if got.Seq != 9 || got.Type != "bid.accepted" {
+			t.Fatalf("unexpected envelope: %+v", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for first bid event")
+	}
+	if delivered := hub.Broadcast(21001, env); delivered != 0 {
+		t.Fatalf("expected duplicate seq to be skipped, got %d", delivered)
+	}
+	select {
+	case dup := <-client.Outbound():
+		t.Fatalf("unexpected duplicate delivery: %+v", dup)
+	case <-time.After(20 * time.Millisecond):
+	}
+}
+
 func TestHubOnlineCountUpdatesOnSubscribeUnsubscribeAndSlowConsumer(t *testing.T) {
 	hub := NewHub()
 	c1 := NewClient("c1", "u1", 30001, 4)

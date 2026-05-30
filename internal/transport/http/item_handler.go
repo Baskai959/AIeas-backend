@@ -23,19 +23,20 @@ import (
 const maxImageUploadSizeBytes int64 = 2 * 1024 * 1024
 
 type ItemHandler struct {
-	items          *service.ItemService
-	uploader       objectstorage.Uploader
-	descriptionGen service.ProductDescriptionGenerator
+	items                   *service.ItemService
+	uploader                objectstorage.Uploader
+	descriptionGen          service.ProductDescriptionGenerator
+	productAuditCallbackKey string
 }
 
-func NewItemHandler(items *service.ItemService, uploader objectstorage.Uploader, descriptionGen service.ProductDescriptionGenerator) *ItemHandler {
+func NewItemHandler(items *service.ItemService, uploader objectstorage.Uploader, descriptionGen service.ProductDescriptionGenerator, productAuditCallbackKey string) *ItemHandler {
 	if uploader == nil {
 		uploader = objectstorage.DisabledUploader{}
 	}
 	if descriptionGen == nil {
 		descriptionGen = service.DisabledProductDescriptionGenerator{}
 	}
-	return &ItemHandler{items: items, uploader: uploader, descriptionGen: descriptionGen}
+	return &ItemHandler{items: items, uploader: uploader, descriptionGen: descriptionGen, productAuditCallbackKey: strings.TrimSpace(productAuditCallbackKey)}
 }
 
 type itemCreateRequest struct {
@@ -56,6 +57,16 @@ type itemPatchRequest struct {
 	Images         *[]string              `json:"images"`
 	Description    *string                `json:"description"`
 	Status         *domain.ItemStatus     `json:"status"`
+}
+
+type productAuditCallbackRequest struct {
+	ItemID          uint64                 `json:"itemId"`
+	ItemIDSnake     uint64                 `json:"item_id"`
+	RequestID       string                 `json:"request_id"`
+	Success         bool                   `json:"success"`
+	IsApproved      bool                   `json:"is_approved"`
+	RejectReason    *string                `json:"reject_reason"`
+	CallbackContext map[string]interface{} `json:"callback_context"`
 }
 
 func (h *ItemHandler) Create(ctx context.Context, c *app.RequestContext) {
@@ -97,6 +108,50 @@ func (h *ItemHandler) Create(ctx context.Context, c *app.RequestContext) {
 		return
 	}
 	WriteSuccess(c, item)
+}
+
+func (h *ItemHandler) AuditCallback(ctx context.Context, c *app.RequestContext) {
+	if !h.authorizeProductAuditCallback(c) {
+		WriteError(c, 401, 10002, "访问令牌无效或已过期", nil)
+		return
+	}
+	var req productAuditCallbackRequest
+	if err := c.BindJSON(&req); err != nil {
+		WriteError(c, 400, 20001, "参数不合法", nil)
+		return
+	}
+	itemID := req.ItemID
+	if itemID == 0 {
+		itemID = req.ItemIDSnake
+	}
+	item, err := h.items.HandleProductAuditCallback(ctx, service.ProductAuditCallbackInput{
+		ItemID:          itemID,
+		Success:         req.Success,
+		IsApproved:      req.IsApproved,
+		RejectReason:    req.RejectReason,
+		CallbackContext: req.CallbackContext,
+	})
+	if err != nil {
+		writeItemError(c, err)
+		return
+	}
+	WriteSuccess(c, item)
+}
+
+func (h *ItemHandler) authorizeProductAuditCallback(c *app.RequestContext) bool {
+	expected := strings.TrimSpace(h.productAuditCallbackKey)
+	if expected == "" {
+		return false
+	}
+	if constantTimeStringEqual(strings.TrimSpace(string(c.GetHeader("X-Callback-Key"))), expected) {
+		return true
+	}
+	auth := strings.TrimSpace(string(c.GetHeader("Authorization")))
+	const prefix = "Bearer "
+	if strings.HasPrefix(auth, prefix) {
+		return constantTimeStringEqual(strings.TrimSpace(strings.TrimPrefix(auth, prefix)), expected)
+	}
+	return false
 }
 
 func (h *ItemHandler) List(ctx context.Context, c *app.RequestContext) {

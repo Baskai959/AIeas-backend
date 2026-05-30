@@ -68,7 +68,8 @@ func (s *TimerScheduler) run(ctx context.Context, auctionID uint64) {
 				return
 			}
 			if state.Status != domain.AuctionStatusRunning && state.Status != domain.AuctionStatusExtended {
-				continue
+				s.Stop(auctionID)
+				return
 			}
 			remaining := state.EndTime.Sub(now)
 			if remaining < 0 {

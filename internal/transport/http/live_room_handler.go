@@ -248,6 +248,21 @@ func (h *LiveRoomHandler) MountLot(ctx context.Context, c *app.RequestContext) {
 	WriteSuccess(c, map[string]interface{}{"lot": lot})
 }
 
+// MountLotToMerchantRoom 根据拍品归属商家自动挂载到该商家的直播间。
+func (h *LiveRoomHandler) MountLotToMerchantRoom(ctx context.Context, c *app.RequestContext) {
+	var req liveRoomMountRequest
+	if err := c.BindJSON(&req); err != nil || req.AuctionID == 0 {
+		WriteError(c, 400, 20001, "参数不合法", nil)
+		return
+	}
+	lot, err := h.rooms.MountAuctionToMerchantRoom(ctx, req.AuctionID, AuthUserID(c), AuthRole(c))
+	if err != nil {
+		writeLiveRoomError(c, err)
+		return
+	}
+	WriteSuccess(c, map[string]interface{}{"lot": lot})
+}
+
 // UnmountLot 将拍品从直播间移除。
 func (h *LiveRoomHandler) UnmountLot(ctx context.Context, c *app.RequestContext) {
 	id, ok := parseUintParam(c, "id")

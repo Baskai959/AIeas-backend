@@ -66,8 +66,8 @@ func decodeParams(raw json.RawMessage, out interface{}) error {
 	return json.Unmarshal(raw, out)
 }
 
-func payloadText(traceID string, data interface{}) (string, error) {
-	encoded, err := json.Marshal(payloadEnvelope{SchemaVersion: schemaVersion, TraceID: traceID, Data: data})
+func (h *Handler) payloadText(traceID string, data interface{}) (string, error) {
+	encoded, err := json.Marshal(payloadEnvelope{SchemaVersion: h.schemaVersion, TraceID: traceID, Data: data})
 	if err != nil {
 		return "", err
 	}

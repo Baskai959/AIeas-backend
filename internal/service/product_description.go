@@ -30,17 +30,23 @@ type ProductDescriptionGenerator interface {
 }
 
 type ProductAuditInput struct {
-	ProductText string
-	ImageName   string
-	ContentType string
-	ImageSize   int64
-	Image       []byte
+	ProductText     string
+	ImageName       string
+	ContentType     string
+	ImageSize       int64
+	Image           []byte
+	CallbackURL     string
+	CallbackHeaders map[string]string
+	CallbackContext map[string]interface{}
 }
 
 type ProductAuditResult struct {
 	Success      bool    `json:"success"`
 	IsApproved   bool    `json:"is_approved"`
 	RejectReason *string `json:"reject_reason"`
+	RequestID    string  `json:"request_id,omitempty"`
+	Status       string  `json:"status,omitempty"`
+	Message      string  `json:"message,omitempty"`
 }
 
 type ProductAuditor interface {

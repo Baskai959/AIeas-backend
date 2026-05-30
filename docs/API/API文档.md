@@ -910,7 +910,7 @@ curl -X POST 'https://api.example.com/api/v1/admin/auth/login' \
 - Header：`Authorization`
 - Query：`page`、`page_size`、`role`、`status`、`keyword`
 - 请求示例：`curl 'https://api.example.com/api/v1/admin/users?page=1&page_size=20&role=buyer' -H 'Authorization: Bearer <admin_jwt>'`
-- Response 示例：`{"code":0,"message":"success","data":{"items":[{"id":"u_1001","nickname":"竞拍用户001","role":"buyer","status":"ACTIVE","riskLevel":"LOW"}],"total":1,"page":1,"page_size":20},"trace_id":"trc_admin_users"}`
+- Response 示例：`{"code":0,"message":"success","data":{"items":[{"id":"u_1001","nickname":"竞拍用户001","role":"buyer","status":"ACTIVE","riskLevel":"LOW","blacklisted":false}],"total":1,"page":1,"page_size":20},"trace_id":"trc_admin_users"}`
 - 常见错误码：`10003`、`20003`
 - 备注：敏感字段脱敏返回。
 
@@ -950,7 +950,7 @@ curl -X POST 'https://api.example.com/api/v1/admin/auth/login' \
 - Header：`Authorization`
 - Query：`page`、`page_size`、`keyword`
 - 请求示例：`curl 'https://api.example.com/api/v1/admin/blacklist?page=1&page_size=20' -H 'Authorization: Bearer <admin_jwt>'`
-- Response 示例：`{"code":0,"message":"success","data":{"items":[{"userId":"u_1001","reason":"多次恶意竞价","expireAt":"2026-06-23T00:00:00+08:00"}],"total":1,"page":1,"page_size":20},"trace_id":"trc_blacklist_list"}`
+- Response 示例：`{"code":0,"message":"success","data":{"items":[{"id":8,"userId":"u_1001","nickname":"竞拍用户001","role":"buyer","status":"ACTIVE","reason":"多次恶意竞价","createdBy":"u_9001","createdAt":"2026-05-26T17:28:23+08:00","expiresAt":"2026-06-23T00:00:00+08:00"}],"total":1,"page":1,"page_size":20},"trace_id":"trc_blacklist_list"}`
 - 常见错误码：`10003`、`20003`
 - 备注：过期黑名单可由后台任务自动解除。
 
@@ -970,7 +970,7 @@ curl -X POST 'https://api.example.com/api/v1/admin/auth/login' \
 - Header：`Authorization`
 - Query：`page`、`page_size`、`operatorId`、`action`、`startTime`、`endTime`
 - 请求示例：`curl 'https://api.example.com/api/v1/admin/audit-logs?page=1&page_size=20&action=AUCTION_AUDIT' -H 'Authorization: Bearer <admin_jwt>'`
-- Response 示例：`{"code":0,"message":"success","data":{"items":[{"id":"log_1001","operatorId":"adm_1001","action":"AUCTION_AUDIT","targetId":"auc_1001","createdAt":"2026-05-23T19:00:00+08:00"}],"total":1,"page":1,"page_size":20},"trace_id":"trc_audit_logs"}`
+- Response 示例：`{"code":0,"message":"success","data":{"items":[{"id":90000438,"operatorId":"u_9001","operatorRole":"admin","action":"POST /api/v1/admin/blacklist","actionCode":"BLACKLIST_ADD","actionName":"加入黑名单","summary":"将用户 u_1001 加入黑名单","targetType":"USER","targetId":"u_1001","createdAt":"2026-05-23T19:00:00+08:00"}],"total":1,"page":1,"page_size":20},"trace_id":"trc_audit_logs"}`
 - 常见错误码：`10003`、`20004`
 - 备注：审计日志不可由 API 修改。
 
@@ -990,7 +990,7 @@ curl -X POST 'https://api.example.com/api/v1/admin/auth/login' \
 - Header：`Authorization`、`Content-Type`、`Idempotency-Key`
 - Body 示例：`{"bidMaxQps":10,"blacklistEnabled":true,"selfOverbidBlocked":true,"suspiciousIpThreshold":5}`
 - 请求示例：`curl -X PUT 'https://api.example.com/api/v1/admin/risk/rules' -H 'Authorization: Bearer <admin_jwt>' -H 'Content-Type: application/json; charset=utf-8' -H 'Idempotency-Key: risk-rules-put-001' -d '{"bidMaxQps":10,"blacklistEnabled":true,"selfOverbidBlocked":true,"suspiciousIpThreshold":5}'`
-- Response 示例：`{"code":0,"message":"success","data":{"updated":true,"version":3},"trace_id":"trc_risk_rules_put"}`
+- Response 示例：`{"code":0,"message":"success","data":{"bidMaxQps":10,"blacklistEnabled":true,"selfOverbidBlocked":true,"suspiciousIpThreshold":5},"trace_id":"trc_risk_rules_put"}`
 - 常见错误码：`10003`、`20001`
 - 备注：建议前端展示二次确认。
 
@@ -1020,7 +1020,7 @@ curl -X POST 'https://api.example.com/api/v1/admin/auth/login' \
 - Header：`Authorization`
 - Query：`startTime`、`endTime`
 - 请求示例：`curl 'https://api.example.com/api/v1/admin/dashboard/metrics?startTime=2026-05-23T00:00:00%2B08:00&endTime=2026-05-23T23:59:59%2B08:00' -H 'Authorization: Bearer <admin_jwt>'`
-- Response 示例：`{"code":0,"message":"success","data":{"liveAuctionCount":12,"gmv":986000,"paidOrderCount":88,"riskEventCount":3,"activeBidderCount":560},"trace_id":"trc_dashboard_metrics"}`
+- Response 示例：`{"code":0,"message":"success","data":{"summary":{"pendingAuditCount":7,"runningAuctionCount":2,"paidOrderCount":88,"pendingRiskCount":1,"todayNewUserCount":18,"paidAmountTotal":912000},"trend":[{"bucketStart":"2026-05-27T08:00:00Z","paidGmvCent":96000,"paidOrderCount":8,"riskEventCount":0}],"orderStatusDistribution":[{"status":"PAID","count":88}],"riskSeverityDistribution":[{"severity":"HIGH","count":1}]},"trace_id":"trc_dashboard_metrics"}`
 - 常见错误码：`10003`、`20004`
 - 备注：`gmv` 单位为分。
 

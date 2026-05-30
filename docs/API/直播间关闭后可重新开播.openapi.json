@@ -1,0 +1,160 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "直播间关闭后可重新开播",
+    "version": "1.0.0",
+    "description": "直播间是商家的长期资产。即使状态为 CLOSED，也允许商家再次 PATCH status=LIVE 重新开播。"
+  },
+  "paths": {
+    "/api/v1/live-rooms/{id}": {
+      "patch": {
+        "tags": [
+          "直播间"
+        ],
+        "summary": "重新开播直播间",
+        "description": "需要 merchant 或 admin 角色，并要求 Idempotency-Key。CLOSED 状态的直播间允许重新设置为 LIVE 或 OFFLINE；设置为 LIVE 时会清理历史终态拍品挂载，避免已结束拍品继续停留在直播拍品列表。",
+        "operationId": "reopenClosedLiveRoom",
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "uint64"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateLiveRoomRequest"
+              },
+              "example": {
+                "status": "LIVE",
+                "title": "今晚 8 点拍卖专场"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "更新成功，直播间已重新开播。",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LiveRoomResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "状态流转不合法。"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "BearerAuth": {
+        "type": "http",
+        "scheme": "bearer"
+      }
+    },
+    "schemas": {
+      "UpdateLiveRoomRequest": {
+        "type": "object",
+        "properties": {
+          "title": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "coverUrl": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "OFFLINE",
+              "LIVE",
+              "CLOSED"
+            ]
+          }
+        }
+      },
+      "LiveRoomResponse": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "integer",
+            "example": 0
+          },
+          "message": {
+            "type": "string",
+            "example": "success"
+          },
+          "data": {
+            "$ref": "#/components/schemas/LiveRoom"
+          },
+          "trace_id": {
+            "type": "string"
+          }
+        }
+      },
+      "LiveRoom": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer",
+            "format": "uint64"
+          },
+          "merchantId": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "coverUrl": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "activeAuctionId": {
+            "type": "integer",
+            "format": "uint64"
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "updatedAt": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      }
+    }
+  }
+}

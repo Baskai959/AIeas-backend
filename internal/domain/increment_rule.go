@@ -18,7 +18,9 @@ const (
 	BidRejectStepMismatch      = "PRICE_STEP_MISMATCH"
 	BidRejectBelowMinIncrement = "BELOW_MIN_INCREMENT"
 	BidRejectAboveMaxBidSteps  = "ABOVE_MAX_BID_STEPS"
+	BidRejectAboveExpectedMaxBidSteps = "ABOVE_EXPECTED_MAX_BID_STEPS"
 	BidRejectAboveCapPrice     = "ABOVE_CAP_PRICE"
+	BidRejectMissingExpectedState = "MISSING_EXPECTED_STATE"
 	BidRejectStaleAuctionState = "STALE_AUCTION_STATE"
 )
 
@@ -149,6 +151,30 @@ func ValidateBidPrice(startPrice, currentPrice, capPrice, price int64, rule Incr
 	}
 	if price > maxAllowed {
 		return BidRejectAboveMaxBidSteps
+	}
+	return ""
+}
+
+func ValidateBidExpectedCurrentPrice(expectedCurrentPrice, currentPrice, capPrice, price int64, rule IncrementRule) string {
+	if expectedCurrentPrice < 0 {
+		return BidRejectStaleAuctionState
+	}
+	if expectedCurrentPrice > currentPrice {
+		return BidRejectStaleAuctionState
+	}
+	if rule.MaxBidSteps <= 0 {
+		return BidRejectStepMismatch
+	}
+	amount := rule.AmountForPrice(expectedCurrentPrice)
+	if amount <= 0 {
+		return BidRejectStepMismatch
+	}
+	maxAllowed := expectedCurrentPrice + amount*int64(rule.MaxBidSteps)
+	if capPrice > 0 && maxAllowed > capPrice {
+		maxAllowed = capPrice
+	}
+	if expectedCurrentPrice < currentPrice && price > maxAllowed {
+		return BidRejectAboveExpectedMaxBidSteps
 	}
 	return ""
 }

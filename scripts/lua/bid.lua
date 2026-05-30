@@ -24,9 +24,8 @@ local idem_ttl_ms = tonumber(ARGV[12])
 local source = ARGV[13]
 local anti_extend_mode = ARGV[14]
 local expected_current_price_raw = ARGV[15]
-local expected_version_raw = ARGV[16]
-local trace_parent = ARGV[17]
-local trace_state = ARGV[18]
+local trace_parent = ARGV[16]
+local trace_state = ARGV[17]
 
 if request_id == nil then request_id = "" end
 if bidder_id == nil then bidder_id = "" end
@@ -135,6 +134,9 @@ local function append_event(accepted, reason, current_price, leader_id, end_ts, 
     "traceparent", trace_parent,
     "tracestate", trace_state
   )
+  local payload = build_result(accepted, reason, current_price, leader_id, end_ts, extend_count, extended, version, seq, stream_id, false, auction_status, auto_closed)
+  local channel = "auction:" .. tostring(auction_id) .. ":events"
+  redis.call("PUBLISH", channel, payload)
   redis.call("SADD", active_streams_key, tostring(auction_id))
   return seq, stream_id
 end
@@ -228,18 +230,12 @@ if redis.call("SISMEMBER", deposit_key, bidder_id) ~= 1 then
   return reject("DEPOSIT_NOT_READY")
 end
 
-if expected_current_price_raw ~= nil and expected_current_price_raw ~= "" then
-  local expected_current_price = tonumber(expected_current_price_raw)
-  if expected_current_price == nil or expected_current_price ~= current_price then
-    return reject("STALE_AUCTION_STATE")
-  end
+local expected_current_price = tonumber(expected_current_price_raw)
+if expected_current_price_raw == nil or expected_current_price_raw == "" or expected_current_price == nil or expected_current_price < 0 then
+  return reject("MISSING_EXPECTED_STATE")
 end
-
-if expected_version_raw ~= nil and expected_version_raw ~= "" then
-  local expected_version = tonumber(expected_version_raw)
-  if expected_version == nil or expected_version ~= version then
-    return reject("STALE_AUCTION_STATE")
-  end
+if expected_current_price > current_price then
+  return reject("STALE_AUCTION_STATE")
 end
 
 if freq_limit_count > 0 and freq_window_ms > 0 then
@@ -253,11 +249,19 @@ if freq_limit_count > 0 and freq_window_ms > 0 then
 end
 
 local increment_amount, max_bid_steps = increment_rule_for_price(increment_rule, min_increment, current_price)
+local expected_increment_amount, expected_max_bid_steps = increment_rule_for_price(increment_rule, min_increment, expected_current_price)
 if price <= start_price then
   return reject("BELOW_START_PRICE")
 end
 if cap_price > 0 and price > cap_price then
   return reject("ABOVE_CAP_PRICE")
+end
+local expected_max_allowed = expected_current_price + expected_increment_amount * expected_max_bid_steps
+if cap_price > 0 and expected_max_allowed > cap_price then
+  expected_max_allowed = cap_price
+end
+if expected_current_price < current_price and price > expected_max_allowed then
+  return reject("ABOVE_EXPECTED_MAX_BID_STEPS")
 end
 local is_cap_bid = cap_price > 0 and price == cap_price
 if (not is_cap_bid) and ((price - current_price) % increment_amount) ~= 0 then

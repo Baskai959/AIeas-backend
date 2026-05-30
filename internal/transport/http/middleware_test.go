@@ -3,6 +3,7 @@ package http
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"sync"
 	"testing"
@@ -230,5 +231,75 @@ func TestRateLimiterRejectsAfterLimit(t *testing.T) {
 	second := ut.PerformRequest(h.Engine, consts.MethodGet, "/limited", nil, ut.Header{Key: "X-Real-IP", Value: "10.0.0.1"})
 	if second.Code != 429 {
 		t.Fatalf("expected second request rate limited, got %d body=%s", second.Code, second.Body.String())
+	}
+}
+
+func TestRateLimiterCanBeDisabledBySwitch(t *testing.T) {
+	h := server.Default()
+	limiter := NewRateLimiter(1, time.Minute)
+	enabled := false
+	limiter.SetEnabledFunc(func(ctx context.Context) bool {
+		_ = ctx
+		return enabled
+	})
+	h.Use(RequestIDMiddleware(), limiter.Middleware())
+	h.GET("/limited", func(ctx context.Context, c *app.RequestContext) {
+		WriteSuccess(c, "ok")
+	})
+
+	first := ut.PerformRequest(h.Engine, consts.MethodGet, "/limited", nil, ut.Header{Key: "X-Real-IP", Value: "10.0.0.2"})
+	second := ut.PerformRequest(h.Engine, consts.MethodGet, "/limited", nil, ut.Header{Key: "X-Real-IP", Value: "10.0.0.2"})
+	if first.Code != 200 || second.Code != 200 {
+		t.Fatalf("expected disabled limiter to allow both requests, first=%d second=%d", first.Code, second.Code)
+	}
+
+	enabled = true
+	third := ut.PerformRequest(h.Engine, consts.MethodGet, "/limited", nil, ut.Header{Key: "X-Real-IP", Value: "10.0.0.3"})
+	fourth := ut.PerformRequest(h.Engine, consts.MethodGet, "/limited", nil, ut.Header{Key: "X-Real-IP", Value: "10.0.0.3"})
+	if third.Code != 200 || fourth.Code != 429 {
+		t.Fatalf("expected enabled limiter to reject second request, third=%d fourth=%d", third.Code, fourth.Code)
+	}
+}
+
+type failingDistributedRateLimitStore struct{}
+
+func (f failingDistributedRateLimitStore) Allow(ctx context.Context, key string, limit int, window time.Duration, cost int, now time.Time) (bool, error) {
+	return false, errors.New("redis unavailable")
+}
+
+type denyingDistributedRateLimitStore struct{}
+
+func (d denyingDistributedRateLimitStore) Allow(ctx context.Context, key string, limit int, window time.Duration, cost int, now time.Time) (bool, error) {
+	return false, nil
+}
+
+func TestRateLimiterL2FailOpen(t *testing.T) {
+	h := server.Default()
+	limiter := NewRateLimiter(10, time.Minute)
+	limiter.SetDistributedStore(failingDistributedRateLimitStore{})
+	h.Use(RequestIDMiddleware(), limiter.Middleware())
+	h.GET("/limited", func(ctx context.Context, c *app.RequestContext) {
+		WriteSuccess(c, "ok")
+	})
+
+	resp := ut.PerformRequest(h.Engine, consts.MethodGet, "/limited", nil, ut.Header{Key: "X-Real-IP", Value: "10.0.0.4"})
+	if resp.Code != 200 {
+		t.Fatalf("expected L2 failure to fail-open, got %d body=%s", resp.Code, resp.Body.String())
+	}
+}
+
+func TestRateLimiterL2CanRejectWhenEnabled(t *testing.T) {
+	h := server.Default()
+	limiter := NewRateLimiter(10, time.Minute)
+	limiter.SetDistributedStore(denyingDistributedRateLimitStore{})
+	limiter.SetDistributedEnabledFunc(func(ctx context.Context) bool { return true })
+	h.Use(RequestIDMiddleware(), limiter.Middleware())
+	h.GET("/limited", func(ctx context.Context, c *app.RequestContext) {
+		WriteSuccess(c, "ok")
+	})
+
+	resp := ut.PerformRequest(h.Engine, consts.MethodGet, "/limited", nil, ut.Header{Key: "X-Real-IP", Value: "10.0.0.5"})
+	if resp.Code != 429 {
+		t.Fatalf("expected L2 denial, got %d body=%s", resp.Code, resp.Body.String())
 	}
 }

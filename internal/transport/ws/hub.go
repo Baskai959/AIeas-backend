@@ -64,6 +64,7 @@ type Room struct {
 	mu          sync.RWMutex
 	clients     map[string]*Client
 	seq         atomic.Int64
+	pubSeq      atomic.Int64
 	history     []Envelope
 	disconnects atomic.Int64
 }
@@ -255,10 +256,10 @@ func (h *Hub) SessionClientCount(liveSessionID uint64) int {
 
 // HubStats 描述 Hub 的实例级运行状态，对外暴露用于运维 / 调试入口。
 type HubStats struct {
-	Rooms          int             `json:"rooms"`
-	Clients        int             `json:"clients"`
-	LiveSessions   int             `json:"liveSessions"`
-	SessionClients map[uint64]int  `json:"liveSessionId,omitempty"`
+	Rooms          int            `json:"rooms"`
+	Clients        int            `json:"clients"`
+	LiveSessions   int            `json:"liveSessions"`
+	SessionClients map[uint64]int `json:"liveSessionId,omitempty"`
 }
 
 // Stats 返回 Hub 的实例级状态快照。SessionClients map 的 key 是 liveSessionId，value 是该 session 下挂着的客户端数。
@@ -541,6 +542,10 @@ func (r *Room) removeReturning(clientID string) (bool, uint64) {
 
 func (r *Room) Broadcast(env Envelope) (int, []string) {
 	r.mu.Lock()
+	if r.isDuplicatePubEventLocked(env) {
+		r.mu.Unlock()
+		return 0, nil
+	}
 	if env.Seq == 0 {
 		env.Seq = r.NextSeq()
 	} else {
@@ -576,6 +581,30 @@ func (r *Room) Broadcast(env Envelope) (int, []string) {
 		slow = removed
 	}
 	return delivered, slow
+}
+
+func (r *Room) isDuplicatePubEventLocked(env Envelope) bool {
+	if env.Seq <= 0 || !dedupeByPubSeq(env.Type) {
+		return false
+	}
+	for {
+		current := r.pubSeq.Load()
+		if env.Seq <= current {
+			return true
+		}
+		if r.pubSeq.CompareAndSwap(current, env.Seq) {
+			return false
+		}
+	}
+}
+
+func dedupeByPubSeq(eventType string) bool {
+	switch eventType {
+	case "bid.accepted", "bid.rejected":
+		return true
+	default:
+		return false
+	}
 }
 
 func (r *Room) ClientCount() int {
@@ -647,6 +676,13 @@ func (r *Room) broadcastPresenceLocked(online int) []string {
 
 func (r *Room) NextSeq() int64 {
 	return r.seq.Add(1)
+}
+
+// CurrentSeq 返回当前 Room 已经分发过的最大 seq；客户端用它作为
+// "已对齐到此点"的水位线（snapshot 帧用此值），后续广播 seq>this 即增量。
+// 0 表示房间尚未分发过任何事件。
+func (r *Room) CurrentSeq() int64 {
+	return r.seq.Load()
 }
 
 func (r *Room) observeSeq(seq int64) {

@@ -1,32 +1,39 @@
 # 直播控制 MCP 对接文档
 
-本文档说明 `aieas_backend` 面向 Agent/上游系统暴露的直播控制 MCP 接口。该 MCP 保留既有只读工具，并新增商家直播中的核心控制能力：获取当前直播间控制台上下文、拍品上架、拍品下架、开始讲解、落槌、下播。
+本文档说明 `aieas_backend` 面向 Agent/上游系统暴露的直播控制 MCP 接口。该 MCP 只包含商家直播中的控制能力：获取当前直播间控制台上下文、拍品上架、拍品下架、开始讲解、落槌、下播。
+
+只读数据查询使用独立 MCP：`POST /mcp/read`。直播控制使用本文档的独立 MCP：`POST /mcp/control`。
 
 ## 1. 服务信息
 
-- MCP Endpoint：`POST /mcp`
+- MCP Endpoint：`POST /mcp/control`
 - Transport：Streamable HTTP，当前实现使用 JSON-RPC 2.0 请求/响应。
-- 鉴权：请求头 `X-API-Key: <mcp.apiKey>`。
+- 鉴权：请求头 `X-API-Key: <mcp.control.apiKey>`。
 - 不使用用户登录 `accessToken`。
-- 服务端调用身份来自配置项 `mcp.actorID` / `mcp.actorRole`。
-- Server name：`aieas-live-control-mcp`
-- Server version：`1.1.0`
-- 业务响应 schema：`aieas.mcp.live-control.v1`
+- 服务端调用身份来自配置项 `mcp.control.actorID` / `mcp.control.actorRole`。
+- Server name：`aieas-control-mcp`
+- Server version：`1.2.0`
+- 业务响应 schema：`aieas.mcp.control.v1`
 
 配置示例：
 
 ```yaml
 mcp:
-  apiKey: "replace-with-secret"
-  actorID: "u_9001"
-  actorRole: "admin"
+  read:
+    apiKey: "replace-with-read-secret"
+    actorID: "u_9001"
+    actorRole: "admin"
+  control:
+    apiKey: "replace-with-control-secret"
+    actorID: "u_9001"
+    actorRole: "admin"
 ```
 
 环境变量可覆盖：
 
-- `MCP_API_KEY`
-- `MCP_ACTOR_ID`
-- `MCP_ACTOR_ROLE`
+- `MCP_CONTROL_API_KEY`
+- `MCP_CONTROL_ACTOR_ID`
+- `MCP_CONTROL_ACTOR_ROLE`
 
 权限规则：
 
@@ -85,7 +92,7 @@ mcp:
 
 ```json
 {
-  "schemaVersion": "aieas.mcp.live-control.v1",
+  "schemaVersion": "aieas.mcp.control.v1",
   "traceId": "req_xxx",
   "data": {}
 }
@@ -126,7 +133,8 @@ mcp:
 | `merchantId` | string | 商家用户 ID |
 | `room` | object | 当前商家的直播间信息 |
 | `session` | object/null | 当前直播场次；没有场次时为空 |
-| `stats` | object | 直播间统计信息 |
+| `stats` | object | 直播间统计信息；`stats.online` 为当前在线人数，`stats.currentPrice` 为当前价 |
+| `currentAuctionState` | object/null | 当前讲解拍品的实时拍卖状态；无讲解中拍品时为空 |
 | `lots.explainingLot` | object/null | 当前讲解中的拍品 |
 | `lots.roomLots` | array | 当前直播间已挂载的拍品 |
 | `lots.sessionLots` | array | 当前直播场次出现过的拍品 |
@@ -139,7 +147,7 @@ mcp:
 
 ```json
 {
-  "schemaVersion": "aieas.mcp.live-control.v1",
+  "schemaVersion": "aieas.mcp.control.v1",
   "traceId": "req_7f4c",
   "data": {
     "merchantId": "u_2001",
@@ -156,9 +164,26 @@ mcp:
       "status": "LIVE"
     },
     "stats": {
-      "onlineCount": 128,
-      "bidCount": 36,
-      "orderCount": 3
+      "roomId": 80001,
+      "online": 128,
+      "lotsTotal": 6,
+      "activeAuctionId": 91001,
+      "currentBidCount": 36,
+      "currentRemainSeconds": 82,
+      "currentPrice": 120000
+    },
+    "currentAuctionState": {
+      "auctionId": 91001,
+      "status": "RUNNING",
+      "currentPrice": 120000,
+      "leaderBidderId": "u_1001",
+      "startTime": "2026-05-28T10:20:00Z",
+      "endTime": "2026-05-28T10:30:00Z",
+      "remainSeconds": 82,
+      "lastBidTsMs": 1780000000000,
+      "extendCount": 1,
+      "version": 1780000000001,
+      "source": "redis"
     },
     "lots": {
       "explainingLot": {
@@ -314,7 +339,7 @@ mcp:
 
 ```json
 {
-  "schemaVersion": "aieas.mcp.live-control.v1",
+  "schemaVersion": "aieas.mcp.control.v1",
   "traceId": "req_8c10",
   "data": {
     "action": "startExplain",
@@ -339,7 +364,25 @@ mcp:
         "merchantId": "u_2001",
         "status": "LIVE"
       },
-      "stats": {},
+      "stats": {
+        "roomId": 80001,
+        "online": 0,
+        "lotsTotal": 1,
+        "activeAuctionId": 91001,
+        "currentBidCount": 0,
+        "currentRemainSeconds": 600,
+        "currentPrice": 1000
+      },
+      "currentAuctionState": {
+        "auctionId": 91001,
+        "status": "RUNNING",
+        "currentPrice": 1000,
+        "startTime": "2026-05-28T10:20:00Z",
+        "endTime": "2026-05-28T10:30:00Z",
+        "remainSeconds": 600,
+        "version": 1780000000001,
+        "source": "redis"
+      },
       "lots": {
         "explainingLot": {
           "auctionId": 91001,
@@ -361,6 +404,7 @@ mcp:
 ## 4. 业务约束
 
 - `operate_live_session_lot.liveSessionId` 必须指向当前直播间正在直播的场次。
+- 当前在线人数在 `stats.online`；当前最高价和最高价用户在 `currentAuctionState.currentPrice` / `currentAuctionState.leaderBidderId`。
 - 商家角色只能操作自己的直播场次和拍品。
 - `startExplain` 只能激活已挂载到该直播间且状态允许开始的拍品。
 - `hammer` 要求传入的 `auctionId` 是当前正在讲解的拍品。

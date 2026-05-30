@@ -58,13 +58,12 @@ func (s *LiveRoomService) SetAuctionService(auction *AuctionService) {
 	s.auction = auction
 }
 
-// SetLiveSessionService 注入直播场次服务，用于 Activate/Deactivate 时打开/关闭场次并回填 lot.live_session_id。
+// SetLiveSessionService 注入直播场次服务，用于 Activate 时打开场次并回填 lot.live_session_id。
 func (s *LiveRoomService) SetLiveSessionService(sessions *LiveSessionService) {
 	s.sessions = sessions
 }
 
-// SetHammerService 注入结拍服务，用于 Deactivate 时收尾房间内仍在拍的拍品（强制 Force=true）。
-// 未注入时退化为旧行为：仅释放房间锁、不动 auction 状态。
+// SetHammerService 注入结拍服务。取消讲解不走 Hammer；成交/流拍仍由 Hammer 路径处理。
 func (s *LiveRoomService) SetHammerService(hammer *HammerService) {
 	s.hammer = hammer
 }
@@ -180,7 +179,12 @@ func (s *LiveRoomService) UpdateAgentHookConfig(ctx context.Context, roomID uint
 	if s.hook == nil {
 		return LiveAgentHookConfig{}, domain.ErrInvalidState
 	}
-	return s.hook.SetConfig(ctx, room.MerchantID, actorID, enabled)
+	cfg, err := s.hook.SetConfig(ctx, room.MerchantID, actorID, enabled)
+	if err != nil {
+		return LiveAgentHookConfig{}, err
+	}
+	s.hook.EmitConfigChanged(ctx, room.MerchantID, room.ID, enabled)
+	return cfg, nil
 }
 
 func (s *LiveRoomService) Get(ctx context.Context, id uint64) (domain.LiveRoom, error) {
@@ -223,14 +227,21 @@ func (s *LiveRoomService) Update(ctx context.Context, id uint64, in UpdateLiveRo
 		if in.CoverURL != nil {
 			current.CoverURL = strings.TrimSpace(*in.CoverURL)
 		}
+		shouldUnmountTerminalLots := false
 		if in.Status != nil {
 			if !in.Status.Valid() || !domain.CanTransitionLiveRoom(current.Status, *in.Status) {
 				return domain.ErrInvalidState
 			}
+			shouldUnmountTerminalLots = *in.Status == domain.LiveRoomStatusOffline || *in.Status == domain.LiveRoomStatusLive
 			current.Status = *in.Status
 		}
 		if err := s.rooms.Update(txCtx, &current); err != nil {
 			return err
+		}
+		if shouldUnmountTerminalLots {
+			if err := s.unmountTerminalLots(txCtx, current); err != nil {
+				return err
+			}
 		}
 		updated = current
 		return nil
@@ -273,6 +284,23 @@ func (s *LiveRoomService) ListLots(ctx context.Context, roomID uint64) ([]domain
 		return nil, err
 	}
 	return s.auctions.List(ctx, domain.AuctionFilter{LiveRoomID: roomID, Limit: 100})
+}
+
+func (s *LiveRoomService) unmountTerminalLots(ctx context.Context, room domain.LiveRoom) error {
+	lots, err := s.auctions.List(ctx, domain.AuctionFilter{LiveRoomID: room.ID, Limit: 100})
+	if err != nil {
+		return err
+	}
+	for _, lot := range lots {
+		if lot.Status != domain.AuctionStatusClosedFailed {
+			continue
+		}
+		lot.LiveRoomID = 0
+		if err := s.auctions.Update(ctx, &lot); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // ActivateAuction 在房间内启动指定拍品；保证同一房间同时只有一个拍品在拍。
@@ -369,14 +397,8 @@ func (s *LiveRoomService) ActivateAuctionWithOptions(ctx context.Context, in Act
 	return auction, nil
 }
 
-// DeactivateAuction 关闭房间当前在拍的拍品并释放房间锁。
-//
-// 调用顺序（先收尾 lot 再释放锁，保证押金/订单/state 全部走 HammerService 的 canonical 路径）：
-//  1. 若当前 ActiveAuctionID 指向一个非 Terminal 拍品，使用 HammerService.Hammer 以 Force=true 收尾它。
-//     Hammer 内部会广播 auction.closed、释放押金、调用 OnAuctionClosed（释放房间锁、清 ActiveAuctionID）。
-//  2. 重新读 room；若锁与 ActiveAuctionID 在第 1 步未被清掉（如 hammer 未注入或 lot 已是终态），
-//     再做一次保护性 release + Update。
-//  3. 关闭当前 LIVE 场次（CloseSession 内部会先把 realtime 计数 flush 到 MySQL）。
+// DeactivateAuction 取消当前拍品讲解：释放房间 active/锁，并把非终态拍品退回 READY，
+// 允许商家重新开始拍卖或手动下架。该动作不是落槌，不生成成交/流拍结果，也不关闭直播场次。
 func (s *LiveRoomService) DeactivateAuction(ctx context.Context, roomID uint64, actorID string, actorRole domain.Role) (domain.LiveRoom, error) {
 	room, err := s.rooms.FindByID(ctx, roomID)
 	if err != nil {
@@ -385,24 +407,16 @@ func (s *LiveRoomService) DeactivateAuction(ctx context.Context, roomID uint64, 
 	if !canAccessSellerOwned(actorID, actorRole, room.MerchantID) {
 		return domain.LiveRoom{}, domain.ErrForbidden
 	}
-	// Step 1: 若 active auction 仍在非终态，走 HammerService 的 canonical 收尾路径。
-	if room.ActiveAuctionID != 0 && s.hammer != nil {
-		if auction, err := s.auctions.FindByID(ctx, room.ActiveAuctionID); err == nil && !auction.Status.Terminal() {
-			_, _, _ = s.hammer.Hammer(ctx, domain.HammerInput{
-				RequestID: fmt.Sprintf("deactivate-%d-%d", roomID, time.Now().UTC().UnixNano()),
-				AuctionID: auction.AuctionID,
-				ActorID:   actorID,
-				ActorRole: actorRole,
-				ClosedBy:  actorID,
-				Force:     true,
-				Now:       time.Now().UTC(),
-			})
+	if room.ActiveAuctionID != 0 {
+		auction, err := s.auctions.FindByID(ctx, room.ActiveAuctionID)
+		if err != nil {
+			return domain.LiveRoom{}, err
 		}
-	}
-	// Step 2: 重新读 room，取 hammer 路径里 OnAuctionClosed 已应用的最新状态。
-	room, err = s.rooms.FindByID(ctx, roomID)
-	if err != nil {
-		return domain.LiveRoom{}, err
+		if !auction.Status.Terminal() {
+			if err := s.resetAuctionToReady(ctx, &auction); err != nil {
+				return domain.LiveRoom{}, err
+			}
+		}
 	}
 	if room.ActiveAuctionID != 0 {
 		_ = s.lock.Release(ctx, roomID, room.ActiveAuctionID)
@@ -411,11 +425,46 @@ func (s *LiveRoomService) DeactivateAuction(ctx context.Context, roomID uint64, 
 	if err := s.rooms.Update(ctx, &room); err != nil {
 		return domain.LiveRoom{}, err
 	}
-	// Step 3: 关闭当前 LIVE 场次（若存在）。CloseSession 会先 flush 计数再切状态。
-	if s.sessions != nil {
-		_, _, _ = s.sessions.CloseActiveByRoom(ctx, roomID)
-	}
 	return room, nil
+}
+
+func (s *LiveRoomService) resetAuctionToReady(ctx context.Context, auction *domain.AuctionLot) error {
+	switch auction.Status {
+	case domain.AuctionStatusReady, domain.AuctionStatusWarmingUp, domain.AuctionStatusRunning, domain.AuctionStatusExtended, domain.AuctionStatusHammerPending:
+		// allowed
+	default:
+		return domain.ErrInvalidState
+	}
+	auction.Status = domain.AuctionStatusReady
+	auction.WinnerID = nil
+	auction.DealPrice = nil
+	auction.ClosedAt = nil
+	auction.ClosedBy = ""
+	if auction.DurationSec > 0 {
+		auction.StartTime = time.Time{}
+		auction.EndTime = time.Time{}
+	}
+	if err := s.auctions.Update(ctx, auction); err != nil {
+		return err
+	}
+	realtime := s.realtime
+	minIncrement := int64(1)
+	if s.auction != nil {
+		realtime = s.auction.realtime
+		minIncrement = s.auction.cfg.MinIncrementCent
+		if s.auction.timer != nil {
+			s.auction.timer.Stop(auction.AuctionID)
+		}
+	}
+	if realtime != nil {
+		if minIncrement <= 0 {
+			minIncrement = 1
+		}
+		if _, err := realtime.InitAuction(ctx, *auction, domain.MinIncrementForPrice(auction.IncrementRule, auction.StartPrice, minIncrement)); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // OnAuctionClosed 由 HammerService 终态回调，用于自动释放房间锁。
@@ -505,8 +554,31 @@ func (s *LiveRoomService) MountAuction(ctx context.Context, roomID, auctionID ui
 	if auction.SellerID != room.MerchantID {
 		return domain.AuctionLot{}, domain.ErrForbidden
 	}
+	return s.mountAuctionToRoom(ctx, room, auction)
+}
+
+// MountAuctionToMerchantRoom 根据拍品归属商家自动挂载到该商家的直播间。
+func (s *LiveRoomService) MountAuctionToMerchantRoom(ctx context.Context, auctionID uint64, actorID string, actorRole domain.Role) (domain.AuctionLot, error) {
+	if auctionID == 0 || strings.TrimSpace(actorID) == "" {
+		return domain.AuctionLot{}, domain.ErrInvalidArgument
+	}
+	auction, err := s.auctions.FindByID(ctx, auctionID)
+	if err != nil {
+		return domain.AuctionLot{}, err
+	}
+	if !canAccessSellerOwned(actorID, actorRole, auction.SellerID) {
+		return domain.AuctionLot{}, domain.ErrForbidden
+	}
+	room, err := s.rooms.FindByMerchantID(ctx, auction.SellerID)
+	if err != nil {
+		return domain.AuctionLot{}, err
+	}
+	return s.mountAuctionToRoom(ctx, room, auction)
+}
+
+func (s *LiveRoomService) mountAuctionToRoom(ctx context.Context, room domain.LiveRoom, auction domain.AuctionLot) (domain.AuctionLot, error) {
 	// 已挂入其他直播间则冲突；同房间重复挂载视为幂等成功。
-	if auction.LiveRoomID != 0 && auction.LiveRoomID != roomID {
+	if auction.LiveRoomID != 0 && auction.LiveRoomID != room.ID {
 		return domain.AuctionLot{}, ErrLotAlreadyMounted
 	}
 	// 仅允许挂入未进入 WARMING_UP/RUNNING 等运行态、且非 Terminal 的拍品。
@@ -516,16 +588,13 @@ func (s *LiveRoomService) MountAuction(ctx context.Context, roomID, auctionID ui
 	default:
 		return domain.AuctionLot{}, domain.ErrInvalidState
 	}
-	if auction.LiveRoomID == roomID {
+	if auction.LiveRoomID == room.ID {
 		// 幂等返回，无需再次写库。
 		return auction, nil
 	}
-	auction.LiveRoomID = roomID
+	auction.LiveRoomID = room.ID
 	if err := s.auctions.Update(ctx, &auction); err != nil {
 		return domain.AuctionLot{}, err
-	}
-	if s.hook != nil {
-		s.hook.EmitLotMounted(ctx, room.MerchantID, roomID, auctionID)
 	}
 	return auction, nil
 }
@@ -553,12 +622,12 @@ func (s *LiveRoomService) UnmountAuction(ctx context.Context, roomID, auctionID 
 	if room.ActiveAuctionID == auctionID {
 		return domain.ErrInvalidState
 	}
+	if auction.Status == domain.AuctionStatusClosedWon || auction.Status == domain.AuctionStatusSettled {
+		return domain.ErrInvalidState
+	}
 	auction.LiveRoomID = 0
 	if err := s.auctions.Update(ctx, &auction); err != nil {
 		return err
-	}
-	if s.hook != nil {
-		s.hook.EmitLotUnmounted(ctx, room.MerchantID, roomID, auctionID)
 	}
 	return nil
 }

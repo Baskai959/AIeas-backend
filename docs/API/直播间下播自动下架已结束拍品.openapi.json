@@ -1,0 +1,165 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "直播间下播自动下架已结束拍品",
+    "version": "1.0.0",
+    "description": "直播间从 LIVE 切换到 OFFLINE 时，后端会自动解除该直播间下终态拍品的挂载。未结束拍品仍保留在直播间。"
+  },
+  "paths": {
+    "/api/v1/live-rooms/{id}": {
+      "patch": {
+        "tags": [
+          "直播间"
+        ],
+        "summary": "更新直播间状态",
+        "description": "需要 merchant 或 admin 角色，并要求 Idempotency-Key。传 status=OFFLINE 下播时，后端会自动将该直播间下 CLOSED_WON、CLOSED_FAILED、SETTLED 的拍品下架，即清空拍品 liveRoomId；READY、DRAFT 等未结束拍品不受影响。",
+        "operationId": "updateLiveRoomOfflineAutoUnmountTerminalLots",
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "uint64"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateLiveRoomRequest"
+              },
+              "example": {
+                "status": "OFFLINE"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "下播成功；终态拍品已自动从直播间下架。",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LiveRoomResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "无直播间操作权限。"
+          },
+          "404": {
+            "description": "直播间不存在。"
+          },
+          "409": {
+            "description": "直播间状态不允许此操作。"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "BearerAuth": {
+        "type": "http",
+        "scheme": "bearer"
+      }
+    },
+    "schemas": {
+      "UpdateLiveRoomRequest": {
+        "type": "object",
+        "properties": {
+          "title": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "coverUrl": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "OFFLINE",
+              "LIVE",
+              "CLOSED"
+            ]
+          }
+        }
+      },
+      "LiveRoomResponse": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "integer",
+            "example": 0
+          },
+          "message": {
+            "type": "string",
+            "example": "success"
+          },
+          "data": {
+            "$ref": "#/components/schemas/LiveRoom"
+          },
+          "trace_id": {
+            "type": "string"
+          }
+        }
+      },
+      "LiveRoom": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer",
+            "format": "uint64"
+          },
+          "merchantId": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "coverUrl": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "activeAuctionId": {
+            "type": "integer",
+            "format": "uint64"
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "updatedAt": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      }
+    }
+  }
+}

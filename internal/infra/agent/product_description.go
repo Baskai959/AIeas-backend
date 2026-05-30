@@ -35,7 +35,6 @@ type LiveAnalysisClient struct {
 
 type LiveAuctionHookClient struct {
 	endpoint string
-	apiKey   string
 	client   *http.Client
 }
 
@@ -76,7 +75,6 @@ func NewLiveAuctionHookClient(cfg appconfig.AgentConfig) *LiveAuctionHookClient 
 	timeout := cfg.Timeout.Std()
 	return &LiveAuctionHookClient{
 		endpoint: strings.TrimSpace(cfg.LiveAuctionHookURL),
-		apiKey:   strings.TrimSpace(cfg.LiveAuctionHookAPIKey),
 		client: &http.Client{
 			Timeout:   timeout,
 			Transport: newAgentTransport("agent.live_auction_hook"),
@@ -156,7 +154,7 @@ func (c *ProductAuditClient) AuditProduct(ctx context.Context, in service.Produc
 	if c == nil || c.client == nil || c.endpoint == "" {
 		return service.ProductAuditResult{}, service.ErrProductAuditUnavailable
 	}
-	if strings.TrimSpace(in.ProductText) == "" || len(in.Image) == 0 {
+	if strings.TrimSpace(in.ProductText) == "" || len(in.Image) == 0 || strings.TrimSpace(in.CallbackURL) == "" {
 		return service.ProductAuditResult{}, domain.ErrInvalidArgument
 	}
 
@@ -167,6 +165,27 @@ func (c *ProductAuditClient) AuditProduct(ctx context.Context, in service.Produc
 	}
 	if err := writer.WriteField("product_text", strings.TrimSpace(in.ProductText)); err != nil {
 		return service.ProductAuditResult{}, err
+	}
+	if err := writer.WriteField("callback_url", strings.TrimSpace(in.CallbackURL)); err != nil {
+		return service.ProductAuditResult{}, err
+	}
+	if len(in.CallbackHeaders) > 0 {
+		headers, err := json.Marshal(in.CallbackHeaders)
+		if err != nil {
+			return service.ProductAuditResult{}, err
+		}
+		if err := writer.WriteField("callback_headers", string(headers)); err != nil {
+			return service.ProductAuditResult{}, err
+		}
+	}
+	if len(in.CallbackContext) > 0 {
+		callbackContext, err := json.Marshal(in.CallbackContext)
+		if err != nil {
+			return service.ProductAuditResult{}, err
+		}
+		if err := writer.WriteField("callback_context", string(callbackContext)); err != nil {
+			return service.ProductAuditResult{}, err
+		}
 	}
 	if err := writer.Close(); err != nil {
 		return service.ProductAuditResult{}, err
@@ -189,10 +208,20 @@ func (c *ProductAuditClient) AuditProduct(ctx context.Context, in service.Produc
 		return service.ProductAuditResult{}, fmt.Errorf("agent product audit status %d: %s", resp.StatusCode, strings.TrimSpace(string(preview)))
 	}
 
-	var result service.ProductAuditResult
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+	payload, err := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+	if err != nil {
 		return service.ProductAuditResult{}, err
 	}
+	if strings.TrimSpace(string(payload)) == "" {
+		return service.ProductAuditResult{Success: true, Status: "ACCEPTED"}, nil
+	}
+	var result service.ProductAuditResult
+	if err := json.Unmarshal(payload, &result); err != nil {
+		return service.ProductAuditResult{}, err
+	}
+	result.RequestID = strings.TrimSpace(result.RequestID)
+	result.Status = strings.TrimSpace(result.Status)
+	result.Message = strings.TrimSpace(result.Message)
 	if result.RejectReason != nil {
 		reason := strings.TrimSpace(*result.RejectReason)
 		if reason == "" {
@@ -282,9 +311,6 @@ func (c *LiveAuctionHookClient) InvokeLiveAgentHook(ctx context.Context, message
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	if c.apiKey != "" {
-		req.Header.Set("X-Agent-Hook-Key", c.apiKey)
-	}
 	resp, err := c.client.Do(req)
 	if err != nil {
 		return err

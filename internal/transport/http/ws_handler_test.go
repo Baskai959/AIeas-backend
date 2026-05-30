@@ -90,7 +90,97 @@ func TestWSHandlerParseLastSeq(t *testing.T) {
 	}
 }
 
+// TestWSHandlerDeliverRoomSnapshotFromRT 验证 P1-B：握手后 deliverRoomSnapshot
+// 走 RT (auctionService.State 优先 RT)，下发的 envelope.type=room.snapshot，
+// payload 含 currentPrice/leaderBidderId/endTime/seq/status/serverTime，且
+// degraded=false（state.Source="redis"）。
+func TestWSHandlerDeliverRoomSnapshotFromRT(t *testing.T) {
+	ctx := context.Background()
+	cfg := appconfig.Default().Auction
+	cfg.FreqLimitCount = 100
+	hub := corews.NewHub()
+	bidSvc, auctionSvc, auctionID := newWSBidFixtureWithAuctionService(t, cfg, hub)
+	handler := NewWSHandler(hub, bidSvc, 8, 65536, time.Second, 2*time.Second)
+	handler.SetAuctionService(auctionSvc)
+
+	client := corews.NewClient("c1", "u_1001", auctionID, 8)
+	if err := hub.Subscribe(auctionID, client); err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	// Subscribe 后 Hub 会自动广播 room.online；先把它收掉，让后续 select 命中 snapshot。
+	for {
+		select {
+		case env := <-client.Outbound():
+			if env.Type == corews.TypeRoomSnapshot {
+				t.Fatalf("snapshot delivered before deliverRoomSnapshot was called")
+			}
+			continue
+		default:
+		}
+		break
+	}
+
+	before := time.Now().UTC().UnixMilli()
+	handler.deliverRoomSnapshot(ctx, client)
+	after := time.Now().UTC().UnixMilli()
+
+	select {
+	case env := <-client.Outbound():
+		if env.Type != corews.TypeRoomSnapshot {
+			t.Fatalf("expected room.snapshot, got %s", env.Type)
+		}
+		var payload map[string]interface{}
+		if err := json.Unmarshal(env.Payload, &payload); err != nil {
+			t.Fatalf("decode snapshot payload: %v", err)
+		}
+		for _, key := range []string{"auctionId", "status", "currentPrice", "leaderBidderId", "endTime", "seq", "serverTime", "source", "degraded"} {
+			if _, ok := payload[key]; !ok {
+				t.Fatalf("snapshot payload missing %q: %+v", key, payload)
+			}
+		}
+		if degraded, _ := payload["degraded"].(bool); degraded {
+			t.Fatalf("expected degraded=false from RT-served snapshot, got payload=%+v", payload)
+		}
+		if src, _ := payload["source"].(string); src != "redis" {
+			t.Fatalf("expected source=redis, got %v", payload["source"])
+		}
+		serverTime, ok := payload["serverTime"].(float64)
+		if !ok {
+			t.Fatalf("serverTime should be number, got %T", payload["serverTime"])
+		}
+		if int64(serverTime) < before || int64(serverTime) > after+1 {
+			t.Fatalf("serverTime=%v out of [%d,%d]", serverTime, before, after)
+		}
+	default:
+		t.Fatalf("expected snapshot envelope on outbound, got none")
+	}
+}
+
+// TestWSHandlerDeliverRoomSnapshotSkipsWhenNoAuctionService 验证未注入
+// auctionService 时 deliverRoomSnapshot 是 noop（不阻塞、不下发任何帧）。
+func TestWSHandlerDeliverRoomSnapshotSkipsWhenNoAuctionService(t *testing.T) {
+	ctx := context.Background()
+	cfg := appconfig.Default().Auction
+	hub := corews.NewHub()
+	bidSvc, auctionID := newWSBidFixture(t, cfg, hub)
+	handler := NewWSHandler(hub, bidSvc, 8, 65536, time.Second, 2*time.Second)
+	// 不调用 SetAuctionService。
+	client := corews.NewClient("c2", "u_1001", auctionID, 8)
+	handler.deliverRoomSnapshot(ctx, client)
+
+	select {
+	case env := <-client.Outbound():
+		t.Fatalf("expected no snapshot frame when auctionService is unset, got %+v", env)
+	default:
+	}
+}
+
 func newWSBidFixture(t *testing.T, cfg appconfig.AuctionConfig, hub *corews.Hub) (*service.BidService, uint64) {
+	bidSvc, _, auctionID := newWSBidFixtureWithAuctionService(t, cfg, hub)
+	return bidSvc, auctionID
+}
+
+func newWSBidFixtureWithAuctionService(t *testing.T, cfg appconfig.AuctionConfig, hub *corews.Hub) (*service.BidService, *service.AuctionService, uint64) {
 	t.Helper()
 	ctx := context.Background()
 	itemRepo := repository.NewMemoryItemRepository()
@@ -124,7 +214,7 @@ func newWSBidFixture(t *testing.T, cfg appconfig.AuctionConfig, hub *corews.Hub)
 		AntiSnipingSec: 60,
 		AntiExtendSec:  30,
 		DepositAmount:  100,
-		Status:         domain.AuctionStatusPendingAudit,
+		Status:         domain.AuctionStatusReady,
 		StartTime:      time.Now().UTC().Add(-time.Minute),
 		EndTime:        time.Now().UTC().Add(time.Hour),
 	})
@@ -141,5 +231,5 @@ func newWSBidFixture(t *testing.T, cfg appconfig.AuctionConfig, hub *corews.Hub)
 	if _, err := depositSvc.Enroll(ctx, service.EnrollInput{AuctionID: auction.AuctionID, UserID: "u_1001", UserRole: domain.RoleBuyer}); err != nil {
 		t.Fatalf("enroll: %v", err)
 	}
-	return bidSvc, auction.AuctionID
+	return bidSvc, auctionSvc, auction.AuctionID
 }

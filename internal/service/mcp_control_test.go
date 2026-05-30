@@ -25,7 +25,11 @@ func newMCPControlFixture(t *testing.T) mcpControlFixture {
 	auctionRepo := repository.NewMemoryAuctionRepository()
 	roomRepo := repository.NewMemoryLiveRoomRepository()
 	sessionRepo := repository.NewMemoryLiveSessionRepository()
+	realtimeStore := repository.NewMemoryRealtimeStore()
+	auctionSvc := NewAuctionService(auctionRepo, nil, repository.NoopTxManager{})
+	auctionSvc.SetRealtime(realtimeStore)
 	roomSvc := NewLiveRoomService(roomRepo, auctionRepo, repository.NoopTxManager{}, repository.NewMemoryLiveRoomLock())
+	roomSvc.SetAuctionService(auctionSvc)
 	room, err := roomSvc.Create(ctx, CreateLiveRoomInput{
 		ActorID:   "m_1",
 		ActorRole: domain.RoleMerchant,
@@ -51,6 +55,7 @@ func newMCPControlFixture(t *testing.T) mcpControlFixture {
 		Rooms:       roomRepo,
 		Sessions:    sessionRepo,
 		LiveRoomSvc: roomSvc,
+		AuctionSvc:  auctionSvc,
 	})
 	return mcpControlFixture{svc: svc, auctions: auctionRepo, rooms: roomRepo, sessions: sessionRepo, room: room, session: session}
 }
@@ -89,6 +94,26 @@ func TestMCPControlServiceReadAndOperate(t *testing.T) {
 	if result.Context == nil || len(result.Context.Lots.UpcomingLots) != 1 {
 		t.Fatalf("expected refreshed context with upcoming lot, got %+v", result.Context)
 	}
+
+	result, err = fixture.svc.OperateLiveSessionLot(ctx, MCPLiveLotOperationInput{
+		LiveSessionID: fixture.session.ID,
+		AuctionID:     lot.AuctionID,
+		Action:        "startExplain",
+		DurationSec:   600,
+	}, actor)
+	if err != nil {
+		t.Fatalf("operate start explain: %v", err)
+	}
+	if result.Context == nil || result.Context.CurrentAuctionState == nil {
+		t.Fatalf("expected refreshed context with current auction state, got %+v", result.Context)
+	}
+	if result.Context.CurrentAuctionState.AuctionID != lot.AuctionID || result.Context.CurrentAuctionState.CurrentPrice != lot.StartPrice {
+		t.Fatalf("unexpected current auction state: %+v", result.Context.CurrentAuctionState)
+	}
+	if result.Context.CurrentAuctionState.RemainSeconds <= 0 {
+		t.Fatalf("expected positive remain seconds, got %+v", result.Context.CurrentAuctionState)
+	}
+
 }
 
 func TestMCPControlServiceErrors(t *testing.T) {
@@ -147,14 +172,15 @@ func TestMCPControlServiceErrors(t *testing.T) {
 func mcpControlReadyLot(id uint64, sellerID string) domain.AuctionLot {
 	now := time.Now().UTC()
 	return domain.AuctionLot{
-		AuctionID:   id,
-		ItemID:      id + 1000,
-		SellerID:    sellerID,
-		AuctionType: domain.AuctionTypeEnglish,
-		StartPrice:  1000,
-		Status:      domain.AuctionStatusReady,
-		StartTime:   now,
-		EndTime:     now.Add(time.Hour),
-		DurationSec: 600,
+		AuctionID:     id,
+		ItemID:        id + 1000,
+		SellerID:      sellerID,
+		AuctionType:   domain.AuctionTypeEnglish,
+		StartPrice:    1000,
+		IncrementRule: domain.DefaultIncrementRule(),
+		Status:        domain.AuctionStatusReady,
+		StartTime:     now,
+		EndTime:       now.Add(time.Hour),
+		DurationSec:   600,
 	}
 }

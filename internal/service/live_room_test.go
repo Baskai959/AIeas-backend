@@ -93,6 +93,105 @@ func TestLiveRoomServiceUpdateForbidden(t *testing.T) {
 	}
 }
 
+func TestLiveRoomServiceUpdateClosedRoomCanStartLiveAgain(t *testing.T) {
+	svc, auctionRepo, _, _ := newLiveRoomFixture(t)
+	ctx := context.Background()
+	room, err := svc.Create(ctx, CreateLiveRoomInput{
+		ActorID:   "m_1",
+		ActorRole: domain.RoleMerchant,
+		Title:     "t",
+		Status:    domain.LiveRoomStatusClosed,
+	})
+	if err != nil {
+		t.Fatalf("create room: %v", err)
+	}
+	now := time.Now().UTC()
+	closed := domain.AuctionLot{
+		AuctionID: 4001, ItemID: 1, SellerID: "m_1", AuctionType: domain.AuctionTypeEnglish,
+		Status: domain.AuctionStatusClosedFailed, LiveRoomID: room.ID,
+		StartTime: now.Add(-time.Hour), EndTime: now,
+	}
+	if err := auctionRepo.Create(ctx, &closed); err != nil {
+		t.Fatalf("create closed auction: %v", err)
+	}
+	live := domain.LiveRoomStatusLive
+	updated, err := svc.Update(ctx, room.ID, UpdateLiveRoomInput{
+		ActorID:   "m_1",
+		ActorRole: domain.RoleMerchant,
+		Status:    &live,
+	})
+	if err != nil {
+		t.Fatalf("reopen live room: %v", err)
+	}
+	if updated.Status != domain.LiveRoomStatusLive {
+		t.Fatalf("expected room LIVE, got %s", updated.Status)
+	}
+	storedClosed, err := auctionRepo.FindByID(ctx, closed.AuctionID)
+	if err != nil {
+		t.Fatalf("find closed auction: %v", err)
+	}
+	if storedClosed.LiveRoomID != 0 {
+		t.Fatalf("expected terminal lot unmounted on reopen, got LiveRoomID=%d", storedClosed.LiveRoomID)
+	}
+}
+
+func TestLiveRoomServiceUpdateOfflineUnmountsTerminalLots(t *testing.T) {
+	svc, auctionRepo, _, _ := newLiveRoomFixture(t)
+	ctx := context.Background()
+	room, err := svc.Create(ctx, CreateLiveRoomInput{
+		ActorID:   "m_1",
+		ActorRole: domain.RoleMerchant,
+		Title:     "t",
+		Status:    domain.LiveRoomStatusLive,
+	})
+	if err != nil {
+		t.Fatalf("create room: %v", err)
+	}
+	now := time.Now().UTC()
+	closed := domain.AuctionLot{
+		AuctionID: 4101, ItemID: 1, SellerID: "m_1", AuctionType: domain.AuctionTypeEnglish,
+		Status: domain.AuctionStatusClosedFailed, LiveRoomID: room.ID,
+		StartTime: now.Add(-time.Hour), EndTime: now,
+	}
+	ready := domain.AuctionLot{
+		AuctionID: 4102, ItemID: 2, SellerID: "m_1", AuctionType: domain.AuctionTypeEnglish,
+		Status: domain.AuctionStatusReady, LiveRoomID: room.ID,
+		StartTime: now, EndTime: now.Add(time.Hour),
+	}
+	if err := auctionRepo.Create(ctx, &closed); err != nil {
+		t.Fatalf("create closed auction: %v", err)
+	}
+	if err := auctionRepo.Create(ctx, &ready); err != nil {
+		t.Fatalf("create ready auction: %v", err)
+	}
+	offline := domain.LiveRoomStatusOffline
+	updated, err := svc.Update(ctx, room.ID, UpdateLiveRoomInput{
+		ActorID:   "m_1",
+		ActorRole: domain.RoleMerchant,
+		Status:    &offline,
+	})
+	if err != nil {
+		t.Fatalf("update offline: %v", err)
+	}
+	if updated.Status != domain.LiveRoomStatusOffline {
+		t.Fatalf("expected room OFFLINE, got %s", updated.Status)
+	}
+	storedClosed, err := auctionRepo.FindByID(ctx, closed.AuctionID)
+	if err != nil {
+		t.Fatalf("find closed auction: %v", err)
+	}
+	if storedClosed.LiveRoomID != 0 {
+		t.Fatalf("expected terminal lot unmounted, got LiveRoomID=%d", storedClosed.LiveRoomID)
+	}
+	storedReady, err := auctionRepo.FindByID(ctx, ready.AuctionID)
+	if err != nil {
+		t.Fatalf("find ready auction: %v", err)
+	}
+	if storedReady.LiveRoomID != room.ID {
+		t.Fatalf("expected ready lot to stay mounted, got LiveRoomID=%d", storedReady.LiveRoomID)
+	}
+}
+
 func TestLiveRoomServiceActivateAuctionLock(t *testing.T) {
 	svc, auctionRepo, lock, _ := newLiveRoomFixture(t)
 	ctx := context.Background()
@@ -188,6 +287,16 @@ func TestLiveRoomServiceOnAuctionClosedReleasesLock(t *testing.T) {
 	}
 	if got.ActiveAuctionID != 0 || got.Status != domain.LiveRoomStatusLive {
 		t.Fatalf("expected room to keep live with no active auction, got %+v", got)
+	}
+	stored, err := auctionRepo.FindByID(ctx, a.AuctionID)
+	if err != nil {
+		t.Fatalf("find auction: %v", err)
+	}
+	if stored.Status != domain.AuctionStatusReady {
+		t.Fatalf("expected auction back to READY, got %s", stored.Status)
+	}
+	if _, err := svc.ActivateAuction(ctx, room.ID, a.AuctionID, "m_1", domain.RoleMerchant); err != nil {
+		t.Fatalf("reactivate after deactivate: %v", err)
 	}
 }
 
@@ -348,6 +457,51 @@ func TestLiveRoomServiceMountAuctionSuccess(t *testing.T) {
 	}
 }
 
+func TestLiveRoomServiceMountAuctionToMerchantRoomSuccess(t *testing.T) {
+	svc, auctionRepo, _, _ := newLiveRoomFixture(t)
+	ctx := context.Background()
+	room, err := svc.Create(ctx, CreateLiveRoomInput{ActorID: "m_1", ActorRole: domain.RoleMerchant, Title: "t"})
+	if err != nil {
+		t.Fatalf("create room: %v", err)
+	}
+	now := time.Now().UTC()
+	a := domain.AuctionLot{
+		AuctionID: 90501, ItemID: 1, SellerID: "m_1", AuctionType: domain.AuctionTypeEnglish,
+		Status: domain.AuctionStatusReady, LiveRoomID: 0,
+		StartTime: now, EndTime: now.Add(time.Hour),
+	}
+	if err := auctionRepo.Create(ctx, &a); err != nil {
+		t.Fatalf("create auction: %v", err)
+	}
+	lot, err := svc.MountAuctionToMerchantRoom(ctx, a.AuctionID, "m_1", domain.RoleMerchant)
+	if err != nil {
+		t.Fatalf("auto mount: %v", err)
+	}
+	if lot.LiveRoomID != room.ID {
+		t.Fatalf("expected lot.LiveRoomID=%d, got %d", room.ID, lot.LiveRoomID)
+	}
+}
+
+func TestLiveRoomServiceMountAuctionToMerchantRoomForbiddenForeignSeller(t *testing.T) {
+	svc, auctionRepo, _, _ := newLiveRoomFixture(t)
+	ctx := context.Background()
+	if _, err := svc.Create(ctx, CreateLiveRoomInput{ActorID: "m_1", ActorRole: domain.RoleMerchant, Title: "t"}); err != nil {
+		t.Fatalf("create room: %v", err)
+	}
+	now := time.Now().UTC()
+	a := domain.AuctionLot{
+		AuctionID: 90502, ItemID: 1, SellerID: "m_2", AuctionType: domain.AuctionTypeEnglish,
+		Status: domain.AuctionStatusReady, LiveRoomID: 0,
+		StartTime: now, EndTime: now.Add(time.Hour),
+	}
+	if err := auctionRepo.Create(ctx, &a); err != nil {
+		t.Fatalf("create auction: %v", err)
+	}
+	if _, err := svc.MountAuctionToMerchantRoom(ctx, a.AuctionID, "m_1", domain.RoleMerchant); !errors.Is(err, domain.ErrForbidden) {
+		t.Fatalf("expected ErrForbidden, got %v", err)
+	}
+}
+
 func TestLiveRoomServiceMountAuctionForbiddenForeignSeller(t *testing.T) {
 	svc, auctionRepo, _, _ := newLiveRoomFixture(t)
 	ctx := context.Background()
@@ -473,6 +627,27 @@ func TestLiveRoomServiceUnmountAuctionSuccess(t *testing.T) {
 	}
 }
 
+func TestLiveRoomServiceUnmountAuctionRejectsClosedWon(t *testing.T) {
+	svc, auctionRepo, _, _ := newLiveRoomFixture(t)
+	ctx := context.Background()
+	room, err := svc.Create(ctx, CreateLiveRoomInput{ActorID: "m_1", ActorRole: domain.RoleMerchant, Title: "t"})
+	if err != nil {
+		t.Fatalf("create room: %v", err)
+	}
+	now := time.Now().UTC()
+	a := domain.AuctionLot{
+		AuctionID: 9551, ItemID: 1, SellerID: "m_1", AuctionType: domain.AuctionTypeEnglish,
+		Status: domain.AuctionStatusClosedWon, LiveRoomID: room.ID,
+		StartTime: now.Add(-time.Hour), EndTime: now,
+	}
+	if err := auctionRepo.Create(ctx, &a); err != nil {
+		t.Fatalf("create auction: %v", err)
+	}
+	if err := svc.UnmountAuction(ctx, room.ID, a.AuctionID, "m_1", domain.RoleMerchant); !errors.Is(err, domain.ErrInvalidState) {
+		t.Fatalf("expected ErrInvalidState, got %v", err)
+	}
+}
+
 func TestLiveRoomServiceStatsBasic(t *testing.T) {
 	svc, auctionRepo, _, _ := newLiveRoomFixture(t)
 	ctx := context.Background()
@@ -580,7 +755,7 @@ func TestMountAuctionAllowedWhenRoomOffline(t *testing.T) {
 
 // TestDeactivateWithHammerClosesActiveLot 验证 DeactivateAuction 在有 HammerService 时，
 // 会先通过 Hammer 把 RUNNING 的 lot 关闭（Force=true），再释放房间锁。
-func TestDeactivateWithHammerClosesActiveLot(t *testing.T) {
+func TestDeactivateReturnsActiveLotToReady(t *testing.T) {
 	svc, auctionRepo, _, roomRepo := newLiveRoomFixture(t)
 	ctx := context.Background()
 
@@ -622,13 +797,12 @@ func TestDeactivateWithHammerClosesActiveLot(t *testing.T) {
 	if deactivated.ActiveAuctionID != 0 {
 		t.Fatalf("expected ActiveAuctionID=0, got %d", deactivated.ActiveAuctionID)
 	}
-	// 验证 auction 已被 Hammer 关闭
 	auction, err := auctionRepo.FindByID(ctx, a.AuctionID)
 	if err != nil {
 		t.Fatalf("find auction: %v", err)
 	}
-	if !auction.Status.Terminal() {
-		t.Fatalf("expected terminal status, got %s", auction.Status)
+	if auction.Status != domain.AuctionStatusReady {
+		t.Fatalf("expected READY status, got %s", auction.Status)
 	}
 }
 

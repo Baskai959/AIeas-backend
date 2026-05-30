@@ -71,9 +71,7 @@ func TestLiveAnalysisClientReturnsAsyncAgentErrorMessage(t *testing.T) {
 
 func TestLiveAuctionHookClientPostsMessage(t *testing.T) {
 	var gotMessage string
-	var gotKey string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotKey = r.Header.Get("X-Agent-Hook-Key")
 		var req struct {
 			Message string `json:"message"`
 		}
@@ -87,14 +85,13 @@ func TestLiveAuctionHookClientPostsMessage(t *testing.T) {
 	defer server.Close()
 
 	client := NewLiveAuctionHookClient(appconfig.AgentConfig{
-		LiveAuctionHookURL:    server.URL,
-		LiveAuctionHookAPIKey: "hook-key",
-		Timeout:               appconfig.Duration(time.Second),
+		LiveAuctionHookURL: server.URL,
+		Timeout:            appconfig.Duration(time.Second),
 	})
 	if err := client.InvokeLiveAgentHook(t.Context(), "直播间70001开播了"); err != nil {
 		t.Fatalf("invoke live auction hook: %v", err)
 	}
-	if gotMessage != "直播间70001开播了" || gotKey != "hook-key" {
-		t.Fatalf("unexpected hook request message=%q key=%q", gotMessage, gotKey)
+	if gotMessage != "直播间70001开播了" {
+		t.Fatalf("unexpected hook request message=%q", gotMessage)
 	}
 }

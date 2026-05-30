@@ -66,4 +66,6 @@ var (
 	ErrConflict        = errors.New("conflict")
 	ErrInvalidState    = errors.New("invalid state")
 	ErrIdempotencyKey  = errors.New("idempotency key required")
+	// ErrOptimisticConflict 表示行级乐观锁版本号 CAS 失败，调用方可重试或视为冲突。
+	ErrOptimisticConflict = errors.New("optimistic conflict")
 )

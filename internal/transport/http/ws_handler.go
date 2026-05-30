@@ -1,6 +1,7 @@
 package http
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -23,6 +24,7 @@ type WSHandler struct {
 	hub            *corews.Hub
 	bids           *service.BidService
 	rooms          *service.LiveRoomService
+	auctions       *service.AuctionService
 	sendBufferSize int
 	readLimitBytes int
 	pingInterval   time.Duration
@@ -61,6 +63,12 @@ func NewWSHandler(hub *corews.Hub, bids *service.BidService, sendBufferSize, rea
 // SetLiveRoomService 注入直播间服务以支持 /ws/live-rooms/:room_id 入口。
 func (h *WSHandler) SetLiveRoomService(rooms *service.LiveRoomService) {
 	h.rooms = rooms
+}
+
+// SetAuctionService 注入拍卖服务以在握手后下发 room.snapshot（P1-B）。
+// 未注入时握手成功仍可继续，但跳过 snapshot 帧（保留原有读写循环）。
+func (h *WSHandler) SetAuctionService(auctions *service.AuctionService) {
+	h.auctions = auctions
 }
 
 func (h *WSHandler) Auction(ctx context.Context, c *app.RequestContext) {
@@ -136,6 +144,12 @@ func (h *WSHandler) serveConn(ctx context.Context, conn *websocket.Conn, client 
 		return conn.SetReadDeadline(time.Now().Add(h.pongTimeout))
 	})
 
+	// P1-B：握手后立即下发房间快照，让客户端不必等首个 broadcast 才能渲染。
+	// 优先走 RT (LoadState)，RT 不可用 / state 缺失时降级 MySQL，并在 payload
+	// 中标记 degraded=true。snapshot 直接 deliver 到 client，不再走 Hub.Broadcast，
+	// 避免 seq 占用与 history 写入。
+	h.deliverRoomSnapshot(ctx, client)
+
 	done := make(chan struct{})
 	writeDone := make(chan struct{})
 	go func() {
@@ -209,6 +223,45 @@ func (h *WSHandler) replayMissed(client *corews.Client, lastSeq int64) {
 	}
 }
 
+// deliverRoomSnapshot 在握手完成后立即下发一帧 room.snapshot：
+// 优先 RT (auctionService.State 内部已 RT-first → DB fallback)，并基于
+// 返回的 Source=="redis"/"db" 推断是否退化。state 加载失败、auction 不存在
+// 或 auctionService 未注入时，仅 best-effort 跳过——不阻断后续读写循环。
+//
+// snapshot 帧的 seq 字段填当前 Hub Room 的 CurrentSeq()，让客户端把它
+// 当作"已对齐到此点"，后续 broadcast 只要 seq 严格递增即可保证不重不漏。
+func (h *WSHandler) deliverRoomSnapshot(ctx context.Context, client *corews.Client) {
+	if client == nil || h.auctions == nil {
+		return
+	}
+	state, err := h.auctions.State(ctx, client.AuctionID, client.UserID, domain.RoleBuyer)
+	if err != nil {
+		// 拉取失败（auction 不存在 / RT+DB 都失败）：跳过 snapshot，
+		// 老客户端依旧依赖 first broadcast 渲染——保持原有行为。
+		return
+	}
+	var seq int64
+	if room, ok := h.hub.Room(client.AuctionID); ok && room != nil {
+		seq = room.CurrentSeq()
+	}
+	degraded := strings.EqualFold(state.Source, "db")
+	payload := map[string]interface{}{
+		"auctionId":      state.AuctionID,
+		"status":         state.Status,
+		"currentPrice":   state.CurrentPrice,
+		"leaderBidderId": state.LeaderBidderID,
+		"startTime":      state.StartTime.UTC().UnixMilli(),
+		"endTime":        state.EndTime.UTC().UnixMilli(),
+		"extendCount":    state.ExtendCount,
+		"version":        state.Version,
+		"seq":            seq,
+		"serverTime":     time.Now().UTC().UnixMilli(),
+		"source":         state.Source,
+		"degraded":       degraded,
+	}
+	client.Deliver(jsonEnvelope(corews.TypeRoomSnapshot, "", payload))
+}
+
 func (h *WSHandler) handleInbound(ctx context.Context, client *corews.Client, env corews.Envelope) []corews.Envelope {
 	switch env.Type {
 	case "bid.place":
@@ -249,24 +302,17 @@ func (h *WSHandler) handleBidPlace(ctx context.Context, client *corews.Client, e
 		AuctionID            uint64 `json:"auctionId"`
 		Price                int64  `json:"price"`
 		ExpectedCurrentPrice *int64 `json:"expectedCurrentPrice"`
-		ExpectedVersion      *int64 `json:"expectedVersion"`
-		RequestID            string `json:"requestId"`
-		Idempotent           string `json:"idempotencyKey"`
 	}
-	if err := json.Unmarshal(env.Payload, &payload); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(env.Payload))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&payload); err != nil {
 		return []corews.Envelope{jsonEnvelope("bid.ack", env.RequestID, map[string]interface{}{"accepted": false, "reason": "INVALID_PAYLOAD"})}
 	}
 	if payload.AuctionID == 0 {
 		payload.AuctionID = client.AuctionID
 	}
 	requestID := strings.TrimSpace(env.RequestID)
-	if requestID == "" {
-		requestID = strings.TrimSpace(payload.RequestID)
-	}
-	if requestID == "" {
-		requestID = strings.TrimSpace(payload.Idempotent)
-	}
-	if payload.ExpectedCurrentPrice == nil && payload.ExpectedVersion == nil {
+	if payload.ExpectedCurrentPrice == nil {
 		return []corews.Envelope{jsonEnvelope("bid.ack", requestID, map[string]interface{}{"accepted": false, "reason": "MISSING_EXPECTED_STATE"})}
 	}
 	result, err := h.bids.Place(ctx, service.PlaceBidInput{
@@ -276,7 +322,6 @@ func (h *WSHandler) handleBidPlace(ctx context.Context, client *corews.Client, e
 		UserRole:             domain.RoleBuyer,
 		Price:                payload.Price,
 		ExpectedCurrentPrice: payload.ExpectedCurrentPrice,
-		ExpectedVersion:      payload.ExpectedVersion,
 		Source:               "live_ws",
 	})
 	if err != nil {

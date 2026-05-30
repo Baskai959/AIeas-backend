@@ -22,6 +22,7 @@ type DepositService struct {
 	risk     *RiskService
 	tx       repository.TxManager
 	metrics  *metrics.Registry
+	controls *RiskControlService
 }
 
 type EnrollInput struct {
@@ -38,6 +39,10 @@ func NewDepositService(deposits repository.DepositRepository, auctions repositor
 		tx = repository.NoopTxManager{}
 	}
 	return &DepositService{deposits: deposits, auctions: auctions, realtime: realtime, risk: risk, tx: tx}
+}
+
+func (s *DepositService) SetRiskControlService(controls *RiskControlService) {
+	s.controls = controls
 }
 
 // SetMetrics 注入观测性 Registry。nil 安全。
@@ -86,7 +91,7 @@ func (s *DepositService) enroll(ctx context.Context, in EnrollInput) (domain.Dep
 	if in.AuctionID == 0 || in.UserID == "" || in.UserRole != domain.RoleBuyer {
 		return domain.DepositLedger{}, domain.ErrInvalidArgument
 	}
-	if s.risk != nil {
+	if s.risk != nil && s.blacklistCheckEnabled(ctx) {
 		blacklisted, err := s.risk.IsBlacklisted(ctx, in.UserID)
 		if err != nil {
 			return domain.DepositLedger{}, err
@@ -151,7 +156,17 @@ func (s *DepositService) enroll(ctx context.Context, in EnrollInput) (domain.Dep
 		return domain.DepositLedger{}, err
 	}
 	if err := s.realtime.MarkEnrollment(ctx, in.AuctionID, in.UserID); err != nil {
+		if s.metrics != nil {
+			s.metrics.IncDepositSyncRedisFail()
+		}
 		return domain.DepositLedger{}, err
 	}
 	return deposit, nil
+}
+
+func (s *DepositService) blacklistCheckEnabled(ctx context.Context) bool {
+	if s.controls == nil {
+		return true
+	}
+	return s.controls.Enabled(ctx)
 }

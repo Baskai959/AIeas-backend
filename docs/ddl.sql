@@ -82,6 +82,7 @@ CREATE TABLE IF NOT EXISTS `auction_lot` (
   `deal_price`       BIGINT          DEFAULT NULL              COMMENT '成交价（分）',
   `closed_at`        DATETIME(3)     DEFAULT NULL              COMMENT '实际落锤时间',
   `closed_by`        VARCHAR(32)     DEFAULT NULL              COMMENT '落锤来源：AUTO/ADMIN/RISK_TERMINATE',
+  `version`          BIGINT          NOT NULL DEFAULT 0        COMMENT '行级乐观锁版本号，仅由落槌 CAS 路径递增',
   `created_at`       DATETIME(3)     NOT NULL DEFAULT CURRENT_TIMESTAMP(3) COMMENT '创建时间',
   `updated_at`       DATETIME(3)     NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3) COMMENT '更新时间',
   PRIMARY KEY (`auction_id`),

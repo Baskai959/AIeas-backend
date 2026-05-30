@@ -101,6 +101,52 @@ func (r *MemoryAuctionRepository) Delete(ctx context.Context, id uint64) error {
 	return nil
 }
 
+// CloseWithVersion 内存层 CAS 实现：在 mu 内对比 version 与状态白名单，
+// 等价 MySQL CAS 语义；冲突返回 domain.ErrOptimisticConflict，已是终态返回
+// domain.ErrInvalidState；成功时回写 expectedVersion+1 到入参 auction.Version。
+func (r *MemoryAuctionRepository) CloseWithVersion(ctx context.Context, auction *domain.AuctionLot, expectedVersion int64, allowedFromStatuses []domain.AuctionStatus) error {
+	_ = ctx
+	if auction == nil || auction.AuctionID == 0 {
+		return domain.ErrInvalidArgument
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	current, ok := r.auctions[auction.AuctionID]
+	if !ok {
+		return domain.ErrNotFound
+	}
+	if current.Version != expectedVersion || !statusInList(current.Status, allowedFromStatuses) {
+		if current.Status.Terminal() {
+			return domain.ErrInvalidState
+		}
+		return domain.ErrOptimisticConflict
+	}
+	now := time.Now().UTC()
+	current.Status = auction.Status
+	current.WinnerID = auction.WinnerID
+	current.DealPrice = auction.DealPrice
+	current.ClosedAt = auction.ClosedAt
+	current.ClosedBy = auction.ClosedBy
+	current.Version = expectedVersion + 1
+	current.UpdatedAt = now
+	r.auctions[auction.AuctionID] = cloneAuction(current)
+	auction.Version = current.Version
+	auction.UpdatedAt = now
+	return nil
+}
+
+func statusInList(s domain.AuctionStatus, list []domain.AuctionStatus) bool {
+	if len(list) == 0 {
+		return true
+	}
+	for _, v := range list {
+		if v == s {
+			return true
+		}
+	}
+	return false
+}
+
 func cloneAuction(auction domain.AuctionLot) domain.AuctionLot {
 	auction.IncrementRule = append([]byte(nil), auction.IncrementRule...)
 	auction.RuleSnapshot = append([]byte(nil), auction.RuleSnapshot...)

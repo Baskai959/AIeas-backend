@@ -48,7 +48,6 @@ func TestAuctionServiceCreateGeneratesAuctionID(t *testing.T) {
 		StartPrice:    1000,
 		ReservePrice:  5000,
 		CapPrice:      6000,
-		Status:        domain.AuctionStatusPendingAudit,
 		StartTime:     start,
 		EndTime:       start.Add(time.Hour),
 		AuctionType:   domain.AuctionTypeEnglish,
@@ -59,6 +58,9 @@ func TestAuctionServiceCreateGeneratesAuctionID(t *testing.T) {
 	}
 	if auction.AuctionID != 123456789 {
 		t.Fatalf("expected generated auction ID, got %d", auction.AuctionID)
+	}
+	if auction.Status != domain.AuctionStatusReady {
+		t.Fatalf("expected new auction to be READY, got %s", auction.Status)
 	}
 
 	stored, err := auctionRepo.FindByID(ctx, 123456789)
@@ -97,7 +99,6 @@ func TestAuctionServiceCreatePreservesProvidedAuctionID(t *testing.T) {
 		StartPrice:    1000,
 		ReservePrice:  5000,
 		CapPrice:      6000,
-		Status:        domain.AuctionStatusPendingAudit,
 		StartTime:     start,
 		EndTime:       start.Add(time.Hour),
 		AuctionType:   domain.AuctionTypeEnglish,
@@ -129,7 +130,6 @@ func TestAuctionServiceCreateAllowsOptionalTiming(t *testing.T) {
 		StartPrice:    1000,
 		ReservePrice:  5000,
 		CapPrice:      6000,
-		Status:        domain.AuctionStatusPendingAudit,
 		AuctionType:   domain.AuctionTypeEnglish,
 		DepositAmount: 100,
 		DurationSec:   600,
@@ -149,7 +149,6 @@ func TestAuctionServiceCreateAllowsOptionalTiming(t *testing.T) {
 		StartPrice:    1000,
 		ReservePrice:  5000,
 		CapPrice:      6000,
-		Status:        domain.AuctionStatusPendingAudit,
 		StartTime:     start,
 		DurationSec:   300,
 		AuctionType:   domain.AuctionTypeEnglish,
@@ -163,7 +162,7 @@ func TestAuctionServiceCreateAllowsOptionalTiming(t *testing.T) {
 	}
 }
 
-func TestAuctionServiceCreateRejectsApprovedStatus(t *testing.T) {
+func TestAuctionServiceCreateRejectsSystemStatus(t *testing.T) {
 	ctx := context.Background()
 	itemRepo := repository.NewMemoryItemRepository()
 	auctionRepo := repository.NewMemoryAuctionRepository()
@@ -182,7 +181,7 @@ func TestAuctionServiceCreateRejectsApprovedStatus(t *testing.T) {
 		StartPrice:    1000,
 		ReservePrice:  5000,
 		CapPrice:      6000,
-		Status:        domain.AuctionStatusReady,
+		Status:        domain.AuctionStatusRunning,
 		StartTime:     start,
 		EndTime:       start.Add(time.Hour),
 		AuctionType:   domain.AuctionTypeEnglish,
@@ -193,7 +192,7 @@ func TestAuctionServiceCreateRejectsApprovedStatus(t *testing.T) {
 	}
 }
 
-func TestAuctionServiceUpdateRejectsApprovedStatusOutsideAudit(t *testing.T) {
+func TestAuctionServiceUpdateAllowsReadyAndRejectsSystemStatus(t *testing.T) {
 	ctx := context.Background()
 	itemRepo := repository.NewMemoryItemRepository()
 	auctionRepo := repository.NewMemoryAuctionRepository()
@@ -212,7 +211,7 @@ func TestAuctionServiceUpdateRejectsApprovedStatusOutsideAudit(t *testing.T) {
 		StartPrice:    1000,
 		ReservePrice:  5000,
 		CapPrice:      6000,
-		Status:        domain.AuctionStatusPendingAudit,
+		Status:        domain.AuctionStatusDraft,
 		StartTime:     start,
 		EndTime:       start.Add(time.Hour),
 		AuctionType:   domain.AuctionTypeEnglish,
@@ -223,16 +222,16 @@ func TestAuctionServiceUpdateRejectsApprovedStatusOutsideAudit(t *testing.T) {
 	}
 
 	ready := domain.AuctionStatusReady
-	if _, err := svc.Update(ctx, auction.AuctionID, UpdateAuctionInput{ActorID: "u_2001", ActorRole: domain.RoleMerchant, Status: &ready}); !errors.Is(err, domain.ErrInvalidArgument) {
-		t.Fatalf("expected invalid argument, got %v", err)
+	updated, err := svc.Update(ctx, auction.AuctionID, UpdateAuctionInput{ActorID: "u_2001", ActorRole: domain.RoleMerchant, Status: &ready})
+	if err != nil {
+		t.Fatalf("set ready: %v", err)
+	}
+	if updated.Status != domain.AuctionStatusReady {
+		t.Fatalf("expected READY, got %s", updated.Status)
 	}
 
-	admin := NewAdminService(repository.NewSeedUserRepository(), svc, nil, nil, nil, nil)
-	approved, err := admin.AuditAuction(ctx, auction.AuctionID, true, "u_9001")
-	if err != nil {
-		t.Fatalf("audit auction: %v", err)
-	}
-	if approved.Status != domain.AuctionStatusReady {
-		t.Fatalf("expected audit to approve auction, got %s", approved.Status)
+	running := domain.AuctionStatusRunning
+	if _, err := svc.Update(ctx, auction.AuctionID, UpdateAuctionInput{ActorID: "u_2001", ActorRole: domain.RoleMerchant, Status: &running}); !errors.Is(err, domain.ErrInvalidArgument) {
+		t.Fatalf("expected invalid argument, got %v", err)
 	}
 }

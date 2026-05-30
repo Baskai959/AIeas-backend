@@ -3,14 +3,16 @@ package redis
 import "strings"
 
 const (
-	ScriptBidPlace = "bid.place"
-	ScriptHammer   = "auction.hammer"
+	ScriptBidPlace  = "bid.place"
+	ScriptHammer    = "auction.hammer"
+	ScriptRateLimit = "ratelimit.token_bucket"
 )
 
 func DefaultScripts() map[string]string {
 	return map[string]string{
-		ScriptBidPlace: strings.TrimSpace(bidLua),
-		ScriptHammer:   strings.TrimSpace(hammerLua),
+		ScriptBidPlace:  strings.TrimSpace(bidLua),
+		ScriptHammer:    strings.TrimSpace(hammerLua),
+		ScriptRateLimit: strings.TrimSpace(rateLimitLua),
 	}
 }
 
@@ -41,9 +43,8 @@ local idem_ttl_ms = tonumber(ARGV[12])
 local source = ARGV[13]
 local anti_extend_mode = ARGV[14]
 local expected_current_price_raw = ARGV[15]
-local expected_version_raw = ARGV[16]
-local trace_parent = ARGV[17]
-local trace_state = ARGV[18]
+local trace_parent = ARGV[16]
+local trace_state = ARGV[17]
 
 if request_id == nil then request_id = "" end
 if bidder_id == nil then bidder_id = "" end
@@ -152,6 +153,9 @@ local function append_event(accepted, reason, current_price, leader_id, end_ts, 
     "traceparent", trace_parent,
     "tracestate", trace_state
   )
+  local payload = build_result(accepted, reason, current_price, leader_id, end_ts, extend_count, extended, version, seq, stream_id, false, auction_status, auto_closed)
+  local channel = "auction:" .. tostring(auction_id) .. ":events"
+  redis.call("PUBLISH", channel, payload)
   redis.call("SADD", active_streams_key, tostring(auction_id))
   return seq, stream_id
 end
@@ -245,18 +249,12 @@ if redis.call("SISMEMBER", deposit_key, bidder_id) ~= 1 then
   return reject("DEPOSIT_NOT_READY")
 end
 
-if expected_current_price_raw ~= nil and expected_current_price_raw ~= "" then
-  local expected_current_price = tonumber(expected_current_price_raw)
-  if expected_current_price == nil or expected_current_price ~= current_price then
-    return reject("STALE_AUCTION_STATE")
-  end
+local expected_current_price = tonumber(expected_current_price_raw)
+if expected_current_price_raw == nil or expected_current_price_raw == "" or expected_current_price == nil or expected_current_price < 0 then
+  return reject("MISSING_EXPECTED_STATE")
 end
-
-if expected_version_raw ~= nil and expected_version_raw ~= "" then
-  local expected_version = tonumber(expected_version_raw)
-  if expected_version == nil or expected_version ~= version then
-    return reject("STALE_AUCTION_STATE")
-  end
+if expected_current_price > current_price then
+  return reject("STALE_AUCTION_STATE")
 end
 
 if freq_limit_count > 0 and freq_window_ms > 0 then
@@ -270,11 +268,19 @@ if freq_limit_count > 0 and freq_window_ms > 0 then
 end
 
 local increment_amount, max_bid_steps = increment_rule_for_price(increment_rule, min_increment, current_price)
+local expected_increment_amount, expected_max_bid_steps = increment_rule_for_price(increment_rule, min_increment, expected_current_price)
 if price <= start_price then
   return reject("BELOW_START_PRICE")
 end
 if cap_price > 0 and price > cap_price then
   return reject("ABOVE_CAP_PRICE")
+end
+local expected_max_allowed = expected_current_price + expected_increment_amount * expected_max_bid_steps
+if cap_price > 0 and expected_max_allowed > cap_price then
+  expected_max_allowed = cap_price
+end
+if expected_current_price < current_price and price > expected_max_allowed then
+  return reject("ABOVE_EXPECTED_MAX_BID_STEPS")
 end
 local is_cap_bid = cap_price > 0 and price == cap_price
 if (not is_cap_bid) and ((price - current_price) % increment_amount) ~= 0 then
@@ -457,4 +463,76 @@ local result = cjson.encode({
 })
 redis.call("SET", close_lock_key, result, "PX", idem_ttl_ms)
 return result
+`
+
+// rateLimitLua 实现一个原子的令牌桶（token bucket）限流。
+//
+// KEYS[1] : bucket hash key holding {tokens, ts_ms}
+// ARGV[1] : capacity (max tokens, integer)
+// ARGV[2] : refill_rate_per_ms (float, tokens added per millisecond)
+// ARGV[3] : now_ms
+// ARGV[4] : ttl_ms (key TTL；> capacity / refill_rate_per_ms)
+// ARGV[5] : cost (>=1)
+//
+// 返回 { allowed (1|0), remaining_tokens (int), retry_after_ms (int) }。
+//
+// 注意：本脚本必须与 scripts/lua/rate_limit.lua 字节同步（去尾首空白）。
+const rateLimitLua = `
+-- Token-bucket rate limit (atomic).
+--
+-- KEYS[1] : bucket hash key holding {tokens, ts_ms}
+-- ARGV[1] : capacity (max tokens)
+-- ARGV[2] : refill_rate_per_ms (float; tokens added per ms)
+-- ARGV[3] : now_ms
+-- ARGV[4] : ttl_ms (key TTL — should be longer than (capacity / refill_rate_per_ms))
+-- ARGV[5] : cost (tokens consumed per call; >=1)
+--
+-- Returns: { allowed (1|0), remaining_tokens (int), retry_after_ms (int) }
+
+local key = KEYS[1]
+local capacity = tonumber(ARGV[1])
+local refill_rate_per_ms = tonumber(ARGV[2])
+local now_ms = tonumber(ARGV[3])
+local ttl_ms = tonumber(ARGV[4])
+local cost = tonumber(ARGV[5])
+
+if capacity == nil or capacity <= 0 then capacity = 1 end
+if refill_rate_per_ms == nil or refill_rate_per_ms <= 0 then refill_rate_per_ms = capacity / 1000.0 end
+if now_ms == nil or now_ms <= 0 then now_ms = 0 end
+if ttl_ms == nil or ttl_ms <= 0 then ttl_ms = 60000 end
+if cost == nil or cost <= 0 then cost = 1 end
+
+local bucket = redis.call("HMGET", key, "tokens", "ts_ms")
+local tokens = tonumber(bucket[1])
+local last_ts = tonumber(bucket[2])
+
+if tokens == nil then tokens = capacity end
+if last_ts == nil or last_ts <= 0 then last_ts = now_ms end
+
+local elapsed = now_ms - last_ts
+if elapsed < 0 then elapsed = 0 end
+local refill = elapsed * refill_rate_per_ms
+tokens = tokens + refill
+if tokens > capacity then tokens = capacity end
+
+local allowed = 0
+local retry_after_ms = 0
+if tokens >= cost then
+  tokens = tokens - cost
+  allowed = 1
+else
+  local missing = cost - tokens
+  if refill_rate_per_ms > 0 then
+    retry_after_ms = math.ceil(missing / refill_rate_per_ms)
+  else
+    retry_after_ms = ttl_ms
+  end
+end
+
+redis.call("HSET", key, "tokens", tostring(tokens), "ts_ms", tostring(now_ms))
+redis.call("PEXPIRE", key, ttl_ms)
+
+local remaining = math.floor(tokens)
+if remaining < 0 then remaining = 0 end
+return { allowed, remaining, retry_after_ms }
 `

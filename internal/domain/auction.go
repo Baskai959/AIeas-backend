@@ -121,8 +121,10 @@ type AuctionLot struct {
 	DealPrice      *int64            `json:"dealPrice,omitempty"`
 	ClosedAt       *time.Time        `json:"closedAt,omitempty"`
 	ClosedBy       string            `json:"closedBy,omitempty"`
-	CreatedAt      time.Time         `json:"createdAt"`
-	UpdatedAt      time.Time         `json:"updatedAt"`
+	// Version 是 MySQL 行级乐观锁版本号，仅在落槌路径（CloseWithVersion）参与 CAS。
+	Version   int64     `json:"version"`
+	CreatedAt time.Time `json:"createdAt"`
+	UpdatedAt time.Time `json:"updatedAt"`
 }
 
 type AuctionFilter struct {
@@ -190,7 +192,6 @@ type BidInput struct {
 	BidderID             string
 	Price                int64
 	ExpectedCurrentPrice *int64
-	ExpectedVersion      *int64
 	Now                  time.Time
 	Source               string
 	MinIncrement         int64

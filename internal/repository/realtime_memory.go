@@ -89,6 +89,11 @@ func (s *MemoryRealtimeStore) InitAuction(ctx context.Context, auction domain.Au
 	existing.startPrice = auction.StartPrice
 	existing.capPrice = auction.CapPrice
 	existing.rule = rule
+	existing.ranking = make(map[string]memoryRankingEntry)
+	existing.idempotency = make(map[string]domain.BidResult)
+	existing.frequency = make(map[string]memoryFrequency)
+	existing.nextBidSeq = 0
+	existing.hammerResult = nil
 	return state, nil
 }
 
@@ -176,13 +181,28 @@ func (s *MemoryRealtimeStore) PlaceBid(ctx context.Context, input domain.BidInpu
 		auction.storeBidResult(input.RequestID, result)
 		return result, nil
 	}
-	if input.ExpectedCurrentPrice != nil && *input.ExpectedCurrentPrice != state.CurrentPrice {
-		result := rejectBid(input, domain.BidRejectStaleAuctionState, state.CurrentPrice, state.LeaderBidderID, state.EndTime, state.ExtendCount)
+	rule := input.IncrementRule
+	if rule.Type == "" || rule.MaxBidSteps <= 0 || rule.AmountForPrice(state.CurrentPrice) <= 0 {
+		rule = auction.rule
+	}
+	if rule.AmountForPrice(state.CurrentPrice) <= 0 {
+		rule = domain.IncrementRule{Type: domain.IncrementRuleTypeFixed, Amount: auction.minIncrement, MaxBidSteps: 1}
+	}
+	startPrice := input.StartPrice
+	if startPrice == 0 {
+		startPrice = auction.startPrice
+	}
+	capPrice := input.CapPrice
+	if capPrice == 0 {
+		capPrice = auction.capPrice
+	}
+	if input.ExpectedCurrentPrice == nil {
+		result := rejectBid(input, domain.BidRejectMissingExpectedState, state.CurrentPrice, state.LeaderBidderID, state.EndTime, state.ExtendCount)
 		auction.storeBidResult(input.RequestID, result)
 		return result, nil
 	}
-	if input.ExpectedVersion != nil && *input.ExpectedVersion != state.Version {
-		result := rejectBid(input, domain.BidRejectStaleAuctionState, state.CurrentPrice, state.LeaderBidderID, state.EndTime, state.ExtendCount)
+	if reason := domain.ValidateBidExpectedCurrentPrice(*input.ExpectedCurrentPrice, state.CurrentPrice, capPrice, input.Price, rule); reason != "" {
+		result := rejectBid(input, reason, state.CurrentPrice, state.LeaderBidderID, state.EndTime, state.ExtendCount)
 		auction.storeBidResult(input.RequestID, result)
 		return result, nil
 	}
@@ -199,21 +219,6 @@ func (s *MemoryRealtimeStore) PlaceBid(ctx context.Context, input domain.BidInpu
 			auction.storeBidResult(input.RequestID, result)
 			return result, nil
 		}
-	}
-	rule := input.IncrementRule
-	if rule.Type == "" || rule.MaxBidSteps <= 0 || rule.AmountForPrice(state.CurrentPrice) <= 0 {
-		rule = auction.rule
-	}
-	if rule.AmountForPrice(state.CurrentPrice) <= 0 {
-		rule = domain.IncrementRule{Type: domain.IncrementRuleTypeFixed, Amount: auction.minIncrement, MaxBidSteps: 1}
-	}
-	startPrice := input.StartPrice
-	if startPrice == 0 {
-		startPrice = auction.startPrice
-	}
-	capPrice := input.CapPrice
-	if capPrice == 0 {
-		capPrice = auction.capPrice
 	}
 	if reason := domain.ValidateBidPrice(startPrice, state.CurrentPrice, capPrice, input.Price, rule); reason != "" {
 		result := rejectBid(input, reason, state.CurrentPrice, state.LeaderBidderID, state.EndTime, state.ExtendCount)

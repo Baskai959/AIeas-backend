@@ -54,7 +54,7 @@ func (h *Handler) Get(ctx context.Context, c *app.RequestContext) {
 	c.JSON(consts.StatusMethodNotAllowed, rpcResponse{
 		JSONRPC: "2.0",
 		ID:      json.RawMessage("null"),
-		Error:   protocolError(rpcMethodNotFound, "streaming GET is not enabled", traceID, "use POST /mcp for MCP calls"),
+		Error:   protocolError(rpcMethodNotFound, "streaming GET is not enabled", traceID, "use POST /mcp/read or /mcp/control for MCP calls"),
 	})
 }
 
@@ -91,7 +91,7 @@ func (h *Handler) handleRequest(ctx context.Context, req rpcRequest, actor servi
 	}
 	switch req.Method {
 	case "initialize":
-		return successResponse(req, initializeResult()), true
+		return successResponse(req, h.initializeResult()), true
 	case "ping":
 		return successResponse(req, utils.H{}), true
 	case "notifications/initialized":
@@ -100,10 +100,19 @@ func (h *Handler) handleRequest(ctx context.Context, req rpcRequest, actor servi
 		}
 		return successResponse(req, utils.H{}), true
 	case "resources/templates/list":
+		if h.read == nil {
+			return errorResponse(req, protocolError(rpcMethodNotFound, "method not found", traceID, req.Method)), true
+		}
 		return successResponse(req, utils.H{"resourceTemplates": resourceTemplates()}), true
 	case "resources/list":
+		if h.read == nil {
+			return errorResponse(req, protocolError(rpcMethodNotFound, "method not found", traceID, req.Method)), true
+		}
 		return successResponse(req, utils.H{"resources": []interface{}{}}), true
 	case "resources/read":
+		if h.read == nil {
+			return errorResponse(req, protocolError(rpcMethodNotFound, "method not found", traceID, req.Method)), true
+		}
 		var params resourcesReadParams
 		if err := decodeParams(req.Params, &params); err != nil || strings.TrimSpace(params.URI) == "" {
 			return errorResponse(req, protocolError(rpcInvalidParams, "invalid params", traceID, "uri is required")), true
@@ -114,7 +123,7 @@ func (h *Handler) handleRequest(ctx context.Context, req rpcRequest, actor servi
 		}
 		return successResponse(req, result), true
 	case "tools/list":
-		return successResponse(req, utils.H{"tools": toolDefinitions()}), true
+		return successResponse(req, utils.H{"tools": h.toolDefinitions()}), true
 	case "tools/call":
 		var params toolsCallParams
 		if err := decodeParams(req.Params, &params); err != nil || strings.TrimSpace(params.Name) == "" {
@@ -132,16 +141,19 @@ func (h *Handler) handleRequest(ctx context.Context, req rpcRequest, actor servi
 	}
 }
 
-func initializeResult() utils.H {
+func (h *Handler) initializeResult() utils.H {
+	capabilities := utils.H{
+		"tools":   utils.H{},
+		"prompts": utils.H{},
+	}
+	if h.read != nil {
+		capabilities["resources"] = utils.H{}
+	}
 	return utils.H{
 		"protocolVersion": protocolVersion,
-		"capabilities": utils.H{
-			"resources": utils.H{},
-			"tools":     utils.H{},
-			"prompts":   utils.H{},
-		},
+		"capabilities":    capabilities,
 		"serverInfo": utils.H{
-			"name":    serverName,
+			"name":    h.serverName,
 			"version": serverVersion,
 		},
 	}

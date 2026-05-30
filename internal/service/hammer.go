@@ -2,6 +2,8 @@ package service
 
 import (
 	"context"
+	"errors"
+	"log/slog"
 	"strconv"
 	"strings"
 	"time"
@@ -27,6 +29,7 @@ type HammerService struct {
 	onClose   func(ctx context.Context, auctionID uint64)
 	metrics   *metrics.Registry
 	hook      *LiveAgentHookService
+	events    SettlementEventPublisher
 }
 
 type OrderIDGenerator interface {
@@ -65,6 +68,11 @@ func (s *HammerService) SetLiveAgentHookService(hook *LiveAgentHookService) {
 // SetMetrics 注入观测性 Registry。nil 安全。
 func (s *HammerService) SetMetrics(reg *metrics.Registry) {
 	s.metrics = reg
+}
+
+// SetSettlementEventPublisher 注入落槌 / 成交 Kafka 事件发布器。
+func (s *HammerService) SetSettlementEventPublisher(publisher SettlementEventPublisher) {
+	s.events = publisher
 }
 
 // Hammer 触发拍卖落槌，根据结果返回 hammer result + 可选成交订单。
@@ -149,7 +157,8 @@ func (s *HammerService) hammerInternal(ctx context.Context, in domain.HammerInpu
 		return domain.HammerResult{}, nil, err
 	}
 	var order *domain.OrderDeal
-	if err := s.tx.WithinTx(ctx, func(txCtx context.Context) error {
+	txStart := time.Now()
+	txErr := s.tx.WithinTx(ctx, func(txCtx context.Context) error {
 		current, err := s.auctions.FindByID(txCtx, in.AuctionID)
 		if err != nil {
 			return err
@@ -167,6 +176,7 @@ func (s *HammerService) hammerInternal(ctx context.Context, in domain.HammerInpu
 			result.WinnerID = ""
 			result.Price = 0
 		}
+		current.Status = result.Status
 		if result.Status == domain.AuctionStatusClosedWon {
 			current.WinnerID = &result.WinnerID
 			current.DealPrice = &result.Price
@@ -174,7 +184,13 @@ func (s *HammerService) hammerInternal(ctx context.Context, in domain.HammerInpu
 			current.WinnerID = nil
 			current.DealPrice = nil
 		}
-		if err := s.auctions.Update(txCtx, &current); err != nil {
+		expectedVersion := current.Version
+		allowedFrom := []domain.AuctionStatus{
+			domain.AuctionStatusRunning,
+			domain.AuctionStatusExtended,
+			domain.AuctionStatusHammerPending,
+		}
+		if err := s.auctions.CloseWithVersion(txCtx, &current, expectedVersion, allowedFrom); err != nil {
 			return err
 		}
 		if result.Status != domain.AuctionStatusClosedWon {
@@ -220,7 +236,31 @@ func (s *HammerService) hammerInternal(ctx context.Context, in domain.HammerInpu
 			return s.releaseDeposits(txCtx, current.AuctionID, "released_by_hammer", &result.WinnerID)
 		}
 		return nil
-	}); err != nil {
+	})
+	if s.metrics != nil {
+		s.metrics.ObserveHammerMySQLTx(time.Since(txStart))
+		if txErr != nil && !errors.Is(txErr, domain.ErrOptimisticConflict) && !errors.Is(txErr, domain.ErrInvalidState) {
+			s.metrics.IncHammerMySQLFail()
+		}
+	}
+	if txErr != nil {
+		err := txErr
+		if errors.Is(err, domain.ErrOptimisticConflict) {
+			if s.metrics != nil {
+				s.metrics.IncHammerOptimisticConflict()
+			}
+			return domain.HammerResult{}, nil, err
+		}
+		if errors.Is(err, domain.ErrInvalidState) {
+			// 行在 CAS 时已是终态：走已有终态短路逻辑回放成交结果。
+			if existing, fetchErr := s.auctions.FindByID(ctx, in.AuctionID); fetchErr == nil {
+				if terminal, terminalOrder, ok, terminalErr := s.existingCloseResult(ctx, existing, in.RequestID); terminalErr == nil && ok {
+					terminal.Duplicate = true
+					return terminal, terminalOrder, nil
+				}
+			}
+			return domain.HammerResult{}, nil, err
+		}
 		return domain.HammerResult{}, nil, err
 	}
 	// 终态后累加场次计数：成交（CLOSED_WON）→ lots_sold/gmv；流拍/失败 → lots_unsold。
@@ -235,6 +275,7 @@ func (s *HammerService) hammerInternal(ctx context.Context, in domain.HammerInpu
 		}
 		_ = s.sessions.IncrCounters(ctx, *auction.LiveSessionID, counters)
 	}
+	s.publishSettlementEvents(ctx, auction, result, order, in)
 	payload := map[string]interface{}{
 		"auctionId": result.AuctionID,
 		"status":    result.Status,
@@ -253,6 +294,35 @@ func (s *HammerService) hammerInternal(ctx context.Context, in domain.HammerInpu
 		s.onClose(ctx, result.AuctionID)
 	}
 	return result, order, nil
+}
+
+func (s *HammerService) publishSettlementEvents(ctx context.Context, auction domain.AuctionLot, result domain.HammerResult, order *domain.OrderDeal, in domain.HammerInput) {
+	if s.events == nil {
+		return
+	}
+	eventAuction := auction
+	eventAuction.Status = result.Status
+	eventAuction.ClosedAt = &result.ClosedAt
+	if in.ClosedBy != "" {
+		eventAuction.ClosedBy = in.ClosedBy
+	} else {
+		eventAuction.ClosedBy = in.ActorID
+	}
+	if result.Status == domain.AuctionStatusClosedWon {
+		eventAuction.WinnerID = &result.WinnerID
+		eventAuction.DealPrice = &result.Price
+	} else {
+		eventAuction.WinnerID = nil
+		eventAuction.DealPrice = nil
+	}
+	if err := s.events.PublishAuctionClosed(ctx, eventAuction, result, order); err != nil {
+		slog.Default().Warn("publish auction closed kafka event failed", "auction_id", result.AuctionID, "error", err)
+	}
+	if order != nil {
+		if err := s.events.PublishOrderCreated(ctx, *order); err != nil {
+			slog.Default().Warn("publish order created kafka event failed", "auction_id", result.AuctionID, "order_id", order.ID, "error", err)
+		}
+	}
 }
 
 func (s *HammerService) existingCloseResult(ctx context.Context, auction domain.AuctionLot, requestID string) (domain.HammerResult, *domain.OrderDeal, bool, error) {

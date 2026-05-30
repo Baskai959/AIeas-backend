@@ -16,33 +16,37 @@ type MCPLiveControlDependencies struct {
 	Rooms       repository.LiveRoomRepository
 	Sessions    repository.LiveSessionRepository
 	LiveRoomSvc *LiveRoomService
+	AuctionSvc  *AuctionService
 	HammerSvc   *HammerService
 }
 
 type MCPControlService struct {
-	auctions  repository.AuctionRepository
-	rooms     repository.LiveRoomRepository
-	sessions  repository.LiveSessionRepository
-	roomSvc   *LiveRoomService
-	hammerSvc *HammerService
+	auctions   repository.AuctionRepository
+	rooms      repository.LiveRoomRepository
+	sessions   repository.LiveSessionRepository
+	roomSvc    *LiveRoomService
+	auctionSvc *AuctionService
+	hammerSvc  *HammerService
 }
 
 func NewMCPControlService(deps MCPLiveControlDependencies) *MCPControlService {
 	return &MCPControlService{
-		auctions:  deps.Auctions,
-		rooms:     deps.Rooms,
-		sessions:  deps.Sessions,
-		roomSvc:   deps.LiveRoomSvc,
-		hammerSvc: deps.HammerSvc,
+		auctions:   deps.Auctions,
+		rooms:      deps.Rooms,
+		sessions:   deps.Sessions,
+		roomSvc:    deps.LiveRoomSvc,
+		auctionSvc: deps.AuctionSvc,
+		hammerSvc:  deps.HammerSvc,
 	}
 }
 
 type MCPLiveControlContext struct {
-	MerchantID string                 `json:"merchantId"`
-	Room       domain.LiveRoom        `json:"room"`
-	Session    *domain.LiveSession    `json:"session,omitempty"`
-	Stats      LiveRoomStats          `json:"stats"`
-	Lots       MCPLiveControlLotState `json:"lots"`
+	MerchantID          string                      `json:"merchantId"`
+	Room                domain.LiveRoom             `json:"room"`
+	Session             *domain.LiveSession         `json:"session,omitempty"`
+	Stats               LiveRoomStats               `json:"stats"`
+	CurrentAuctionState *MCPLiveCurrentAuctionState `json:"currentAuctionState,omitempty"`
+	Lots                MCPLiveControlLotState      `json:"lots"`
 }
 
 type MCPLiveControlLotState struct {
@@ -53,6 +57,20 @@ type MCPLiveControlLotState struct {
 	UnsoldLots    []domain.AuctionLot `json:"unsoldLots"`
 	UpcomingLots  []domain.AuctionLot `json:"upcomingLots"`
 	CandidateLots []domain.AuctionLot `json:"candidateLots"`
+}
+
+type MCPLiveCurrentAuctionState struct {
+	AuctionID      uint64               `json:"auctionId"`
+	Status         domain.AuctionStatus `json:"status"`
+	CurrentPrice   int64                `json:"currentPrice"`
+	LeaderBidderID string               `json:"leaderBidderId,omitempty"`
+	StartTime      time.Time            `json:"startTime"`
+	EndTime        time.Time            `json:"endTime"`
+	RemainSeconds  int64                `json:"remainSeconds"`
+	LastBidTSMS    int64                `json:"lastBidTsMs,omitempty"`
+	ExtendCount    int                  `json:"extendCount,omitempty"`
+	Version        int64                `json:"version,omitempty"`
+	Source         string               `json:"source,omitempty"`
 }
 
 type MCPLiveLotOperationInput struct {
@@ -94,7 +112,7 @@ func (s *MCPControlService) ReadMerchantLiveControlContext(ctx context.Context, 
 	if err != nil {
 		return MCPLiveControlContext{}, err
 	}
-	return s.buildLiveControlContext(ctx, merchantID, room)
+	return s.buildLiveControlContext(ctx, merchantID, room, actor)
 }
 
 func (s *MCPControlService) OperateLiveSessionLot(ctx context.Context, in MCPLiveLotOperationInput, actor MCPActor) (MCPLiveLotOperationResult, error) {
@@ -190,7 +208,7 @@ func (s *MCPControlService) OperateLiveSessionLot(ctx context.Context, in MCPLiv
 	if err != nil {
 		return MCPLiveLotOperationResult{}, err
 	}
-	context, err := s.buildLiveControlContext(ctx, session.MerchantID, latestRoom)
+	context, err := s.buildLiveControlContext(ctx, session.MerchantID, latestRoom, actor)
 	if err != nil {
 		return MCPLiveLotOperationResult{}, err
 	}
@@ -226,7 +244,7 @@ func (s *MCPControlService) requireLiveControlSession(ctx context.Context, sessi
 	return session, room, nil
 }
 
-func (s *MCPControlService) buildLiveControlContext(ctx context.Context, merchantID string, room domain.LiveRoom) (MCPLiveControlContext, error) {
+func (s *MCPControlService) buildLiveControlContext(ctx context.Context, merchantID string, room domain.LiveRoom, actor MCPActor) (MCPLiveControlContext, error) {
 	stats, err := s.roomSvc.Stats(ctx, room.ID)
 	if err != nil {
 		return MCPLiveControlContext{}, err
@@ -259,6 +277,13 @@ func (s *MCPControlService) buildLiveControlContext(ctx context.Context, merchan
 			return MCPLiveControlContext{}, err
 		}
 	}
+	if room.ActiveAuctionID != 0 {
+		currentState, err := s.readCurrentAuctionState(ctx, room.ActiveAuctionID, actor)
+		if err != nil {
+			return MCPLiveControlContext{}, err
+		}
+		out.CurrentAuctionState = currentState
+	}
 
 	for _, lot := range sellerLots {
 		if ok && lot.LiveSessionID != nil && *lot.LiveSessionID == session.ID {
@@ -281,6 +306,70 @@ func (s *MCPControlService) buildLiveControlContext(ctx context.Context, merchan
 		out.Lots.UpcomingLots = append(out.Lots.UpcomingLots, lot)
 	}
 	return out, nil
+}
+
+func (s *MCPControlService) readCurrentAuctionState(ctx context.Context, auctionID uint64, actor MCPActor) (*MCPLiveCurrentAuctionState, error) {
+	var state domain.AuctionState
+	var err error
+	if s.auctionSvc != nil {
+		state, err = s.auctionSvc.State(ctx, auctionID, actor.ID, actor.Role)
+	} else if s.auctions != nil {
+		lot, findErr := s.auctions.FindByID(ctx, auctionID)
+		if findErr != nil {
+			err = findErr
+		} else {
+			currentPrice := lot.StartPrice
+			if lot.DealPrice != nil {
+				currentPrice = *lot.DealPrice
+			}
+			leaderBidderID := ""
+			if lot.WinnerID != nil {
+				leaderBidderID = *lot.WinnerID
+			}
+			state = domain.AuctionState{
+				AuctionID:      lot.AuctionID,
+				Status:         lot.Status,
+				CurrentPrice:   currentPrice,
+				LeaderBidderID: leaderBidderID,
+				StartTime:      lot.StartTime,
+				EndTime:        lot.EndTime,
+				Version:        lot.UpdatedAt.UnixMilli(),
+				Source:         "db",
+			}
+		}
+	} else {
+		return nil, nil
+	}
+	if err != nil {
+		if errors.Is(err, domain.ErrNotFound) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return mcpCurrentAuctionStateFromDomain(state), nil
+}
+
+func mcpCurrentAuctionStateFromDomain(state domain.AuctionState) *MCPLiveCurrentAuctionState {
+	remain := int64(0)
+	if !state.EndTime.IsZero() {
+		remain = int64(time.Until(state.EndTime).Seconds())
+		if remain < 0 {
+			remain = 0
+		}
+	}
+	return &MCPLiveCurrentAuctionState{
+		AuctionID:      state.AuctionID,
+		Status:         state.Status,
+		CurrentPrice:   state.CurrentPrice,
+		LeaderBidderID: state.LeaderBidderID,
+		StartTime:      state.StartTime,
+		EndTime:        state.EndTime,
+		RemainSeconds:  remain,
+		LastBidTSMS:    state.LastBidTSMS,
+		ExtendCount:    state.ExtendCount,
+		Version:        state.Version,
+		Source:         state.Source,
+	}
 }
 
 func (s *MCPControlService) currentLiveControlSession(ctx context.Context, room domain.LiveRoom) (domain.LiveSession, bool, error) {

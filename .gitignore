@@ -2,6 +2,7 @@
 .env.*
 !.env.example
 docker/prod.env
+docker/prometheus/metrics-token
 
 .DS_Store
 

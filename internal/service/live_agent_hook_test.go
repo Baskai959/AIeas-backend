@@ -27,7 +27,7 @@ func TestLiveAgentHookServiceEmitsHighestBidWithNickname(t *testing.T) {
 	}
 }
 
-func TestLiveRoomAndSessionEmitLiveAgentHooks(t *testing.T) {
+func TestLiveRoomSessionAndItemEmitLiveAgentHooks(t *testing.T) {
 	ctx := context.Background()
 	invoker := newRecordingLiveAgentHookInvoker()
 	hook := NewLiveAgentHookService(repository.NewMemoryConfigRepository(), repository.NewSeedUserRepository(), invoker)
@@ -50,6 +50,9 @@ func TestLiveRoomAndSessionEmitLiveAgentHooks(t *testing.T) {
 	if _, err := roomSvc.UpdateAgentHookConfig(ctx, room.ID, "u_2001", domain.RoleMerchant, true); err != nil {
 		t.Fatalf("enable hook: %v", err)
 	}
+	if msg := invoker.wait(t); msg != "直播间"+strconv.FormatUint(room.ID, 10)+"AI直播助手已开启" {
+		t.Fatalf("unexpected hook config changed message: %q", msg)
+	}
 
 	session, err := sessionSvc.OpenSession(ctx, room.ID, room.MerchantID, room.Title)
 	if err != nil {
@@ -60,27 +63,43 @@ func TestLiveRoomAndSessionEmitLiveAgentHooks(t *testing.T) {
 		t.Fatalf("unexpected live started hook message: %q", msg)
 	}
 
-	auction := domain.AuctionLot{
-		AuctionID:   10001,
-		ItemID:      1,
-		SellerID:    room.MerchantID,
-		AuctionType: domain.AuctionTypeEnglish,
-		Status:      domain.AuctionStatusReady,
+	itemRepo := repository.NewMemoryItemRepository()
+	itemSvc := NewItemService(itemRepo)
+	itemSvc.SetLiveAgentHookService(hook)
+	item := domain.Item{
+		SellerID:       room.MerchantID,
+		Title:          "商品",
+		Category:       "分类",
+		ConditionGrade: domain.ConditionNew,
+		Images:         []byte("[]"),
+		Status:         domain.ItemStatusReady,
 	}
-	if err := auctionRepo.Create(ctx, &auction); err != nil {
-		t.Fatalf("create auction: %v", err)
+	if err := itemRepo.Create(ctx, &item); err != nil {
+		t.Fatalf("create item: %v", err)
 	}
-	if _, err := roomSvc.MountAuction(ctx, room.ID, auction.AuctionID, "u_2001", domain.RoleMerchant); err != nil {
-		t.Fatalf("mount auction: %v", err)
+	listed := domain.ItemStatusListed
+	if _, err := itemSvc.Update(ctx, item.ID, UpdateItemInput{ActorID: "admin", ActorRole: domain.RoleAdmin, Status: &listed}); err != nil {
+		t.Fatalf("list item: %v", err)
 	}
-	if msg := invoker.wait(t); msg != "直播间"+roomIDText+"的拍品10001上架了" {
-		t.Fatalf("unexpected lot mounted hook message: %q", msg)
+	itemIDText := strconv.FormatUint(item.ID, 10)
+	if msg := invoker.wait(t); msg != "商品"+itemIDText+"上架了" {
+		t.Fatalf("unexpected item listed hook message: %q", msg)
 	}
-	if err := roomSvc.UnmountAuction(ctx, room.ID, auction.AuctionID, "u_2001", domain.RoleMerchant); err != nil {
-		t.Fatalf("unmount auction: %v", err)
+	offline := domain.ItemStatusOffline
+	if _, err := itemSvc.Update(ctx, item.ID, UpdateItemInput{ActorID: "admin", ActorRole: domain.RoleAdmin, Status: &offline}); err != nil {
+		t.Fatalf("offline item: %v", err)
 	}
-	if msg := invoker.wait(t); msg != "直播间"+roomIDText+"的拍品10001下架了" {
-		t.Fatalf("unexpected lot unmounted hook message: %q", msg)
+	if msg := invoker.wait(t); msg != "商品"+itemIDText+"下架了" {
+		t.Fatalf("unexpected item offline hook message: %q", msg)
+	}
+
+	if _, err := roomSvc.UpdateAgentHookConfig(ctx, room.ID, "u_2001", domain.RoleMerchant, false); err != nil {
+		t.Fatalf("disable hook: %v", err)
+	}
+	select {
+	case msg := <-invoker.ch:
+		t.Fatalf("disable hook should not emit message, got %q", msg)
+	case <-time.After(20 * time.Millisecond):
 	}
 }
 

@@ -11,6 +11,10 @@ type EventPublisher interface {
 }
 
 func broadcastJSON(publisher EventPublisher, auctionID uint64, eventType string, payload interface{}) {
+	broadcastJSONWithSeq(publisher, auctionID, eventType, 0, payload)
+}
+
+func broadcastJSONWithSeq(publisher EventPublisher, auctionID uint64, eventType string, seq int64, payload interface{}) {
 	if publisher == nil || auctionID == 0 || eventType == "" {
 		return
 	}
@@ -18,5 +22,5 @@ func broadcastJSON(publisher EventPublisher, auctionID uint64, eventType string,
 	if err != nil {
 		return
 	}
-	publisher.Broadcast(auctionID, wstransport.Envelope{Type: eventType, Payload: raw})
+	publisher.Broadcast(auctionID, wstransport.Envelope{Type: eventType, Seq: seq, Payload: raw})
 }

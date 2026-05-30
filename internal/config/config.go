@@ -52,9 +52,11 @@ type Config struct {
 	JWT           JWTConfig           `yaml:"jwt"`
 	IDGen         IDGenConfig         `yaml:"idgen"`
 	Auction       AuctionConfig       `yaml:"auction"`
+	RiskControl   RiskControlConfig   `yaml:"riskControl"`
 	WebSocket     WebSocketConfig     `yaml:"websocket"`
 	ObjectStorage ObjectStorageConfig `yaml:"objectStorage"`
 	Agent         AgentConfig         `yaml:"agent"`
+	Kafka         KafkaConfig         `yaml:"kafka"`
 	MCP           MCPConfig           `yaml:"mcp"`
 	Observability ObservabilityConfig `yaml:"observability"`
 }
@@ -120,6 +122,10 @@ type AuctionConfig struct {
 	FreqWindowMs     int64 `yaml:"freqWindowMs"`
 }
 
+type RiskControlConfig struct {
+	Enabled bool `yaml:"enabled"`
+}
+
 type WebSocketConfig struct {
 	ReadLimitBytes int      `yaml:"readLimitBytes"`
 	SendBufferSize int      `yaml:"sendBufferSize"`
@@ -141,15 +147,31 @@ type ObjectStorageConfig struct {
 type AgentConfig struct {
 	ProductDescriptionURL      string   `yaml:"productDescriptionURL"`
 	ProductAuditURL            string   `yaml:"productAuditURL"`
+	ProductAuditCallbackURL    string   `yaml:"productAuditCallbackURL"`
 	LiveAnalysisURL            string   `yaml:"liveAnalysisURL"`
 	LiveAnalysisCallbackURL    string   `yaml:"liveAnalysisCallbackURL"`
 	LiveAnalysisCallbackAPIKey string   `yaml:"liveAnalysisCallbackAPIKey"`
 	LiveAuctionHookURL         string   `yaml:"liveAuctionHookURL"`
-	LiveAuctionHookAPIKey      string   `yaml:"liveAuctionHookAPIKey"`
 	Timeout                    Duration `yaml:"timeout"`
 }
 
+type KafkaConfig struct {
+	Enabled            bool     `yaml:"enabled"`
+	Brokers            []string `yaml:"brokers"`
+	ClientID           string   `yaml:"clientID"`
+	BidEventsTopic     string   `yaml:"bidEventsTopic"`
+	AuctionEventsTopic string   `yaml:"auctionEventsTopic"`
+	OrderEventsTopic   string   `yaml:"orderEventsTopic"`
+	BidBridgeGroup     string   `yaml:"bidBridgeGroup"`
+	BidRecordGroup     string   `yaml:"bidRecordGroup"`
+}
+
 type MCPConfig struct {
+	Read    MCPAuthConfig `yaml:"read"`
+	Control MCPAuthConfig `yaml:"control"`
+}
+
+type MCPAuthConfig struct {
 	APIKey    string `yaml:"apiKey"`
 	ActorID   string `yaml:"actorID"`
 	ActorRole string `yaml:"actorRole"`
@@ -256,6 +278,9 @@ func Default() Config {
 			FreqLimitCount:   10,
 			FreqWindowMs:     1000,
 		},
+		RiskControl: RiskControlConfig{
+			Enabled: true,
+		},
 		WebSocket: WebSocketConfig{
 			ReadLimitBytes: 65536,
 			SendBufferSize: 256,
@@ -273,17 +298,34 @@ func Default() Config {
 		Agent: AgentConfig{
 			ProductDescriptionURL:      "http://127.0.0.1:8000/api/v1/product-description",
 			ProductAuditURL:            "http://127.0.0.1:8000/api/v1/product-audit",
+			ProductAuditCallbackURL:    "http://127.0.0.1:8080/api/v1/items/audit/callback",
 			LiveAnalysisURL:            "http://127.0.0.1:8000/api/v1/live-analysis/async",
 			LiveAnalysisCallbackURL:    "http://127.0.0.1:8080/api/v1/live-analysis/callback",
 			LiveAnalysisCallbackAPIKey: "change-me-in-local-dev-live-analysis-callback",
 			LiveAuctionHookURL:         "",
-			LiveAuctionHookAPIKey:      "",
 			Timeout:                    Duration(30 * time.Second),
 		},
+		Kafka: KafkaConfig{
+			Enabled:            false,
+			Brokers:            []string{"127.0.0.1:9092"},
+			ClientID:           "aieas-backend",
+			BidEventsTopic:     "aieas.bid.events",
+			AuctionEventsTopic: "aieas.auction.events",
+			OrderEventsTopic:   "aieas.order.events",
+			BidBridgeGroup:     "aieas-bid-kafka-bridge",
+			BidRecordGroup:     "aieas-bid-record-writers",
+		},
 		MCP: MCPConfig{
-			APIKey:    "change-me-in-local-dev-mcp",
-			ActorID:   "u_9001",
-			ActorRole: "admin",
+			Read: MCPAuthConfig{
+				APIKey:    "change-me-in-local-dev-mcp-read",
+				ActorID:   "u_9001",
+				ActorRole: "admin",
+			},
+			Control: MCPAuthConfig{
+				APIKey:    "change-me-in-local-dev-mcp-control",
+				ActorID:   "u_9001",
+				ActorRole: "admin",
+			},
 		},
 		Observability: ObservabilityConfig{
 			LogLevel:           "info",
@@ -429,6 +471,12 @@ func (c Config) Validate() error {
 	if err := validateHTTPURL(c.Agent.ProductAuditURL, "agent.productAuditURL"); err != nil {
 		return err
 	}
+	if strings.TrimSpace(c.Agent.ProductAuditCallbackURL) == "" {
+		return fmt.Errorf("agent.productAuditCallbackURL is required")
+	}
+	if err := validateHTTPURL(c.Agent.ProductAuditCallbackURL, "agent.productAuditCallbackURL"); err != nil {
+		return err
+	}
 	if strings.TrimSpace(c.Agent.LiveAnalysisURL) == "" {
 		return fmt.Errorf("agent.liveAnalysisURL is required")
 	}
@@ -452,16 +500,15 @@ func (c Config) Validate() error {
 	if c.Agent.Timeout.Std() <= 0 {
 		return fmt.Errorf("agent.timeout must be positive")
 	}
-	if strings.TrimSpace(c.MCP.APIKey) == "" {
-		return fmt.Errorf("mcp.apiKey is required")
+	c.Kafka.normalize()
+	if err := c.Kafka.validate(); err != nil {
+		return err
 	}
-	if strings.TrimSpace(c.MCP.ActorID) == "" {
-		return fmt.Errorf("mcp.actorID is required")
+	if err := validateMCPAuthConfig("mcp.read", c.MCP.Read); err != nil {
+		return err
 	}
-	switch strings.ToLower(strings.TrimSpace(c.MCP.ActorRole)) {
-	case "buyer", "merchant", "admin":
-	default:
-		return fmt.Errorf("mcp.actorRole must be one of buyer, merchant, admin")
+	if err := validateMCPAuthConfig("mcp.control", c.MCP.Control); err != nil {
+		return err
 	}
 	if c.ObjectStorage.Enabled {
 		if strings.TrimSpace(c.ObjectStorage.Endpoint) == "" {
@@ -490,6 +537,82 @@ func (c Config) Validate() error {
 		if err := validateBucketURL(c.ObjectStorage.BucketURL, c.Redis.Cache.Addr); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+func validateMCPAuthConfig(prefix string, auth MCPAuthConfig) error {
+	if strings.TrimSpace(auth.APIKey) == "" {
+		return fmt.Errorf("%s.apiKey is required", prefix)
+	}
+	if strings.TrimSpace(auth.ActorID) == "" {
+		return fmt.Errorf("%s.actorID is required", prefix)
+	}
+	switch strings.ToLower(strings.TrimSpace(auth.ActorRole)) {
+	case "buyer", "merchant", "admin":
+	default:
+		return fmt.Errorf("%s.actorRole must be one of buyer, merchant, admin", prefix)
+	}
+	return nil
+}
+
+func (k *KafkaConfig) normalize() {
+	if k == nil {
+		return
+	}
+	if len(k.Brokers) == 0 {
+		k.Brokers = []string{"127.0.0.1:9092"}
+	}
+	for i := range k.Brokers {
+		k.Brokers[i] = strings.TrimSpace(k.Brokers[i])
+	}
+	if strings.TrimSpace(k.ClientID) == "" {
+		k.ClientID = "aieas-backend"
+	}
+	if strings.TrimSpace(k.BidEventsTopic) == "" {
+		k.BidEventsTopic = "aieas.bid.events"
+	}
+	if strings.TrimSpace(k.AuctionEventsTopic) == "" {
+		k.AuctionEventsTopic = "aieas.auction.events"
+	}
+	if strings.TrimSpace(k.OrderEventsTopic) == "" {
+		k.OrderEventsTopic = "aieas.order.events"
+	}
+	if strings.TrimSpace(k.BidBridgeGroup) == "" {
+		k.BidBridgeGroup = "aieas-bid-kafka-bridge"
+	}
+	if strings.TrimSpace(k.BidRecordGroup) == "" {
+		k.BidRecordGroup = "aieas-bid-record-writers"
+	}
+}
+
+func (k KafkaConfig) validate() error {
+	k.normalize()
+	if !k.Enabled {
+		return nil
+	}
+	if len(k.Brokers) == 0 {
+		return fmt.Errorf("kafka.brokers must contain at least one broker when kafka enabled")
+	}
+	for i, broker := range k.Brokers {
+		if strings.TrimSpace(broker) == "" {
+			return fmt.Errorf("kafka.brokers[%d] is required when kafka enabled", i)
+		}
+	}
+	if strings.TrimSpace(k.BidEventsTopic) == "" {
+		return fmt.Errorf("kafka.bidEventsTopic is required when kafka enabled")
+	}
+	if strings.TrimSpace(k.AuctionEventsTopic) == "" {
+		return fmt.Errorf("kafka.auctionEventsTopic is required when kafka enabled")
+	}
+	if strings.TrimSpace(k.OrderEventsTopic) == "" {
+		return fmt.Errorf("kafka.orderEventsTopic is required when kafka enabled")
+	}
+	if strings.TrimSpace(k.BidBridgeGroup) == "" {
+		return fmt.Errorf("kafka.bidBridgeGroup is required when kafka enabled")
+	}
+	if strings.TrimSpace(k.BidRecordGroup) == "" {
+		return fmt.Errorf("kafka.bidRecordGroup is required when kafka enabled")
 	}
 	return nil
 }
@@ -566,6 +689,9 @@ func (c *Config) applyEnv() error {
 	if err := setInt64("AUCTION_FREQ_WINDOW_MS", &c.Auction.FreqWindowMs); err != nil {
 		return err
 	}
+	if err := setBool("RISK_CONTROL_ENABLED", &c.RiskControl.Enabled); err != nil {
+		return err
+	}
 
 	if err := setInt("WEBSOCKET_READ_LIMIT_BYTES", &c.WebSocket.ReadLimitBytes); err != nil {
 		return err
@@ -593,18 +719,32 @@ func (c *Config) applyEnv() error {
 
 	setString("AGENT_PRODUCT_DESCRIPTION_URL", &c.Agent.ProductDescriptionURL)
 	setString("AGENT_PRODUCT_AUDIT_URL", &c.Agent.ProductAuditURL)
+	setString("AGENT_PRODUCT_AUDIT_CALLBACK_URL", &c.Agent.ProductAuditCallbackURL)
 	setString("AGENT_LIVE_ANALYSIS_URL", &c.Agent.LiveAnalysisURL)
 	setString("AGENT_LIVE_ANALYSIS_CALLBACK_URL", &c.Agent.LiveAnalysisCallbackURL)
 	setString("AGENT_LIVE_ANALYSIS_CALLBACK_API_KEY", &c.Agent.LiveAnalysisCallbackAPIKey)
 	setString("AGENT_LIVE_AUCTION_HOOK_URL", &c.Agent.LiveAuctionHookURL)
-	setString("AGENT_LIVE_AUCTION_HOOK_API_KEY", &c.Agent.LiveAuctionHookAPIKey)
 	if err := setDuration("AGENT_TIMEOUT", &c.Agent.Timeout); err != nil {
 		return err
 	}
 
-	setString("MCP_API_KEY", &c.MCP.APIKey)
-	setString("MCP_ACTOR_ID", &c.MCP.ActorID)
-	setString("MCP_ACTOR_ROLE", &c.MCP.ActorRole)
+	if err := setBool("KAFKA_ENABLED", &c.Kafka.Enabled); err != nil {
+		return err
+	}
+	setStringSlice("KAFKA_BROKERS", &c.Kafka.Brokers)
+	setString("KAFKA_CLIENT_ID", &c.Kafka.ClientID)
+	setString("KAFKA_BID_EVENTS_TOPIC", &c.Kafka.BidEventsTopic)
+	setString("KAFKA_AUCTION_EVENTS_TOPIC", &c.Kafka.AuctionEventsTopic)
+	setString("KAFKA_ORDER_EVENTS_TOPIC", &c.Kafka.OrderEventsTopic)
+	setString("KAFKA_BID_BRIDGE_GROUP", &c.Kafka.BidBridgeGroup)
+	setString("KAFKA_BID_RECORD_GROUP", &c.Kafka.BidRecordGroup)
+
+	setString("MCP_READ_API_KEY", &c.MCP.Read.APIKey)
+	setString("MCP_READ_ACTOR_ID", &c.MCP.Read.ActorID)
+	setString("MCP_READ_ACTOR_ROLE", &c.MCP.Read.ActorRole)
+	setString("MCP_CONTROL_API_KEY", &c.MCP.Control.APIKey)
+	setString("MCP_CONTROL_ACTOR_ID", &c.MCP.Control.ActorID)
+	setString("MCP_CONTROL_ACTOR_ROLE", &c.MCP.Control.ActorRole)
 
 	setString("OBSERVABILITY_LOG_LEVEL", &c.Observability.LogLevel)
 	setString("OBSERVABILITY_METRICS_PATH", &c.Observability.MetricsPath)
@@ -633,6 +773,7 @@ func (c *Config) applyEnv() error {
 	}
 	setString("OBSERVABILITY_HEALTH_LIVENESS_PATH", &c.Observability.Health.LivenessPath)
 	setString("OBSERVABILITY_HEALTH_READINESS_PATH", &c.Observability.Health.ReadinessPath)
+	c.Kafka.normalize()
 	c.Observability.normalize()
 	return nil
 }
@@ -667,6 +808,21 @@ func setString(name string, target *string) {
 	if value, ok := os.LookupEnv(name); ok {
 		*target = value
 	}
+}
+
+func setStringSlice(name string, target *[]string) {
+	value, ok := os.LookupEnv(name)
+	if !ok {
+		return
+	}
+	parts := strings.Split(value, ",")
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if trimmed := strings.TrimSpace(part); trimmed != "" {
+			out = append(out, trimmed)
+		}
+	}
+	*target = out
 }
 
 func loadDotEnv(startDir string) error {

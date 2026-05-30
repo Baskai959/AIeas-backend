@@ -4348,7 +4348,9 @@
           "id",
           "nickname",
           "role",
-          "riskLevel"
+          "status",
+          "riskLevel",
+          "blacklisted"
         ],
         "properties": {
           "id": {
@@ -4377,6 +4379,11 @@
           "riskLevel": {
             "type": "string",
             "example": "LOW"
+          },
+          "blacklisted": {
+            "type": "boolean",
+            "description": "用户当前是否处于黑名单中。加入或移出黑名单后该字段应实时反映最新状态。",
+            "example": false
           }
         }
       },
@@ -5233,6 +5240,7 @@
         "required": [
           "id",
           "userId",
+          "nickname",
           "reason",
           "createdBy",
           "createdAt"
@@ -5244,6 +5252,28 @@
           },
           "userId": {
             "type": "string"
+          },
+          "nickname": {
+            "type": "string",
+            "description": "被拉黑用户昵称，供管理端直接展示。",
+            "example": "竞拍用户001"
+          },
+          "role": {
+            "type": "string",
+            "enum": [
+              "buyer",
+              "merchant",
+              "admin"
+            ],
+            "description": "被拉黑用户角色。"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "ACTIVE",
+              "DISABLED"
+            ],
+            "description": "被拉黑用户账号状态。"
           },
           "reason": {
             "type": "string"
@@ -5291,6 +5321,18 @@
           },
           "action": {
             "type": "string"
+          },
+          "actionCode": {
+            "type": "string",
+            "description": "业务动作编码；用于管理端按业务语义筛选和展示，例如 BLACKLIST_ADD。"
+          },
+          "actionName": {
+            "type": "string",
+            "description": "业务动作名称，例如 加入黑名单。"
+          },
+          "summary": {
+            "type": "string",
+            "description": "面向运营展示的业务摘要。"
           },
           "targetType": {
             "type": "string"

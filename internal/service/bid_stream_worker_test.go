@@ -26,7 +26,7 @@ func TestBidServiceStreamEnabledDoesNotPersistOrBroadcastDirectly(t *testing.T) 
 	publisher := &trackingPublisher{}
 	svc := NewBidService(bids, auctionRepo, realtime, nil, publisher, appconfig.Default().Auction)
 
-	result, err := svc.Place(ctx, PlaceBidInput{RequestID: "req-1", AuctionID: auction.AuctionID, BidderID: "u_1001", UserRole: domain.RoleBuyer, Price: 1100})
+	result, err := svc.Place(ctx, PlaceBidInput{RequestID: "req-1", AuctionID: auction.AuctionID, BidderID: "u_1001", UserRole: domain.RoleBuyer, Price: 1100, ExpectedCurrentPrice: expectedCurrentPrice(1000)})
 	if err != nil {
 		t.Fatalf("place: %v", err)
 	}
@@ -63,6 +63,9 @@ func TestBidRecordWriterAckDlqAndPendingSemantics(t *testing.T) {
 		if len(log.acks) != 1 || len(log.dlqReasons) != 0 {
 			t.Fatalf("expected duplicate consistent ack, log=%+v", log)
 		}
+		if repo.createCalls != 0 {
+			t.Fatalf("duplicate consistent event should not insert before idempotency check, got createCalls=%d", repo.createCalls)
+		}
 	})
 
 	t.Run("duplicate conflict DLQ", func(t *testing.T) {
@@ -74,6 +77,9 @@ func TestBidRecordWriterAckDlqAndPendingSemantics(t *testing.T) {
 		writer.handleEvents(ctx, []redisinfra.BidEvent{base})
 		if len(log.acks) != 1 || len(log.dlqReasons) != 1 || log.dlqReasons[0] != "DUPLICATE_CONFLICT" {
 			t.Fatalf("expected duplicate conflict dlq+ack, log=%+v", log)
+		}
+		if repo.createCalls != 0 {
+			t.Fatalf("duplicate conflict event should not insert before idempotency check, got createCalls=%d", repo.createCalls)
 		}
 	})
 

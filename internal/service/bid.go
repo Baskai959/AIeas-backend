@@ -3,7 +3,9 @@ package service
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"strings"
+	"sync"
 	"time"
 
 	appconfig "aieas_backend/internal/config"
@@ -27,6 +29,13 @@ type BidService struct {
 	cfg       appconfig.AuctionConfig
 	metrics   *metrics.Registry
 	hook      *LiveAgentHookService
+	configs   repository.ConfigRepository
+	controls  *RiskControlService
+
+	blacklistStrategyMu        sync.RWMutex
+	blacklistStrategyCached    bool
+	blacklistStrategy          domain.BlacklistStrategyConfig
+	blacklistStrategyExpiresAt time.Time
 }
 
 type PlaceBidInput struct {
@@ -36,7 +45,6 @@ type PlaceBidInput struct {
 	UserRole             domain.Role
 	Price                int64
 	ExpectedCurrentPrice *int64
-	ExpectedVersion      *int64
 	Source               string
 }
 
@@ -78,6 +86,14 @@ func (s *BidService) SetHammerService(hammer *HammerService) {
 // SetLiveAgentHookService 注入直播拍卖事件 hook。
 func (s *BidService) SetLiveAgentHookService(hook *LiveAgentHookService) {
 	s.hook = hook
+}
+
+func (s *BidService) SetConfigRepository(configs repository.ConfigRepository) {
+	s.configs = configs
+}
+
+func (s *BidService) SetRiskControlService(controls *RiskControlService) {
+	s.controls = controls
 }
 
 // SetMetrics 注入观测性 Registry。nil 安全：未注入时所有 Observe* 调用走 noop。
@@ -134,10 +150,13 @@ func (s *BidService) Place(ctx context.Context, in PlaceBidInput) (domain.BidRes
 func (s *BidService) place(ctx context.Context, in PlaceBidInput) (domain.BidResult, error) {
 	in.RequestID = strings.TrimSpace(in.RequestID)
 	in.BidderID = strings.TrimSpace(in.BidderID)
-	if in.RequestID == "" || in.AuctionID == 0 || in.BidderID == "" || in.Price <= 0 || in.UserRole != domain.RoleBuyer {
+	if in.RequestID == "" || in.AuctionID == 0 || in.BidderID == "" || in.Price <= 0 || in.UserRole != domain.RoleBuyer || in.ExpectedCurrentPrice == nil {
 		return domain.BidResult{}, domain.ErrInvalidArgument
 	}
-	if s.bids != nil {
+	// P0-3：bidStreamEnabled=true 时跳过 MySQL `bid_record` 的 FindByRequestID 前置查询，
+	// 直接走 Redis 幂等链路（realtimeBidResultByRequestID）。MySQL 路径仅在 stream 关闭时承担前置幂等。
+	streamEnabled := bidStreamEnabled(s.realtime)
+	if !streamEnabled && s.bids != nil {
 		record, err := s.bids.FindByRequestID(ctx, in.RequestID)
 		if err == nil {
 			return bidResultFromRecord(record), nil
@@ -160,12 +179,17 @@ func (s *BidService) place(ctx context.Context, in PlaceBidInput) (domain.BidRes
 	if in.Source == "" {
 		in.Source = "live_ws"
 	}
-	streamEnabled := bidStreamEnabled(s.realtime)
+	riskControl := s.currentRiskControl(ctx)
+	riskControlEnabled := riskControl.Enabled
+	blacklistStrategy := domain.BlacklistStrategyConfig{}
+	if riskControlEnabled {
+		blacklistStrategy = s.currentBlacklistStrategy(ctx)
+	}
 	// v2 起黑名单完全在 service 层做前置门面拦截：MySQL（source of truth）+ LayeredCache，
 	// 不再下沉到 Lua（避免把全局黑名单 key 复制到每个 RT shard）。
 	// RiskService.IsBlacklisted 在 cache/repo 故障时 fail-open，由 cap-price 等下游约束兜底。
 	blacklisted := false
-	if s.risk != nil {
+	if s.risk != nil && riskControlEnabled {
 		isBlacklisted, err := s.risk.IsBlacklisted(ctx, in.BidderID)
 		if err != nil {
 			return domain.BidResult{}, err
@@ -208,19 +232,37 @@ func (s *BidService) place(ctx context.Context, in PlaceBidInput) (domain.BidRes
 		if amount := rule.AmountForPrice(state.CurrentPrice); amount > 0 {
 			minIncrement = amount
 		}
-		prerequisitesReady, err := realtimeBidPrerequisitesReady(ctx, s.realtime, in.AuctionID, in.BidderID)
+		enrolled, depositReady, err := realtimeBidPrerequisites(ctx, s.realtime, in.AuctionID, in.BidderID)
 		if err != nil {
 			return domain.BidResult{}, err
 		}
+		prerequisitesReady := enrolled && depositReady
+		if !prerequisitesReady {
+			reason := "DEPOSIT_NOT_READY"
+			if !enrolled {
+				reason = "NOT_ENROLLED"
+			}
+			result := rejectBidFromState(in, state, reason)
+			if riskControlEnabled && blacklistStrategy.Enabled && blacklistStrategy.MissingDepositEnabled && s.risk != nil {
+				s.scheduleAutoBlacklist(ctx, blacklistStrategy, in.BidderID, in.AuctionID, "AUTO_BLACKLIST_"+reason, result)
+			}
+			s.persistBid(ctx, in, result, now)
+			s.publishBidResult(ctx, result)
+			return result, nil
+		}
 		if prerequisitesReady {
-			if staleBidState(in, state) {
-				result := rejectBidFromState(in, state, domain.BidRejectStaleAuctionState)
+			if reason := validateBidExpectedState(in, state, auction.CapPrice, rule); reason != "" {
+				result := rejectBidFromState(in, state, reason)
 				s.persistBid(ctx, in, result, now)
 				s.publishBidResult(ctx, result)
 				return result, nil
 			}
 			if reason := domain.ValidateBidPrice(auction.StartPrice, state.CurrentPrice, auction.CapPrice, in.Price, rule); reason != "" {
 				result := rejectBidFromState(in, state, reason)
+				if riskControlEnabled && blacklistStrategy.Enabled && blacklistStrategy.UnreasonablePriceEnabled && s.risk != nil &&
+					(isAutoBlacklistPriceReason(reason) || bidAboveAllowedMax(auction.StartPrice, state.CurrentPrice, auction.CapPrice, in.Price, rule)) {
+					s.scheduleAutoBlacklist(ctx, blacklistStrategy, in.BidderID, in.AuctionID, "AUTO_BLACKLIST_"+reason, result)
+				}
 				s.persistBid(ctx, in, result, now)
 				s.publishBidResult(ctx, result)
 				return result, nil
@@ -228,19 +270,34 @@ func (s *BidService) place(ctx context.Context, in PlaceBidInput) (domain.BidRes
 		}
 	}
 	if !stateOK && !blacklisted {
-		if reason := domain.ValidateBidPrice(auction.StartPrice, auction.StartPrice, auction.CapPrice, in.Price, rule); reason != "" {
-			state := domain.AuctionState{
-				AuctionID:    auction.AuctionID,
-				Status:       auction.Status,
-				CurrentPrice: auction.StartPrice,
-				StartTime:    auction.StartTime,
-				EndTime:      auction.EndTime,
-			}
+		state := domain.AuctionState{
+			AuctionID:    auction.AuctionID,
+			Status:       auction.Status,
+			CurrentPrice: auction.StartPrice,
+			StartTime:    auction.StartTime,
+			EndTime:      auction.EndTime,
+		}
+		if reason := validateBidExpectedState(in, state, auction.CapPrice, rule); reason != "" {
 			result := rejectBidFromState(in, state, reason)
 			s.persistBid(ctx, in, result, now)
 			s.publishBidResult(ctx, result)
 			return result, nil
 		}
+		if reason := domain.ValidateBidPrice(auction.StartPrice, auction.StartPrice, auction.CapPrice, in.Price, rule); reason != "" {
+			result := rejectBidFromState(in, state, reason)
+			s.persistBid(ctx, in, result, now)
+			s.publishBidResult(ctx, result)
+			return result, nil
+		}
+	}
+	freqLimitCount := s.cfg.FreqLimitCount
+	freqWindowMS := s.cfg.FreqWindowMs
+	if riskControlEnabled && blacklistStrategy.Enabled && blacklistStrategy.FrequencyEnabled {
+		freqLimitCount = blacklistStrategy.FrequencyMaxRequests
+		freqWindowMS = blacklistStrategy.FrequencyWindowMs
+	} else if !riskControlEnabled {
+		freqLimitCount = 0
+		freqWindowMS = 0
 	}
 	result, err := s.realtime.PlaceBid(ctx, domain.BidInput{
 		RequestID:            in.RequestID,
@@ -248,7 +305,6 @@ func (s *BidService) place(ctx context.Context, in PlaceBidInput) (domain.BidRes
 		BidderID:             in.BidderID,
 		Price:                in.Price,
 		ExpectedCurrentPrice: in.ExpectedCurrentPrice,
-		ExpectedVersion:      in.ExpectedVersion,
 		Now:                  now,
 		Source:               in.Source,
 		MinIncrement:         minIncrement,
@@ -256,8 +312,8 @@ func (s *BidService) place(ctx context.Context, in PlaceBidInput) (domain.BidRes
 		AntiExtendMS:         int64(auction.AntiExtendSec) * 1000,
 		AntiExtendMode:       domain.NormalizeAuctionExtendMode(auction.AntiExtendMode),
 		MaxExtendCount:       s.cfg.MaxExtendCount,
-		FreqLimitCount:       s.cfg.FreqLimitCount,
-		FreqWindowMS:         s.cfg.FreqWindowMs,
+		FreqLimitCount:       freqLimitCount,
+		FreqWindowMS:         freqWindowMS,
 		IdempotencyTTL:       24 * time.Hour,
 		StartPrice:           auction.StartPrice,
 		CapPrice:             auction.CapPrice,
@@ -279,7 +335,7 @@ func (s *BidService) place(ctx context.Context, in PlaceBidInput) (domain.BidRes
 	if !streamEnabled {
 		s.persistBid(ctx, in, result, now)
 	}
-	if result.Accepted && result.AutoClosed && s.hammer != nil {
+	if result.Accepted && !result.Duplicate && result.AutoClosed && s.hammer != nil {
 		if _, _, err := s.hammer.Hammer(ctx, domain.HammerInput{
 			RequestID:      "cap-" + in.RequestID,
 			AuctionID:      in.AuctionID,
@@ -295,6 +351,9 @@ func (s *BidService) place(ctx context.Context, in PlaceBidInput) (domain.BidRes
 	}
 	if result.Reason == "FREQ_LIMIT" && s.risk != nil {
 		s.risk.RecordEvent(ctx, "BID_FREQ", in.BidderID, in.AuctionID, domain.RiskSeverityMid, result)
+		if riskControlEnabled && blacklistStrategy.Enabled && blacklistStrategy.FrequencyEnabled {
+			s.scheduleAutoBlacklist(ctx, blacklistStrategy, in.BidderID, in.AuctionID, "AUTO_BLACKLIST_FREQ_LIMIT", result)
+		}
 	}
 	if !streamEnabled {
 		s.publishBidResult(ctx, result)
@@ -315,6 +374,98 @@ func bidStreamEnabled(realtime repository.AuctionRealtimeStore) bool {
 	return ok && store.StreamEnabled()
 }
 
+const blacklistStrategyCacheTTL = time.Second
+
+func (s *BidService) currentRiskControl(ctx context.Context) domain.RiskControlConfig {
+	if s.controls == nil {
+		return domain.DefaultRiskControlConfig()
+	}
+	return s.controls.Config(ctx)
+}
+
+func (s *BidService) currentBlacklistStrategy(ctx context.Context) domain.BlacklistStrategyConfig {
+	now := time.Now()
+	s.blacklistStrategyMu.RLock()
+	if s.blacklistStrategyCached && now.Before(s.blacklistStrategyExpiresAt) {
+		cfg := s.blacklistStrategy
+		s.blacklistStrategyMu.RUnlock()
+		return cfg
+	}
+	s.blacklistStrategyMu.RUnlock()
+
+	cfg, err := readBlacklistStrategyConfig(ctx, s.configs)
+	if err != nil {
+		fallback := domain.DefaultBlacklistStrategyConfig()
+		s.blacklistStrategyMu.RLock()
+		if s.blacklistStrategyCached {
+			fallback = s.blacklistStrategy
+		}
+		s.blacklistStrategyMu.RUnlock()
+		s.blacklistStrategyMu.Lock()
+		s.blacklistStrategy = fallback
+		s.blacklistStrategyCached = true
+		s.blacklistStrategyExpiresAt = now.Add(blacklistStrategyCacheTTL)
+		s.blacklistStrategyMu.Unlock()
+		return fallback
+	}
+	s.blacklistStrategyMu.Lock()
+	s.blacklistStrategy = cfg
+	s.blacklistStrategyCached = true
+	s.blacklistStrategyExpiresAt = now.Add(blacklistStrategyCacheTTL)
+	s.blacklistStrategyMu.Unlock()
+	return cfg
+}
+
+func (s *BidService) scheduleAutoBlacklist(ctx context.Context, cfg domain.BlacklistStrategyConfig, bidderID string, auctionID uint64, reason string, payload interface{}) {
+	if s.risk == nil || !cfg.Enabled {
+		return
+	}
+	base := context.WithoutCancel(ctx)
+	go func() {
+		taskCtx, cancel := context.WithTimeout(base, 2*time.Second)
+		defer cancel()
+		if err := s.autoBlacklistBidder(taskCtx, cfg, bidderID, auctionID, reason, payload); err != nil {
+			slog.Default().Warn("auto blacklist failed", "auction_id", auctionID, "bidder_id", bidderID, "reason", reason, "error", err)
+		}
+	}()
+}
+
+func (s *BidService) autoBlacklistBidder(ctx context.Context, cfg domain.BlacklistStrategyConfig, bidderID string, auctionID uint64, reason string, payload interface{}) error {
+	if s.risk == nil || !cfg.Enabled {
+		return nil
+	}
+	expiresAt := blacklistExpiresAt(cfg, time.Now().UTC())
+	if err := s.risk.AddBlacklist(ctx, bidderID, reason, systemBlacklistActorID, expiresAt); err != nil {
+		return err
+	}
+	s.risk.RecordEvent(ctx, "AUTO_BLACKLIST", bidderID, auctionID, domain.RiskSeverityHigh, payload)
+	return nil
+}
+
+func isAutoBlacklistPriceReason(reason string) bool {
+	switch reason {
+	case domain.BidRejectAboveMaxBidSteps, domain.BidRejectAboveExpectedMaxBidSteps, domain.BidRejectAboveCapPrice:
+		return true
+	default:
+		return false
+	}
+}
+
+func bidAboveAllowedMax(startPrice, currentPrice, capPrice, price int64, rule domain.IncrementRule) bool {
+	if price <= startPrice || rule.MaxBidSteps <= 0 {
+		return false
+	}
+	amount := rule.AmountForPrice(currentPrice)
+	if amount <= 0 {
+		return false
+	}
+	maxAllowed := currentPrice + amount*int64(rule.MaxBidSteps)
+	if capPrice > 0 && maxAllowed > capPrice {
+		maxAllowed = capPrice
+	}
+	return price > maxAllowed
+}
+
 func realtimeBidResultByRequestID(ctx context.Context, realtime repository.AuctionRealtimeStore, auctionID uint64, requestID string) (domain.BidResult, bool, error) {
 	type bidResultReader interface {
 		BidResultByRequestID(context.Context, uint64, string) (domain.BidResult, bool, error)
@@ -330,28 +481,33 @@ func realtimeBidResultByRequestID(ctx context.Context, realtime repository.Aucti
 }
 
 func realtimeBidPrerequisitesReady(ctx context.Context, realtime repository.AuctionRealtimeStore, auctionID uint64, bidderID string) (bool, error) {
-	type prerequisiteReader interface {
-		BidPrerequisites(context.Context, uint64, string) (bool, bool, error)
-	}
-	reader, ok := realtime.(prerequisiteReader)
-	if !ok {
-		return false, nil
-	}
-	enrolled, depositReady, err := reader.BidPrerequisites(ctx, auctionID, bidderID)
+	enrolled, depositReady, err := realtimeBidPrerequisites(ctx, realtime, auctionID, bidderID)
 	if err != nil {
 		return false, err
 	}
 	return enrolled && depositReady, nil
 }
 
-func staleBidState(in PlaceBidInput, state domain.AuctionState) bool {
-	if in.ExpectedCurrentPrice != nil && *in.ExpectedCurrentPrice != state.CurrentPrice {
-		return true
+func realtimeBidPrerequisites(ctx context.Context, realtime repository.AuctionRealtimeStore, auctionID uint64, bidderID string) (bool, bool, error) {
+	type prerequisiteReader interface {
+		BidPrerequisites(context.Context, uint64, string) (bool, bool, error)
 	}
-	if in.ExpectedVersion != nil && *in.ExpectedVersion != state.Version {
-		return true
+	reader, ok := realtime.(prerequisiteReader)
+	if !ok {
+		return false, false, nil
 	}
-	return false
+	enrolled, depositReady, err := reader.BidPrerequisites(ctx, auctionID, bidderID)
+	if err != nil {
+		return false, false, err
+	}
+	return enrolled, depositReady, nil
+}
+
+func validateBidExpectedState(in PlaceBidInput, state domain.AuctionState, capPrice int64, rule domain.IncrementRule) string {
+	if in.ExpectedCurrentPrice == nil {
+		return domain.BidRejectMissingExpectedState
+	}
+	return domain.ValidateBidExpectedCurrentPrice(*in.ExpectedCurrentPrice, state.CurrentPrice, capPrice, in.Price, rule)
 }
 
 func rejectBidFromState(in PlaceBidInput, state domain.AuctionState, reason string) domain.BidResult {
@@ -410,7 +566,7 @@ func (s *BidService) persistBid(ctx context.Context, in PlaceBidInput, result do
 
 func (s *BidService) publishBidResult(ctx context.Context, result domain.BidResult) {
 	if result.Accepted {
-		broadcastJSON(s.publisher, result.AuctionID, "bid.accepted", result)
+		broadcastJSONWithSeq(s.publisher, result.AuctionID, "bid.accepted", result.Seq, result)
 		if ranking, err := s.TopN(ctx, result.AuctionID, 10); err == nil {
 			broadcastJSON(s.publisher, result.AuctionID, "ranking.updated", map[string]interface{}{
 				"auctionId": result.AuctionID,
@@ -426,7 +582,7 @@ func (s *BidService) publishBidResult(ctx context.Context, result domain.BidResu
 		}
 		return
 	}
-	broadcastJSON(s.publisher, result.AuctionID, "bid.rejected", result)
+	broadcastJSONWithSeq(s.publisher, result.AuctionID, "bid.rejected", result.Seq, result)
 }
 
 func bidResultFromRecord(record domain.BidRecord) domain.BidResult {

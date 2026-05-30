@@ -82,8 +82,13 @@
                     "summary": {
                       "dealGmvCent": 986000,
                       "paidGmvCent": 912000,
+                      "paidAmountTotal": 912000,
                       "orderCreatedCount": 96,
                       "paidOrderCount": 88,
+                      "pendingAuditCount": 7,
+                      "runningAuctionCount": 2,
+                      "pendingRiskCount": 1,
+                      "todayNewUserCount": 18,
                       "unpaidOrderCount": 8,
                       "timeoutOrderCount": 2,
                       "cancelledOrderCount": 1,
@@ -133,6 +138,18 @@
                         }
                       ]
                     },
+                    "orderStatusDistribution": [
+                      {
+                        "status": "PAID",
+                        "count": 88
+                      }
+                    ],
+                    "riskSeverityDistribution": [
+                      {
+                        "severity": "HIGH",
+                        "count": 1
+                      }
+                    ],
                     "trend": [
                       {
                         "bucketStart": "2026-05-27T08:00:00Z",
@@ -228,6 +245,8 @@
           "summary",
           "current",
           "breakdowns",
+          "orderStatusDistribution",
+          "riskSeverityDistribution",
           "trend"
         ],
         "properties": {
@@ -259,6 +278,20 @@
           "breakdowns": {
             "$ref": "#/components/schemas/AdminDashboardBreakdowns"
           },
+          "orderStatusDistribution": {
+            "type": "array",
+            "description": "订单状态分布，供管理端看板直接渲染。",
+            "items": {
+              "$ref": "#/components/schemas/AdminStatusCount"
+            }
+          },
+          "riskSeverityDistribution": {
+            "type": "array",
+            "description": "风险严重等级分布，供管理端看板直接渲染。",
+            "items": {
+              "$ref": "#/components/schemas/AdminRiskSeverityCount"
+            }
+          },
           "trend": {
             "type": "array",
             "items": {
@@ -269,6 +302,14 @@
       },
       "AdminDashboardSummary": {
         "type": "object",
+        "required": [
+          "pendingAuditCount",
+          "runningAuctionCount",
+          "paidOrderCount",
+          "pendingRiskCount",
+          "todayNewUserCount",
+          "paidAmountTotal"
+        ],
         "properties": {
           "dealGmvCent": {
             "type": "integer",
@@ -280,6 +321,11 @@
             "format": "int64",
             "description": "统计范围内已支付订单金额合计，单位分。"
           },
+          "paidAmountTotal": {
+            "type": "integer",
+            "format": "int64",
+            "description": "统计范围内已支付订单金额合计，单位分；与 paidGmvCent 保持一致。"
+          },
           "orderCreatedCount": {
             "type": "integer",
             "format": "int64"
@@ -287,6 +333,26 @@
           "paidOrderCount": {
             "type": "integer",
             "format": "int64"
+          },
+          "pendingAuditCount": {
+            "type": "integer",
+            "format": "int64",
+            "description": "待审核拍品数量。"
+          },
+          "runningAuctionCount": {
+            "type": "integer",
+            "format": "int64",
+            "description": "当前进行中的拍品数量。"
+          },
+          "pendingRiskCount": {
+            "type": "integer",
+            "format": "int64",
+            "description": "待处理风险事件数量。"
+          },
+          "todayNewUserCount": {
+            "type": "integer",
+            "format": "int64",
+            "description": "今日新增用户数量。"
           },
           "unpaidOrderCount": {
             "type": "integer",
@@ -413,6 +479,27 @@
         "properties": {
           "status": {
             "type": "string"
+          },
+          "count": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
+      "AdminRiskSeverityCount": {
+        "type": "object",
+        "required": [
+          "severity",
+          "count"
+        ],
+        "properties": {
+          "severity": {
+            "type": "string",
+            "enum": [
+              "LOW",
+              "MID",
+              "HIGH"
+            ]
           },
           "count": {
             "type": "integer",

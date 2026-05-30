@@ -20,7 +20,7 @@ func (s LiveRoomStatus) Valid() bool {
 	}
 }
 
-// CanTransitionLiveRoom 控制直播间状态机：OFFLINE <-> LIVE，二者均可进入 CLOSED。
+// CanTransitionLiveRoom 控制直播间状态机：直播间是商家的长期资产，CLOSED 也允许重新开播。
 func CanTransitionLiveRoom(from, to LiveRoomStatus) bool {
 	if from == to {
 		return true
@@ -30,6 +30,8 @@ func CanTransitionLiveRoom(from, to LiveRoomStatus) bool {
 		return to == LiveRoomStatusLive || to == LiveRoomStatusClosed
 	case LiveRoomStatusLive:
 		return to == LiveRoomStatusOffline || to == LiveRoomStatusClosed
+	case LiveRoomStatusClosed:
+		return to == LiveRoomStatusLive || to == LiveRoomStatusOffline
 	default:
 		return false
 	}

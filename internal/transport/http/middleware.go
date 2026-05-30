@@ -262,10 +262,17 @@ func shouldCacheIdempotencyResponse(c *app.RequestContext) bool {
 }
 
 type RateLimiter struct {
-	mu      sync.Mutex
-	limit   int
-	window  time.Duration
-	buckets map[string]*rateBucket
+	mu                     sync.Mutex
+	limit                  int
+	window                 time.Duration
+	buckets                map[string]*rateBucket
+	enabledFunc            func(context.Context) bool
+	distributed            DistributedRateLimitStore
+	distributedEnabledFunc func(context.Context) bool
+}
+
+type DistributedRateLimitStore interface {
+	Allow(ctx context.Context, key string, limit int, window time.Duration, cost int, now time.Time) (bool, error)
 }
 
 type rateBucket struct {
@@ -283,19 +290,77 @@ func NewRateLimiter(limit int, window time.Duration) *RateLimiter {
 	return &RateLimiter{limit: limit, window: window, buckets: make(map[string]*rateBucket)}
 }
 
+func (l *RateLimiter) SetEnabledFunc(fn func(context.Context) bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.enabledFunc = fn
+}
+
+func (l *RateLimiter) SetDistributedStore(store DistributedRateLimitStore) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.distributed = store
+}
+
+func (l *RateLimiter) SetDistributedEnabledFunc(fn func(context.Context) bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.distributedEnabledFunc = fn
+}
+
 func (l *RateLimiter) Middleware() app.HandlerFunc {
 	return func(ctx context.Context, c *app.RequestContext) {
 		if IsObservabilitySkipPath(string(c.Path())) {
 			c.Next(ctx)
 			return
 		}
+		if !l.enabled(ctx) {
+			c.Next(ctx)
+			return
+		}
 		key := clientIP(c) + ":" + string(c.Method()) + ":" + string(c.Path())
-		if !l.allow(key, time.Now()) {
+		now := time.Now()
+		if !l.allow(key, now) {
+			AbortError(c, consts.StatusTooManyRequests, 20029, "请求过于频繁", nil)
+			return
+		}
+		if !l.allowDistributed(ctx, key, now) {
 			AbortError(c, consts.StatusTooManyRequests, 20029, "请求过于频繁", nil)
 			return
 		}
 		c.Next(ctx)
 	}
+}
+
+func (l *RateLimiter) enabled(ctx context.Context) bool {
+	l.mu.Lock()
+	fn := l.enabledFunc
+	l.mu.Unlock()
+	if fn == nil {
+		return true
+	}
+	return fn(ctx)
+}
+
+func (l *RateLimiter) allowDistributed(ctx context.Context, key string, now time.Time) bool {
+	l.mu.Lock()
+	store := l.distributed
+	fn := l.distributedEnabledFunc
+	limit := l.limit
+	window := l.window
+	l.mu.Unlock()
+	if store == nil {
+		return true
+	}
+	if fn != nil && !fn(ctx) {
+		return true
+	}
+	allowed, err := store.Allow(ctx, key, limit, window, 1, now)
+	if err != nil {
+		// Redis L2 限流按 fail-open 处理：L1 已经保护单机，L2 故障不阻塞主链路。
+		return true
+	}
+	return allowed
 }
 
 func (l *RateLimiter) allow(key string, now time.Time) bool {

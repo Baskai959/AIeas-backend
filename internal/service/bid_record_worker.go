@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"aieas_backend/internal/domain"
+	"aieas_backend/internal/infra/observability/metrics"
 	"aieas_backend/internal/infra/observability/tracing"
 	redisinfra "aieas_backend/internal/infra/redis"
 	"aieas_backend/internal/repository"
@@ -23,6 +24,7 @@ type BidRecordWriter struct {
 	maxRetries int64
 	claimIdle  time.Duration
 	interval   time.Duration
+	metrics    *metrics.Registry
 }
 
 type bidRecordEventLog interface {
@@ -41,6 +43,14 @@ func NewBidRecordWriter(repo repository.BidRepository, log *redisinfra.EventLog,
 		consumer = fmt.Sprintf("bid-record-%d", time.Now().UTC().UnixNano())
 	}
 	return &BidRecordWriter{repo: repo, log: log, consumer: consumer, maxRetries: 5, claimIdle: 30 * time.Second, interval: time.Second}
+}
+
+// SetMetrics 注入压测所需的 worker 指标。nil 安全。
+func (w *BidRecordWriter) SetMetrics(reg *metrics.Registry) {
+	if w == nil {
+		return
+	}
+	w.metrics = reg
 }
 
 // Start 为每个 RT shard 启动一个独立的 worker goroutine：
@@ -95,6 +105,7 @@ func (w *BidRecordWriter) consumerForShard(shardIdx int) string {
 func (w *BidRecordWriter) runOnceAll(ctx context.Context) {
 	auctions, err := w.log.ActiveAuctions(ctx)
 	if err != nil {
+		w.observeConsume("poll_error")
 		return
 	}
 	w.processAuctions(ctx, auctions, w.consumer)
@@ -103,6 +114,7 @@ func (w *BidRecordWriter) runOnceAll(ctx context.Context) {
 func (w *BidRecordWriter) runOnceShard(ctx context.Context, shardIdx int) {
 	auctions, err := w.log.ActiveAuctionsOnShard(ctx, shardIdx)
 	if err != nil {
+		w.observeConsume("poll_error")
 		return
 	}
 	w.processAuctions(ctx, auctions, w.consumerForShard(shardIdx))
@@ -113,10 +125,14 @@ func (w *BidRecordWriter) processAuctions(ctx context.Context, auctions []uint64
 		claimed, err := w.log.ClaimStaleBidRecordEvents(ctx, auctionID, consumer, w.claimIdle, 32)
 		if err == nil {
 			w.handleEvents(ctx, claimed)
+		} else {
+			w.observeConsume("poll_error")
 		}
 		events, err := w.log.ReadBidRecordGroup(ctx, auctionID, consumer, 64, 10*time.Millisecond)
 		if err == nil {
 			w.handleEvents(ctx, events)
+		} else {
+			w.observeConsume("poll_error")
 		}
 	}
 }
@@ -140,32 +156,42 @@ func (w *BidRecordWriter) handleEvent(parentCtx context.Context, event redisinfr
 	if event.EventType != "bid.accepted" && event.EventType != "bid.rejected" {
 		_ = w.log.AckBidRecord(ctx, event.AuctionID, event.StreamID)
 		span.SetAttributes(attribute.String("bid_record.result", "skip"))
+		w.observeConsume("skip")
 		return
 	}
 	if event.Deliveries >= w.maxRetries {
 		_ = w.log.WriteBidRecordDLQ(ctx, event, "MAX_RETRIES")
 		_ = w.log.AckBidRecord(ctx, event.AuctionID, event.StreamID)
 		span.SetAttributes(attribute.String("bid_record.result", "dlq_max_retries"))
+		w.observeDLQ("MAX_RETRIES")
+		w.observeConsume("dlq")
 		return
 	}
+	writeStart := time.Now()
 	result, err := WriteBidRecordIdempotent(ctx, w.repo, event)
+	w.observeWrite(time.Since(writeStart))
 	switch result {
 	case BidRecordWriteOK, BidRecordWriteDuplicateConsistent:
 		_ = w.log.AckBidRecord(ctx, event.AuctionID, event.StreamID)
 		if result == BidRecordWriteOK {
 			span.SetAttributes(attribute.String("bid_record.result", "ok"))
+			w.observeConsume("ok")
 		} else {
 			span.SetAttributes(attribute.String("bid_record.result", "duplicate_consistent"))
+			w.observeConsume("duplicate_consistent")
 		}
 	case BidRecordWriteDuplicateConflict:
 		_ = w.log.WriteBidRecordDLQ(ctx, event, "DUPLICATE_CONFLICT")
 		_ = w.log.AckBidRecord(ctx, event.AuctionID, event.StreamID)
 		span.SetAttributes(attribute.String("bid_record.result", "duplicate_conflict"))
+		w.observeDLQ("DUPLICATE_CONFLICT")
+		w.observeConsume("duplicate_conflict")
 		if err != nil {
 			span.RecordError(err)
 		}
 	default:
 		span.SetAttributes(attribute.String("bid_record.result", "temporary_failure"))
+		w.observeConsume("temporary_failure")
 		if err != nil {
 			span.RecordError(err)
 			span.SetStatus(codes.Error, err.Error())
@@ -174,7 +200,27 @@ func (w *BidRecordWriter) handleEvent(parentCtx context.Context, event redisinfr
 			_ = w.log.WriteBidRecordDLQ(ctx, event, "MAX_RETRIES")
 			_ = w.log.AckBidRecord(ctx, event.AuctionID, event.StreamID)
 			span.SetAttributes(attribute.String("bid_record.result", "dlq_max_retries"))
+			w.observeDLQ("MAX_RETRIES")
+			w.observeConsume("dlq")
 		}
+	}
+}
+
+func (w *BidRecordWriter) observeConsume(result string) {
+	if w != nil && w.metrics != nil {
+		w.metrics.IncWorkerBidRecordConsume(result)
+	}
+}
+
+func (w *BidRecordWriter) observeWrite(elapsed time.Duration) {
+	if w != nil && w.metrics != nil {
+		w.metrics.ObserveWorkerBidRecordWrite(elapsed)
+	}
+}
+
+func (w *BidRecordWriter) observeDLQ(reason string) {
+	if w != nil && w.metrics != nil {
+		w.metrics.IncWorkerBidRecordDLQ(reason)
 	}
 }
 
@@ -192,6 +238,16 @@ func WriteBidRecordIdempotent(ctx context.Context, repo repository.BidRepository
 	if record.CreatedAt.IsZero() {
 		record.CreatedAt = time.Now().UTC()
 	}
+	existing, findErr := repo.FindByRequestID(ctx, event.RequestID)
+	if findErr == nil {
+		if bidRecordConsistent(existing, record) {
+			return BidRecordWriteDuplicateConsistent, nil
+		}
+		return BidRecordWriteDuplicateConflict, domain.ErrConflict
+	}
+	if !errors.Is(findErr, domain.ErrNotFound) {
+		return BidRecordWriteTemporaryFailure, findErr
+	}
 	err := repo.Create(ctx, &record)
 	if err == nil {
 		return BidRecordWriteOK, nil
@@ -199,7 +255,7 @@ func WriteBidRecordIdempotent(ctx context.Context, repo repository.BidRepository
 	if !errors.Is(err, domain.ErrConflict) && !isDuplicateError(err) {
 		return BidRecordWriteTemporaryFailure, err
 	}
-	existing, findErr := repo.FindByRequestID(ctx, event.RequestID)
+	existing, findErr = repo.FindByRequestID(ctx, event.RequestID)
 	if findErr != nil {
 		return BidRecordWriteTemporaryFailure, findErr
 	}
@@ -222,8 +278,9 @@ func isDuplicateError(err error) bool {
 }
 
 type BidRecordReconciler struct {
-	repo repository.BidRepository
-	log  bidRecordReconcileLog
+	repo    repository.BidRepository
+	log     bidRecordReconcileLog
+	metrics *metrics.Registry
 }
 
 type bidRecordReconcileLog interface {
@@ -239,6 +296,14 @@ type bidRecordReconcileLog interface {
 
 func NewBidRecordReconciler(repo repository.BidRepository, log *redisinfra.EventLog) *BidRecordReconciler {
 	return &BidRecordReconciler{repo: repo, log: log}
+}
+
+// SetMetrics 注入压测所需的补偿巡检指标。nil 安全。
+func (r *BidRecordReconciler) SetMetrics(reg *metrics.Registry) {
+	if r == nil {
+		return
+	}
+	r.metrics = reg
 }
 
 // Start 为每个 RT shard 起一个独立的 reconcile goroutine。
@@ -289,10 +354,11 @@ func (r *BidRecordReconciler) loopShard(ctx context.Context, shardIdx int, inter
 	}
 }
 
-func (r *BidRecordReconciler) RunOnce(ctx context.Context) error {
+func (r *BidRecordReconciler) RunOnce(ctx context.Context) (err error) {
 	if r == nil || r.repo == nil || r.log == nil || !r.log.Enabled() {
 		return nil
 	}
+	defer func() { r.observeTask("bid_record_reconcile", err) }()
 	auctions, err := r.log.ActiveAuctions(ctx)
 	if err != nil {
 		return err
@@ -302,10 +368,11 @@ func (r *BidRecordReconciler) RunOnce(ctx context.Context) error {
 
 // RunOnceShard 对单个 shard 上的 active_streams 跑一轮 reconcile；
 // 错误立即向上冒泡（与 RunOnce 行为一致）。
-func (r *BidRecordReconciler) RunOnceShard(ctx context.Context, shardIdx int) error {
+func (r *BidRecordReconciler) RunOnceShard(ctx context.Context, shardIdx int) (err error) {
 	if r == nil || r.repo == nil || r.log == nil || !r.log.Enabled() {
 		return nil
 	}
+	defer func() { r.observeTask("bid_record_reconcile", err) }()
 	auctions, err := r.log.ActiveAuctionsOnShard(ctx, shardIdx)
 	if err != nil {
 		return err
@@ -325,15 +392,19 @@ func (r *BidRecordReconciler) reconcileAuctions(ctx context.Context, auctions []
 		}
 		if !complete {
 			_ = r.log.WriteBidRecordDLQ(ctx, redisinfra.BidEvent{AuctionID: auctionID, Seq: lastSeq}, "RECONCILE_GAP")
+			r.observeDLQ("RECONCILE_GAP")
 			continue
 		}
 		for _, event := range events {
 			if event.EventType != "bid.accepted" && event.EventType != "bid.rejected" {
 				continue
 			}
+			writeStart := time.Now()
 			result, err := WriteBidRecordIdempotent(ctx, r.repo, event)
+			r.observeWrite(time.Since(writeStart))
 			if result == BidRecordWriteDuplicateConflict {
 				_ = r.log.WriteBidRecordDLQ(ctx, event, "RECONCILE_DUPLICATE_CONFLICT")
+				r.observeDLQ("RECONCILE_DUPLICATE_CONFLICT")
 			} else if result == BidRecordWriteTemporaryFailure {
 				return err
 			}
@@ -346,4 +417,27 @@ func (r *BidRecordReconciler) reconcileAuctions(ctx context.Context, auctions []
 		}
 	}
 	return nil
+}
+
+func (r *BidRecordReconciler) observeTask(worker string, err error) {
+	if r == nil || r.metrics == nil {
+		return
+	}
+	result := "ok"
+	if err != nil {
+		result = "error"
+	}
+	r.metrics.IncWorkerTask(worker, result)
+}
+
+func (r *BidRecordReconciler) observeWrite(elapsed time.Duration) {
+	if r != nil && r.metrics != nil {
+		r.metrics.ObserveWorkerBidRecordWrite(elapsed)
+	}
+}
+
+func (r *BidRecordReconciler) observeDLQ(reason string) {
+	if r != nil && r.metrics != nil {
+		r.metrics.IncWorkerBidRecordDLQ(reason)
+	}
 }

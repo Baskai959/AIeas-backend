@@ -3,7 +3,7 @@
   "info": {
     "title": "直播拍卖 Agent Hook 开关接口",
     "version": "v1",
-    "description": "商家可按直播间查询或设置本商家的直播拍卖 AI Agent hook 开关。开关开启后，后端会在开播、拍品上架、拍品下架、落锤成交、最高出价变化时向 Agent hook 函数传递一条中文事件字符串。"
+    "description": "商家可按直播间查询或设置本商家的直播拍卖 AI Agent hook 开关。开关开启后，后端会在开播、商品状态切换为 LISTED、商品状态切换为 OFFLINE、落锤成交、最高出价变化时向 Agent hook 函数传递一条中文事件字符串。"
   },
   "servers": [
     {
@@ -88,7 +88,7 @@
           "LiveRoomAgentHook"
         ],
         "summary": "设置直播拍卖 Agent Hook 开关",
-        "description": "需要 merchant 或 admin 角色。merchant 只能设置自己的直播间；admin 可设置任意直播间。该设置按商家维度存储，开启后事件字符串会投递给 Agent hook。",
+        "description": "需要 merchant 或 admin 角色。merchant 只能设置自己的直播间；admin 可设置任意直播间。该设置按商家维度存储。开启成功后会立即触发一次 Agent hook 配置变更事件，事件字符串包含直播间 ID，例如：直播间90001AI直播助手已开启；关闭时只更新配置，不触发 hook。",
         "operationId": "updateLiveRoomAgentHookConfig",
         "security": [
           {

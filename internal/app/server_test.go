@@ -138,11 +138,12 @@ func TestAuthMeRejectsMissingAndInvalidToken(t *testing.T) {
 
 func TestMCPInitializeAndToolsList(t *testing.T) {
 	h := newTestServer()
-	apiKey := appconfig.Default().MCP.APIKey
+	readAPIKey := appconfig.Default().MCP.Read.APIKey
+	controlAPIKey := appconfig.Default().MCP.Control.APIKey
 
-	initResp := doMCP(t, h.Engine, apiKey, `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1.0.0"}}}`)
-	if initResp.status != 200 || initResp.body.Error != nil {
-		t.Fatalf("expected initialize success, status=%d raw=%s", initResp.status, initResp.raw)
+	readInitResp := doMCPPath(t, h.Engine, "/mcp/read", readAPIKey, `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1.0.0"}}}`)
+	if readInitResp.status != 200 || readInitResp.body.Error != nil {
+		t.Fatalf("expected read initialize success, status=%d raw=%s", readInitResp.status, readInitResp.raw)
 	}
 	var initResult struct {
 		ProtocolVersion string `json:"protocolVersion"`
@@ -150,26 +151,47 @@ func TestMCPInitializeAndToolsList(t *testing.T) {
 			Name string `json:"name"`
 		} `json:"serverInfo"`
 	}
-	mustDecodeData(t, initResp.body.Result, &initResult)
-	if initResult.ProtocolVersion != "2025-06-18" || initResult.ServerInfo.Name != "aieas-live-control-mcp" {
-		t.Fatalf("unexpected initialize result: %+v", initResult)
+	mustDecodeData(t, readInitResp.body.Result, &initResult)
+	if initResult.ProtocolVersion != "2025-06-18" || initResult.ServerInfo.Name != "aieas-read-mcp" {
+		t.Fatalf("unexpected read initialize result: %+v", initResult)
 	}
 
-	toolsResp := doMCP(t, h.Engine, apiKey, `{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}`)
-	if toolsResp.status != 200 || toolsResp.body.Error != nil {
-		t.Fatalf("expected tools/list success, status=%d raw=%s", toolsResp.status, toolsResp.raw)
+	readToolsResp := doMCPPath(t, h.Engine, "/mcp/read", readAPIKey, `{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}`)
+	if readToolsResp.status != 200 || readToolsResp.body.Error != nil {
+		t.Fatalf("expected read tools/list success, status=%d raw=%s", readToolsResp.status, readToolsResp.raw)
 	}
 	var toolsResult struct {
 		Tools []struct {
 			Name string `json:"name"`
 		} `json:"tools"`
 	}
-	mustDecodeData(t, toolsResp.body.Result, &toolsResult)
+	mustDecodeData(t, readToolsResp.body.Result, &toolsResult)
 	if !containsTool(toolsResult.Tools, "read_live_session_bids") ||
 		!containsTool(toolsResult.Tools, "read_live_session_settlement") ||
+		containsTool(toolsResult.Tools, "get_merchant_live_control_context") ||
+		containsTool(toolsResult.Tools, "operate_live_session_lot") {
+		t.Fatalf("expected only read tools from read MCP, got %+v", toolsResult.Tools)
+	}
+
+	controlInitResp := doMCPPath(t, h.Engine, "/mcp/control", controlAPIKey, `{"jsonrpc":"2.0","id":3,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1.0.0"}}}`)
+	if controlInitResp.status != 200 || controlInitResp.body.Error != nil {
+		t.Fatalf("expected control initialize success, status=%d raw=%s", controlInitResp.status, controlInitResp.raw)
+	}
+	mustDecodeData(t, controlInitResp.body.Result, &initResult)
+	if initResult.ProtocolVersion != "2025-06-18" || initResult.ServerInfo.Name != "aieas-control-mcp" {
+		t.Fatalf("unexpected control initialize result: %+v", initResult)
+	}
+
+	controlToolsResp := doMCPPath(t, h.Engine, "/mcp/control", controlAPIKey, `{"jsonrpc":"2.0","id":4,"method":"tools/list","params":{}}`)
+	if controlToolsResp.status != 200 || controlToolsResp.body.Error != nil {
+		t.Fatalf("expected control tools/list success, status=%d raw=%s", controlToolsResp.status, controlToolsResp.raw)
+	}
+	mustDecodeData(t, controlToolsResp.body.Result, &toolsResult)
+	if containsTool(toolsResult.Tools, "read_live_session_bids") ||
 		!containsTool(toolsResult.Tools, "get_merchant_live_control_context") ||
-		!containsTool(toolsResult.Tools, "operate_live_session_lot") {
-		t.Fatalf("expected live session tools, got %+v", toolsResult.Tools)
+		!containsTool(toolsResult.Tools, "operate_live_session_lot") ||
+		len(toolsResult.Tools) != 2 {
+		t.Fatalf("expected only control tools from control MCP, got %+v", toolsResult.Tools)
 	}
 }
 
@@ -227,9 +249,9 @@ func TestMCPReadLiveSessionBidsAuthorization(t *testing.T) {
 	}
 
 	cfg := appconfig.Default()
-	cfg.MCP.APIKey = "merchant-mcp-key"
-	cfg.MCP.ActorID = "u_2001"
-	cfg.MCP.ActorRole = "merchant"
+	cfg.MCP.Read.APIKey = "merchant-mcp-key"
+	cfg.MCP.Read.ActorID = "u_2001"
+	cfg.MCP.Read.ActorRole = "merchant"
 	h := NewServerWithDependencies(cfg, ServerDependencies{
 		UserRepo:        userRepo,
 		ItemRepo:        itemRepo,
@@ -243,7 +265,7 @@ func TestMCPReadLiveSessionBidsAuthorization(t *testing.T) {
 	})
 
 	body := `{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"read_live_session_bids","arguments":{"sessionId":` + strconv.FormatUint(session.ID, 10) + `,"limit":10}}}`
-	merchantResp := doMCP(t, h.Engine, "merchant-mcp-key", body)
+	merchantResp := doMCPPath(t, h.Engine, "/mcp/read", "merchant-mcp-key", body)
 	if merchantResp.status != 200 || merchantResp.body.Error != nil {
 		t.Fatalf("expected merchant mcp success, status=%d raw=%s", merchantResp.status, merchantResp.raw)
 	}
@@ -265,9 +287,9 @@ func TestMCPReadLiveSessionBidsAuthorization(t *testing.T) {
 	}
 
 	buyerCfg := appconfig.Default()
-	buyerCfg.MCP.APIKey = "buyer-mcp-key"
-	buyerCfg.MCP.ActorID = "u_1001"
-	buyerCfg.MCP.ActorRole = "buyer"
+	buyerCfg.MCP.Read.APIKey = "buyer-mcp-key"
+	buyerCfg.MCP.Read.ActorID = "u_1001"
+	buyerCfg.MCP.Read.ActorRole = "buyer"
 	buyerServer := NewServerWithDependencies(buyerCfg, ServerDependencies{
 		UserRepo:        userRepo,
 		ItemRepo:        itemRepo,
@@ -279,12 +301,12 @@ func TestMCPReadLiveSessionBidsAuthorization(t *testing.T) {
 		ObjectUploader:  objectstorage.NewMemoryUploader(""),
 		ProductAuditor:  service.DisabledProductAuditor{},
 	})
-	buyerResp := doMCP(t, buyerServer.Engine, "buyer-mcp-key", body)
+	buyerResp := doMCPPath(t, buyerServer.Engine, "/mcp/read", "buyer-mcp-key", body)
 	if buyerResp.status != 200 || buyerResp.body.Error == nil || buyerResp.body.Error.Code != -32003 {
 		t.Fatalf("expected buyer forbidden json-rpc error, status=%d raw=%s", buyerResp.status, buyerResp.raw)
 	}
 
-	invalidKeyResp := doMCP(t, h.Engine, "wrong-key", body)
+	invalidKeyResp := doMCPPath(t, h.Engine, "/mcp/read", "wrong-key", body)
 	if invalidKeyResp.status != 401 || invalidKeyResp.body.Error == nil || invalidKeyResp.body.Error.Code != -32001 {
 		t.Fatalf("expected invalid api key unauthorized, status=%d raw=%s", invalidKeyResp.status, invalidKeyResp.raw)
 	}
@@ -328,9 +350,9 @@ func TestMCPLiveControlContextAndOperations(t *testing.T) {
 	}
 
 	cfg := appconfig.Default()
-	cfg.MCP.APIKey = "merchant-live-control-key"
-	cfg.MCP.ActorID = "u_2001"
-	cfg.MCP.ActorRole = "merchant"
+	cfg.MCP.Control.APIKey = "merchant-live-control-key"
+	cfg.MCP.Control.ActorID = "u_2001"
+	cfg.MCP.Control.ActorRole = "merchant"
 	h := NewServerWithDependencies(cfg, ServerDependencies{
 		UserRepo:        userRepo,
 		AuctionRepo:     auctionRepo,
@@ -341,7 +363,7 @@ func TestMCPLiveControlContextAndOperations(t *testing.T) {
 	})
 
 	contextBody := `{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"get_merchant_live_control_context","arguments":{"merchantId":"u_2001"}}}`
-	contextResp := doMCP(t, h.Engine, "merchant-live-control-key", contextBody)
+	contextResp := doMCPPath(t, h.Engine, "/mcp/control", "merchant-live-control-key", contextBody)
 	if contextResp.status != 200 || contextResp.body.Error != nil {
 		t.Fatalf("expected live context success, status=%d raw=%s", contextResp.status, contextResp.raw)
 	}
@@ -354,7 +376,7 @@ func TestMCPLiveControlContextAndOperations(t *testing.T) {
 	}
 
 	onShelfBody := `{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"operate_live_session_lot","arguments":{"liveSessionId":` + strconv.FormatUint(session.ID, 10) + `,"auctionId":91001,"action":"onShelf"}}}`
-	onShelfResp := doMCP(t, h.Engine, "merchant-live-control-key", onShelfBody)
+	onShelfResp := doMCPPath(t, h.Engine, "/mcp/control", "merchant-live-control-key", onShelfBody)
 	if onShelfResp.status != 200 || onShelfResp.body.Error != nil {
 		t.Fatalf("expected onShelf success, status=%d raw=%s", onShelfResp.status, onShelfResp.raw)
 	}
@@ -364,7 +386,7 @@ func TestMCPLiveControlContextAndOperations(t *testing.T) {
 	}
 
 	startBody := `{"jsonrpc":"2.0","id":13,"method":"tools/call","params":{"name":"operate_live_session_lot","arguments":{"liveSessionId":` + strconv.FormatUint(session.ID, 10) + `,"auctionId":91001,"action":"startExplain","durationSec":600}}}`
-	startResp := doMCP(t, h.Engine, "merchant-live-control-key", startBody)
+	startResp := doMCPPath(t, h.Engine, "/mcp/control", "merchant-live-control-key", startBody)
 	if startResp.status != 200 || startResp.body.Error != nil {
 		t.Fatalf("expected startExplain success, status=%d raw=%s", startResp.status, startResp.raw)
 	}
@@ -372,9 +394,14 @@ func TestMCPLiveControlContextAndOperations(t *testing.T) {
 	if started.Data.Context == nil || started.Data.Context.Lots.ExplainingLot == nil || started.Data.Context.Lots.ExplainingLot.AuctionID != lot.AuctionID {
 		t.Fatalf("expected explaining lot after start, got %+v", started.Data)
 	}
+	if started.Data.Context.CurrentAuctionState == nil ||
+		started.Data.Context.CurrentAuctionState.AuctionID != lot.AuctionID ||
+		started.Data.Context.CurrentAuctionState.CurrentPrice != lot.StartPrice {
+		t.Fatalf("expected current auction state after start, got %+v", started.Data.Context.CurrentAuctionState)
+	}
 
 	hammerBody := `{"jsonrpc":"2.0","id":14,"method":"tools/call","params":{"name":"operate_live_session_lot","arguments":{"liveSessionId":` + strconv.FormatUint(session.ID, 10) + `,"auctionId":91001,"action":"hammer","force":true,"requestId":"mcp-live-control-hammer-1"}}}`
-	hammerResp := doMCP(t, h.Engine, "merchant-live-control-key", hammerBody)
+	hammerResp := doMCPPath(t, h.Engine, "/mcp/control", "merchant-live-control-key", hammerBody)
 	if hammerResp.status != 200 || hammerResp.body.Error != nil {
 		t.Fatalf("expected hammer success, status=%d raw=%s", hammerResp.status, hammerResp.raw)
 	}
@@ -532,32 +559,36 @@ func TestLiveRoomCoverUploadRoute(t *testing.T) {
 	}
 }
 
-func TestItemCreateRunsProductAudit(t *testing.T) {
+func TestItemCreateTriggersProductAuditCallback(t *testing.T) {
 	cases := []struct {
-		name       string
-		result     service.ProductAuditResult
-		wantStatus string
+		name            string
+		callbackSuccess bool
+		approved        bool
+		wantStatus      string
 	}{
 		{
-			name:       "approved",
-			result:     service.ProductAuditResult{Success: true, IsApproved: true},
-			wantStatus: "READY",
+			name:            "approved",
+			callbackSuccess: true,
+			approved:        true,
+			wantStatus:      "READY",
 		},
 		{
-			name:       "rejected",
-			result:     service.ProductAuditResult{Success: true, IsApproved: false},
-			wantStatus: "REJECTED",
+			name:            "rejected",
+			callbackSuccess: true,
+			approved:        false,
+			wantStatus:      "REJECTED",
 		},
 		{
-			name:       "manual review",
-			result:     service.ProductAuditResult{Success: false},
-			wantStatus: "PENDING_AUDIT",
+			name:            "audit failed",
+			callbackSuccess: false,
+			approved:        false,
+			wantStatus:      "PENDING_AUDIT",
 		},
 	}
 
 	for _, tt := range cases {
 		t.Run(tt.name, func(t *testing.T) {
-			auditor := &captureProductAuditor{result: tt.result}
+			auditor := &captureProductAuditor{result: service.ProductAuditResult{Success: true, RequestID: "agent-product-audit-1", Status: "ACCEPTED"}, called: make(chan struct{}, 1)}
 			h := NewServerWithDependencies(appconfig.Default(), ServerDependencies{
 				UserRepo:       repository.NewSeedUserRepository(),
 				ObjectUploader: objectstorage.NewMemoryUploader(""),
@@ -577,19 +608,91 @@ func TestItemCreateRunsProductAudit(t *testing.T) {
 				t.Fatalf("expected item create success, got status=%d raw=%s", resp.status, resp.raw)
 			}
 			var item struct {
+				ID     uint64 `json:"id"`
 				Status string `json:"status"`
 			}
 			mustDecodeData(t, resp.body.Data, &item)
-			if item.Status != tt.wantStatus {
-				t.Fatalf("expected status %s, got %+v", tt.wantStatus, item)
+			if item.Status != "PENDING_AUDIT" {
+				t.Fatalf("expected create response to stay PENDING_AUDIT, got %+v", item)
 			}
-			if auditor.input.ProductText == "" || !strings.Contains(auditor.input.ProductText, "机械键盘 87键") || !strings.Contains(auditor.input.ProductText, "电脑外设/键盘") {
-				t.Fatalf("unexpected audit product text: %q", auditor.input.ProductText)
+			input := auditor.waitInput(t)
+			if input.ProductText == "" || !strings.Contains(input.ProductText, "机械键盘 87键") || !strings.Contains(input.ProductText, "电脑外设/键盘") {
+				t.Fatalf("unexpected audit product text: %q", input.ProductText)
 			}
-			if string(auditor.input.Image) != "audit image bytes" || auditor.input.ImageName != "keyboard.jpg" {
-				t.Fatalf("unexpected audit image: name=%q body=%q", auditor.input.ImageName, string(auditor.input.Image))
+			if string(input.Image) != "audit image bytes" || input.ImageName != "keyboard.jpg" {
+				t.Fatalf("unexpected audit image: name=%q body=%q", input.ImageName, string(input.Image))
+			}
+			if input.CallbackURL != appconfig.Default().Agent.ProductAuditCallbackURL ||
+				input.CallbackHeaders["X-Callback-Key"] != appconfig.Default().Agent.LiveAnalysisCallbackAPIKey ||
+				input.CallbackHeaders["Authorization"] != "Bearer "+appconfig.Default().Agent.LiveAnalysisCallbackAPIKey {
+				t.Fatalf("unexpected audit callback config: %+v", input)
+			}
+			if contextItemID, ok := input.CallbackContext["itemId"].(uint64); !ok || contextItemID != item.ID {
+				t.Fatalf("unexpected callback context itemId: %+v", input.CallbackContext)
+			}
+			if tt.name == "approved" {
+				badCallback := doJSONWithHeaders(t, h.Engine, consts.MethodPost, "/api/v1/items/audit/callback", productAuditCallbackJSON(t, tt.callbackSuccess, tt.approved, input.CallbackContext))
+				if badCallback.status != 401 {
+					t.Fatalf("expected callback auth failure, got status=%d raw=%s", badCallback.status, badCallback.raw)
+				}
+			}
+			callback := doJSONWithHeaders(t, h.Engine, consts.MethodPost, "/api/v1/items/audit/callback", productAuditCallbackJSON(t, tt.callbackSuccess, tt.approved, input.CallbackContext),
+				ut.Header{Key: "X-Callback-Key", Value: appconfig.Default().Agent.LiveAnalysisCallbackAPIKey},
+			)
+			if callback.status != 200 || callback.body.Code != 0 {
+				t.Fatalf("expected callback success, got status=%d raw=%s", callback.status, callback.raw)
+			}
+			gotStatus := pollItemStatus(t, h.Engine, item.ID, token, tt.wantStatus)
+			if gotStatus != tt.wantStatus {
+				t.Fatalf("expected callback status %s, got %s", tt.wantStatus, gotStatus)
 			}
 		})
+	}
+}
+
+func TestItemAuditCallbackIgnoresStaleSnapshot(t *testing.T) {
+	auditor := &captureProductAuditor{result: service.ProductAuditResult{Success: true, RequestID: "agent-product-audit-1", Status: "ACCEPTED"}, called: make(chan struct{}, 2)}
+	h := NewServerWithDependencies(appconfig.Default(), ServerDependencies{
+		UserRepo:       repository.NewSeedUserRepository(),
+		ObjectUploader: objectstorage.NewMemoryUploader(""),
+		ProductAuditor: auditor,
+	})
+	token := loginForToken(t, h.Engine, "merchant001", "Passw0rd!", "merchant")
+
+	resp := doMultipartWithHeaders(t, h.Engine, consts.MethodPost, "/api/v1/items", map[string]string{
+		"title":          "机械键盘 87键",
+		"category":       "电脑外设/键盘",
+		"conditionGrade": "GOOD",
+		"description":    "RGB背光，适合办公和游戏",
+	}, []multipartTestFile{
+		{FieldName: "images", Filename: "keyboard.jpg", Body: "audit image bytes"},
+	}, ut.Header{Key: "Authorization", Value: "Bearer " + token})
+	if resp.status != 200 || resp.body.Code != 0 {
+		t.Fatalf("expected item create success, got status=%d raw=%s", resp.status, resp.raw)
+	}
+	var item struct {
+		ID uint64 `json:"id"`
+	}
+	mustDecodeData(t, resp.body.Data, &item)
+	firstAudit := auditor.waitInput(t)
+
+	patch := doMultipartWithHeaders(t, h.Engine, consts.MethodPatch, "/api/v1/items/"+strconv.FormatUint(item.ID, 10), map[string]string{
+		"title": "机械键盘 87键 改版",
+	}, nil, ut.Header{Key: "Authorization", Value: "Bearer " + token})
+	if patch.status != 200 || patch.body.Code != 0 {
+		t.Fatalf("expected item patch success, got status=%d raw=%s", patch.status, patch.raw)
+	}
+	_ = auditor.waitInput(t)
+
+	callback := doJSONWithHeaders(t, h.Engine, consts.MethodPost, "/api/v1/items/audit/callback", productAuditCallbackJSON(t, true, true, firstAudit.CallbackContext),
+		ut.Header{Key: "Authorization", Value: "Bearer " + appconfig.Default().Agent.LiveAnalysisCallbackAPIKey},
+	)
+	if callback.status != 200 || callback.body.Code != 0 {
+		t.Fatalf("expected stale callback success response, got status=%d raw=%s", callback.status, callback.raw)
+	}
+	gotStatus := pollItemStatus(t, h.Engine, item.ID, token, "PENDING_AUDIT")
+	if gotStatus != "PENDING_AUDIT" {
+		t.Fatalf("expected stale callback to keep PENDING_AUDIT, got %s", gotStatus)
 	}
 }
 
@@ -687,7 +790,6 @@ func TestItemDescriptionOptimizeRouteUsesImageURL(t *testing.T) {
 func TestItemRoutesProtectItemsBoundToActiveAuctions(t *testing.T) {
 	h := newTestServer()
 	merchantToken := loginForToken(t, h.Engine, "merchant001", "Passw0rd!", "merchant")
-	adminToken := loginForToken(t, h.Engine, "admin001", "AdminPassw0rd!", "admin")
 
 	missing := doJSONWithHeaders(t, h.Engine, consts.MethodGet, "/api/v1/items/999999", "", ut.Header{Key: "Authorization", Value: "Bearer " + merchantToken})
 	if missing.status != 404 || missing.body.Code != 30001 {
@@ -707,7 +809,7 @@ func TestItemRoutesProtectItemsBoundToActiveAuctions(t *testing.T) {
 	}
 	mustDecodeData(t, createItem.body.Data, &itemData)
 
-	auctionBody := `{"itemId":` + strconv.FormatUint(itemData.ID, 10) + `,"startPrice":10000,"reservePrice":10000,"capPrice":20000,"depositAmount":0,"status":"PENDING_AUDIT","incrementRule":{"type":"fixed","amount":100,"maxBidSteps":10}}`
+	auctionBody := `{"itemId":` + strconv.FormatUint(itemData.ID, 10) + `,"startPrice":10000,"reservePrice":10000,"capPrice":20000,"depositAmount":0,"status":"READY","incrementRule":{"type":"fixed","amount":100,"maxBidSteps":10}}`
 	createAuction := doJSONWithHeaders(t, h.Engine, consts.MethodPost, "/api/v1/auctions", auctionBody, ut.Header{Key: "Authorization", Value: "Bearer " + merchantToken})
 	if createAuction.status != 200 || createAuction.body.Code != 0 {
 		t.Fatalf("expected auction create success, got status=%d raw=%s", createAuction.status, createAuction.raw)
@@ -716,11 +818,6 @@ func TestItemRoutesProtectItemsBoundToActiveAuctions(t *testing.T) {
 		AuctionID uint64 `json:"auctionId"`
 	}
 	mustDecodeData(t, createAuction.body.Data, &auctionData)
-
-	auditAuction := doJSONWithHeaders(t, h.Engine, consts.MethodPost, "/api/v1/admin/auctions/"+strconv.FormatUint(auctionData.AuctionID, 10)+"/audit", `{"auditResult":"APPROVED"}`, ut.Header{Key: "Authorization", Value: "Bearer " + adminToken}, ut.Header{Key: "Idempotency-Key", Value: "item-active-auction-audit"})
-	if auditAuction.status != 200 || auditAuction.body.Code != 0 {
-		t.Fatalf("expected auction audit success, got status=%d raw=%s", auditAuction.status, auditAuction.raw)
-	}
 
 	start := doJSONWithHeaders(t, h.Engine, consts.MethodPost, "/api/v1/auctions/"+strconv.FormatUint(auctionData.AuctionID, 10)+"/start", "", ut.Header{Key: "Authorization", Value: "Bearer " + merchantToken}, ut.Header{Key: "Idempotency-Key", Value: "item-active-auction-start"})
 	if start.status != 200 || start.body.Code != 0 {
@@ -747,7 +844,7 @@ func TestItemRoutesProtectItemsBoundToActiveAuctions(t *testing.T) {
 	}
 }
 
-func TestAuctionCreateAndUpdateRejectApprovedStatus(t *testing.T) {
+func TestAuctionCreateAndUpdateReadyWithoutAudit(t *testing.T) {
 	h := newTestServer()
 	merchantToken := loginForToken(t, h.Engine, "merchant001", "Passw0rd!", "merchant")
 
@@ -766,28 +863,81 @@ func TestAuctionCreateAndUpdateRejectApprovedStatus(t *testing.T) {
 
 	readyBody := `{"itemId":` + strconv.FormatUint(itemData.ID, 10) + `,"startPrice":10000,"reservePrice":15000,"capPrice":20000,"depositAmount":1000,"status":"READY","incrementRule":{"type":"fixed","amount":500,"maxBidSteps":10}}`
 	createReady := doJSONWithHeaders(t, h.Engine, consts.MethodPost, "/api/v1/auctions", readyBody, ut.Header{Key: "Authorization", Value: "Bearer " + merchantToken})
-	if createReady.status != 400 || createReady.body.Code != 20001 {
-		t.Fatalf("expected create READY to fail validation, got status=%d code=%d raw=%s", createReady.status, createReady.body.Code, createReady.raw)
+	if createReady.status != 200 || createReady.body.Code != 0 {
+		t.Fatalf("expected create READY success, got status=%d raw=%s", createReady.status, createReady.raw)
 	}
 
 	pendingBody := `{"itemId":` + strconv.FormatUint(itemData.ID, 10) + `,"startPrice":10000,"reservePrice":15000,"capPrice":20000,"depositAmount":1000,"status":"PENDING_AUDIT","incrementRule":{"type":"fixed","amount":500,"maxBidSteps":10}}`
 	createPending := doJSONWithHeaders(t, h.Engine, consts.MethodPost, "/api/v1/auctions", pendingBody, ut.Header{Key: "Authorization", Value: "Bearer " + merchantToken})
-	if createPending.status != 200 || createPending.body.Code != 0 {
-		t.Fatalf("expected create PENDING_AUDIT success, got status=%d raw=%s", createPending.status, createPending.raw)
+	if createPending.status != 400 || createPending.body.Code != 20001 {
+		t.Fatalf("expected create PENDING_AUDIT to fail validation, got status=%d code=%d raw=%s", createPending.status, createPending.body.Code, createPending.raw)
 	}
-	fixedBody := `{"itemId":` + strconv.FormatUint(itemData.ID, 10) + `,"startPrice":100,"reservePrice":5000,"capPrice":10000,"depositAmount":0,"status":"PENDING_AUDIT","incrementRule":{"type":"fixed","amount":100,"maxBidSteps":5}}`
-	createFixed := doJSONWithHeaders(t, h.Engine, consts.MethodPost, "/api/v1/auctions", fixedBody, ut.Header{Key: "Authorization", Value: "Bearer " + merchantToken})
-	if createFixed.status != 200 || createFixed.body.Code != 0 {
-		t.Fatalf("expected create fixed PENDING_AUDIT success, got status=%d raw=%s", createFixed.status, createFixed.raw)
+
+	systemBody := `{"itemId":` + strconv.FormatUint(itemData.ID, 10) + `,"startPrice":100,"reservePrice":5000,"capPrice":10000,"depositAmount":0,"status":"RUNNING","incrementRule":{"type":"fixed","amount":100,"maxBidSteps":5}}`
+	createSystem := doJSONWithHeaders(t, h.Engine, consts.MethodPost, "/api/v1/auctions", systemBody, ut.Header{Key: "Authorization", Value: "Bearer " + merchantToken})
+	if createSystem.status != 400 || createSystem.body.Code != 20001 {
+		t.Fatalf("expected create RUNNING to fail validation, got status=%d code=%d raw=%s", createSystem.status, createSystem.body.Code, createSystem.raw)
 	}
 	var auctionData struct {
 		AuctionID uint64 `json:"auctionId"`
 	}
-	mustDecodeData(t, createPending.body.Data, &auctionData)
+	mustDecodeData(t, createReady.body.Data, &auctionData)
 
-	patchReady := doJSONWithHeaders(t, h.Engine, consts.MethodPatch, "/api/v1/auctions/"+strconv.FormatUint(auctionData.AuctionID, 10), `{"status":"READY"}`, ut.Header{Key: "Authorization", Value: "Bearer " + merchantToken})
-	if patchReady.status != 400 || patchReady.body.Code != 20001 {
-		t.Fatalf("expected patch READY to fail validation, got status=%d code=%d raw=%s", patchReady.status, patchReady.body.Code, patchReady.raw)
+	patchRunning := doJSONWithHeaders(t, h.Engine, consts.MethodPatch, "/api/v1/auctions/"+strconv.FormatUint(auctionData.AuctionID, 10), `{"status":"RUNNING"}`, ut.Header{Key: "Authorization", Value: "Bearer " + merchantToken})
+	if patchRunning.status != 400 || patchRunning.body.Code != 20001 {
+		t.Fatalf("expected patch RUNNING to fail validation, got status=%d code=%d raw=%s", patchRunning.status, patchRunning.body.Code, patchRunning.raw)
+	}
+}
+
+func TestLiveRoomAutoMountLotRoute(t *testing.T) {
+	h := newTestServer()
+	merchantToken := loginForToken(t, h.Engine, "merchant001", "Passw0rd!", "merchant")
+
+	createRoom := doJSONWithHeaders(t, h.Engine, consts.MethodPost, "/api/v1/live-rooms", `{"title":"自动上架直播间"}`, ut.Header{Key: "Authorization", Value: "Bearer " + merchantToken})
+	if createRoom.status != 200 || createRoom.body.Code != 0 {
+		t.Fatalf("expected live room create success, got status=%d raw=%s", createRoom.status, createRoom.raw)
+	}
+	var roomData struct {
+		ID uint64 `json:"id"`
+	}
+	mustDecodeData(t, createRoom.body.Data, &roomData)
+
+	item := doMultipartWithHeaders(t, h.Engine, consts.MethodPost, "/api/v1/items", map[string]string{
+		"title":          "Auto Mount Lot",
+		"category":       "collectible",
+		"conditionGrade": "GOOD",
+	}, nil, ut.Header{Key: "Authorization", Value: "Bearer " + merchantToken})
+	if item.status != 200 || item.body.Code != 0 {
+		t.Fatalf("expected item create success, got status=%d raw=%s", item.status, item.raw)
+	}
+	var itemData struct {
+		ID uint64 `json:"id"`
+	}
+	mustDecodeData(t, item.body.Data, &itemData)
+
+	auctionBody := `{"itemId":` + strconv.FormatUint(itemData.ID, 10) + `,"startPrice":10000,"reservePrice":15000,"depositAmount":1000,"status":"READY","incrementRule":{"type":"fixed","amount":500,"maxBidSteps":10}}`
+	createAuction := doJSONWithHeaders(t, h.Engine, consts.MethodPost, "/api/v1/auctions", auctionBody, ut.Header{Key: "Authorization", Value: "Bearer " + merchantToken})
+	if createAuction.status != 200 || createAuction.body.Code != 0 {
+		t.Fatalf("expected auction create success, got status=%d raw=%s", createAuction.status, createAuction.raw)
+	}
+	var auctionData struct {
+		AuctionID uint64 `json:"auctionId"`
+	}
+	mustDecodeData(t, createAuction.body.Data, &auctionData)
+
+	mount := doJSONWithHeaders(t, h.Engine, consts.MethodPost, "/api/v1/live-rooms/lots", `{"auctionId":`+strconv.FormatUint(auctionData.AuctionID, 10)+`}`, ut.Header{Key: "Authorization", Value: "Bearer " + merchantToken}, ut.Header{Key: "Idempotency-Key", Value: "auto-mount-lot-1"})
+	if mount.status != 200 || mount.body.Code != 0 {
+		t.Fatalf("expected auto mount success, got status=%d raw=%s", mount.status, mount.raw)
+	}
+	var mountData struct {
+		Lot struct {
+			AuctionID  uint64 `json:"auctionId"`
+			LiveRoomID uint64 `json:"liveRoomId"`
+		} `json:"lot"`
+	}
+	mustDecodeData(t, mount.body.Data, &mountData)
+	if mountData.Lot.AuctionID != auctionData.AuctionID || mountData.Lot.LiveRoomID != roomData.ID {
+		t.Fatalf("unexpected mount response: %+v want auction=%d room=%d", mountData, auctionData.AuctionID, roomData.ID)
 	}
 }
 
@@ -795,7 +945,6 @@ func TestAuctionRoutesStateAndIdempotencyMiddleware(t *testing.T) {
 	h := newTestServer()
 	merchantToken := loginForToken(t, h.Engine, "merchant001", "Passw0rd!", "merchant")
 	buyerToken := loginForToken(t, h.Engine, "buyer001", "Passw0rd!", "buyer")
-	adminToken := loginForToken(t, h.Engine, "admin001", "AdminPassw0rd!", "admin")
 
 	item := doMultipartWithHeaders(t, h.Engine, consts.MethodPost, "/api/v1/items", map[string]string{
 		"title":          "Watch",
@@ -810,7 +959,7 @@ func TestAuctionRoutesStateAndIdempotencyMiddleware(t *testing.T) {
 	}
 	mustDecodeData(t, item.body.Data, &itemData)
 
-	auctionBody := `{"itemId":` + strconv.FormatUint(itemData.ID, 10) + `,"startPrice":10000,"reservePrice":15000,"capPrice":20000,"depositAmount":1000,"status":"PENDING_AUDIT","incrementRule":{"type":"fixed","amount":500,"maxBidSteps":10}}`
+	auctionBody := `{"itemId":` + strconv.FormatUint(itemData.ID, 10) + `,"startPrice":10000,"reservePrice":15000,"capPrice":20000,"depositAmount":1000,"incrementRule":{"type":"fixed","amount":500,"maxBidSteps":10}}`
 	createAuction := doJSONWithHeaders(t, h.Engine, consts.MethodPost, "/api/v1/auctions", auctionBody, ut.Header{Key: "Authorization", Value: "Bearer " + merchantToken})
 	if createAuction.status != 200 || createAuction.body.Code != 0 {
 		t.Fatalf("expected auction create success, got status=%d raw=%s", createAuction.status, createAuction.raw)
@@ -820,13 +969,8 @@ func TestAuctionRoutesStateAndIdempotencyMiddleware(t *testing.T) {
 		Status    string `json:"status"`
 	}
 	mustDecodeData(t, createAuction.body.Data, &auctionData)
-	if auctionData.AuctionID == 0 || auctionData.Status != "PENDING_AUDIT" {
+	if auctionData.AuctionID == 0 || auctionData.Status != "READY" {
 		t.Fatalf("unexpected auction create payload: %+v", auctionData)
-	}
-
-	auditAuction := doJSONWithHeaders(t, h.Engine, consts.MethodPost, "/api/v1/admin/auctions/"+strconv.FormatUint(auctionData.AuctionID, 10)+"/audit", `{"auditResult":"APPROVED"}`, ut.Header{Key: "Authorization", Value: "Bearer " + adminToken}, ut.Header{Key: "Idempotency-Key", Value: "auction-route-audit-1"})
-	if auditAuction.status != 200 || auditAuction.body.Code != 0 {
-		t.Fatalf("expected auction audit success, got status=%d raw=%s", auditAuction.status, auditAuction.raw)
 	}
 
 	noKey := doJSONWithHeaders(t, h.Engine, consts.MethodPost, "/api/v1/auctions/"+strconv.FormatUint(auctionData.AuctionID, 10)+"/start", "", ut.Header{Key: "Authorization", Value: "Bearer " + merchantToken})
@@ -1375,18 +1519,42 @@ func (g *captureProductDescriptionGenerator) GenerateProductDescription(ctx cont
 }
 
 type captureProductAuditor struct {
+	mu     sync.Mutex
 	input  service.ProductAuditInput
 	result service.ProductAuditResult
 	err    error
+	called chan struct{}
 }
 
 func (a *captureProductAuditor) AuditProduct(ctx context.Context, in service.ProductAuditInput) (service.ProductAuditResult, error) {
 	_ = ctx
+	a.mu.Lock()
 	a.input = in
+	if a.called != nil {
+		select {
+		case a.called <- struct{}{}:
+		default:
+		}
+	}
+	a.mu.Unlock()
 	if a.err != nil {
 		return service.ProductAuditResult{}, a.err
 	}
 	return a.result, nil
+}
+
+func (a *captureProductAuditor) waitInput(t *testing.T) service.ProductAuditInput {
+	t.Helper()
+	if a.called != nil {
+		select {
+		case <-a.called:
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for product audit hook")
+		}
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.input
 }
 
 type captureLiveAnalysisRequester struct {
@@ -1428,6 +1596,43 @@ func pollLiveAnalysisTask(t *testing.T, engine *route.Engine, liveSessionID uint
 	}
 	t.Fatalf("task did not finish: %+v", last)
 	return service.LiveAnalysisTask{}
+}
+
+func pollItemStatus(t *testing.T, engine *route.Engine, itemID uint64, token string, want string) string {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	var last string
+	for time.Now().Before(deadline) {
+		resp := doJSONWithHeaders(t, engine, consts.MethodGet, "/api/v1/items/"+strconv.FormatUint(itemID, 10), "",
+			ut.Header{Key: "Authorization", Value: "Bearer " + token},
+		)
+		if resp.status != 200 || resp.body.Code != 0 {
+			t.Fatalf("expected item get success, got status=%d raw=%s", resp.status, resp.raw)
+		}
+		var item struct {
+			Status string `json:"status"`
+		}
+		mustDecodeData(t, resp.body.Data, &item)
+		last = item.Status
+		if last == want {
+			return last
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return last
+}
+
+func productAuditCallbackJSON(t *testing.T, success, approved bool, callbackContext map[string]interface{}) string {
+	t.Helper()
+	payload, err := json.Marshal(map[string]interface{}{
+		"success":          success,
+		"is_approved":      approved,
+		"callback_context": callbackContext,
+	})
+	if err != nil {
+		t.Fatalf("marshal product audit callback: %v", err)
+	}
+	return string(payload)
 }
 
 func getLiveAnalysisTask(t *testing.T, engine *route.Engine, liveSessionID uint64, token string) service.LiveAnalysisTask {
@@ -1536,11 +1741,16 @@ func decodeMCPToolEnvelope[T any](t *testing.T, resp testMCPResult) struct {
 
 func doMCP(t *testing.T, engine *route.Engine, apiKey, body string) testMCPResult {
 	t.Helper()
+	return doMCPPath(t, engine, "/mcp/read", apiKey, body)
+}
+
+func doMCPPath(t *testing.T, engine *route.Engine, path, apiKey, body string) testMCPResult {
+	t.Helper()
 	headers := []ut.Header{{Key: "Content-Type", Value: "application/json; charset=utf-8"}}
 	if apiKey != "" {
 		headers = append(headers, ut.Header{Key: "X-API-Key", Value: apiKey})
 	}
-	resp := ut.PerformRequest(engine, consts.MethodPost, "/mcp", &ut.Body{Body: strings.NewReader(body), Len: len(body)}, headers...)
+	resp := ut.PerformRequest(engine, consts.MethodPost, path, &ut.Body{Body: strings.NewReader(body), Len: len(body)}, headers...)
 	var decoded mcpRPCResponse
 	if err := json.Unmarshal(resp.Body.Bytes(), &decoded); err != nil {
 		t.Fatalf("decode mcp response: %v raw=%s", err, resp.Body.String())

@@ -17,6 +17,8 @@ type AdminService struct {
 	risk      *RiskService
 	audits    repository.AuditRepository
 	dashboard repository.AdminDashboardRepository
+	configs   repository.ConfigRepository
+	flags     *FeatureFlagService
 }
 
 func NewAdminService(users repository.UserRepository, auctions *AuctionService, hammers *HammerService, orders *OrderService, risk *RiskService, audits repository.AuditRepository) *AdminService {
@@ -25,6 +27,14 @@ func NewAdminService(users repository.UserRepository, auctions *AuctionService, 
 
 func (s *AdminService) SetDashboardRepository(repo repository.AdminDashboardRepository) {
 	s.dashboard = repo
+}
+
+func (s *AdminService) SetConfigRepository(repo repository.ConfigRepository) {
+	s.configs = repo
+}
+
+func (s *AdminService) SetFeatureFlagService(flags *FeatureFlagService) {
+	s.flags = flags
 }
 
 func (s *AdminService) ListAuctions(ctx context.Context, filter domain.AuctionFilter) ([]domain.AuctionLot, error) {
@@ -85,6 +95,28 @@ func (s *AdminService) RemoveBlacklist(ctx context.Context, userID string) error
 
 func (s *AdminService) ListBlacklist(ctx context.Context, limit, offset int) ([]domain.Blacklist, error) {
 	return s.risk.ListBlacklist(ctx, limit, offset)
+}
+
+func (s *AdminService) BlacklistStrategyConfig(ctx context.Context) (domain.BlacklistStrategyConfig, error) {
+	return readBlacklistStrategyConfig(ctx, s.configs)
+}
+
+func (s *AdminService) UpdateBlacklistStrategyConfig(ctx context.Context, cfg domain.BlacklistStrategyConfig, actorID string) (domain.BlacklistStrategyConfig, error) {
+	return upsertBlacklistStrategyConfig(ctx, s.configs, cfg, actorID)
+}
+
+func (s *AdminService) FeatureFlag(ctx context.Context, key string) (domain.FeatureFlag, error) {
+	if s.flags == nil {
+		return domain.FeatureFlag{}, domain.ErrInvalidState
+	}
+	return s.flags.Get(ctx, key)
+}
+
+func (s *AdminService) UpdateFeatureFlag(ctx context.Context, flag domain.FeatureFlag, actorID string) (domain.FeatureFlag, error) {
+	if s.flags == nil {
+		return domain.FeatureFlag{}, domain.ErrInvalidState
+	}
+	return s.flags.Update(ctx, flag, actorID)
 }
 
 func (s *AdminService) ListOrders(ctx context.Context, filter domain.OrderFilter) ([]domain.OrderDeal, error) {

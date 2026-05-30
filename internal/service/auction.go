@@ -152,13 +152,11 @@ func (s *AuctionService) Create(ctx context.Context, in CreateAuctionInput) (dom
 	if err := domain.ValidateAuctionPricing(in.StartPrice, in.ReservePrice, in.CapPrice, in.IncrementRule); err != nil {
 		return domain.AuctionLot{}, domain.ErrInvalidArgument
 	}
-	if in.Status == "" {
-		in.Status = domain.AuctionStatusDraft
-	}
+	in.Status = normalizeClientAuctionStatus(in.Status)
 	if !in.Status.Valid() {
 		return domain.AuctionLot{}, domain.ErrInvalidArgument
 	}
-	if !in.allowSystemStatus && !isEditableAuctionStatus(in.Status) {
+	if !in.allowSystemStatus && !isClientWritableAuctionStatus(in.Status) {
 		return domain.AuctionLot{}, domain.ErrInvalidArgument
 	}
 	startTime, endTime, durationSec, err := normalizeAuctionTiming(in.StartTime, in.EndTime, in.DurationSec)
@@ -317,13 +315,20 @@ func (s *AuctionService) Update(ctx context.Context, id uint64, in UpdateAuction
 		}
 		current.AntiExtendMode = domain.NormalizeAuctionExtendMode(current.AntiExtendMode)
 		if in.Status != nil {
-			if !in.allowSystemStatus && !isEditableAuctionStatus(*in.Status) {
+			nextStatus := *in.Status
+			if !in.allowSystemStatus {
+				nextStatus = normalizeClientAuctionStatus(nextStatus)
+			}
+			if !nextStatus.Valid() {
 				return domain.ErrInvalidArgument
 			}
-			if !in.Status.Valid() || !domain.CanTransitionAuction(current.Status, *in.Status) {
+			if !in.allowSystemStatus && !isClientWritableAuctionStatus(nextStatus) {
+				return domain.ErrInvalidArgument
+			}
+			if !domain.CanTransitionAuction(current.Status, nextStatus) {
 				return domain.ErrInvalidState
 			}
-			current.Status = *in.Status
+			current.Status = nextStatus
 		}
 		snapshot, err := snapshotFromAuction(current)
 		if err != nil {
@@ -405,25 +410,39 @@ func (s *AuctionService) startWithTiming(ctx context.Context, id uint64, actorID
 	} else if startTime.IsZero() || endTime.IsZero() || !endTime.After(startTime) {
 		return domain.AuctionLot{}, domain.ErrInvalidArgument
 	}
-	status := domain.AuctionStatusRunning
-	input := UpdateAuctionInput{ActorID: actorID, ActorRole: actorRole, Status: &status, allowSystemStatus: true}
+	// P0-2 TCC：READY → WARMING_UP → InitAuction → RUNNING。
+	// Step1：先把 status 置为 WARMING_UP 并写入 startTime/endTime；事务/校验保持原样。
+	warming := domain.AuctionStatusWarmingUp
+	warmInput := UpdateAuctionInput{ActorID: actorID, ActorRole: actorRole, Status: &warming, allowSystemStatus: true}
 	if !startTime.IsZero() {
 		start := startTime.UTC()
-		input.StartTime = &start
+		warmInput.StartTime = &start
 	}
 	if !endTime.IsZero() {
 		end := endTime.UTC()
-		input.EndTime = &end
+		warmInput.EndTime = &end
 	}
-	auction, err := s.Update(ctx, id, input)
+	warmed, err := s.Update(ctx, id, warmInput)
 	if err != nil {
 		return domain.AuctionLot{}, err
 	}
-	if auction.EndTime.IsZero() || !auction.EndTime.After(now) {
+	if warmed.EndTime.IsZero() || !warmed.EndTime.After(now) {
 		return domain.AuctionLot{}, domain.ErrInvalidArgument
 	}
-	minIncrement := domain.MinIncrementForPrice(auction.IncrementRule, auction.StartPrice, s.cfg.MinIncrementCent)
-	state, err := s.realtime.InitAuction(ctx, auction, minIncrement)
+	// Step2：调 realtime.InitAuction。失败时不回退状态——保持 WARMING_UP 让监控/对账观察，
+	// 由调用方/告警决定后续动作（本轮不引入 reconciler）。
+	// 传给 InitAuction 的 auction 状态使用最终目标 RUNNING：MySQL 仍是 WARMING_UP，
+	// 但 Redis 直接写入 RUNNING 语义，避免 Step3 之后 RT 状态滞后于 MySQL。
+	rtAuction := warmed
+	rtAuction.Status = domain.AuctionStatusRunning
+	minIncrement := domain.MinIncrementForPrice(rtAuction.IncrementRule, rtAuction.StartPrice, s.cfg.MinIncrementCent)
+	state, err := s.realtime.InitAuction(ctx, rtAuction, minIncrement)
+	if err != nil {
+		return domain.AuctionLot{}, err
+	}
+	// Step3：InitAuction 成功后再把 status 置为 RUNNING；timing 已在 Step1 写入，无需重复传。
+	running := domain.AuctionStatusRunning
+	auction, err := s.Update(ctx, id, UpdateAuctionInput{ActorID: actorID, ActorRole: actorRole, Status: &running, allowSystemStatus: true})
 	if err != nil {
 		return domain.AuctionLot{}, err
 	}
@@ -527,7 +546,18 @@ func snapshotFromAuction(auction domain.AuctionLot) (json.RawMessage, error) {
 }
 
 func isEditableAuctionStatus(status domain.AuctionStatus) bool {
-	return status == domain.AuctionStatusDraft || status == domain.AuctionStatusPendingAudit
+	return status == domain.AuctionStatusDraft || status == domain.AuctionStatusPendingAudit || status == domain.AuctionStatusReady
+}
+
+func normalizeClientAuctionStatus(status domain.AuctionStatus) domain.AuctionStatus {
+	if status == "" {
+		return domain.AuctionStatusReady
+	}
+	return status
+}
+
+func isClientWritableAuctionStatus(status domain.AuctionStatus) bool {
+	return status == domain.AuctionStatusDraft || status == domain.AuctionStatusReady
 }
 
 func hasAuctionContentPatch(in UpdateAuctionInput) bool {

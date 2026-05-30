@@ -63,7 +63,16 @@ func (s *AuctionRealtimeStore) InitAuction(ctx context.Context, auction domain.A
 		Source:       "redis",
 	}
 	client, _ := s.shardForAuction(auction.AuctionID)
-	err = client.HSet(ctx, s.keys.AuctionState(auction.AuctionID),
+	pipe := client.Pipeline()
+	pipe.Del(ctx,
+		s.keys.AuctionBids(auction.AuctionID),
+		s.keys.AuctionUserBids(auction.AuctionID),
+		s.keys.AuctionStream(auction.AuctionID),
+		s.keys.AuctionSeq(auction.AuctionID),
+		s.keys.AuctionCloseLock(auction.AuctionID),
+	)
+	pipe.SRem(ctx, s.keys.ActiveStreams(), strconv.FormatUint(auction.AuctionID, 10))
+	pipe.HSet(ctx, s.keys.AuctionState(auction.AuctionID),
 		"auction_id", auction.AuctionID,
 		"status", string(auction.Status),
 		"start_price", auction.StartPrice,
@@ -80,7 +89,8 @@ func (s *AuctionRealtimeStore) InitAuction(ctx context.Context, auction domain.A
 		"max_bid_steps", rule.MaxBidSteps,
 		"increment_rule", string(auction.IncrementRule),
 		"anti_extend_mode", string(domain.NormalizeAuctionExtendMode(auction.AntiExtendMode)),
-	).Err()
+	)
+	_, err = pipe.Exec(ctx)
 	return state, err
 }
 
@@ -161,10 +171,6 @@ func (s *AuctionRealtimeStore) PlaceBid(ctx context.Context, input domain.BidInp
 	if input.ExpectedCurrentPrice != nil {
 		expectedCurrentPrice = strconv.FormatInt(*input.ExpectedCurrentPrice, 10)
 	}
-	expectedVersion := ""
-	if input.ExpectedVersion != nil {
-		expectedVersion = strconv.FormatInt(*input.ExpectedVersion, 10)
-	}
 	keys := []string{
 		s.keys.AuctionState(input.AuctionID),
 		s.keys.AuctionBids(input.AuctionID),
@@ -198,7 +204,6 @@ func (s *AuctionRealtimeStore) PlaceBid(ctx context.Context, input domain.BidInp
 		input.Source,
 		string(domain.NormalizeAuctionExtendMode(input.AntiExtendMode)),
 		expectedCurrentPrice,
-		expectedVersion,
 		traceParent,
 		traceState,
 	)

@@ -8,18 +8,22 @@ import (
 )
 
 const (
-	protocolVersion = "2025-06-18"
-	serverName      = "aieas-live-control-mcp"
-	serverVersion   = "1.1.0"
-	schemaVersion   = "aieas.mcp.live-control.v1"
+	protocolVersion      = "2025-06-18"
+	readServerName       = "aieas-read-mcp"
+	controlServerName    = "aieas-control-mcp"
+	serverVersion        = "1.2.0"
+	readSchemaVersion    = "aieas.mcp.read.v1"
+	controlSchemaVersion = "aieas.mcp.control.v1"
 )
 
 type Handler struct {
-	read     *service.MCPReadService
-	control  *service.MCPControlService
-	apiKey   string
-	apiActor service.MCPActor
-	metrics  *metrics.Registry
+	read          *service.MCPReadService
+	control       *service.MCPControlService
+	apiKey        string
+	apiActor      service.MCPActor
+	serverName    string
+	schemaVersion string
+	metrics       *metrics.Registry
 }
 
 type APIKeyAuthConfig struct {
@@ -27,8 +31,24 @@ type APIKeyAuthConfig struct {
 	Actor  service.MCPActor
 }
 
-func NewHandler(read *service.MCPReadService, control *service.MCPControlService, auth APIKeyAuthConfig) *Handler {
-	return &Handler{read: read, control: control, apiKey: auth.APIKey, apiActor: auth.Actor, metrics: metrics.Default()}
+func NewReadHandler(read *service.MCPReadService, auth APIKeyAuthConfig) *Handler {
+	return newHandler(read, nil, readServerName, readSchemaVersion, auth)
+}
+
+func NewControlHandler(control *service.MCPControlService, auth APIKeyAuthConfig) *Handler {
+	return newHandler(nil, control, controlServerName, controlSchemaVersion, auth)
+}
+
+func newHandler(read *service.MCPReadService, control *service.MCPControlService, name, schema string, auth APIKeyAuthConfig) *Handler {
+	return &Handler{
+		read:          read,
+		control:       control,
+		apiKey:        auth.APIKey,
+		apiActor:      auth.Actor,
+		serverName:    name,
+		schemaVersion: schema,
+		metrics:       metrics.Default(),
+	}
 }
 
 // SetMetrics 注入业务指标 Registry，用于上报 MCP tool/resource 调用情况。

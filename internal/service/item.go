@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"strconv"
 	"strings"
+	"time"
 
 	"aieas_backend/internal/domain"
 	"aieas_backend/internal/repository"
@@ -29,11 +31,16 @@ type ItemCache interface {
 // service 层据此转 domain.ErrNotFound，避免反复回源。
 var ErrItemNotCached = errors.New("service: item not cached (negative hit)")
 
+const productAuditHookTimeout = 30 * time.Second
+
 type ItemService struct {
-	items    repository.ItemRepository
-	auctions repository.AuctionRepository
-	auditor  ProductAuditor
-	cache    ItemCache
+	items                   repository.ItemRepository
+	auctions                repository.AuctionRepository
+	auditor                 ProductAuditor
+	liveHook                *LiveAgentHookService
+	productAuditCallbackURL string
+	productAuditCallbackKey string
+	cache                   ItemCache
 }
 
 type CreateItemInput struct {
@@ -69,6 +76,14 @@ type ProductAuditImage struct {
 	Image       []byte
 }
 
+type ProductAuditCallbackInput struct {
+	ItemID          uint64
+	Success         bool
+	IsApproved      bool
+	RejectReason    *string
+	CallbackContext map[string]interface{}
+}
+
 func NewItemService(items repository.ItemRepository) *ItemService {
 	return &ItemService{items: items}
 }
@@ -79,6 +94,15 @@ func (s *ItemService) SetAuctionRepository(auctions repository.AuctionRepository
 
 func (s *ItemService) SetProductAuditor(auditor ProductAuditor) {
 	s.auditor = auditor
+}
+
+func (s *ItemService) SetLiveAgentHookService(hook *LiveAgentHookService) {
+	s.liveHook = hook
+}
+
+func (s *ItemService) SetProductAuditCallback(callbackURL, callbackAPIKey string) {
+	s.productAuditCallbackURL = strings.TrimSpace(callbackURL)
+	s.productAuditCallbackKey = strings.TrimSpace(callbackAPIKey)
 }
 
 // SetCache 注入 Item 缓存；nil 表示禁用缓存（直接走 repo）。
@@ -132,10 +156,13 @@ func (s *ItemService) Create(ctx context.Context, in CreateItemInput) (domain.It
 		Status:         in.Status,
 	}
 	if in.ActorRole == domain.RoleMerchant {
-		item.Status = s.auditItem(ctx, item, in.AuditImage)
+		item.Status = domain.ItemStatusPendingAudit
 	}
 	if err := s.items.Create(ctx, &item); err != nil {
 		return domain.Item{}, err
+	}
+	if in.ActorRole == domain.RoleMerchant {
+		s.triggerProductAuditHook(item, in.AuditImage)
 	}
 	return item, nil
 }
@@ -196,6 +223,7 @@ func (s *ItemService) Update(ctx context.Context, id uint64, in UpdateItemInput)
 	} else if hasActiveAuction && hasCriticalItemPatch(in) {
 		return domain.Item{}, domain.ErrInvalidState
 	}
+	previousStatus := item.Status
 	if in.Title != nil {
 		title := strings.TrimSpace(*in.Title)
 		if title == "" {
@@ -236,33 +264,185 @@ func (s *ItemService) Update(ctx context.Context, id uint64, in UpdateItemInput)
 		item.Status = *in.Status
 	}
 	if in.ActorRole == domain.RoleMerchant {
-		item.Status = s.auditItem(ctx, item, in.AuditImage)
+		item.Status = domain.ItemStatusPendingAudit
 	}
 	if err := s.items.Update(ctx, &item); err != nil {
 		return domain.Item{}, err
 	}
 	s.invalidateCache(ctx, id)
+	s.emitItemStatusHook(ctx, item.SellerID, item.ID, previousStatus, item.Status)
+	if in.ActorRole == domain.RoleMerchant {
+		s.triggerProductAuditHook(item, in.AuditImage)
+	}
 	return item, nil
 }
 
-func (s *ItemService) auditItem(ctx context.Context, item domain.Item, image *ProductAuditImage) domain.ItemStatus {
-	if s.auditor == nil || image == nil || len(image.Image) == 0 {
-		return domain.ItemStatusPendingAudit
+func (s *ItemService) emitItemStatusHook(ctx context.Context, sellerID string, itemID uint64, from, to domain.ItemStatus) {
+	if s.liveHook == nil || from == to {
+		return
 	}
-	result, err := s.auditor.AuditProduct(ctx, ProductAuditInput{
-		ProductText: buildProductAuditText(item),
+	switch to {
+	case domain.ItemStatusListed:
+		s.liveHook.EmitItemListed(ctx, sellerID, itemID)
+	case domain.ItemStatusOffline:
+		s.liveHook.EmitItemOffline(ctx, sellerID, itemID)
+	}
+}
+
+func (s *ItemService) triggerProductAuditHook(item domain.Item, image *ProductAuditImage) {
+	if s.auditor == nil || image == nil || len(image.Image) == 0 || s.productAuditCallbackURL == "" {
+		return
+	}
+	auditItem := item
+	auditImage := cloneProductAuditImage(image)
+	callbackHeaders := map[string]string{}
+	if s.productAuditCallbackKey != "" {
+		callbackHeaders["X-Callback-Key"] = s.productAuditCallbackKey
+		callbackHeaders["Authorization"] = "Bearer " + s.productAuditCallbackKey
+	}
+	go func() {
+		defer func() { _ = recover() }()
+		ctx, cancel := context.WithTimeout(context.Background(), productAuditHookTimeout)
+		defer cancel()
+		result, err := s.auditor.AuditProduct(ctx, ProductAuditInput{
+			ProductText:     buildProductAuditText(auditItem),
+			ImageName:       auditImage.ImageName,
+			ContentType:     auditImage.ContentType,
+			ImageSize:       auditImage.ImageSize,
+			Image:           append([]byte(nil), auditImage.Image...),
+			CallbackURL:     s.productAuditCallbackURL,
+			CallbackHeaders: callbackHeaders,
+			CallbackContext: buildProductAuditCallbackContext(auditItem),
+		})
+		if err != nil {
+			if !errors.Is(err, ErrProductAuditUnavailable) {
+				slog.Default().Warn("product audit hook failed", "item_id", auditItem.ID, "error", err)
+			}
+			return
+		}
+		if !result.Success {
+			slog.Default().Warn("product audit hook not accepted", "item_id", auditItem.ID, "status", result.Status, "message", result.Message)
+			return
+		}
+	}()
+}
+
+func (s *ItemService) HandleProductAuditCallback(ctx context.Context, in ProductAuditCallbackInput) (domain.Item, error) {
+	itemID := in.ItemID
+	if itemID == 0 {
+		itemID = uint64FromCallbackContext(in.CallbackContext, "itemId", "item_id")
+	}
+	if itemID == 0 {
+		return domain.Item{}, domain.ErrInvalidArgument
+	}
+	item, err := s.items.FindByID(ctx, itemID)
+	if err != nil {
+		return domain.Item{}, err
+	}
+	if !in.Success {
+		return item, nil
+	}
+	snapshot, ok := productAuditSnapshotFromCallbackContext(in.CallbackContext)
+	if !ok {
+		return domain.Item{}, domain.ErrInvalidArgument
+	}
+	if !sameProductAuditSnapshot(item, snapshot) {
+		return item, nil
+	}
+	if item.Status != domain.ItemStatusPendingAudit {
+		return item, nil
+	}
+	nextStatus := domain.ItemStatusRejected
+	if in.IsApproved {
+		nextStatus = domain.ItemStatusReady
+	}
+	item.Status = nextStatus
+	if err := s.items.Update(ctx, &item); err != nil {
+		return domain.Item{}, err
+	}
+	s.invalidateCache(ctx, item.ID)
+	return item, nil
+}
+
+func cloneProductAuditImage(image *ProductAuditImage) ProductAuditImage {
+	if image == nil {
+		return ProductAuditImage{}
+	}
+	return ProductAuditImage{
 		ImageName:   image.ImageName,
 		ContentType: image.ContentType,
 		ImageSize:   image.ImageSize,
 		Image:       append([]byte(nil), image.Image...),
-	})
-	if err != nil || !result.Success {
-		return domain.ItemStatusPendingAudit
 	}
-	if result.IsApproved {
-		return domain.ItemStatusReady
+}
+
+func sameProductAuditSnapshot(current, snapshot domain.Item) bool {
+	return strings.TrimSpace(current.Title) == strings.TrimSpace(snapshot.Title) &&
+		strings.TrimSpace(current.Category) == strings.TrimSpace(snapshot.Category) &&
+		strings.TrimSpace(current.Brand) == strings.TrimSpace(snapshot.Brand) &&
+		current.ConditionGrade == snapshot.ConditionGrade &&
+		strings.TrimSpace(current.Description) == strings.TrimSpace(snapshot.Description) &&
+		string(current.Images) == string(snapshot.Images)
+}
+
+func buildProductAuditCallbackContext(item domain.Item) map[string]interface{} {
+	return map[string]interface{}{
+		"itemId":   item.ID,
+		"sellerId": strings.TrimSpace(item.SellerID),
+		"snapshot": map[string]interface{}{
+			"title":          strings.TrimSpace(item.Title),
+			"category":       strings.TrimSpace(item.Category),
+			"brand":          strings.TrimSpace(item.Brand),
+			"conditionGrade": item.ConditionGrade,
+			"description":    strings.TrimSpace(item.Description),
+			"images":         productAuditSnapshotImages(item.Images),
+		},
 	}
-	return domain.ItemStatusRejected
+}
+
+func productAuditSnapshotImages(raw json.RawMessage) []string {
+	var images []string
+	if len(raw) == 0 || json.Unmarshal(raw, &images) != nil {
+		return []string{}
+	}
+	return images
+}
+
+func productAuditSnapshotFromCallbackContext(ctx map[string]interface{}) (domain.Item, bool) {
+	raw, ok := ctx["snapshot"]
+	if !ok || raw == nil {
+		return domain.Item{}, false
+	}
+	payload, err := json.Marshal(raw)
+	if err != nil {
+		return domain.Item{}, false
+	}
+	var snapshot struct {
+		Title          string                `json:"title"`
+		Category       string                `json:"category"`
+		Brand          string                `json:"brand"`
+		ConditionGrade domain.ConditionGrade `json:"conditionGrade"`
+		Images         []string              `json:"images"`
+		Description    string                `json:"description"`
+	}
+	if err := json.Unmarshal(payload, &snapshot); err != nil {
+		return domain.Item{}, false
+	}
+	if strings.TrimSpace(snapshot.Title) == "" || strings.TrimSpace(snapshot.Category) == "" || !snapshot.ConditionGrade.Valid() {
+		return domain.Item{}, false
+	}
+	images, err := json.Marshal(snapshot.Images)
+	if err != nil {
+		return domain.Item{}, false
+	}
+	return domain.Item{
+		Title:          strings.TrimSpace(snapshot.Title),
+		Category:       strings.TrimSpace(snapshot.Category),
+		Brand:          strings.TrimSpace(snapshot.Brand),
+		ConditionGrade: snapshot.ConditionGrade,
+		Images:         images,
+		Description:    strings.TrimSpace(snapshot.Description),
+	}, true
 }
 
 func buildProductAuditText(item domain.Item) string {

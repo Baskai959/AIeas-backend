@@ -10,7 +10,8 @@ services:
       - --default-time-zone=+08:00
     volumes:
       - mysql-data:/var/lib/mysql
-      - ./docs/ddl.sql:/docker-entrypoint-initdb.d/001_aieas.sql:ro
+      - ./docker/mysql-init/001_init.sql:/docker-entrypoint-initdb.d/001_init.sql:ro
+      - ./docs/ddl.sql:/docker-init/ddl.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u\"$${MYSQL_USER}\" -p\"$${MYSQL_PASSWORD}\" --silent"]
       interval: 10s
@@ -100,8 +101,79 @@ services:
     ports:
       - "0.0.0.0:8888:8888"
 
+  prometheus:
+    image: prom/prometheus:v3.1.0
+    restart: unless-stopped
+    env_file:
+      - ./docker/prod.env
+    depends_on:
+      app:
+        condition: service_started
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - |
+        : "$${OBSERVABILITY_METRICS_AUTH_TOKEN:?OBSERVABILITY_METRICS_AUTH_TOKEN is required in ./docker/prod.env}"
+        cat > /tmp/prometheus.yml <<EOF
+        global:
+          scrape_interval: 15s
+          evaluation_interval: 15s
+
+        scrape_configs:
+          - job_name: aieas-backend
+            metrics_path: /metrics
+            authorization:
+              type: Bearer
+              credentials: "$${OBSERVABILITY_METRICS_AUTH_TOKEN}"
+            static_configs:
+              - targets:
+                  - app:8888
+        EOF
+        exec /bin/prometheus \
+          --config.file=/tmp/prometheus.yml \
+          --storage.tsdb.path=/prometheus \
+          --storage.tsdb.retention.time=15d \
+          --web.enable-lifecycle
+    volumes:
+      - prometheus-data:/prometheus
+    ports:
+      - "127.0.0.1:9090:9090"
+
+  grafana:
+    image: grafana/grafana:11.4.0
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    depends_on:
+      prometheus:
+        condition: service_started
+    configs:
+      - source: grafana_datasource
+        target: /etc/grafana/provisioning/datasources/prometheus.yml
+    volumes:
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "0.0.0.0:3000:3000"
+
 volumes:
   mysql-data:
   redis-rt-1-data:
   redis-rt-2-data:
   redis-cache-data:
+  prometheus-data:
+  grafana-data:
+
+configs:
+  grafana_datasource:
+    content: |
+      apiVersion: 1
+
+      datasources:
+        - name: Prometheus
+          type: prometheus
+          access: proxy
+          url: http://prometheus:9090
+          isDefault: true
+          editable: true

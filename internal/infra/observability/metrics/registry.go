@@ -1,5 +1,5 @@
 // Package metrics 提供进程级 Prometheus 指标 Registry，以及面向 HTTP / 出价 /
-// 落槌 / 报名 / Redis / MySQL / Worker / WebSocket / Agent 各业务领域的指标收集器。
+// 落槌 / 报名 / Redis / Worker / WebSocket / Agent 各业务领域的指标收集器。
 //
 // 注意基数约束：所有 label 必须是有限低基数维度（route/method/status/result/
 // reason/script/operation/event_type/...）。**严禁** 把 user_id / auction_id /
@@ -32,67 +32,48 @@ type Registry struct {
 	httpResponseBytes    *prometheus.HistogramVec
 
 	// Bid
-	bidTotal               *prometheus.CounterVec
-	bidDuration            prometheus.Histogram
-	bidLuaDuration         *prometheus.HistogramVec
-	bidRejectTotal         *prometheus.CounterVec
-	bidDuplicateTotal      prometheus.Counter
-	bidFreqLimitTotal      prometheus.Counter
-	bidPrecheckRejectTotal *prometheus.CounterVec
-	bidStreamWriteTotal    *prometheus.CounterVec
+	bidTotal          *prometheus.CounterVec
+	bidDuration       prometheus.Histogram
+	bidRejectTotal    *prometheus.CounterVec
+	bidDuplicateTotal prometheus.Counter
+	bidFreqLimitTotal prometheus.Counter
 
 	// Hammer
-	hammerTotal                    *prometheus.CounterVec
-	hammerDuration                 prometheus.Histogram
-	hammerLuaDuration              *prometheus.HistogramVec
-	hammerMySQLTxDuration          prometheus.Histogram
-	hammerDuplicateTotal           prometheus.Counter
-	hammerOptimisticConflictTotal  prometheus.Counter
-	hammerMySQLFailTotal           prometheus.Counter
-	auctionClosedReconcileTotal    *prometheus.CounterVec
+	hammerTotal                   *prometheus.CounterVec
+	hammerDuration                prometheus.Histogram
+	hammerMySQLTxDuration         prometheus.Histogram
+	hammerDuplicateTotal          prometheus.Counter
+	hammerOptimisticConflictTotal prometheus.Counter
+	hammerMySQLFailTotal          prometheus.Counter
 
 	// Enroll & Deposit
-	enrollTotal                    *prometheus.CounterVec
-	enrollDuration                 prometheus.Histogram
-	depositReadyTotal              prometheus.Counter
-	depositSyncRedisFailTotal      prometheus.Counter
-	depositReconcileTotal          *prometheus.CounterVec
-	depositReconcileLagSeconds     prometheus.Histogram
+	enrollTotal                *prometheus.CounterVec
+	enrollDuration             prometheus.Histogram
+	depositReadyTotal          prometheus.Counter
+	depositSyncRedisFailTotal  prometheus.Counter
+	depositReconcileTotal      *prometheus.CounterVec
+	depositReconcileLagSeconds prometheus.Histogram
 
 	// Redis
 	redisCommandDuration *prometheus.HistogramVec
 	redisCommandErrors   *prometheus.CounterVec
 	redisLuaDuration     *prometheus.HistogramVec
 	redisLuaErrors       *prometheus.CounterVec
-	redisStreamXadd      *prometheus.CounterVec
-	redisLockAcquire     *prometheus.CounterVec
-
-	// MySQL (应用层补充指标，与 GORM 慢 SQL 日志互补)
-	mysqlQueryDuration *prometheus.HistogramVec
-	mysqlTxDuration    *prometheus.HistogramVec
-	mysqlQueryErrors   *prometheus.CounterVec
-	mysqlSlowQueries   prometheus.Counter
 
 	// Worker (Redis Stream)
-	workerBidRecordConsumeTotal    *prometheus.CounterVec
-	workerBidRecordWriteDuration   prometheus.Histogram
-	workerBidRecordDuplicateTotal  *prometheus.CounterVec
-	workerBidRecordDLQTotal        *prometheus.CounterVec
-	workerReconcileTotal           *prometheus.CounterVec
+	workerBidRecordConsumeTotal  *prometheus.CounterVec
+	workerBidRecordWriteDuration prometheus.Histogram
+	workerBidRecordDLQTotal      *prometheus.CounterVec
+	workerTaskTotal              *prometheus.CounterVec
 
 	// WebSocket
-	wsConnections             prometheus.Gauge
-	wsConnectionTotal         *prometheus.CounterVec
-	wsBroadcastDuration       prometheus.Histogram
-	wsBroadcastFanoutTotal    prometheus.Counter
-	wsBroadcastQueueLength    prometheus.Gauge
-	wsMessageDropTotal        *prometheus.CounterVec
-	wsSlowClientDisconnect    prometheus.Counter
-	wsHeartbeatTimeoutTotal   prometheus.Counter
+	wsConnections          prometheus.Gauge
+	wsConnectionTotal      *prometheus.CounterVec
+	wsBroadcastDuration    prometheus.Histogram
+	wsBroadcastFanoutTotal prometheus.Counter
+	wsSlowClientDisconnect prometheus.Counter
 
 	// Agent
-	agentTaskTotal       *prometheus.CounterVec
-	agentTaskDuration    *prometheus.HistogramVec
 	agentToolCallTotal   *prometheus.CounterVec
 	agentToolCallLatency *prometheus.HistogramVec
 }
@@ -196,10 +177,6 @@ func (r *Registry) register() {
 		Namespace: ns, Name: "auction_bid_duration_seconds", Help: "Bid handler duration",
 		Buckets: durBucketsFast,
 	})
-	r.bidLuaDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
-		Namespace: ns, Name: "auction_bid_lua_duration_seconds", Help: "Bid Lua script duration",
-		Buckets: durBucketsRedis,
-	}, []string{"script"})
 	r.bidRejectTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: ns, Name: "auction_bid_reject_total", Help: "Bid rejection by reason",
 	}, []string{"reason"})
@@ -209,12 +186,6 @@ func (r *Registry) register() {
 	r.bidFreqLimitTotal = prometheus.NewCounter(prometheus.CounterOpts{
 		Namespace: ns, Name: "auction_bid_freq_limit_total", Help: "Bids hitting frequency limit",
 	})
-	r.bidPrecheckRejectTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Namespace: ns, Name: "auction_bid_precheck_reject_total", Help: "Bid pre-check rejections",
-	}, []string{"reason"})
-	r.bidStreamWriteTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Namespace: ns, Name: "auction_bid_stream_write_total", Help: "Bid stream write outcome",
-	}, []string{"result"})
 
 	// Hammer ---------------------------------------------------------------
 	r.hammerTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
@@ -224,10 +195,6 @@ func (r *Registry) register() {
 		Namespace: ns, Name: "auction_hammer_duration_seconds", Help: "Hammer duration",
 		Buckets: durBucketsFast,
 	})
-	r.hammerLuaDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
-		Namespace: ns, Name: "auction_hammer_lua_duration_seconds", Help: "Hammer Lua duration",
-		Buckets: durBucketsRedis,
-	}, []string{"script"})
 	r.hammerMySQLTxDuration = prometheus.NewHistogram(prometheus.HistogramOpts{
 		Namespace: ns, Name: "auction_hammer_mysql_tx_duration_seconds", Help: "Hammer MySQL tx duration",
 		Buckets: durBucketsFast,
@@ -241,9 +208,6 @@ func (r *Registry) register() {
 	r.hammerMySQLFailTotal = prometheus.NewCounter(prometheus.CounterOpts{
 		Namespace: ns, Name: "auction_hammer_mysql_fail_total", Help: "Hammer MySQL persistence failures",
 	})
-	r.auctionClosedReconcileTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Namespace: ns, Name: "auction_closed_reconcile_total", Help: "Auction-closed reconciler outcome",
-	}, []string{"result"})
 
 	// Enroll & deposit -----------------------------------------------------
 	r.enrollTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
@@ -282,28 +246,6 @@ func (r *Registry) register() {
 	r.redisLuaErrors = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: ns, Name: "redis_lua_errors_total", Help: "Redis Lua script errors",
 	}, []string{"script", "error"})
-	r.redisStreamXadd = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Namespace: ns, Name: "redis_stream_xadd_total", Help: "Redis stream XADD outcome",
-	}, []string{"stream", "result"})
-	r.redisLockAcquire = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Namespace: ns, Name: "redis_lock_acquire_total", Help: "Distributed lock acquire outcome",
-	}, []string{"lock", "result"})
-
-	// MySQL ----------------------------------------------------------------
-	r.mysqlQueryDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
-		Namespace: ns, Name: "mysql_query_duration_seconds", Help: "MySQL query duration",
-		Buckets: durBucketsFast,
-	}, []string{"operation"})
-	r.mysqlTxDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
-		Namespace: ns, Name: "mysql_tx_duration_seconds", Help: "MySQL transaction duration",
-		Buckets: durBucketsFast,
-	}, []string{"operation"})
-	r.mysqlQueryErrors = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Namespace: ns, Name: "mysql_query_errors_total", Help: "MySQL query errors",
-	}, []string{"operation"})
-	r.mysqlSlowQueries = prometheus.NewCounter(prometheus.CounterOpts{
-		Namespace: ns, Name: "mysql_slow_query_total", Help: "MySQL slow queries observed",
-	})
 
 	// Worker ---------------------------------------------------------------
 	r.workerBidRecordConsumeTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
@@ -313,15 +255,12 @@ func (r *Registry) register() {
 		Namespace: ns, Name: "worker_bid_record_write_duration_seconds", Help: "Bid record write duration",
 		Buckets: durBucketsFast,
 	})
-	r.workerBidRecordDuplicateTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Namespace: ns, Name: "worker_bid_record_duplicate_total", Help: "Bid record duplicate outcome",
-	}, []string{"result"})
 	r.workerBidRecordDLQTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: ns, Name: "worker_bid_record_dlq_total", Help: "Bid record dead-letter queue writes",
 	}, []string{"reason"})
-	r.workerReconcileTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Namespace: ns, Name: "worker_reconcile_total", Help: "Reconciliation outcome",
-	}, []string{"type", "result"})
+	r.workerTaskTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: ns, Name: "worker_task_total", Help: "Background worker task outcome",
+	}, []string{"worker", "result"})
 
 	// WebSocket ------------------------------------------------------------
 	r.wsConnections = prometheus.NewGauge(prometheus.GaugeOpts{
@@ -337,27 +276,11 @@ func (r *Registry) register() {
 	r.wsBroadcastFanoutTotal = prometheus.NewCounter(prometheus.CounterOpts{
 		Namespace: ns, Name: "ws_broadcast_fanout_total", Help: "WebSocket broadcast fan-out total",
 	})
-	r.wsBroadcastQueueLength = prometheus.NewGauge(prometheus.GaugeOpts{
-		Namespace: ns, Name: "ws_broadcast_queue_length", Help: "Current broadcast queue length",
-	})
-	r.wsMessageDropTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Namespace: ns, Name: "ws_message_drop_total", Help: "WebSocket message drops",
-	}, []string{"reason"})
 	r.wsSlowClientDisconnect = prometheus.NewCounter(prometheus.CounterOpts{
 		Namespace: ns, Name: "ws_slow_client_disconnect_total", Help: "WebSocket slow-client disconnects",
 	})
-	r.wsHeartbeatTimeoutTotal = prometheus.NewCounter(prometheus.CounterOpts{
-		Namespace: ns, Name: "ws_heartbeat_timeout_total", Help: "WebSocket heartbeat timeout",
-	})
 
 	// Agent ----------------------------------------------------------------
-	r.agentTaskTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Namespace: ns, Name: "agent_task_total", Help: "Agent task outcome",
-	}, []string{"type", "status"})
-	r.agentTaskDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
-		Namespace: ns, Name: "agent_task_duration_seconds", Help: "Agent task duration",
-		Buckets: durBucketsHTTP,
-	}, []string{"type"})
 	r.agentToolCallTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: ns, Name: "agent_tool_call_total", Help: "Agent tool call outcome",
 	}, []string{"tool", "status"})
@@ -369,27 +292,21 @@ func (r *Registry) register() {
 	collectors := []prometheus.Collector{
 		r.httpRequestsTotal, r.httpRequestDuration, r.httpInflight,
 		r.httpRequestBodyBytes, r.httpResponseBytes,
-		r.bidTotal, r.bidDuration, r.bidLuaDuration, r.bidRejectTotal,
-		r.bidDuplicateTotal, r.bidFreqLimitTotal, r.bidPrecheckRejectTotal,
-		r.bidStreamWriteTotal,
-		r.hammerTotal, r.hammerDuration, r.hammerLuaDuration,
+		r.bidTotal, r.bidDuration, r.bidRejectTotal,
+		r.bidDuplicateTotal, r.bidFreqLimitTotal,
+		r.hammerTotal, r.hammerDuration,
 		r.hammerMySQLTxDuration, r.hammerDuplicateTotal,
 		r.hammerOptimisticConflictTotal, r.hammerMySQLFailTotal,
-		r.auctionClosedReconcileTotal,
 		r.enrollTotal, r.enrollDuration,
 		r.depositReadyTotal, r.depositSyncRedisFailTotal,
 		r.depositReconcileTotal, r.depositReconcileLagSeconds,
 		r.redisCommandDuration, r.redisCommandErrors, r.redisLuaDuration,
-		r.redisLuaErrors, r.redisStreamXadd, r.redisLockAcquire,
-		r.mysqlQueryDuration, r.mysqlTxDuration, r.mysqlQueryErrors,
-		r.mysqlSlowQueries,
+		r.redisLuaErrors,
 		r.workerBidRecordConsumeTotal, r.workerBidRecordWriteDuration,
-		r.workerBidRecordDuplicateTotal, r.workerBidRecordDLQTotal,
-		r.workerReconcileTotal,
+		r.workerBidRecordDLQTotal,
+		r.workerTaskTotal,
 		r.wsConnections, r.wsConnectionTotal, r.wsBroadcastDuration,
-		r.wsBroadcastFanoutTotal, r.wsBroadcastQueueLength,
-		r.wsMessageDropTotal, r.wsSlowClientDisconnect, r.wsHeartbeatTimeoutTotal,
-		r.agentTaskTotal, r.agentTaskDuration,
+		r.wsBroadcastFanoutTotal, r.wsSlowClientDisconnect,
 		r.agentToolCallTotal, r.agentToolCallLatency,
 	}
 	for _, c := range collectors {

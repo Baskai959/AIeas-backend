@@ -26,7 +26,7 @@ func TestAuctionRealtimeStorePlaceBidWritesStreamAndIsIdempotent(t *testing.T) {
 		t.Fatalf("deposit: %v", err)
 	}
 
-	result, err := store.PlaceBid(ctx, domain.BidInput{RequestID: "req-1", AuctionID: auctionID, BidderID: "u_1001", Price: 1100, Now: now, Source: "live_ws", MinIncrement: 100, IdempotencyTTL: time.Hour})
+	result, err := store.PlaceBid(ctx, domain.BidInput{RequestID: "req-1", AuctionID: auctionID, BidderID: "u_1001", Price: 1100, ExpectedCurrentPrice: expectedCurrentPrice(1000), Now: now, Source: "live_ws", MinIncrement: 100, IdempotencyTTL: time.Hour})
 	if err != nil {
 		t.Fatalf("place accepted bid: %v", err)
 	}
@@ -41,7 +41,7 @@ func TestAuctionRealtimeStorePlaceBidWritesStreamAndIsIdempotent(t *testing.T) {
 		t.Fatalf("unexpected accepted stream entries: %+v", entries)
 	}
 
-	duplicate, err := store.PlaceBid(ctx, domain.BidInput{RequestID: "req-1", AuctionID: auctionID, BidderID: "u_1001", Price: 1500, Now: now.Add(time.Second), Source: "live_ws", MinIncrement: 100, IdempotencyTTL: time.Hour})
+	duplicate, err := store.PlaceBid(ctx, domain.BidInput{RequestID: "req-1", AuctionID: auctionID, BidderID: "u_1001", Price: 1500, ExpectedCurrentPrice: expectedCurrentPrice(1100), Now: now.Add(time.Second), Source: "live_ws", MinIncrement: 100, IdempotencyTTL: time.Hour})
 	if err != nil {
 		t.Fatalf("duplicate bid: %v", err)
 	}
@@ -61,7 +61,7 @@ func TestAuctionRealtimeStoreRejectedBidWritesStreamAndReplayGap(t *testing.T) {
 	now := time.UnixMilli(1700000000000).UTC()
 	mustInitRunningAuction(t, ctx, client, keys, auctionID, now)
 
-	rejected, err := store.PlaceBid(ctx, domain.BidInput{RequestID: "req-reject", AuctionID: auctionID, BidderID: "u_missing", Price: 1100, Now: now, Source: "live_ws", MinIncrement: 100, IdempotencyTTL: time.Hour})
+	rejected, err := store.PlaceBid(ctx, domain.BidInput{RequestID: "req-reject", AuctionID: auctionID, BidderID: "u_missing", Price: 1100, ExpectedCurrentPrice: expectedCurrentPrice(1000), Now: now, Source: "live_ws", MinIncrement: 100, IdempotencyTTL: time.Hour})
 	if err != nil {
 		t.Fatalf("place rejected bid: %v", err)
 	}
@@ -108,32 +108,32 @@ func TestAuctionRealtimeStoreFixedRuleValidatesStepAndCap(t *testing.T) {
 		t.Fatalf("mark enrollment 2: %v", err)
 	}
 
-	mismatch, err := store.PlaceBid(ctx, domain.BidInput{RequestID: "fixed-mismatch", AuctionID: auctionID, BidderID: "u_1001", Price: 1150, Now: now, Source: "live_ws", MinIncrement: 100, IdempotencyTTL: time.Hour})
+	mismatch, err := store.PlaceBid(ctx, domain.BidInput{RequestID: "fixed-mismatch", AuctionID: auctionID, BidderID: "u_1001", Price: 1150, ExpectedCurrentPrice: expectedCurrentPrice(1000), Now: now, Source: "live_ws", MinIncrement: 100, IdempotencyTTL: time.Hour})
 	if err != nil {
 		t.Fatalf("step mismatch bid: %v", err)
 	}
 	if mismatch.Accepted || mismatch.Reason != domain.BidRejectStepMismatch {
 		t.Fatalf("expected step mismatch rejection, got %+v", mismatch)
 	}
-	tooHigh, err := store.PlaceBid(ctx, domain.BidInput{RequestID: "fixed-too-high", AuctionID: auctionID, BidderID: "u_1001", Price: 1500, Now: now.Add(time.Second), Source: "live_ws", MinIncrement: 100, IdempotencyTTL: time.Hour})
+	tooHigh, err := store.PlaceBid(ctx, domain.BidInput{RequestID: "fixed-too-high", AuctionID: auctionID, BidderID: "u_1001", Price: 1500, ExpectedCurrentPrice: expectedCurrentPrice(1000), Now: now.Add(time.Second), Source: "live_ws", MinIncrement: 100, IdempotencyTTL: time.Hour})
 	if err != nil {
 		t.Fatalf("too high bid: %v", err)
 	}
 	if tooHigh.Accepted || tooHigh.Reason != domain.BidRejectAboveMaxBidSteps {
 		t.Fatalf("expected max steps rejection, got %+v", tooHigh)
 	}
-	okBid, err := store.PlaceBid(ctx, domain.BidInput{RequestID: "fixed-ok", AuctionID: auctionID, BidderID: "u_1001", Price: 1300, Now: now.Add(2 * time.Second), Source: "live_ws", MinIncrement: 100, IdempotencyTTL: time.Hour})
+	okBid, err := store.PlaceBid(ctx, domain.BidInput{RequestID: "fixed-ok", AuctionID: auctionID, BidderID: "u_1001", Price: 1300, ExpectedCurrentPrice: expectedCurrentPrice(1000), Now: now.Add(2 * time.Second), Source: "live_ws", MinIncrement: 100, IdempotencyTTL: time.Hour})
 	if err != nil || !okBid.Accepted || okBid.CurrentPrice != 1300 {
 		t.Fatalf("expected fixed bid accept, result=%+v err=%v", okBid, err)
 	}
-	aboveCap, err := store.PlaceBid(ctx, domain.BidInput{RequestID: "fixed-above-cap", AuctionID: auctionID, BidderID: "u_1002", Price: 2100, Now: now.Add(3 * time.Second), Source: "live_ws", MinIncrement: 100, IdempotencyTTL: time.Hour})
+	aboveCap, err := store.PlaceBid(ctx, domain.BidInput{RequestID: "fixed-above-cap", AuctionID: auctionID, BidderID: "u_1002", Price: 2100, ExpectedCurrentPrice: expectedCurrentPrice(1300), Now: now.Add(3 * time.Second), Source: "live_ws", MinIncrement: 100, IdempotencyTTL: time.Hour})
 	if err != nil {
 		t.Fatalf("above cap bid: %v", err)
 	}
 	if aboveCap.Accepted || aboveCap.Reason != domain.BidRejectAboveCapPrice {
 		t.Fatalf("expected cap rejection, got %+v", aboveCap)
 	}
-	capBid, err := store.PlaceBid(ctx, domain.BidInput{RequestID: "fixed-cap", AuctionID: auctionID, BidderID: "u_1002", Price: 1600, Now: now.Add(4 * time.Second), Source: "live_ws", MinIncrement: 100, IdempotencyTTL: time.Hour})
+	capBid, err := store.PlaceBid(ctx, domain.BidInput{RequestID: "fixed-cap", AuctionID: auctionID, BidderID: "u_1002", Price: 1600, ExpectedCurrentPrice: expectedCurrentPrice(1300), Now: now.Add(4 * time.Second), Source: "live_ws", MinIncrement: 100, IdempotencyTTL: time.Hour})
 	if err != nil || !capBid.Accepted || capBid.AutoClosed {
 		t.Fatalf("expected non-cap bid accept, result=%+v err=%v", capBid, err)
 	}
@@ -163,20 +163,22 @@ func TestAuctionRealtimeStoreLadderRuleUsesCurrentPriceBand(t *testing.T) {
 	if err := store.MarkEnrollment(ctx, auctionID, "u_1002"); err != nil {
 		t.Fatalf("mark enrollment 2: %v", err)
 	}
+	currentPrice := int64(1000)
 	for i, price := range []int64{1300, 1600, 1900, 2200} {
-		result, err := store.PlaceBid(ctx, domain.BidInput{RequestID: "ladder-ok-" + strconv.Itoa(i), AuctionID: auctionID, BidderID: "u_1001", Price: price, Now: now.Add(time.Duration(i) * time.Second), Source: "live_ws", MinIncrement: 100, IdempotencyTTL: time.Hour})
+		result, err := store.PlaceBid(ctx, domain.BidInput{RequestID: "ladder-ok-" + strconv.Itoa(i), AuctionID: auctionID, BidderID: "u_1001", Price: price, ExpectedCurrentPrice: expectedCurrentPrice(currentPrice), Now: now.Add(time.Duration(i) * time.Second), Source: "live_ws", MinIncrement: 100, IdempotencyTTL: time.Hour})
 		if err != nil || !result.Accepted || result.CurrentPrice != price {
 			t.Fatalf("expected ladder bid %d accepted, result=%+v err=%v", price, result, err)
 		}
+		currentPrice = price
 	}
-	mismatch, err := store.PlaceBid(ctx, domain.BidInput{RequestID: "ladder-mismatch", AuctionID: auctionID, BidderID: "u_1002", Price: 2300, Now: now.Add(5 * time.Second), Source: "live_ws", MinIncrement: 100, IdempotencyTTL: time.Hour})
+	mismatch, err := store.PlaceBid(ctx, domain.BidInput{RequestID: "ladder-mismatch", AuctionID: auctionID, BidderID: "u_1002", Price: 2300, ExpectedCurrentPrice: expectedCurrentPrice(currentPrice), Now: now.Add(5 * time.Second), Source: "live_ws", MinIncrement: 100, IdempotencyTTL: time.Hour})
 	if err != nil {
 		t.Fatalf("ladder mismatch bid: %v", err)
 	}
 	if mismatch.Accepted || mismatch.Reason != domain.BidRejectStepMismatch {
 		t.Fatalf("expected ladder step mismatch, got %+v", mismatch)
 	}
-	okBid, err := store.PlaceBid(ctx, domain.BidInput{RequestID: "ladder-second-band-ok", AuctionID: auctionID, BidderID: "u_1002", Price: 3700, Now: now.Add(6 * time.Second), Source: "live_ws", MinIncrement: 100, IdempotencyTTL: time.Hour})
+	okBid, err := store.PlaceBid(ctx, domain.BidInput{RequestID: "ladder-second-band-ok", AuctionID: auctionID, BidderID: "u_1002", Price: 3700, ExpectedCurrentPrice: expectedCurrentPrice(currentPrice), Now: now.Add(6 * time.Second), Source: "live_ws", MinIncrement: 100, IdempotencyTTL: time.Hour})
 	if err != nil || !okBid.Accepted || okBid.CurrentPrice != 3700 {
 		t.Fatalf("expected second band bid accept, result=%+v err=%v", okBid, err)
 	}
@@ -203,7 +205,7 @@ func TestAuctionRealtimeStoreCapBidAutoCloses(t *testing.T) {
 	if err := store.MarkEnrollment(ctx, auctionID, "u_1001"); err != nil {
 		t.Fatalf("mark enrollment: %v", err)
 	}
-	result, err := store.PlaceBid(ctx, domain.BidInput{RequestID: "cap-ok", AuctionID: auctionID, BidderID: "u_1001", Price: 1950, Now: now, Source: "live_ws", MinIncrement: 100, IdempotencyTTL: time.Hour})
+	result, err := store.PlaceBid(ctx, domain.BidInput{RequestID: "cap-ok", AuctionID: auctionID, BidderID: "u_1001", Price: 1950, ExpectedCurrentPrice: expectedCurrentPrice(1000), Now: now, Source: "live_ws", MinIncrement: 100, IdempotencyTTL: time.Hour})
 	if err != nil {
 		t.Fatalf("cap bid: %v", err)
 	}
@@ -237,7 +239,7 @@ func TestAuctionRealtimeStoreRejectsStaleExpectedState(t *testing.T) {
 	if err := store.MarkEnrollment(ctx, auctionID, "u_1001"); err != nil {
 		t.Fatalf("mark enrollment: %v", err)
 	}
-	expected := int64(900)
+	expected := int64(1100)
 	result, err := store.PlaceBid(ctx, domain.BidInput{
 		RequestID:            "stale-bid",
 		AuctionID:            auctionID,
@@ -282,18 +284,19 @@ func TestAuctionRealtimeStoreAntiExtendResetMode(t *testing.T) {
 		t.Fatalf("mark enrollment: %v", err)
 	}
 	result, err := store.PlaceBid(ctx, domain.BidInput{
-		RequestID:      "reset-extend",
-		AuctionID:      auctionID,
-		BidderID:       "u_1001",
-		Price:          1100,
-		Now:            now,
-		Source:         "live_ws",
-		MinIncrement:   100,
-		AntiSnipingMS:  15 * 1000,
-		AntiExtendMS:   30 * 1000,
-		AntiExtendMode: domain.AuctionExtendModeReset,
-		MaxExtendCount: 10,
-		IdempotencyTTL: time.Hour,
+		RequestID:            "reset-extend",
+		AuctionID:            auctionID,
+		BidderID:             "u_1001",
+		Price:                1100,
+		ExpectedCurrentPrice: expectedCurrentPrice(1000),
+		Now:                  now,
+		Source:               "live_ws",
+		MinIncrement:         100,
+		AntiSnipingMS:        15 * 1000,
+		AntiExtendMS:         30 * 1000,
+		AntiExtendMode:       domain.AuctionExtendModeReset,
+		MaxExtendCount:       10,
+		IdempotencyTTL:       time.Hour,
 	})
 	if err != nil {
 		t.Fatalf("reset extend bid: %v", err)
@@ -301,6 +304,10 @@ func TestAuctionRealtimeStoreAntiExtendResetMode(t *testing.T) {
 	if !result.Accepted || !result.Extended || !result.EndTime.Equal(now.Add(30*time.Second)) {
 		t.Fatalf("expected reset-mode extension to now+30s, got %+v", result)
 	}
+}
+
+func expectedCurrentPrice(price int64) *int64 {
+	return &price
 }
 
 func newMiniredisStore(t *testing.T) (*AuctionRealtimeStore, *redisgo.Client, KeyBuilder) {

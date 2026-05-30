@@ -1,0 +1,332 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "商品 AI 审核异步 Hook 变更",
+    "version": "v1",
+    "description": "商品创建与编辑接口的 AI 审核调用改为异步 hook。商家提交商品时，主链路只负责参数校验、图片上传与商品落库；响应不等待 AI 审核。商家提交后的商品状态先返回 PENDING_AUDIT，AI hook 成功后再异步更新为 READY 或 REJECTED；AI hook 失败不影响本次接口响应，商品保持 PENDING_AUDIT。"
+  },
+  "servers": [
+    {
+      "url": "http://localhost:8888",
+      "description": "Local"
+    }
+  ],
+  "tags": [
+    {
+      "name": "Items",
+      "description": "商品"
+    }
+  ],
+  "paths": {
+    "/api/v1/items": {
+      "post": {
+        "tags": [
+          "Items"
+        ],
+        "summary": "创建商品，AI 审核异步触发",
+        "description": "需要 merchant 或 admin 角色。merchant 创建商品时，后端不再同步等待 AI 审核，接口成功后立即返回 PENDING_AUDIT；AI 审核作为异步 hook 在后台执行，成功后再更新商品状态。admin 创建时仍按传入 status 处理。",
+        "operationId": "createItemAsyncAudit",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateItemMultipartRequest"
+              }
+            },
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateItemJSONRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "创建成功；merchant 创建时 data.status 固定先返回 PENDING_AUDIT。",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/ApiResponse"
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "data": {
+                          "$ref": "#/components/schemas/Item"
+                        }
+                      }
+                    }
+                  ]
+                },
+                "example": {
+                  "code": 0,
+                  "message": "success",
+                  "data": {
+                    "id": 1001,
+                    "sellerId": "u_2001",
+                    "title": "机械键盘 87键",
+                    "category": "电脑外设/键盘",
+                    "brand": "DemoBrand",
+                    "conditionGrade": "GOOD",
+                    "images": [
+                      "/api/v1/images/2026/05/29/abc123.jpg"
+                    ],
+                    "description": "RGB背光，适合办公和游戏",
+                    "status": "PENDING_AUDIT"
+                  },
+                  "trace_id": "req_1710000000000000000"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/items/{id}": {
+      "patch": {
+        "tags": [
+          "Items"
+        ],
+        "summary": "编辑商品，AI 审核异步触发",
+        "description": "需要 merchant 或 admin 角色。merchant 编辑商品时，接口不再同步等待 AI 审核，成功后立即返回 PENDING_AUDIT；AI 审核作为异步 hook 在后台执行，成功后再更新商品状态。admin 编辑时仍按传入 status 处理。",
+        "operationId": "updateItemAsyncAudit",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "商品 ID。",
+            "schema": {
+              "type": "integer",
+              "format": "uint64",
+              "example": 1001
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateItemMultipartRequest"
+              }
+            },
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateItemJSONRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "编辑成功；merchant 编辑时 data.status 固定先返回 PENDING_AUDIT。",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/ApiResponse"
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "data": {
+                          "$ref": "#/components/schemas/Item"
+                        }
+                      }
+                    }
+                  ]
+                },
+                "example": {
+                  "code": 0,
+                  "message": "success",
+                  "data": {
+                    "id": 1001,
+                    "sellerId": "u_2001",
+                    "title": "机械键盘 87键",
+                    "category": "电脑外设/键盘",
+                    "brand": "DemoBrand",
+                    "conditionGrade": "GOOD",
+                    "images": [
+                      "/api/v1/images/2026/05/29/abc123.jpg"
+                    ],
+                    "description": "RGB背光，适合办公和游戏",
+                    "status": "PENDING_AUDIT"
+                  },
+                  "trace_id": "req_1710000000000000000"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT"
+      }
+    },
+    "schemas": {
+      "ApiResponse": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "integer",
+            "example": 0
+          },
+          "message": {
+            "type": "string",
+            "example": "success"
+          },
+          "trace_id": {
+            "type": "string",
+            "example": "req_1710000000000000000"
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ]
+      },
+      "CreateItemMultipartRequest": {
+        "type": "object",
+        "properties": {
+          "title": {
+            "type": "string"
+          },
+          "category": {
+            "type": "string"
+          },
+          "brand": {
+            "type": "string"
+          },
+          "conditionGrade": {
+            "type": "string",
+            "example": "GOOD"
+          },
+          "description": {
+            "type": "string"
+          },
+          "images": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "format": "binary"
+            },
+            "description": "商品图片文件数组，单张不超过 2MB。"
+          }
+        },
+        "required": [
+          "title",
+          "category"
+        ]
+      },
+      "CreateItemJSONRequest": {
+        "type": "object",
+        "properties": {
+          "title": {
+            "type": "string"
+          },
+          "category": {
+            "type": "string"
+          },
+          "brand": {
+            "type": "string"
+          },
+          "conditionGrade": {
+            "type": "string",
+            "example": "GOOD"
+          },
+          "images": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "已上传图片代理 URL 数组。"
+          },
+          "description": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "title",
+          "category"
+        ]
+      },
+      "UpdateItemMultipartRequest": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/CreateItemMultipartRequest"
+          }
+        ]
+      },
+      "UpdateItemJSONRequest": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/CreateItemJSONRequest"
+          }
+        ]
+      },
+      "Item": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer",
+            "format": "uint64"
+          },
+          "sellerId": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "category": {
+            "type": "string"
+          },
+          "brand": {
+            "type": "string"
+          },
+          "conditionGrade": {
+            "type": "string"
+          },
+          "images": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "description": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "PENDING_AUDIT",
+              "READY",
+              "REJECTED"
+            ]
+          }
+        }
+      }
+    }
+  }
+}
+

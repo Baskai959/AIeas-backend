@@ -3,11 +3,13 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 	"time"
 
 	appconfig "aieas_backend/internal/config"
 	"aieas_backend/internal/domain"
+	"aieas_backend/internal/infra/observability/metrics"
 	"aieas_backend/internal/repository"
 )
 
@@ -35,7 +37,7 @@ func TestBidServiceIdempotencyMinimumIncrementAndTopN(t *testing.T) {
 	fixture := newRealtimeAuctionFixture(t, cfg)
 	mustEnroll(t, fixture, "u_1001")
 
-	tooLow, err := fixture.bids.Place(ctx, PlaceBidInput{RequestID: "bid-low", AuctionID: fixture.auctionID, BidderID: "u_1001", UserRole: domain.RoleBuyer, Price: 1050})
+	tooLow, err := fixture.bids.Place(ctx, PlaceBidInput{RequestID: "bid-low", AuctionID: fixture.auctionID, BidderID: "u_1001", UserRole: domain.RoleBuyer, Price: 1050, ExpectedCurrentPrice: expectedCurrentPrice(1000)})
 	if err != nil {
 		t.Fatalf("low bid: %v", err)
 	}
@@ -43,14 +45,14 @@ func TestBidServiceIdempotencyMinimumIncrementAndTopN(t *testing.T) {
 		t.Fatalf("expected PRICE_STEP_MISMATCH rejection, got %+v", tooLow)
 	}
 
-	accepted, err := fixture.bids.Place(ctx, PlaceBidInput{RequestID: "bid-ok", AuctionID: fixture.auctionID, BidderID: "u_1001", UserRole: domain.RoleBuyer, Price: 1100})
+	accepted, err := fixture.bids.Place(ctx, PlaceBidInput{RequestID: "bid-ok", AuctionID: fixture.auctionID, BidderID: "u_1001", UserRole: domain.RoleBuyer, Price: 1100, ExpectedCurrentPrice: expectedCurrentPrice(1000)})
 	if err != nil {
 		t.Fatalf("accepted bid: %v", err)
 	}
 	if !accepted.Accepted || accepted.CurrentPrice != 1100 {
 		t.Fatalf("expected accepted 1100 bid, got %+v", accepted)
 	}
-	duplicate, err := fixture.bids.Place(ctx, PlaceBidInput{RequestID: "bid-ok", AuctionID: fixture.auctionID, BidderID: "u_1001", UserRole: domain.RoleBuyer, Price: 1300})
+	duplicate, err := fixture.bids.Place(ctx, PlaceBidInput{RequestID: "bid-ok", AuctionID: fixture.auctionID, BidderID: "u_1001", UserRole: domain.RoleBuyer, Price: 1300, ExpectedCurrentPrice: expectedCurrentPrice(1100)})
 	if err != nil {
 		t.Fatalf("duplicate bid: %v", err)
 	}
@@ -73,7 +75,7 @@ func TestBidServiceRejectsStaleExpectedState(t *testing.T) {
 	fixture := newRealtimeAuctionFixture(t, cfg)
 	mustEnroll(t, fixture, "u_1001")
 
-	expected := int64(900)
+	expected := int64(1100)
 	result, err := fixture.bids.Place(ctx, PlaceBidInput{
 		RequestID:            "bid-stale",
 		AuctionID:            fixture.auctionID,
@@ -99,18 +101,18 @@ func TestBidServiceRejectsEqualPriceAfterLeader(t *testing.T) {
 	mustEnroll(t, fixture, "u_1002")
 	mustEnroll(t, fixture, "u_1003")
 
-	first, err := fixture.bids.Place(ctx, PlaceBidInput{RequestID: "tie-first", AuctionID: fixture.auctionID, BidderID: "u_1001", UserRole: domain.RoleBuyer, Price: 1100})
+	first, err := fixture.bids.Place(ctx, PlaceBidInput{RequestID: "tie-first", AuctionID: fixture.auctionID, BidderID: "u_1001", UserRole: domain.RoleBuyer, Price: 1100, ExpectedCurrentPrice: expectedCurrentPrice(1000)})
 	if err != nil || !first.Accepted || first.LeaderBidderID != "u_1001" {
 		t.Fatalf("first bid result=%+v err=%v", first, err)
 	}
-	second, err := fixture.bids.Place(ctx, PlaceBidInput{RequestID: "tie-second", AuctionID: fixture.auctionID, BidderID: "u_1002", UserRole: domain.RoleBuyer, Price: 1100})
+	second, err := fixture.bids.Place(ctx, PlaceBidInput{RequestID: "tie-second", AuctionID: fixture.auctionID, BidderID: "u_1002", UserRole: domain.RoleBuyer, Price: 1100, ExpectedCurrentPrice: expectedCurrentPrice(1100)})
 	if err != nil {
 		t.Fatalf("second equal-price bid: %v", err)
 	}
 	if second.Accepted || second.Reason != domain.BidRejectBelowMinIncrement {
 		t.Fatalf("expected equal-price bid rejected, result=%+v", second)
 	}
-	third, err := fixture.bids.Place(ctx, PlaceBidInput{RequestID: "tie-higher", AuctionID: fixture.auctionID, BidderID: "u_1003", UserRole: domain.RoleBuyer, Price: 1300})
+	third, err := fixture.bids.Place(ctx, PlaceBidInput{RequestID: "tie-higher", AuctionID: fixture.auctionID, BidderID: "u_1003", UserRole: domain.RoleBuyer, Price: 1300, ExpectedCurrentPrice: expectedCurrentPrice(1100)})
 	if err != nil || !third.Accepted || third.LeaderBidderID != "u_1003" {
 		t.Fatalf("higher bid result=%+v err=%v", third, err)
 	}
@@ -143,25 +145,25 @@ func TestBidServiceFixedRulePrecheck(t *testing.T) {
 	mustEnroll(t, fixture, "u_1001")
 	mustEnroll(t, fixture, "u_1002")
 
-	mismatch, err := fixture.bids.Place(ctx, PlaceBidInput{RequestID: "fixed-mismatch", AuctionID: fixture.auctionID, BidderID: "u_1001", UserRole: domain.RoleBuyer, Price: 1150})
+	mismatch, err := fixture.bids.Place(ctx, PlaceBidInput{RequestID: "fixed-mismatch", AuctionID: fixture.auctionID, BidderID: "u_1001", UserRole: domain.RoleBuyer, Price: 1150, ExpectedCurrentPrice: expectedCurrentPrice(1000)})
 	if err != nil {
 		t.Fatalf("step mismatch bid: %v", err)
 	}
 	if mismatch.Accepted || mismatch.Reason != domain.BidRejectStepMismatch {
 		t.Fatalf("expected step mismatch, got %+v", mismatch)
 	}
-	tooHigh, err := fixture.bids.Place(ctx, PlaceBidInput{RequestID: "fixed-too-high", AuctionID: fixture.auctionID, BidderID: "u_1001", UserRole: domain.RoleBuyer, Price: 1500})
+	tooHigh, err := fixture.bids.Place(ctx, PlaceBidInput{RequestID: "fixed-too-high", AuctionID: fixture.auctionID, BidderID: "u_1001", UserRole: domain.RoleBuyer, Price: 1500, ExpectedCurrentPrice: expectedCurrentPrice(1000)})
 	if err != nil {
 		t.Fatalf("too high bid: %v", err)
 	}
 	if tooHigh.Accepted || tooHigh.Reason != domain.BidRejectAboveMaxBidSteps {
 		t.Fatalf("expected max-steps rejection, got %+v", tooHigh)
 	}
-	okBid, err := fixture.bids.Place(ctx, PlaceBidInput{RequestID: "fixed-ok", AuctionID: fixture.auctionID, BidderID: "u_1001", UserRole: domain.RoleBuyer, Price: 1300})
+	okBid, err := fixture.bids.Place(ctx, PlaceBidInput{RequestID: "fixed-ok", AuctionID: fixture.auctionID, BidderID: "u_1001", UserRole: domain.RoleBuyer, Price: 1300, ExpectedCurrentPrice: expectedCurrentPrice(1000)})
 	if err != nil || !okBid.Accepted || okBid.CurrentPrice != 1300 {
 		t.Fatalf("expected fixed bid accepted, result=%+v err=%v", okBid, err)
 	}
-	aboveCap, err := fixture.bids.Place(ctx, PlaceBidInput{RequestID: "fixed-above-cap", AuctionID: fixture.auctionID, BidderID: "u_1002", UserRole: domain.RoleBuyer, Price: 10100})
+	aboveCap, err := fixture.bids.Place(ctx, PlaceBidInput{RequestID: "fixed-above-cap", AuctionID: fixture.auctionID, BidderID: "u_1002", UserRole: domain.RoleBuyer, Price: 10100, ExpectedCurrentPrice: expectedCurrentPrice(1300)})
 	if err != nil {
 		t.Fatalf("above cap bid: %v", err)
 	}
@@ -179,7 +181,7 @@ func TestBidServiceCapPriceAutoClosesAndCreatesOrder(t *testing.T) {
 	fixture.hammers.SetOrderIDGenerator(fixedAuctionIDGenerator{id: 567890123})
 	mustEnroll(t, fixture, "u_1001")
 
-	result, err := fixture.bids.Place(ctx, PlaceBidInput{RequestID: "cap-bid", AuctionID: fixture.auctionID, BidderID: "u_1001", UserRole: domain.RoleBuyer, Price: 2000})
+	result, err := fixture.bids.Place(ctx, PlaceBidInput{RequestID: "cap-bid", AuctionID: fixture.auctionID, BidderID: "u_1001", UserRole: domain.RoleBuyer, Price: 2000, ExpectedCurrentPrice: expectedCurrentPrice(1000)})
 	if err != nil {
 		t.Fatalf("cap bid: %v", err)
 	}
@@ -195,6 +197,59 @@ func TestBidServiceCapPriceAutoClosesAndCreatesOrder(t *testing.T) {
 	}
 }
 
+// TestBidServiceCapPriceDuplicateDoesNotInvokeHammer 验证 P1-C：
+// 当同一 RequestID 在 cap-price 命中后被重放时，BidService 必须依靠
+// `result.Accepted && !result.Duplicate && result.AutoClosed` 守卫直接复用幂等
+// 结果，不应再次触发 Hammer。否则 cap-price 重放会引发重复 Hammer 调用，造成
+// hammer_duplicate_total 抖动并污染 RT/MySQL 终态短路链路。
+func TestBidServiceCapPriceDuplicateDoesNotInvokeHammer(t *testing.T) {
+	ctx := context.Background()
+	cfg := appconfig.Default().Auction
+	cfg.FreqLimitCount = 100
+	rule := json.RawMessage(`{"type":"fixed","amount":100,"maxBidSteps":10}`)
+	fixture := newRealtimeAuctionFixtureWithRule(t, cfg, -2*time.Minute, 1000, rule)
+	fixture.hammers.SetOrderIDGenerator(fixedAuctionIDGenerator{id: 567890123})
+	reg := metrics.New(metrics.Options{Enabled: true, Namespace: "test"})
+	fixture.hammers.SetMetrics(reg)
+	mustEnroll(t, fixture, "u_1001")
+
+	first, err := fixture.bids.Place(ctx, PlaceBidInput{RequestID: "cap-dup", AuctionID: fixture.auctionID, BidderID: "u_1001", UserRole: domain.RoleBuyer, Price: 2000, ExpectedCurrentPrice: expectedCurrentPrice(1000)})
+	if err != nil {
+		t.Fatalf("first cap bid: %v", err)
+	}
+	if !first.Accepted || !first.AutoClosed || first.Duplicate || first.AuctionStatus != domain.AuctionStatusClosedWon {
+		t.Fatalf("expected first cap bid accepted+auto-closed+!duplicate, got %+v", first)
+	}
+	if got := counterValue(t, reg, "test_auction_hammer_total"); got != 1 {
+		t.Fatalf("expected hammer_total=1 after first cap bid, got %v", got)
+	}
+
+	second, err := fixture.bids.Place(ctx, PlaceBidInput{RequestID: "cap-dup", AuctionID: fixture.auctionID, BidderID: "u_1001", UserRole: domain.RoleBuyer, Price: 2000, ExpectedCurrentPrice: expectedCurrentPrice(2000)})
+	if err != nil {
+		t.Fatalf("duplicate cap bid: %v", err)
+	}
+	if !second.Duplicate {
+		t.Fatalf("expected duplicate cap bid replay, got %+v", second)
+	}
+	// 守卫存在时：BidService 在见到 Duplicate=true 后短路，不会再次进入 Hammer 流程。
+	// 因此 hammer_total 仍为 1；如守卫被移除，第二次 Hammer 会被识别为终态重放并落入
+	// hammer_duplicate_total，hammer_total 也会变成 2。
+	if got := counterValue(t, reg, "test_auction_hammer_total"); got != 1 {
+		t.Fatalf("expected hammer_total still=1 after duplicate cap bid, got %v", got)
+	}
+	if got := counterValue(t, reg, "test_auction_hammer_duplicate_total"); got != 0 {
+		t.Fatalf("expected hammer_duplicate_total=0 (BidService should short-circuit before Hammer), got %v", got)
+	}
+	// 订单仍然只有一条：cap-price 单据 ID 与首次落槌一致，未被覆盖也未新增。
+	order, err := fixture.orderRepo.FindByAuctionID(ctx, fixture.auctionID)
+	if err != nil {
+		t.Fatalf("expected single order to remain after duplicate, err=%v", err)
+	}
+	if order.ID != 567890123 || order.WinnerID != "u_1001" || order.DealPrice != 2000 {
+		t.Fatalf("unexpected order after duplicate cap bid: %+v", order)
+	}
+}
+
 func TestBidServiceFrequencyLimitRecordsRiskRejection(t *testing.T) {
 	ctx := context.Background()
 	cfg := appconfig.Default().Auction
@@ -203,19 +258,149 @@ func TestBidServiceFrequencyLimitRecordsRiskRejection(t *testing.T) {
 	fixture := newRealtimeAuctionFixture(t, cfg)
 	mustEnroll(t, fixture, "u_1001")
 
-	first, err := fixture.bids.Place(ctx, PlaceBidInput{RequestID: "freq-1", AuctionID: fixture.auctionID, BidderID: "u_1001", UserRole: domain.RoleBuyer, Price: 1100})
+	first, err := fixture.bids.Place(ctx, PlaceBidInput{RequestID: "freq-1", AuctionID: fixture.auctionID, BidderID: "u_1001", UserRole: domain.RoleBuyer, Price: 1100, ExpectedCurrentPrice: expectedCurrentPrice(1000)})
 	if err != nil {
 		t.Fatalf("first bid: %v", err)
 	}
 	if !first.Accepted {
 		t.Fatalf("expected first bid accepted, got %+v", first)
 	}
-	second, err := fixture.bids.Place(ctx, PlaceBidInput{RequestID: "freq-2", AuctionID: fixture.auctionID, BidderID: "u_1001", UserRole: domain.RoleBuyer, Price: 1300})
+	second, err := fixture.bids.Place(ctx, PlaceBidInput{RequestID: "freq-2", AuctionID: fixture.auctionID, BidderID: "u_1001", UserRole: domain.RoleBuyer, Price: 1300, ExpectedCurrentPrice: expectedCurrentPrice(1100)})
 	if err != nil {
 		t.Fatalf("second bid: %v", err)
 	}
 	if second.Accepted || second.Reason != "FREQ_LIMIT" {
 		t.Fatalf("expected FREQ_LIMIT rejection, got %+v", second)
+	}
+}
+
+func TestBidServiceBlacklistStrategyMissingDeposit(t *testing.T) {
+	ctx := context.Background()
+	cfg := appconfig.Default().Auction
+	cfg.FreqLimitCount = 100
+	fixture := newRealtimeAuctionFixture(t, cfg)
+	setBidBlacklistStrategy(t, fixture.bids, domain.BlacklistStrategyConfig{
+		Enabled:               true,
+		FrequencyEnabled:      false,
+		MissingDepositEnabled: true,
+	})
+
+	result, err := fixture.bids.Place(ctx, PlaceBidInput{RequestID: "auto-blacklist-no-deposit", AuctionID: fixture.auctionID, BidderID: "u_1009", UserRole: domain.RoleBuyer, Price: 1100, ExpectedCurrentPrice: expectedCurrentPrice(1000)})
+	if err != nil {
+		t.Fatalf("bid without deposit: %v", err)
+	}
+	if result.Accepted || result.Reason != "NOT_ENROLLED" {
+		t.Fatalf("expected no-enrollment rejection, got %+v", result)
+	}
+	waitForBlacklisted(t, fixture.risk, "u_1009")
+}
+
+func TestBidServiceBlacklistStrategyUnreasonablePrice(t *testing.T) {
+	ctx := context.Background()
+	cfg := appconfig.Default().Auction
+	cfg.FreqLimitCount = 100
+	rule := json.RawMessage(`{"type":"fixed","amount":100,"maxBidSteps":3}`)
+	fixture := newRealtimeAuctionFixtureWithRule(t, cfg, time.Hour, 1000, rule)
+	setBidBlacklistStrategy(t, fixture.bids, domain.BlacklistStrategyConfig{
+		Enabled:                  true,
+		FrequencyEnabled:         false,
+		UnreasonablePriceEnabled: true,
+	})
+	mustEnroll(t, fixture, "u_1010")
+
+	result, err := fixture.bids.Place(ctx, PlaceBidInput{RequestID: "auto-blacklist-price", AuctionID: fixture.auctionID, BidderID: "u_1010", UserRole: domain.RoleBuyer, Price: 1350, ExpectedCurrentPrice: expectedCurrentPrice(1000)})
+	if err != nil {
+		t.Fatalf("unreasonable bid: %v", err)
+	}
+	if result.Accepted || result.Reason != domain.BidRejectStepMismatch {
+		t.Fatalf("expected step mismatch rejection, got %+v", result)
+	}
+	waitForBlacklisted(t, fixture.risk, "u_1010")
+}
+
+func TestBidServiceBlacklistStrategyFrequencyLimit(t *testing.T) {
+	ctx := context.Background()
+	cfg := appconfig.Default().Auction
+	cfg.FreqLimitCount = 100
+	fixture := newRealtimeAuctionFixture(t, cfg)
+	setBidBlacklistStrategy(t, fixture.bids, domain.BlacklistStrategyConfig{
+		Enabled:              true,
+		FrequencyEnabled:     true,
+		FrequencyWindowMs:    1000,
+		FrequencyMaxRequests: 1,
+	})
+	mustEnroll(t, fixture, "u_1011")
+
+	first, err := fixture.bids.Place(ctx, PlaceBidInput{RequestID: "auto-blacklist-freq-1", AuctionID: fixture.auctionID, BidderID: "u_1011", UserRole: domain.RoleBuyer, Price: 1100, ExpectedCurrentPrice: expectedCurrentPrice(1000)})
+	if err != nil || !first.Accepted {
+		t.Fatalf("first bid result=%+v err=%v", first, err)
+	}
+	second, err := fixture.bids.Place(ctx, PlaceBidInput{RequestID: "auto-blacklist-freq-2", AuctionID: fixture.auctionID, BidderID: "u_1011", UserRole: domain.RoleBuyer, Price: 1200, ExpectedCurrentPrice: expectedCurrentPrice(1100)})
+	if err != nil {
+		t.Fatalf("second bid: %v", err)
+	}
+	if second.Accepted || second.Reason != "FREQ_LIMIT" {
+		t.Fatalf("expected freq limit rejection, got %+v", second)
+	}
+	waitForBlacklisted(t, fixture.risk, "u_1011")
+}
+
+func TestBidServiceAutoBlacklistFailureDoesNotBlockRejection(t *testing.T) {
+	ctx := context.Background()
+	cfg := appconfig.Default().Auction
+	cfg.FreqLimitCount = 100
+	fixture := newRealtimeAuctionFixture(t, cfg)
+	failingRisk := NewRiskService(failingCreateBlacklistRepo{MemoryRiskRepository: repository.NewMemoryRiskRepository()}, nil, nil)
+	fixture.risk = failingRisk
+	fixture.bids.risk = failingRisk
+	setBidBlacklistStrategy(t, fixture.bids, domain.BlacklistStrategyConfig{
+		Enabled:               true,
+		FrequencyEnabled:      false,
+		MissingDepositEnabled: true,
+	})
+
+	result, err := fixture.bids.Place(ctx, PlaceBidInput{RequestID: "auto-blacklist-fail", AuctionID: fixture.auctionID, BidderID: "u_1014", UserRole: domain.RoleBuyer, Price: 1100, ExpectedCurrentPrice: expectedCurrentPrice(1000)})
+	if err != nil {
+		t.Fatalf("auto blacklist failure must not fail bid path: %v", err)
+	}
+	if result.Accepted || result.Reason != "NOT_ENROLLED" {
+		t.Fatalf("expected normal no-enrollment rejection, got %+v", result)
+	}
+}
+
+func TestBidServiceRiskControlDisablesBidFrequencyLimit(t *testing.T) {
+	ctx := context.Background()
+	cfg := appconfig.Default().Auction
+	cfg.FreqLimitCount = 1
+	cfg.FreqWindowMs = int64(time.Minute / time.Millisecond)
+	fixture := newRealtimeAuctionFixture(t, cfg)
+	setRiskControl(t, fixture.controls, domain.RiskControlConfig{Enabled: false})
+	mustEnroll(t, fixture, "u_1012")
+
+	first, err := fixture.bids.Place(ctx, PlaceBidInput{RequestID: "risk-control-freq-1", AuctionID: fixture.auctionID, BidderID: "u_1012", UserRole: domain.RoleBuyer, Price: 1100, ExpectedCurrentPrice: expectedCurrentPrice(1000)})
+	if err != nil || !first.Accepted {
+		t.Fatalf("first bid result=%+v err=%v", first, err)
+	}
+	second, err := fixture.bids.Place(ctx, PlaceBidInput{RequestID: "risk-control-freq-2", AuctionID: fixture.auctionID, BidderID: "u_1012", UserRole: domain.RoleBuyer, Price: 1200, ExpectedCurrentPrice: expectedCurrentPrice(1100)})
+	if err != nil || !second.Accepted {
+		t.Fatalf("expected frequency limiter disabled, second=%+v err=%v", second, err)
+	}
+}
+
+func TestBidServiceRiskControlDisablesBlacklistCheck(t *testing.T) {
+	ctx := context.Background()
+	cfg := appconfig.Default().Auction
+	cfg.FreqLimitCount = 100
+	fixture := newRealtimeAuctionFixture(t, cfg)
+	setRiskControl(t, fixture.controls, domain.RiskControlConfig{Enabled: false})
+	if err := fixture.risk.AddBlacklist(ctx, "u_1013", "manual", "u_9999", nil); err != nil {
+		t.Fatalf("add blacklist: %v", err)
+	}
+	mustEnroll(t, fixture, "u_1013")
+
+	result, err := fixture.bids.Place(ctx, PlaceBidInput{RequestID: "risk-control-blacklist", AuctionID: fixture.auctionID, BidderID: "u_1013", UserRole: domain.RoleBuyer, Price: 1100, ExpectedCurrentPrice: expectedCurrentPrice(1000)})
+	if err != nil || !result.Accepted {
+		t.Fatalf("expected blacklist check disabled, result=%+v err=%v", result, err)
 	}
 }
 
@@ -225,7 +410,7 @@ func TestHammerAndOrderPayAreIdempotent(t *testing.T) {
 	cfg.FreqLimitCount = 100
 	fixture := newRealtimeAuctionFixture(t, cfg)
 	mustEnroll(t, fixture, "u_1001")
-	if result, err := fixture.bids.Place(ctx, PlaceBidInput{RequestID: "hammer-bid", AuctionID: fixture.auctionID, BidderID: "u_1001", UserRole: domain.RoleBuyer, Price: 1100}); err != nil || !result.Accepted {
+	if result, err := fixture.bids.Place(ctx, PlaceBidInput{RequestID: "hammer-bid", AuctionID: fixture.auctionID, BidderID: "u_1001", UserRole: domain.RoleBuyer, Price: 1100, ExpectedCurrentPrice: expectedCurrentPrice(1000)}); err != nil || !result.Accepted {
 		t.Fatalf("place bid before hammer result=%+v err=%v", result, err)
 	}
 
@@ -264,7 +449,7 @@ func TestHammerGeneratesOrderID(t *testing.T) {
 	fixture := newRealtimeAuctionFixture(t, cfg)
 	fixture.hammers.SetOrderIDGenerator(fixedAuctionIDGenerator{id: 345678901})
 	mustEnroll(t, fixture, "u_1001")
-	if result, err := fixture.bids.Place(ctx, PlaceBidInput{RequestID: "order-id-bid", AuctionID: fixture.auctionID, BidderID: "u_1001", UserRole: domain.RoleBuyer, Price: 1100}); err != nil || !result.Accepted {
+	if result, err := fixture.bids.Place(ctx, PlaceBidInput{RequestID: "order-id-bid", AuctionID: fixture.auctionID, BidderID: "u_1001", UserRole: domain.RoleBuyer, Price: 1100, ExpectedCurrentPrice: expectedCurrentPrice(1000)}); err != nil || !result.Accepted {
 		t.Fatalf("place bid: result=%+v err=%v", result, err)
 	}
 
@@ -321,7 +506,7 @@ func TestHammerReserveNotMetClosesFailedWithoutOrder(t *testing.T) {
 	cfg.FreqLimitCount = 100
 	fixture := newRealtimeAuctionFixtureWithTiming(t, cfg, -2*time.Minute, 2000)
 	mustEnroll(t, fixture, "u_1001")
-	if result, err := fixture.bids.Place(ctx, PlaceBidInput{RequestID: "reserve-low-bid", AuctionID: fixture.auctionID, BidderID: "u_1001", UserRole: domain.RoleBuyer, Price: 1100}); err != nil || !result.Accepted {
+	if result, err := fixture.bids.Place(ctx, PlaceBidInput{RequestID: "reserve-low-bid", AuctionID: fixture.auctionID, BidderID: "u_1001", UserRole: domain.RoleBuyer, Price: 1100, ExpectedCurrentPrice: expectedCurrentPrice(1000)}); err != nil || !result.Accepted {
 		t.Fatalf("place reserve-low bid result=%+v err=%v", result, err)
 	}
 
@@ -341,10 +526,10 @@ func TestHammerCapturesWinnerAndReleasesNonWinners(t *testing.T) {
 	fixture := newRealtimeAuctionFixtureWithTiming(t, cfg, -2*time.Minute, 1000)
 	mustEnroll(t, fixture, "u_1001")
 	mustEnroll(t, fixture, "u_1002")
-	if result, err := fixture.bids.Place(ctx, PlaceBidInput{RequestID: "winner-bid-1", AuctionID: fixture.auctionID, BidderID: "u_1001", UserRole: domain.RoleBuyer, Price: 1100}); err != nil || !result.Accepted {
+	if result, err := fixture.bids.Place(ctx, PlaceBidInput{RequestID: "winner-bid-1", AuctionID: fixture.auctionID, BidderID: "u_1001", UserRole: domain.RoleBuyer, Price: 1100, ExpectedCurrentPrice: expectedCurrentPrice(1000)}); err != nil || !result.Accepted {
 		t.Fatalf("first bid result=%+v err=%v", result, err)
 	}
-	if result, err := fixture.bids.Place(ctx, PlaceBidInput{RequestID: "winner-bid-2", AuctionID: fixture.auctionID, BidderID: "u_1002", UserRole: domain.RoleBuyer, Price: 1300}); err != nil || !result.Accepted {
+	if result, err := fixture.bids.Place(ctx, PlaceBidInput{RequestID: "winner-bid-2", AuctionID: fixture.auctionID, BidderID: "u_1002", UserRole: domain.RoleBuyer, Price: 1300, ExpectedCurrentPrice: expectedCurrentPrice(1100)}); err != nil || !result.Accepted {
 		t.Fatalf("second bid result=%+v err=%v", result, err)
 	}
 
@@ -371,6 +556,8 @@ type realtimeAuctionFixture struct {
 	bids        *BidService
 	hammers     *HammerService
 	orders      *OrderService
+	risk        *RiskService
+	controls    *RiskControlService
 	depositRepo *repository.MemoryDepositRepository
 	orderRepo   *repository.MemoryOrderRepository
 }
@@ -394,9 +581,12 @@ func newRealtimeAuctionFixtureWithRule(t *testing.T, cfg appconfig.AuctionConfig
 	depositRepo := repository.NewMemoryDepositRepository()
 	orderRepo := repository.NewMemoryOrderRepository()
 	riskRepo := repository.NewMemoryRiskRepository()
+	configRepo := repository.NewMemoryConfigRepository()
 	realtime := repository.NewMemoryRealtimeStore()
 	riskSvc := NewRiskService(riskRepo, realtime, nil)
+	riskControlSvc := NewRiskControlService(domain.DefaultRiskControlConfig())
 	depositSvc := NewDepositService(depositRepo, auctionRepo, realtime, riskSvc, repository.NoopTxManager{})
+	depositSvc.SetRiskControlService(riskControlSvc)
 	orderSvc := NewOrderService(orderRepo, repository.NoopTxManager{})
 	hammerSvc := NewHammerService(auctionRepo, orderRepo, depositRepo, realtime, repository.NoopTxManager{}, nil)
 	auctionSvc := NewAuctionService(auctionRepo, itemRepo, repository.NoopTxManager{})
@@ -404,6 +594,8 @@ func newRealtimeAuctionFixtureWithRule(t *testing.T, cfg appconfig.AuctionConfig
 	auctionSvc.SetAuctionConfig(cfg)
 	bidSvc := NewBidService(bidRepo, auctionRepo, realtime, riskSvc, nil, cfg)
 	bidSvc.SetHammerService(hammerSvc)
+	bidSvc.SetConfigRepository(configRepo)
+	bidSvc.SetRiskControlService(riskControlSvc)
 
 	item := domain.Item{SellerID: "u_2001", Title: "Watch", Category: "luxury", ConditionGrade: domain.ConditionNew, Status: domain.ItemStatusReady}
 	if err := itemRepo.Create(ctx, &item); err != nil {
@@ -453,7 +645,7 @@ func newRealtimeAuctionFixtureWithRule(t *testing.T, cfg appconfig.AuctionConfig
 			t.Fatalf("expire realtime auction: %v", err)
 		}
 	}
-	return realtimeAuctionFixture{auctionID: auction.AuctionID, deposits: depositSvc, bids: bidSvc, hammers: hammerSvc, orders: orderSvc, depositRepo: depositRepo, orderRepo: orderRepo}
+	return realtimeAuctionFixture{auctionID: auction.AuctionID, deposits: depositSvc, bids: bidSvc, hammers: hammerSvc, orders: orderSvc, risk: riskSvc, controls: riskControlSvc, depositRepo: depositRepo, orderRepo: orderRepo}
 }
 
 func mustEnroll(t *testing.T, fixture realtimeAuctionFixture, userID string) {
@@ -461,4 +653,54 @@ func mustEnroll(t *testing.T, fixture realtimeAuctionFixture, userID string) {
 	if _, err := fixture.deposits.Enroll(context.Background(), EnrollInput{AuctionID: fixture.auctionID, UserID: userID, UserRole: domain.RoleBuyer}); err != nil {
 		t.Fatalf("enroll %s: %v", userID, err)
 	}
+}
+
+func expectedCurrentPrice(price int64) *int64 {
+	return &price
+}
+
+func setBidBlacklistStrategy(t *testing.T, bids *BidService, cfg domain.BlacklistStrategyConfig) {
+	t.Helper()
+	repo := repository.NewMemoryConfigRepository()
+	if _, err := upsertBlacklistStrategyConfig(context.Background(), repo, cfg, "u_9999"); err != nil {
+		t.Fatalf("upsert blacklist strategy: %v", err)
+	}
+	bids.SetConfigRepository(repo)
+}
+
+func setRiskControl(t *testing.T, controls *RiskControlService, cfg domain.RiskControlConfig) {
+	t.Helper()
+	if controls == nil {
+		t.Fatal("risk control service is nil")
+	}
+	controls.cfg = cfg
+}
+
+func waitForBlacklisted(t *testing.T, risk *RiskService, userID string) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		ok, err := risk.IsBlacklisted(context.Background(), userID)
+		if err == nil && ok {
+			return
+		}
+		lastErr = err
+		time.Sleep(10 * time.Millisecond)
+	}
+	ok, err := risk.IsBlacklisted(context.Background(), userID)
+	if err != nil {
+		lastErr = err
+	}
+	t.Fatalf("expected user auto blacklisted, ok=%v err=%v lastErr=%v", ok, err, lastErr)
+}
+
+var errCreateBlacklistFailed = errors.New("create blacklist failed")
+
+type failingCreateBlacklistRepo struct {
+	*repository.MemoryRiskRepository
+}
+
+func (r failingCreateBlacklistRepo) CreateBlacklist(ctx context.Context, item *domain.Blacklist) error {
+	return errCreateBlacklistFailed
 }

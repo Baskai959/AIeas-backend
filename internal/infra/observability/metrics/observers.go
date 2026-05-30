@@ -1,9 +1,6 @@
 package metrics
 
-import (
-	"strconv"
-	"time"
-)
+import "time"
 
 // statusBucket 把 HTTP 状态码归入低基数桶，避免使用具体的 400/401/... 字符串。
 func statusBucket(status int) string {
@@ -69,13 +66,6 @@ func (r *Registry) ObserveBid(result, reason string, elapsed time.Duration) {
 	r.bidDuration.Observe(elapsed.Seconds())
 }
 
-func (r *Registry) ObserveBidLua(script string, elapsed time.Duration) {
-	if !r.Enabled() {
-		return
-	}
-	r.bidLuaDuration.WithLabelValues(script).Observe(elapsed.Seconds())
-}
-
 func (r *Registry) IncBidReject(reason string) {
 	if !r.Enabled() {
 		return
@@ -97,20 +87,6 @@ func (r *Registry) IncBidFreqLimit() {
 	r.bidFreqLimitTotal.Inc()
 }
 
-func (r *Registry) IncBidPrecheckReject(reason string) {
-	if !r.Enabled() {
-		return
-	}
-	r.bidPrecheckRejectTotal.WithLabelValues(reason).Inc()
-}
-
-func (r *Registry) IncBidStreamWrite(result string) {
-	if !r.Enabled() {
-		return
-	}
-	r.bidStreamWriteTotal.WithLabelValues(result).Inc()
-}
-
 // ----- Hammer -----
 
 func (r *Registry) ObserveHammer(result string, elapsed time.Duration) {
@@ -119,13 +95,6 @@ func (r *Registry) ObserveHammer(result string, elapsed time.Duration) {
 	}
 	r.hammerTotal.WithLabelValues(result).Inc()
 	r.hammerDuration.Observe(elapsed.Seconds())
-}
-
-func (r *Registry) ObserveHammerLua(script string, elapsed time.Duration) {
-	if !r.Enabled() {
-		return
-	}
-	r.hammerLuaDuration.WithLabelValues(script).Observe(elapsed.Seconds())
 }
 
 func (r *Registry) ObserveHammerMySQLTx(elapsed time.Duration) {
@@ -154,13 +123,6 @@ func (r *Registry) IncHammerMySQLFail() {
 		return
 	}
 	r.hammerMySQLFailTotal.Inc()
-}
-
-func (r *Registry) IncAuctionClosedReconcile(result string) {
-	if !r.Enabled() {
-		return
-	}
-	r.auctionClosedReconcileTotal.WithLabelValues(result).Inc()
 }
 
 // ----- Enroll & deposit -----
@@ -229,46 +191,6 @@ func (r *Registry) ObserveRedisLua(script string, elapsed time.Duration, errClas
 	}
 }
 
-func (r *Registry) IncRedisStreamXadd(stream, result string) {
-	if !r.Enabled() {
-		return
-	}
-	r.redisStreamXadd.WithLabelValues(stream, result).Inc()
-}
-
-func (r *Registry) IncRedisLockAcquire(lock, result string) {
-	if !r.Enabled() {
-		return
-	}
-	r.redisLockAcquire.WithLabelValues(lock, result).Inc()
-}
-
-// ----- MySQL -----
-
-func (r *Registry) ObserveMySQLQuery(operation string, elapsed time.Duration, err error) {
-	if !r.Enabled() {
-		return
-	}
-	r.mysqlQueryDuration.WithLabelValues(operation).Observe(elapsed.Seconds())
-	if err != nil {
-		r.mysqlQueryErrors.WithLabelValues(operation).Inc()
-	}
-}
-
-func (r *Registry) ObserveMySQLTx(operation string, elapsed time.Duration) {
-	if !r.Enabled() {
-		return
-	}
-	r.mysqlTxDuration.WithLabelValues(operation).Observe(elapsed.Seconds())
-}
-
-func (r *Registry) IncMySQLSlowQuery() {
-	if !r.Enabled() {
-		return
-	}
-	r.mysqlSlowQueries.Inc()
-}
-
 // ----- Worker -----
 
 func (r *Registry) IncWorkerBidRecordConsume(result string) {
@@ -285,13 +207,6 @@ func (r *Registry) ObserveWorkerBidRecordWrite(elapsed time.Duration) {
 	r.workerBidRecordWriteDuration.Observe(elapsed.Seconds())
 }
 
-func (r *Registry) IncWorkerBidRecordDuplicate(result string) {
-	if !r.Enabled() {
-		return
-	}
-	r.workerBidRecordDuplicateTotal.WithLabelValues(result).Inc()
-}
-
 func (r *Registry) IncWorkerBidRecordDLQ(reason string) {
 	if !r.Enabled() {
 		return
@@ -299,11 +214,11 @@ func (r *Registry) IncWorkerBidRecordDLQ(reason string) {
 	r.workerBidRecordDLQTotal.WithLabelValues(reason).Inc()
 }
 
-func (r *Registry) IncWorkerReconcile(typ, result string) {
+func (r *Registry) IncWorkerTask(worker, result string) {
 	if !r.Enabled() {
 		return
 	}
-	r.workerReconcileTotal.WithLabelValues(typ, result).Inc()
+	r.workerTaskTotal.WithLabelValues(worker, result).Inc()
 }
 
 // ----- WebSocket -----
@@ -337,23 +252,6 @@ func (r *Registry) ObserveWSBroadcast(elapsed time.Duration, fanout int) {
 	}
 }
 
-func (r *Registry) SetWSBroadcastQueueLength(n int) {
-	if !r.Enabled() {
-		return
-	}
-	r.wsBroadcastQueueLength.Set(float64(n))
-}
-
-func (r *Registry) IncWSMessageDrop(reason string) {
-	if !r.Enabled() {
-		return
-	}
-	if reason == "" {
-		reason = "unknown"
-	}
-	r.wsMessageDropTotal.WithLabelValues(reason).Inc()
-}
-
 func (r *Registry) IncWSSlowClientDisconnect() {
 	if !r.Enabled() {
 		return
@@ -361,22 +259,7 @@ func (r *Registry) IncWSSlowClientDisconnect() {
 	r.wsSlowClientDisconnect.Inc()
 }
 
-func (r *Registry) IncWSHeartbeatTimeout() {
-	if !r.Enabled() {
-		return
-	}
-	r.wsHeartbeatTimeoutTotal.Inc()
-}
-
 // ----- Agent -----
-
-func (r *Registry) ObserveAgentTask(taskType, status string, elapsed time.Duration) {
-	if !r.Enabled() {
-		return
-	}
-	r.agentTaskTotal.WithLabelValues(taskType, status).Inc()
-	r.agentTaskDuration.WithLabelValues(taskType).Observe(elapsed.Seconds())
-}
 
 func (r *Registry) ObserveAgentToolCall(tool, status string, elapsed time.Duration) {
 	if !r.Enabled() {
@@ -385,7 +268,3 @@ func (r *Registry) ObserveAgentToolCall(tool, status string, elapsed time.Durati
 	r.agentToolCallTotal.WithLabelValues(tool, status).Inc()
 	r.agentToolCallLatency.WithLabelValues(tool).Observe(elapsed.Seconds())
 }
-
-// FormatStatus 是 helper：把 int 状态码格式化成低基数 label 用的字符串（仅在
-// 调用方需要原始 code 时使用，例如 trace attribute）。
-func FormatStatus(status int) string { return strconv.Itoa(status) }

@@ -16,6 +16,12 @@ type AuctionRepository interface {
 	List(ctx context.Context, filter domain.AuctionFilter) ([]domain.AuctionLot, error)
 	Update(ctx context.Context, auction *domain.AuctionLot) error
 	Delete(ctx context.Context, id uint64) error
+	// CloseWithVersion 使用乐观锁 CAS 完成落槌：仅当 version=expectedVersion 且
+	// status ∈ allowedFromStatuses 时把 status/hammer_price_cent/winner_user_id/
+	// hammer_at/version+1/updated_at 持久化。冲突或状态不允许时返回
+	// domain.ErrOptimisticConflict 或 domain.ErrInvalidState；成功时把
+	// expectedVersion+1 回写到入参 auction.Version。
+	CloseWithVersion(ctx context.Context, auction *domain.AuctionLot, expectedVersion int64, allowedFromStatuses []domain.AuctionStatus) error
 }
 
 type MySQLAuctionRepository struct {
@@ -138,6 +144,53 @@ func (r *MySQLAuctionRepository) Delete(ctx context.Context, id uint64) error {
 	return nil
 }
 
+// CloseWithVersion 见接口注释。SQL 形如：
+//
+//	UPDATE auction_lot SET status=?, deal_price=?, winner_id=?, closed_at=?,
+//	       closed_by=?, version=version+1, updated_at=?
+//	WHERE  auction_id=? AND version=? AND status IN (...)
+//
+// RowsAffected==0 时回查一次：行已是终态返回 ErrInvalidState；否则返回
+// ErrOptimisticConflict（version 不匹配或 status 不在白名单中）。
+func (r *MySQLAuctionRepository) CloseWithVersion(ctx context.Context, auction *domain.AuctionLot, expectedVersion int64, allowedFromStatuses []domain.AuctionStatus) error {
+	if auction == nil || auction.AuctionID == 0 {
+		return domain.ErrInvalidArgument
+	}
+	row := auctionRowFromDomain(*auction)
+	now := time.Now().UTC()
+	updates := map[string]interface{}{
+		"status":     row.Status,
+		"deal_price": row.DealPrice,
+		"winner_id":  row.WinnerID,
+		"closed_at":  row.ClosedAt,
+		"closed_by":  row.ClosedBy,
+		"version":    gorm.Expr("version + 1"),
+		"updated_at": now,
+	}
+	query := r.dbFor(ctx).Table("auction_lot").
+		Where("auction_id = ? AND version = ?", auction.AuctionID, expectedVersion)
+	if len(allowedFromStatuses) > 0 {
+		query = query.Where("status IN ?", allowedFromStatuses)
+	}
+	res := query.Updates(updates)
+	if res.Error != nil {
+		return res.Error
+	}
+	if res.RowsAffected == 0 {
+		current, err := r.FindByID(ctx, auction.AuctionID)
+		if err != nil {
+			return err
+		}
+		if current.Status.Terminal() {
+			return domain.ErrInvalidState
+		}
+		return domain.ErrOptimisticConflict
+	}
+	auction.Version = expectedVersion + 1
+	auction.UpdatedAt = now
+	return nil
+}
+
 type auctionRow struct {
 	AuctionID      uint64                   `gorm:"column:auction_id;primaryKey"`
 	ItemID         uint64                   `gorm:"column:item_id"`
@@ -162,6 +215,7 @@ type auctionRow struct {
 	DealPrice      *int64                   `gorm:"column:deal_price"`
 	ClosedAt       *time.Time               `gorm:"column:closed_at"`
 	ClosedBy       string                   `gorm:"column:closed_by"`
+	Version        int64                    `gorm:"column:version;not null;default:0"`
 	CreatedAt      time.Time                `gorm:"column:created_at"`
 	UpdatedAt      time.Time                `gorm:"column:updated_at"`
 }
@@ -191,6 +245,7 @@ func auctionRowFromDomain(auction domain.AuctionLot) auctionRow {
 		DealPrice:      auction.DealPrice,
 		ClosedAt:       auction.ClosedAt,
 		ClosedBy:       auction.ClosedBy,
+		Version:        auction.Version,
 		CreatedAt:      auction.CreatedAt,
 		UpdatedAt:      auction.UpdatedAt,
 	}
@@ -244,6 +299,7 @@ func (r auctionRow) toDomain() domain.AuctionLot {
 		DealPrice:      r.DealPrice,
 		ClosedAt:       r.ClosedAt,
 		ClosedBy:       r.ClosedBy,
+		Version:        r.Version,
 		CreatedAt:      r.CreatedAt,
 		UpdatedAt:      r.UpdatedAt,
 	}
