@@ -6,53 +6,65 @@ import "time"
 type LiveSessionStatus string
 
 const (
-	LiveSessionStatusLive  LiveSessionStatus = "LIVE"
-	LiveSessionStatusEnded LiveSessionStatus = "ENDED"
+	LiveSessionStatusDraft     LiveSessionStatus = "DRAFT"
+	LiveSessionStatusScheduled LiveSessionStatus = "SCHEDULED"
+	LiveSessionStatusLive      LiveSessionStatus = "LIVE"
+	LiveSessionStatusEnded     LiveSessionStatus = "ENDED"
+	LiveSessionStatusCancelled LiveSessionStatus = "CANCELLED"
 )
 
 func (s LiveSessionStatus) Valid() bool {
 	switch s {
-	case LiveSessionStatusLive, LiveSessionStatusEnded:
+	case LiveSessionStatusDraft, LiveSessionStatusScheduled, LiveSessionStatusLive, LiveSessionStatusEnded, LiveSessionStatusCancelled:
 		return true
 	default:
 		return false
 	}
 }
 
-// CanTransitionLiveSession 控制直播场次状态机：仅允许 LIVE -> ENDED。
+// CanTransitionLiveSession 控制直播场次状态机。
 func CanTransitionLiveSession(from, to LiveSessionStatus) bool {
 	if from == to {
 		return true
 	}
-	if from == LiveSessionStatusLive && to == LiveSessionStatusEnded {
-		return true
+	switch from {
+	case LiveSessionStatusDraft:
+		return to == LiveSessionStatusScheduled || to == LiveSessionStatusLive || to == LiveSessionStatusCancelled
+	case LiveSessionStatusScheduled:
+		return to == LiveSessionStatusDraft || to == LiveSessionStatusLive || to == LiveSessionStatusCancelled
+	case LiveSessionStatusLive:
+		return to == LiveSessionStatusEnded
+	default:
+		return false
 	}
-	return false
 }
 
-// LiveSession 表示一次"开播-闭播"的具体直播场次，归属于 LiveRoom，承载本场拍品/出价/成交统计。
+// LiveSession 表示一次直播场次，承载直播展示信息和开播到下播生命周期。
 type LiveSession struct {
-	ID          uint64            `json:"id"`
-	LiveRoomID  uint64            `json:"liveRoomId"`
-	MerchantID  string            `json:"merchantId"`
-	Title       string            `json:"title,omitempty"`
-	Status      LiveSessionStatus `json:"status"`
-	OpenedAt    time.Time         `json:"openedAt"`
-	ClosedAt    *time.Time        `json:"closedAt,omitempty"`
-	LotsTotal   int               `json:"lotsTotal"`
-	LotsSold    int               `json:"lotsSold"`
-	LotsUnsold  int               `json:"lotsUnsold"`
-	BidCount    int               `json:"bidCount"`
-	GMVCent     int64             `json:"gmvCent"`
-	ViewerPeak  int               `json:"viewerPeak"`
-	ViewerTotal int               `json:"viewerTotal"`
-	CreatedAt   time.Time         `json:"createdAt"`
-	UpdatedAt   time.Time         `json:"updatedAt"`
+	ID                 uint64            `json:"id"`
+	MerchantID         string            `json:"merchantId"`
+	Title              string            `json:"title"`
+	Description        string            `json:"description,omitempty"`
+	CoverURL           string            `json:"coverUrl,omitempty"`
+	Status             LiveSessionStatus `json:"status"`
+	ActiveAuctionID    uint64            `json:"activeAuctionId,omitempty"`
+	OpenedAt           *time.Time        `json:"openedAt,omitempty"`
+	ClosedAt           *time.Time        `json:"closedAt,omitempty"`
+	ScheduledStartTime *time.Time        `json:"scheduledStartTime,omitempty"`
+	PlannedDurationSec int               `json:"plannedDurationSec,omitempty"`
+	LotsTotal          int               `json:"lotsTotal"`
+	LotsSold           int               `json:"lotsSold"`
+	LotsUnsold         int               `json:"lotsUnsold"`
+	BidCount           int               `json:"bidCount"`
+	GMVCent            int64             `json:"gmvCent"`
+	ViewerPeak         int               `json:"viewerPeak"`
+	ViewerTotal        int               `json:"viewerTotal"`
+	CreatedAt          time.Time         `json:"createdAt"`
+	UpdatedAt          time.Time         `json:"updatedAt"`
 }
 
 // LiveSessionFilter 用于场次列表查询。
 type LiveSessionFilter struct {
-	LiveRoomID uint64
 	MerchantID string
 	Status     LiveSessionStatus
 	OpenedFrom *time.Time

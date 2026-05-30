@@ -87,7 +87,6 @@ func (p *Producer) PublishAuctionClosed(ctx context.Context, auction domain.Auct
 		"auctionId":     result.AuctionID,
 		"itemId":        auction.ItemID,
 		"sellerId":      auction.SellerID,
-		"liveRoomId":    auction.LiveRoomID,
 		"status":        result.Status,
 		"winnerId":      result.WinnerID,
 		"price":         result.Price,

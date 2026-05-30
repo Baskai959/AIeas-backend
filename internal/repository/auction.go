@@ -71,8 +71,8 @@ func (r *MySQLAuctionRepository) List(ctx context.Context, filter domain.Auction
 	if filter.ItemID != 0 {
 		query = query.Where("item_id = ?", filter.ItemID)
 	}
-	if filter.LiveRoomID != 0 {
-		query = query.Where("live_room_id = ?", filter.LiveRoomID)
+	if filter.LiveSessionID != 0 {
+		query = query.Where("live_session_id = ?", filter.LiveSessionID)
 	}
 	if filter.Limit <= 0 || filter.Limit > 100 {
 		filter.Limit = 20
@@ -96,7 +96,6 @@ func (r *MySQLAuctionRepository) Update(ctx context.Context, auction *domain.Auc
 	updates := map[string]interface{}{
 		"item_id":          row.ItemID,
 		"seller_id":        row.SellerID,
-		"live_room_id":     row.LiveRoomID,
 		"live_session_id":  row.LiveSessionID,
 		"auction_type":     row.AuctionType,
 		"start_price":      row.StartPrice,
@@ -195,7 +194,6 @@ type auctionRow struct {
 	AuctionID      uint64                   `gorm:"column:auction_id;primaryKey"`
 	ItemID         uint64                   `gorm:"column:item_id"`
 	SellerID       string                   `gorm:"column:seller_id"`
-	LiveRoomID     uint64                   `gorm:"column:live_room_id"`
 	LiveSessionID  *uint64                  `gorm:"column:live_session_id"`
 	AuctionType    domain.AuctionType       `gorm:"column:auction_type"`
 	StartPrice     int64                    `gorm:"column:start_price"`
@@ -225,7 +223,6 @@ func auctionRowFromDomain(auction domain.AuctionLot) auctionRow {
 		AuctionID:      auction.AuctionID,
 		ItemID:         auction.ItemID,
 		SellerID:       normalizeUserIDForDB(auction.SellerID),
-		LiveRoomID:     auction.LiveRoomID,
 		LiveSessionID:  cloneUint64Ptr(auction.LiveSessionID),
 		AuctionType:    auction.AuctionType,
 		StartPrice:     auction.StartPrice,
@@ -279,7 +276,6 @@ func (r auctionRow) toDomain() domain.AuctionLot {
 		AuctionID:      r.AuctionID,
 		ItemID:         r.ItemID,
 		SellerID:       r.SellerID,
-		LiveRoomID:     r.LiveRoomID,
 		LiveSessionID:  cloneUint64Ptr(r.LiveSessionID),
 		AuctionType:    r.AuctionType,
 		StartPrice:     r.StartPrice,

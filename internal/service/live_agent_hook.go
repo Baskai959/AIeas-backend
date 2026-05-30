@@ -95,8 +95,8 @@ func (s *LiveAgentHookService) SetConfig(ctx context.Context, merchantID, update
 	return LiveAgentHookConfig{Enabled: enabled}, nil
 }
 
-func (s *LiveAgentHookService) EmitLiveStarted(ctx context.Context, merchantID string, roomID, sessionID uint64) {
-	s.Emit(ctx, merchantID, fmt.Sprintf("直播间%d的直播场次%d开播了", roomID, sessionID))
+func (s *LiveAgentHookService) EmitLiveStarted(ctx context.Context, merchantID string, sessionID uint64) {
+	s.Emit(ctx, merchantID, fmt.Sprintf("直播场次%d开播了", sessionID))
 }
 
 func (s *LiveAgentHookService) EmitItemListed(ctx context.Context, merchantID string, itemID uint64) {
@@ -107,25 +107,25 @@ func (s *LiveAgentHookService) EmitItemOffline(ctx context.Context, merchantID s
 	s.Emit(ctx, merchantID, fmt.Sprintf("商品%d下架了", itemID))
 }
 
-func (s *LiveAgentHookService) EmitHammerWon(ctx context.Context, merchantID string, roomID, auctionID uint64, price int64) {
-	s.Emit(ctx, merchantID, fmt.Sprintf("直播间%d的拍品%d落锤成交，成交价%d分", roomID, auctionID, price))
+func (s *LiveAgentHookService) EmitHammerWon(ctx context.Context, merchantID string, sessionID, auctionID uint64, price int64) {
+	s.Emit(ctx, merchantID, fmt.Sprintf("直播场次%d的拍品%d落锤成交，成交价%d分", sessionID, auctionID, price))
 }
 
-func (s *LiveAgentHookService) EmitHighestBid(ctx context.Context, merchantID string, roomID uint64, bidderID string, price int64) {
+func (s *LiveAgentHookService) EmitHighestBid(ctx context.Context, merchantID string, sessionID uint64, bidderID string, price int64) {
 	name := strings.TrimSpace(bidderID)
 	if s != nil && s.users != nil {
 		if user, err := s.users.FindByID(bidderID); err == nil && strings.TrimSpace(user.Nickname) != "" {
 			name = strings.TrimSpace(user.Nickname)
 		}
 	}
-	s.Emit(ctx, merchantID, fmt.Sprintf("直播间%d用户%s目前最高价格%d分", roomID, name, price))
+	s.Emit(ctx, merchantID, fmt.Sprintf("直播场次%d用户%s目前最高价格%d分", sessionID, name, price))
 }
 
-func (s *LiveAgentHookService) EmitConfigChanged(ctx context.Context, merchantID string, roomID uint64, enabled bool) {
+func (s *LiveAgentHookService) EmitConfigChanged(ctx context.Context, merchantID string, sessionID uint64, enabled bool) {
 	if !enabled {
 		return
 	}
-	s.emitDirect(ctx, merchantID, fmt.Sprintf("直播间%dAI直播助手已开启", roomID))
+	s.emitDirect(ctx, merchantID, fmt.Sprintf("直播场次%dAI直播助手已开启", sessionID))
 }
 
 func (s *LiveAgentHookService) Emit(ctx context.Context, merchantID, message string) {

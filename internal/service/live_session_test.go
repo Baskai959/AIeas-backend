@@ -10,52 +10,33 @@ import (
 	"aieas_backend/internal/repository"
 )
 
-func newLiveSessionFixture(t *testing.T) (*LiveSessionService, *repository.MemoryLiveSessionRepository, *repository.MemoryLiveRoomRepository, repository.AuctionRepository) {
+func newLiveSessionFixture(t *testing.T) (*LiveSessionService, *repository.MemoryLiveSessionRepository, repository.AuctionRepository) {
 	t.Helper()
 	sessionRepo := repository.NewMemoryLiveSessionRepository()
-	roomRepo := repository.NewMemoryLiveRoomRepository()
 	auctionRepo := repository.NewMemoryAuctionRepository()
-	svc := NewLiveSessionService(sessionRepo, roomRepo, auctionRepo)
-	return svc, sessionRepo, roomRepo, auctionRepo
+	svc := NewLiveSessionService(sessionRepo, auctionRepo)
+	return svc, sessionRepo, auctionRepo
 }
 
-func TestLiveSessionServiceOpenSessionIdempotent(t *testing.T) {
-	svc, sessionRepo, _, _ := newLiveSessionFixture(t)
+func createStartedLiveSession(t *testing.T, svc *LiveSessionService, merchantID, title string) domain.LiveSession {
+	t.Helper()
 	ctx := context.Background()
-
-	first, err := svc.OpenSession(ctx, 100, "m_1", "Live")
+	created, err := svc.Create(ctx, CreateLiveSessionInput{ActorID: merchantID, ActorRole: domain.RoleMerchant, Title: title})
 	if err != nil {
-		t.Fatalf("first open: %v", err)
+		t.Fatalf("create session: %v", err)
 	}
-	if first.Status != domain.LiveSessionStatusLive {
-		t.Fatalf("status should be LIVE, got %s", first.Status)
-	}
-
-	second, err := svc.OpenSession(ctx, 100, "m_1", "Live")
+	started, err := svc.Start(ctx, created.ID, merchantID, domain.RoleMerchant)
 	if err != nil {
-		t.Fatalf("second open: %v", err)
+		t.Fatalf("start session: %v", err)
 	}
-	if second.ID != first.ID {
-		t.Fatalf("expected same session ID on idempotent open, got %d vs %d", first.ID, second.ID)
-	}
-
-	all, err := sessionRepo.List(ctx, domain.LiveSessionFilter{LiveRoomID: 100, Limit: 100})
-	if err != nil {
-		t.Fatalf("list: %v", err)
-	}
-	if len(all) != 1 {
-		t.Fatalf("expected 1 session, got %d", len(all))
-	}
+	return started
 }
 
 func TestLiveSessionServiceCloseSessionTransitionAndIdempotent(t *testing.T) {
-	svc, _, _, _ := newLiveSessionFixture(t)
+	svc, _, _ := newLiveSessionFixture(t)
 	ctx := context.Background()
 
-	opened, err := svc.OpenSession(ctx, 200, "m_2", "Live")
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
+	opened := createStartedLiveSession(t, svc, "m_2", "Live")
 	closed, err := svc.CloseSession(ctx, opened.ID)
 	if err != nil {
 		t.Fatalf("close: %v", err)
@@ -78,13 +59,10 @@ func TestLiveSessionServiceCloseSessionTransitionAndIdempotent(t *testing.T) {
 }
 
 func TestLiveSessionServiceIncrCounters(t *testing.T) {
-	svc, _, _, _ := newLiveSessionFixture(t)
+	svc, _, _ := newLiveSessionFixture(t)
 	ctx := context.Background()
 
-	opened, err := svc.OpenSession(ctx, 300, "m_3", "Live")
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
+	opened := createStartedLiveSession(t, svc, "m_3", "Live")
 
 	if err := svc.IncrCounters(ctx, opened.ID, domain.LiveSessionCounters{LotsTotalDelta: 2, BidCountDelta: 5, GMVCentDelta: 1000, ViewerPeakAtMin: 3}); err != nil {
 		t.Fatalf("incr: %v", err)
@@ -115,33 +93,10 @@ func TestLiveSessionServiceIncrCounters(t *testing.T) {
 	}
 }
 
-func TestLiveSessionServiceListByRoomForbidsOtherMerchant(t *testing.T) {
-	svc, _, roomRepo, _ := newLiveSessionFixture(t)
-	ctx := context.Background()
-
-	room := domain.LiveRoom{MerchantID: "m_owner", Title: "t", Status: domain.LiveRoomStatusOffline}
-	if err := roomRepo.Create(ctx, &room); err != nil {
-		t.Fatalf("create room: %v", err)
-	}
-	if _, err := svc.OpenSession(ctx, room.ID, "m_owner", "t"); err != nil {
-		t.Fatalf("open: %v", err)
-	}
-	// 商家用其他账号去查应当 Forbidden
-	if _, err := svc.ListByRoom(ctx, room.ID, "", "m_other", domain.RoleMerchant, 20, 0); !errors.Is(err, domain.ErrForbidden) {
-		t.Fatalf("expected ErrForbidden, got %v", err)
-	}
-	// admin 不受限
-	if _, err := svc.ListByRoom(ctx, room.ID, "", "admin", domain.RoleAdmin, 20, 0); err != nil {
-		t.Fatalf("admin should access: %v", err)
-	}
-}
-
 func TestLiveSessionServiceListByMerchantOverridesForMerchantRole(t *testing.T) {
-	svc, _, _, _ := newLiveSessionFixture(t)
+	svc, _, _ := newLiveSessionFixture(t)
 	ctx := context.Background()
-	if _, err := svc.OpenSession(ctx, 401, "m_self", "live"); err != nil {
-		t.Fatalf("open: %v", err)
-	}
+	createStartedLiveSession(t, svc, "m_self", "live")
 	// 商家传 merchantId=other 也会被强制改写为自身。
 	sessions, err := svc.ListByMerchant(ctx, "m_other", "", "m_self", domain.RoleMerchant, 20, 0)
 	if err != nil {
@@ -153,17 +108,14 @@ func TestLiveSessionServiceListByMerchantOverridesForMerchantRole(t *testing.T) 
 }
 
 func TestLiveSessionServiceListLotsFilterBySession(t *testing.T) {
-	svc, _, _, auctionRepo := newLiveSessionFixture(t)
+	svc, _, auctionRepo := newLiveSessionFixture(t)
 	ctx := context.Background()
-	opened, err := svc.OpenSession(ctx, 500, "m_x", "live")
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
+	opened := createStartedLiveSession(t, svc, "m_x", "live")
 	now := time.Now().UTC()
 	other := uint64(99999)
-	in := domain.AuctionLot{AuctionID: 7001, ItemID: 1, SellerID: "m_x", AuctionType: domain.AuctionTypeEnglish, Status: domain.AuctionStatusReady, LiveRoomID: 500, LiveSessionID: &opened.ID, StartTime: now, EndTime: now.Add(time.Hour)}
-	out := domain.AuctionLot{AuctionID: 7002, ItemID: 2, SellerID: "m_x", AuctionType: domain.AuctionTypeEnglish, Status: domain.AuctionStatusReady, LiveRoomID: 500, LiveSessionID: &other, StartTime: now, EndTime: now.Add(time.Hour)}
-	none := domain.AuctionLot{AuctionID: 7003, ItemID: 3, SellerID: "m_x", AuctionType: domain.AuctionTypeEnglish, Status: domain.AuctionStatusReady, LiveRoomID: 500, StartTime: now, EndTime: now.Add(time.Hour)}
+	in := domain.AuctionLot{AuctionID: 7001, ItemID: 1, SellerID: "m_x", AuctionType: domain.AuctionTypeEnglish, Status: domain.AuctionStatusReady, LiveSessionID: &opened.ID, StartTime: now, EndTime: now.Add(time.Hour)}
+	out := domain.AuctionLot{AuctionID: 7002, ItemID: 2, SellerID: "m_x", AuctionType: domain.AuctionTypeEnglish, Status: domain.AuctionStatusReady, LiveSessionID: &other, StartTime: now, EndTime: now.Add(time.Hour)}
+	none := domain.AuctionLot{AuctionID: 7003, ItemID: 3, SellerID: "m_x", AuctionType: domain.AuctionTypeEnglish, Status: domain.AuctionStatusReady, StartTime: now, EndTime: now.Add(time.Hour)}
 	for _, lot := range []domain.AuctionLot{in, out, none} {
 		l := lot
 		if err := auctionRepo.Create(ctx, &l); err != nil {
@@ -191,15 +143,12 @@ func TestLiveSessionServiceCanTransitionRule(t *testing.T) {
 // TestLiveSessionServiceIncrCountersGoesThroughRealtimeStore 验证：
 // 注入 RealtimeStore 后，IncrCounters 不再 RMW MySQL，而是走 store；MySQL 行只在 Flush/Close 时才更新。
 func TestLiveSessionServiceIncrCountersGoesThroughRealtimeStore(t *testing.T) {
-	svc, _, _, _ := newLiveSessionFixture(t)
+	svc, _, _ := newLiveSessionFixture(t)
 	store := repository.NewMemoryLiveSessionRealtimeStore()
 	svc.SetRealtimeStore(store)
 	ctx := context.Background()
 
-	opened, err := svc.OpenSession(ctx, 600, "m_rt", "live")
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
+	opened := createStartedLiveSession(t, svc, "m_rt", "live")
 	if err := svc.IncrCounters(ctx, opened.ID, domain.LiveSessionCounters{LotsTotalDelta: 1, BidCountDelta: 4, GMVCentDelta: 100, ViewerPeakAtMin: 5}); err != nil {
 		t.Fatalf("incr: %v", err)
 	}
@@ -227,15 +176,12 @@ func TestLiveSessionServiceIncrCountersGoesThroughRealtimeStore(t *testing.T) {
 // TestLiveSessionServiceFlushCountersToDB 验证 FlushCountersToDB 把 store 中的累积计数一次性写进 MySQL，
 // 并清零 store。
 func TestLiveSessionServiceFlushCountersToDB(t *testing.T) {
-	svc, _, _, _ := newLiveSessionFixture(t)
+	svc, _, _ := newLiveSessionFixture(t)
 	store := repository.NewMemoryLiveSessionRealtimeStore()
 	svc.SetRealtimeStore(store)
 	ctx := context.Background()
 
-	opened, err := svc.OpenSession(ctx, 601, "m_flush", "live")
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
+	opened := createStartedLiveSession(t, svc, "m_flush", "live")
 	if err := svc.IncrCounters(ctx, opened.ID, domain.LiveSessionCounters{LotsTotalDelta: 2, LotsSoldDelta: 1, ViewerPeakAtMin: 7}); err != nil {
 		t.Fatalf("incr1: %v", err)
 	}
@@ -270,15 +216,12 @@ func TestLiveSessionServiceFlushCountersToDB(t *testing.T) {
 // TestLiveSessionServiceCloseFlushesAndResetsStore 验证 CloseSession 会先 flush，
 // 再切 ENDED，再清空 realtime store。
 func TestLiveSessionServiceCloseFlushesAndResetsStore(t *testing.T) {
-	svc, _, _, _ := newLiveSessionFixture(t)
+	svc, _, _ := newLiveSessionFixture(t)
 	store := repository.NewMemoryLiveSessionRealtimeStore()
 	svc.SetRealtimeStore(store)
 	ctx := context.Background()
 
-	opened, err := svc.OpenSession(ctx, 602, "m_close", "live")
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
+	opened := createStartedLiveSession(t, svc, "m_close", "live")
 	if err := svc.IncrCounters(ctx, opened.ID, domain.LiveSessionCounters{LotsTotalDelta: 5, GMVCentDelta: 9999, ViewerPeakAtMin: 11}); err != nil {
 		t.Fatalf("incr: %v", err)
 	}
@@ -303,7 +246,7 @@ func TestLiveSessionServiceCloseFlushesAndResetsStore(t *testing.T) {
 //   - 已 ENDED 的幂等 close 不会再次触发；
 //   - 回调收到的 LiveSession 是 ENDED 后的最终态。
 func TestLiveSessionServiceOnEndedHookFiresOnceAfterTransition(t *testing.T) {
-	svc, _, _, _ := newLiveSessionFixture(t)
+	svc, _, _ := newLiveSessionFixture(t)
 	ctx := context.Background()
 
 	calls := make(chan domain.LiveSession, 4)
@@ -311,10 +254,7 @@ func TestLiveSessionServiceOnEndedHookFiresOnceAfterTransition(t *testing.T) {
 		calls <- session
 	})
 
-	opened, err := svc.OpenSession(ctx, 603, "m_hook", "live")
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
+	opened := createStartedLiveSession(t, svc, "m_hook", "live")
 	if _, err := svc.CloseSession(ctx, opened.ID); err != nil {
 		t.Fatalf("close: %v", err)
 	}
@@ -335,6 +275,110 @@ func TestLiveSessionServiceOnEndedHookFiresOnceAfterTransition(t *testing.T) {
 	case extra := <-calls:
 		t.Fatalf("hook fired on idempotent close: %+v", extra)
 	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+func TestLiveSessionServiceMainlineLifecycleAndSingleLivePerMerchant(t *testing.T) {
+	svc, _, _ := newLiveSessionFixture(t)
+	ctx := context.Background()
+
+	first, err := svc.Create(ctx, CreateLiveSessionInput{ActorID: "m_main", ActorRole: domain.RoleMerchant, Title: "早场"})
+	if err != nil {
+		t.Fatalf("create first: %v", err)
+	}
+	second, err := svc.Create(ctx, CreateLiveSessionInput{ActorID: "m_main", ActorRole: domain.RoleMerchant, Title: "晚场"})
+	if err != nil {
+		t.Fatalf("create second: %v", err)
+	}
+	started, err := svc.Start(ctx, first.ID, "m_main", domain.RoleMerchant)
+	if err != nil {
+		t.Fatalf("start first: %v", err)
+	}
+	if started.Status != domain.LiveSessionStatusLive || started.OpenedAt == nil || started.OpenedAt.IsZero() || started.ActiveAuctionID != 0 {
+		t.Fatalf("started session wrong: %+v", started)
+	}
+	if _, err := svc.Start(ctx, second.ID, "m_main", domain.RoleMerchant); !errors.Is(err, domain.ErrInvalidState) {
+		t.Fatalf("same merchant second LIVE should fail, got %v", err)
+	}
+	ended, err := svc.End(ctx, first.ID, "m_main", domain.RoleMerchant)
+	if err != nil {
+		t.Fatalf("end first: %v", err)
+	}
+	if ended.Status != domain.LiveSessionStatusEnded || ended.ClosedAt == nil || ended.ActiveAuctionID != 0 {
+		t.Fatalf("ended session wrong: %+v", ended)
+	}
+}
+
+func TestLiveSessionServiceMountActivateDeactivateAndUnmountRules(t *testing.T) {
+	svc, _, auctionRepo := newLiveSessionFixture(t)
+	svc.SetWriteDeps(repository.NoopTxManager{}, repository.NewMemoryLiveSessionLock(), nil)
+	ctx := context.Background()
+	session, err := svc.Create(ctx, CreateLiveSessionInput{ActorID: "m_lot", ActorRole: domain.RoleMerchant, Title: "拍品场"})
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	if _, err := svc.Start(ctx, session.ID, "m_lot", domain.RoleMerchant); err != nil {
+		t.Fatalf("start session: %v", err)
+	}
+	now := time.Now().UTC()
+	lot := domain.AuctionLot{AuctionID: 8101, ItemID: 1, SellerID: "m_lot", AuctionType: domain.AuctionTypeEnglish, Status: domain.AuctionStatusReady, StartPrice: 100, StartTime: now, EndTime: now.Add(time.Hour)}
+	if err := auctionRepo.Create(ctx, &lot); err != nil {
+		t.Fatalf("create lot: %v", err)
+	}
+	mounted, err := svc.MountAuction(ctx, session.ID, lot.AuctionID, "m_lot", domain.RoleMerchant)
+	if err != nil {
+		t.Fatalf("mount by auctionId only: %v", err)
+	}
+	if mounted.LiveSessionID == nil || *mounted.LiveSessionID != session.ID {
+		t.Fatalf("mounted session id wrong: %+v", mounted)
+	}
+	active, err := svc.ActivateAuctionWithOptions(ctx, ActivateLiveSessionAuctionInput{SessionID: session.ID, AuctionID: lot.AuctionID, ActorID: "m_lot", ActorRole: domain.RoleMerchant})
+	if err != nil {
+		t.Fatalf("activate: %v", err)
+	}
+	if active.Status != domain.AuctionStatusReady && active.Status != domain.AuctionStatusRunning {
+		t.Fatalf("unexpected active lot: %+v", active)
+	}
+	if err := svc.UnmountAuction(ctx, session.ID, lot.AuctionID, "m_lot", domain.RoleMerchant); !errors.Is(err, domain.ErrInvalidState) {
+		t.Fatalf("active lot should not unmount, got %v", err)
+	}
+	if _, err := svc.DeactivateAuction(ctx, session.ID, "m_lot", domain.RoleMerchant); err != nil {
+		t.Fatalf("deactivate: %v", err)
+	}
+	if _, err := svc.ActivateAuctionWithOptions(ctx, ActivateLiveSessionAuctionInput{SessionID: session.ID, AuctionID: lot.AuctionID, ActorID: "m_lot", ActorRole: domain.RoleMerchant}); err != nil {
+		t.Fatalf("reactivate after deactivate: %v", err)
+	}
+}
+
+func TestLiveSessionServiceSoldLotCannotUnmountAndSessionQueries(t *testing.T) {
+	svc, _, auctionRepo := newLiveSessionFixture(t)
+	ctx := context.Background()
+	session, err := svc.Create(ctx, CreateLiveSessionInput{ActorID: "m_sold", ActorRole: domain.RoleMerchant, Title: "成交场"})
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	sid := session.ID
+	price := int64(500)
+	lot := domain.AuctionLot{AuctionID: 8201, ItemID: 1, SellerID: "m_sold", AuctionType: domain.AuctionTypeEnglish, Status: domain.AuctionStatusClosedWon, LiveSessionID: &sid, DealPrice: &price}
+	if err := auctionRepo.Create(ctx, &lot); err != nil {
+		t.Fatalf("create sold lot: %v", err)
+	}
+	if err := svc.UnmountAuction(ctx, session.ID, lot.AuctionID, "m_sold", domain.RoleMerchant); !errors.Is(err, domain.ErrInvalidState) {
+		t.Fatalf("sold lot should not unmount, got %v", err)
+	}
+	lots, err := svc.ListLots(ctx, session.ID, "m_sold", domain.RoleMerchant)
+	if err != nil {
+		t.Fatalf("list lots: %v", err)
+	}
+	if len(lots) != 1 || lots[0].AuctionID != lot.AuctionID {
+		t.Fatalf("session lots wrong: %+v", lots)
+	}
+	stats, err := svc.Stats(ctx, session.ID, "m_sold", domain.RoleMerchant)
+	if err != nil {
+		t.Fatalf("stats: %v", err)
+	}
+	if stats.LotsTotal != 1 {
+		t.Fatalf("stats should aggregate by liveSessionId, got %+v", stats)
 	}
 }
 

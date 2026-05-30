@@ -155,75 +155,25 @@ func (h *Handler) toolData(ctx context.Context, name string, arguments json.RawM
 			return nil, domain.ErrNotFound
 		}
 		var in struct {
-			SellerID   string               `json:"sellerId"`
-			Status     domain.AuctionStatus `json:"status"`
-			ItemID     uint64               `json:"itemId"`
-			LiveRoomID uint64               `json:"liveRoomId"`
-			Limit      int                  `json:"limit"`
-			Offset     int                  `json:"offset"`
+			SellerID      string               `json:"sellerId"`
+			Status        domain.AuctionStatus `json:"status"`
+			ItemID        uint64               `json:"itemId"`
+			LiveSessionID uint64               `json:"liveSessionId"`
+			Limit         int                  `json:"limit"`
+			Offset        int                  `json:"offset"`
 		}
 		if err := decodeParams(arguments, &in); err != nil {
 			return nil, domain.ErrInvalidArgument
 		}
-		filter := domain.AuctionFilter{SellerID: strings.TrimSpace(in.SellerID), Status: in.Status, ItemID: in.ItemID, LiveRoomID: in.LiveRoomID, Limit: normalizeLimit(in.Limit, 20), Offset: normalizeOffset(in.Offset)}
+		filter := domain.AuctionFilter{SellerID: strings.TrimSpace(in.SellerID), Status: in.Status, ItemID: in.ItemID, LiveSessionID: in.LiveSessionID, Limit: normalizeLimit(in.Limit, 20), Offset: normalizeOffset(in.Offset)}
 		items, err := h.read.ListAuctionLots(ctx, filter, actor)
 		return pagePayload(items, filter.Limit, filter.Offset, len(items)), err
-	case "read_live_room":
-		if h.read == nil {
-			return nil, domain.ErrNotFound
-		}
-		var in struct {
-			RoomID uint64 `json:"roomId"`
-		}
-		if err := decodeParams(arguments, &in); err != nil || in.RoomID == 0 {
-			return nil, domain.ErrInvalidArgument
-		}
-		return h.read.ReadLiveRoom(ctx, in.RoomID, actor)
-	case "read_live_rooms":
-		if h.read == nil {
-			return nil, domain.ErrNotFound
-		}
-		var in struct {
-			MerchantID string                `json:"merchantId"`
-			Status     domain.LiveRoomStatus `json:"status"`
-			Limit      int                   `json:"limit"`
-			Offset     int                   `json:"offset"`
-		}
-		if err := decodeParams(arguments, &in); err != nil {
-			return nil, domain.ErrInvalidArgument
-		}
-		filter := domain.LiveRoomFilter{MerchantID: strings.TrimSpace(in.MerchantID), Status: in.Status, Limit: normalizeLimit(in.Limit, 20), Offset: normalizeOffset(in.Offset)}
-		items, err := h.read.ListLiveRooms(ctx, filter, actor)
-		return pagePayload(items, filter.Limit, filter.Offset, len(items)), err
-	case "read_live_room_lots":
-		if h.read == nil {
-			return nil, domain.ErrNotFound
-		}
-		var in struct {
-			RoomID uint64 `json:"roomId"`
-		}
-		if err := decodeParams(arguments, &in); err != nil || in.RoomID == 0 {
-			return nil, domain.ErrInvalidArgument
-		}
-		return h.read.ListLiveRoomLots(ctx, in.RoomID, actor)
-	case "read_live_room_stats":
-		if h.read == nil {
-			return nil, domain.ErrNotFound
-		}
-		var in struct {
-			RoomID uint64 `json:"roomId"`
-		}
-		if err := decodeParams(arguments, &in); err != nil || in.RoomID == 0 {
-			return nil, domain.ErrInvalidArgument
-		}
-		return h.read.ReadLiveRoomStats(ctx, in.RoomID, actor)
 	case "read_live_sessions":
 		if h.read == nil {
 			return nil, domain.ErrNotFound
 		}
 		var in struct {
 			MerchantID string                   `json:"merchantId"`
-			RoomID     uint64                   `json:"roomId"`
 			Status     domain.LiveSessionStatus `json:"status"`
 			Limit      int                      `json:"limit"`
 			Offset     int                      `json:"offset"`
@@ -231,7 +181,7 @@ func (h *Handler) toolData(ctx context.Context, name string, arguments json.RawM
 		if err := decodeParams(arguments, &in); err != nil {
 			return nil, domain.ErrInvalidArgument
 		}
-		filter := domain.LiveSessionFilter{MerchantID: strings.TrimSpace(in.MerchantID), LiveRoomID: in.RoomID, Status: in.Status, Limit: normalizeLimit(in.Limit, 20), Offset: normalizeOffset(in.Offset)}
+		filter := domain.LiveSessionFilter{MerchantID: strings.TrimSpace(in.MerchantID), Status: in.Status, Limit: normalizeLimit(in.Limit, 20), Offset: normalizeOffset(in.Offset)}
 		items, err := h.read.ListLiveSessions(ctx, filter, actor)
 		return pagePayload(items, filter.Limit, filter.Offset, len(items)), err
 	case "read_live_session":

@@ -23,7 +23,7 @@ const websocketWriteTimeout = 5 * time.Second
 type WSHandler struct {
 	hub            *corews.Hub
 	bids           *service.BidService
-	rooms          *service.LiveRoomService
+	sessions       *service.LiveSessionService
 	auctions       *service.AuctionService
 	sendBufferSize int
 	readLimitBytes int
@@ -60,15 +60,52 @@ func NewWSHandler(hub *corews.Hub, bids *service.BidService, sendBufferSize, rea
 	}
 }
 
-// SetLiveRoomService 注入直播间服务以支持 /ws/live-rooms/:room_id 入口。
-func (h *WSHandler) SetLiveRoomService(rooms *service.LiveRoomService) {
-	h.rooms = rooms
+// SetLiveSessionService 注入直播场次服务以支持 /ws/live-sessions/:session_id 入口。
+func (h *WSHandler) SetLiveSessionService(sessions *service.LiveSessionService) {
+	h.sessions = sessions
 }
 
 // SetAuctionService 注入拍卖服务以在握手后下发 room.snapshot（P1-B）。
 // 未注入时握手成功仍可继续，但跳过 snapshot 帧（保留原有读写循环）。
 func (h *WSHandler) SetAuctionService(auctions *service.AuctionService) {
 	h.auctions = auctions
+}
+
+// LiveSession 处理 `/ws/live-sessions/:session_id` 入口，将客户端订阅到场次当前活跃拍品事件。
+func (h *WSHandler) LiveSession(ctx context.Context, c *app.RequestContext) {
+	sessionID, ok := parseUintParam(c, "session_id")
+	if !ok {
+		return
+	}
+	if h.sessions == nil {
+		WriteError(c, consts.StatusInternalServerError, 90001, "系统内部错误", nil)
+		return
+	}
+	auctionID, liveSessionID, err := h.sessions.ActiveAuctionAndSession(ctx, sessionID)
+	if err != nil {
+		writeLiveSessionError(c, err)
+		return
+	}
+	if auctionID == 0 {
+		WriteError(c, 409, 32004, "直播场次当前无在拍品", nil)
+		return
+	}
+	clientID := fmt.Sprintf("ws_%d", time.Now().UnixNano())
+	userID := AuthUserID(c)
+	if userID == "" {
+		userID = "anonymous"
+	}
+	client := corews.NewClientWithSession(clientID, userID, auctionID, liveSessionID, h.sendBufferSize)
+	lastSeq := parseLastSeq(c)
+	if err := h.hub.Subscribe(auctionID, client); err != nil {
+		WriteError(c, consts.StatusInternalServerError, 90001, "系统内部错误", nil)
+		return
+	}
+	if err := h.upgrader.Upgrade(c, func(conn *websocket.Conn) {
+		h.serveConn(context.Background(), conn, client, lastSeq)
+	}); err != nil {
+		h.hub.Unsubscribe(auctionID, client.ID)
+	}
 }
 
 func (h *WSHandler) Auction(ctx context.Context, c *app.RequestContext) {
@@ -83,43 +120,6 @@ func (h *WSHandler) Auction(ctx context.Context, c *app.RequestContext) {
 		userID = "anonymous"
 	}
 	client := corews.NewClient(clientID, userID, auctionID, h.sendBufferSize)
-	lastSeq := parseLastSeq(c)
-	if err := h.hub.Subscribe(auctionID, client); err != nil {
-		WriteError(c, consts.StatusInternalServerError, 90001, "系统内部错误", nil)
-		return
-	}
-	if err := h.upgrader.Upgrade(c, func(conn *websocket.Conn) {
-		h.serveConn(context.Background(), conn, client, lastSeq)
-	}); err != nil {
-		h.hub.Unsubscribe(auctionID, client.ID)
-	}
-}
-
-// LiveRoom 处理 `/ws/live-rooms/:room_id` 入口，将客户端订阅到房间当前活跃拍品的事件房间。
-func (h *WSHandler) LiveRoom(ctx context.Context, c *app.RequestContext) {
-	roomID, ok := parseUintParam(c, "room_id")
-	if !ok {
-		return
-	}
-	if h.rooms == nil {
-		WriteError(c, consts.StatusInternalServerError, 90001, "系统内部错误", nil)
-		return
-	}
-	auctionID, sessionID, err := h.rooms.ActiveAuctionAndSession(ctx, roomID)
-	if err != nil {
-		writeLiveRoomError(c, err)
-		return
-	}
-	if auctionID == 0 {
-		WriteError(c, 409, 31005, "直播间当前无在拍品", nil)
-		return
-	}
-	clientID := fmt.Sprintf("ws_%d", time.Now().UnixNano())
-	userID := AuthUserID(c)
-	if userID == "" {
-		userID = "anonymous"
-	}
-	client := corews.NewClientWithSession(clientID, userID, auctionID, sessionID, h.sendBufferSize)
 	lastSeq := parseLastSeq(c)
 	if err := h.hub.Subscribe(auctionID, client); err != nil {
 		WriteError(c, consts.StatusInternalServerError, 90001, "系统内部错误", nil)

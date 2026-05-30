@@ -101,7 +101,6 @@ type AuctionLot struct {
 	AuctionID      uint64            `json:"auctionId"`
 	ItemID         uint64            `json:"itemId"`
 	SellerID       string            `json:"sellerId"`
-	LiveRoomID     uint64            `json:"liveRoomId,omitempty"`
 	LiveSessionID  *uint64           `json:"liveSessionId,omitempty"`
 	AuctionType    AuctionType       `json:"auctionType"`
 	StartPrice     int64             `json:"startPrice"`
@@ -121,6 +120,9 @@ type AuctionLot struct {
 	DealPrice      *int64            `json:"dealPrice,omitempty"`
 	ClosedAt       *time.Time        `json:"closedAt,omitempty"`
 	ClosedBy       string            `json:"closedBy,omitempty"`
+	CurrentPrice   int64             `json:"currentPrice,omitempty"`
+	LeaderBidderID string            `json:"leaderBidderId,omitempty"`
+	BidCount       int               `json:"bidCount,omitempty"`
 	// Version 是 MySQL 行级乐观锁版本号，仅在落槌路径（CloseWithVersion）参与 CAS。
 	Version   int64     `json:"version"`
 	CreatedAt time.Time `json:"createdAt"`
@@ -128,12 +130,12 @@ type AuctionLot struct {
 }
 
 type AuctionFilter struct {
-	SellerID   string
-	Status     AuctionStatus
-	ItemID     uint64
-	LiveRoomID uint64
-	Limit      int
-	Offset     int
+	SellerID      string
+	Status        AuctionStatus
+	ItemID        uint64
+	LiveSessionID uint64
+	Limit         int
+	Offset        int
 }
 
 type AuctionPatch struct {
@@ -173,17 +175,17 @@ const (
 )
 
 type BidRecord struct {
-	ID            uint64
-	RequestID     string
-	AuctionID     uint64
-	LiveSessionID *uint64
-	BidderID      string
-	BidPrice      int64
-	BidTSMS       int64
-	Source        string
-	RiskResult    BidRiskResult
-	RejectReason  string
-	CreatedAt     time.Time
+	ID            uint64        `json:"id"`
+	RequestID     string        `json:"requestId"`
+	AuctionID     uint64        `json:"auctionId"`
+	LiveSessionID *uint64       `json:"liveSessionId,omitempty"`
+	BidderID      string        `json:"bidderId"`
+	BidPrice      int64         `json:"bidPrice"`
+	BidTSMS       int64         `json:"bidTsMs"`
+	Source        string        `json:"source"`
+	RiskResult    BidRiskResult `json:"riskResult"`
+	RejectReason  string        `json:"rejectReason,omitempty"`
+	CreatedAt     time.Time     `json:"createdAt"`
 }
 
 type BidInput struct {

@@ -63,7 +63,7 @@ func TestGormSlogLogger_TraceSlowEmitsWarn(t *testing.T) {
 	logger, buf := newTestGormLogger(t)
 	begin := time.Now().Add(-300 * time.Millisecond)
 	logger.Trace(context.Background(), begin,
-		func() (string, int64) { return "SELECT * FROM live_room", 7 },
+		func() (string, int64) { return "SELECT * FROM live_session", 7 },
 		nil,
 	)
 
@@ -80,7 +80,7 @@ func TestGormSlogLogger_TraceSlowEmitsWarn(t *testing.T) {
 	if rows, ok := got["rows"].(float64); !ok || rows != 7 {
 		t.Fatalf("expected rows=7, got %v", got["rows"])
 	}
-	if got["sql"] != "SELECT * FROM live_room" {
+	if got["sql"] != "SELECT * FROM live_session" {
 		t.Fatalf("expected sql preserved, got %v", got["sql"])
 	}
 	if elapsed, ok := got["elapsed_ms"].(float64); !ok || elapsed < 200 {

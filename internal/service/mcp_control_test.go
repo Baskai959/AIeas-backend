@@ -13,9 +13,7 @@ import (
 type mcpControlFixture struct {
 	svc      *MCPControlService
 	auctions *repository.MemoryAuctionRepository
-	rooms    *repository.MemoryLiveRoomRepository
 	sessions *repository.MemoryLiveSessionRepository
-	room     domain.LiveRoom
 	session  domain.LiveSession
 }
 
@@ -23,41 +21,30 @@ func newMCPControlFixture(t *testing.T) mcpControlFixture {
 	t.Helper()
 	ctx := context.Background()
 	auctionRepo := repository.NewMemoryAuctionRepository()
-	roomRepo := repository.NewMemoryLiveRoomRepository()
 	sessionRepo := repository.NewMemoryLiveSessionRepository()
 	realtimeStore := repository.NewMemoryRealtimeStore()
 	auctionSvc := NewAuctionService(auctionRepo, nil, repository.NoopTxManager{})
 	auctionSvc.SetRealtime(realtimeStore)
-	roomSvc := NewLiveRoomService(roomRepo, auctionRepo, repository.NoopTxManager{}, repository.NewMemoryLiveRoomLock())
-	roomSvc.SetAuctionService(auctionSvc)
-	room, err := roomSvc.Create(ctx, CreateLiveRoomInput{
-		ActorID:   "m_1",
-		ActorRole: domain.RoleMerchant,
-		Title:     "直播间",
-		Status:    domain.LiveRoomStatusLive,
-	})
-	if err != nil {
-		t.Fatalf("create room: %v", err)
-	}
+	sessionSvc := NewLiveSessionService(sessionRepo, auctionRepo)
+	sessionSvc.SetWriteDeps(repository.NoopTxManager{}, repository.NewMemoryLiveSessionLock(), auctionSvc)
+	sessionSvc.SetStatsDeps(repository.NewMemoryBidRepository(), realtimeStore, nil)
 	now := time.Now().UTC()
 	session := domain.LiveSession{
-		LiveRoomID: room.ID,
-		MerchantID: room.MerchantID,
-		Title:      room.Title,
+		MerchantID: "m_1",
+		Title:      "直播场次",
 		Status:     domain.LiveSessionStatusLive,
-		OpenedAt:   now,
+		OpenedAt:   &now,
 	}
 	if err := sessionRepo.Create(ctx, &session); err != nil {
 		t.Fatalf("create session: %v", err)
 	}
 	svc := NewMCPControlService(MCPLiveControlDependencies{
-		Auctions:    auctionRepo,
-		Rooms:       roomRepo,
-		Sessions:    sessionRepo,
-		LiveRoomSvc: roomSvc,
-		AuctionSvc:  auctionSvc,
+		Auctions:       auctionRepo,
+		Sessions:       sessionRepo,
+		LiveSessionSvc: sessionSvc,
+		AuctionSvc:     auctionSvc,
 	})
-	return mcpControlFixture{svc: svc, auctions: auctionRepo, rooms: roomRepo, sessions: sessionRepo, room: room, session: session}
+	return mcpControlFixture{svc: svc, auctions: auctionRepo, sessions: sessionRepo, session: session}
 }
 
 func TestMCPControlServiceReadAndOperate(t *testing.T) {
@@ -88,7 +75,7 @@ func TestMCPControlServiceReadAndOperate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("operate on shelf: %v", err)
 	}
-	if result.Action != "onShelf" || result.Lot == nil || result.Lot.LiveRoomID != fixture.room.ID {
+	if result.Action != "onShelf" || result.Lot == nil || result.Lot.LiveSessionID == nil || *result.Lot.LiveSessionID != fixture.session.ID {
 		t.Fatalf("unexpected operation result: %+v", result)
 	}
 	if result.Context == nil || len(result.Context.Lots.UpcomingLots) != 1 {
@@ -133,7 +120,8 @@ func TestMCPControlServiceErrors(t *testing.T) {
 		{
 			name: "operate rejects ended session",
 			run: func(ctx context.Context, fixture mcpControlFixture) error {
-				ended := domain.LiveSession{LiveRoomID: fixture.room.ID, MerchantID: "m_1", Status: domain.LiveSessionStatusEnded, OpenedAt: time.Now().UTC()}
+				now := time.Now().UTC()
+				ended := domain.LiveSession{MerchantID: "m_1", Status: domain.LiveSessionStatusEnded, OpenedAt: &now}
 				if err := fixture.sessions.Create(ctx, &ended); err != nil {
 					return err
 				}

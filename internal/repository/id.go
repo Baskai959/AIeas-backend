@@ -1,6 +1,9 @@
 package repository
 
-import "strings"
+import (
+	"strings"
+	"time"
+)
 
 // normalizeUserIDForDB keeps the domain/API user identifier as string while
 // writing/looking up MySQL BIGINT user columns with their numeric value. It is
@@ -25,3 +28,10 @@ func cloneUint64Ptr(p *uint64) *uint64 {
 	return &v
 }
 
+func cloneTimePtrUTC(p *time.Time) *time.Time {
+	if p == nil {
+		return nil
+	}
+	v := p.UTC()
+	return &v
+}

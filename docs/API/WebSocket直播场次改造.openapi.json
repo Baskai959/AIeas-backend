@@ -189,6 +189,102 @@
           }
         }
       }
+    },
+    "/ws/live-sessions/{sessionId}": {
+      "get": {
+        "tags": ["WebSocket"],
+        "summary": "订阅直播场次当前活跃拍品事件流",
+        "description": "WebSocket Upgrade 端点。客户端直接以直播场次 ID 建连，后端按 `live_session.id` 找到该场次当前活跃拍品并绑定 `(auctionId, liveSessionId)`：\n\n- 当场次不存在：返回 `404`，不进入 Upgrade。\n- 当场次当前无活跃拍品：返回 `409 + 31005 直播场次当前无在拍品`，不进入 Upgrade。\n- 当存在活跃拍品：客户端自动加入 `auctionId -> Room` 与 `liveSessionId -> Clients` 两张反查表，后续可接收出价、拍品状态与 `live_session.ended` 等场次维度事件。\n\n鉴权与 `/ws/auctions/{auction_id}` 一致；同样不属于 `/api/v1` 前缀。",
+        "operationId": "wsLiveSessionSubscribe",
+        "parameters": [
+          {
+            "name": "sessionId",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "integer", "format": "uint64" },
+            "description": "直播场次 ID（live_session.id）"
+          },
+          {
+            "name": "lastSeq",
+            "in": "query",
+            "required": false,
+            "schema": { "type": "integer", "format": "int64", "minimum": 0 },
+            "description": "重放游标，与 /ws/auctions 一致。"
+          },
+          {
+            "name": "Upgrade",
+            "in": "header",
+            "required": true,
+            "schema": { "type": "string", "enum": ["websocket"] }
+          },
+          {
+            "name": "Connection",
+            "in": "header",
+            "required": true,
+            "schema": { "type": "string", "enum": ["Upgrade"] }
+          },
+          {
+            "name": "Sec-WebSocket-Version",
+            "in": "header",
+            "required": true,
+            "schema": { "type": "string", "enum": ["13"] }
+          },
+          {
+            "name": "Sec-WebSocket-Key",
+            "in": "header",
+            "required": true,
+            "schema": { "type": "string" }
+          }
+        ],
+        "security": [{ "BearerAuth": [] }],
+        "responses": {
+          "101": {
+            "description": "协议升级成功；连接已绑定 `(auctionId, liveSessionId)`。后续通过 WebSocket 帧（参考 schemas.Envelope）双向通信。",
+            "headers": {
+              "Upgrade": { "schema": { "type": "string", "enum": ["websocket"] } },
+              "Connection": { "schema": { "type": "string", "enum": ["Upgrade"] } },
+              "Sec-WebSocket-Accept": { "schema": { "type": "string" } }
+            }
+          },
+          "400": {
+            "description": "sessionId 非法",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+              }
+            }
+          },
+          "401": { "description": "未鉴权或 token 无效" },
+          "404": {
+            "description": "直播场次不存在",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+              }
+            }
+          },
+          "409": {
+            "description": "直播场次当前无在拍品（activeAuctionId 为 0）。错误码 31005。",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" },
+                "example": {
+                  "code": 31005,
+                  "message": "直播场次当前无在拍品"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "服务初始化未注入 LiveSessionService 或 Hub Subscribe 失败",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {

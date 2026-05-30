@@ -4,6 +4,8 @@ services:
     restart: unless-stopped
     env_file:
       - ./docker/prod.env
+    ports:
+      - "0.0.0.0:3306:3306"
     command:
       - --character-set-server=utf8mb4
       - --collation-server=utf8mb4_0900_ai_ci
@@ -81,6 +83,52 @@ services:
       timeout: 5s
       retries: 12
 
+  kafka:
+    image: apache/kafka:3.7.2
+    restart: unless-stopped
+    user: "0:0"
+    environment:
+      CLUSTER_ID: "LelM2dIFQkiUFvXCEcqRWA"
+      KAFKA_NODE_ID: "1"
+      KAFKA_PROCESS_ROLES: "broker,controller"
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka:9093"
+      KAFKA_LISTENERS: "INTERNAL://:9092,CONTROLLER://:9093"
+      KAFKA_ADVERTISED_LISTENERS: "INTERNAL://kafka:9092"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "INTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT"
+      KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+      KAFKA_INTER_BROKER_LISTENER_NAME: "INTERNAL"
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_NUM_PARTITIONS: "3"
+      KAFKA_LOG_DIRS: "/tmp/kraft-combined-logs"
+      KAFKA_DEFAULT_REPLICATION_FACTOR: "1"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+    volumes:
+      - kafka-data:/tmp/kraft-combined-logs
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "/opt/kafka/bin/kafka-topics.sh --bootstrap-server 127.0.0.1:9092 --list >/dev/null 2>&1",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:v0.7.2
+    restart: unless-stopped
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      KAFKA_CLUSTERS_0_NAME: "aieas"
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: "kafka:9092"
+    ports:
+      - "127.0.0.1:8082:8080"
+
   app:
     build:
       context: .
@@ -97,6 +145,8 @@ services:
       redis-rt-2:
         condition: service_healthy
       redis-cache:
+        condition: service_healthy
+      kafka:
         condition: service_healthy
     ports:
       - "0.0.0.0:8888:8888"
@@ -162,6 +212,7 @@ volumes:
   redis-rt-1-data:
   redis-rt-2-data:
   redis-cache-data:
+  kafka-data:
   prometheus-data:
   grafana-data:
 

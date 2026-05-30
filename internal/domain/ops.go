@@ -187,8 +187,6 @@ type AdminDashboardSummary struct {
 }
 
 type AdminDashboardCurrent struct {
-	LiveRoomCount          int64 `json:"liveRoomCount"`
-	LiveRoomLiveCount      int64 `json:"liveRoomLiveCount"`
 	RunningAuctionCount    int64 `json:"runningAuctionCount"`
 	ActiveLiveSessionCount int64 `json:"activeLiveSessionCount"`
 	PendingRiskEventCount  int64 `json:"pendingRiskEventCount"`

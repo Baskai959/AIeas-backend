@@ -93,9 +93,9 @@ func (b KeyBuilder) ConfigItem(configKey string) string {
 	return b.key("config:item:%s", configKey)
 }
 
-// LiveRoomActiveLock 是直播间活拍互斥锁的 key（值为 active auction id）。
-func (b KeyBuilder) LiveRoomActiveLock(roomID uint64) string {
-	return b.key("live_room:%d:active", roomID)
+// LiveSessionActiveLock 是直播场次活拍互斥锁的 key（值为 active auction id）。
+func (b KeyBuilder) LiveSessionActiveLock(sessionID uint64) string {
+	return b.key("live_session:%d:active", sessionID)
 }
 
 // LiveSessionCounters 存放直播场次计数 HASH（lots_total/lots_sold/...）。

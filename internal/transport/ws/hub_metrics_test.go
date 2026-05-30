@@ -11,11 +11,11 @@ import (
 
 // fakeHubMetrics 记录 HubMetrics 接口上每个方法被调用的次数与参数。
 type fakeHubMetrics struct {
-	mu                       sync.Mutex
-	connectCalls             int
-	disconnectReasons        []string
-	broadcasts               []broadcastEvent
-	slowClientDisconnects    int
+	mu                    sync.Mutex
+	connectCalls          int
+	disconnectReasons     []string
+	broadcasts            []broadcastEvent
+	slowClientDisconnects int
 }
 
 type broadcastEvent struct {

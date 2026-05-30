@@ -189,6 +189,12 @@ func (r *trackingBidRepo) ListByAuction(ctx context.Context, auctionID uint64, l
 	return nil, nil
 }
 
+func (r *trackingBidRepo) CountByAuction(ctx context.Context, auctionID uint64) (int, error) {
+	_ = ctx
+	_ = auctionID
+	return 0, nil
+}
+
 func (r *trackingBidRepo) ListByLiveSession(ctx context.Context, sessionID uint64, sortBy string, limit, offset int) ([]domain.BidRecord, error) {
 	_ = ctx
 	_ = sessionID

@@ -18,6 +18,7 @@ import (
 type AuctionService struct {
 	auctions  repository.AuctionRepository
 	items     repository.ItemRepository
+	bids      repository.BidRepository
 	tx        repository.TxManager
 	idGen     AuctionIDGenerator
 	realtime  repository.AuctionRealtimeStore
@@ -37,7 +38,6 @@ type CreateAuctionInput struct {
 	AuctionID         uint64
 	ItemID            uint64
 	SellerID          string
-	LiveRoomID        uint64
 	AuctionType       domain.AuctionType
 	StartPrice        int64
 	ReservePrice      int64
@@ -84,6 +84,10 @@ func (s *AuctionService) SetRealtime(realtime repository.AuctionRealtimeStore) {
 		realtime = repository.NoopRealtimeStore{}
 	}
 	s.realtime = realtime
+}
+
+func (s *AuctionService) SetBidRepository(bids repository.BidRepository) {
+	s.bids = bids
 }
 
 func (s *AuctionService) SetPublisher(publisher EventPublisher) {
@@ -181,7 +185,6 @@ func (s *AuctionService) Create(ctx context.Context, in CreateAuctionInput) (dom
 		AuctionID:      auctionID,
 		ItemID:         in.ItemID,
 		SellerID:       sellerID,
-		LiveRoomID:     in.LiveRoomID,
 		AuctionType:    in.AuctionType,
 		StartPrice:     in.StartPrice,
 		ReservePrice:   in.ReservePrice,
@@ -213,14 +216,18 @@ func (s *AuctionService) Get(ctx context.Context, id uint64, actorID string, act
 	if !canAccessSellerOwned(actorID, actorRole, auction.SellerID) {
 		return domain.AuctionLot{}, domain.ErrForbidden
 	}
-	return auction, nil
+	return s.enrichAuctionLot(ctx, auction), nil
 }
 
 func (s *AuctionService) List(ctx context.Context, filter domain.AuctionFilter, actorID string, actorRole domain.Role) ([]domain.AuctionLot, error) {
 	if actorRole == domain.RoleMerchant {
 		filter.SellerID = actorID
 	}
-	return s.auctions.List(ctx, filter)
+	auctions, err := s.auctions.List(ctx, filter)
+	if err != nil {
+		return nil, err
+	}
+	return s.enrichAuctionLots(ctx, auctions), nil
 }
 
 func (s *AuctionService) Update(ctx context.Context, id uint64, in UpdateAuctionInput) (domain.AuctionLot, error) {
@@ -507,6 +514,49 @@ func (s *AuctionService) State(ctx context.Context, id uint64, actorID string, a
 		Version:        auction.UpdatedAt.UnixMilli(),
 		Source:         "db",
 	}, nil
+}
+
+func (s *AuctionService) enrichAuctionLots(ctx context.Context, lots []domain.AuctionLot) []domain.AuctionLot {
+	if len(lots) == 0 {
+		return lots
+	}
+	out := make([]domain.AuctionLot, len(lots))
+	for i := range lots {
+		out[i] = s.enrichAuctionLot(ctx, lots[i])
+	}
+	return out
+}
+
+func (s *AuctionService) enrichAuctionLot(ctx context.Context, lot domain.AuctionLot) domain.AuctionLot {
+	if s.bids != nil {
+		if count, err := s.bids.CountByAuction(ctx, lot.AuctionID); err == nil {
+			lot.BidCount = count
+		}
+		if records, err := s.bids.ListByAuction(ctx, lot.AuctionID, 1); err == nil && len(records) > 0 {
+			if lot.CurrentPrice == 0 {
+				lot.CurrentPrice = records[0].BidPrice
+			}
+			if lot.LeaderBidderID == "" {
+				lot.LeaderBidderID = records[0].BidderID
+			}
+		}
+	}
+	if s.realtime != nil {
+		if state, ok, err := s.realtime.GetAuctionState(ctx, lot.AuctionID); err == nil && ok {
+			lot.CurrentPrice = state.CurrentPrice
+			lot.LeaderBidderID = state.LeaderBidderID
+			if !state.EndTime.IsZero() {
+				lot.EndTime = state.EndTime
+			}
+			if state.Status.Valid() {
+				lot.Status = state.Status
+			}
+		}
+	}
+	if lot.CurrentPrice == 0 && lot.DealPrice != nil {
+		lot.CurrentPrice = *lot.DealPrice
+	}
+	return lot
 }
 
 func buildRuleSnapshot(in CreateAuctionInput) (json.RawMessage, error) {

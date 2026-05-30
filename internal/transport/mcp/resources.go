@@ -135,8 +135,6 @@ func (h *Handler) resourceData(ctx context.Context, rawURI string, actor service
 			}
 			return h.read.ReadAuctionLot(ctx, id, actor)
 		}
-	case "live-rooms":
-		return h.liveRoomResourceData(ctx, parts, q, actor)
 	case "live-sessions":
 		return h.liveSessionResourceData(ctx, parts, q, actor)
 	case "orders":
@@ -168,51 +166,10 @@ func (h *Handler) resourceData(ctx context.Context, rawURI string, actor service
 	return nil, domain.ErrInvalidArgument
 }
 
-func (h *Handler) liveRoomResourceData(ctx context.Context, parts []string, q url.Values, actor service.MCPActor) (interface{}, error) {
-	if len(parts) == 0 {
-		filter := domain.LiveRoomFilter{
-			MerchantID: strings.TrimSpace(q.Get("merchantId")),
-			Status:     liveRoomStatus(q.Get("status")),
-			Limit:      queryInt(q, "limit", 20),
-			Offset:     queryInt(q, "offset", 0),
-		}
-		items, err := h.read.ListLiveRooms(ctx, filter, actor)
-		return pagePayload(items, filter.Limit, filter.Offset, len(items)), err
-	}
-	id, err := parseUintID(parts[0])
-	if err != nil {
-		return nil, domain.ErrInvalidArgument
-	}
-	if len(parts) == 1 {
-		return h.read.ReadLiveRoom(ctx, id, actor)
-	}
-	if len(parts) != 2 {
-		return nil, domain.ErrInvalidArgument
-	}
-	switch parts[1] {
-	case "lots":
-		return h.read.ListLiveRoomLots(ctx, id, actor)
-	case "stats":
-		return h.read.ReadLiveRoomStats(ctx, id, actor)
-	case "live-sessions":
-		filter := domain.LiveSessionFilter{
-			LiveRoomID: id,
-			Status:     liveSessionStatus(q.Get("status")),
-			Limit:      queryInt(q, "limit", 20),
-			Offset:     queryInt(q, "offset", 0),
-		}
-		items, err := h.read.ListLiveSessions(ctx, filter, actor)
-		return pagePayload(items, filter.Limit, filter.Offset, len(items)), err
-	default:
-		return nil, domain.ErrInvalidArgument
-	}
-}
-
 func (h *Handler) liveSessionResourceData(ctx context.Context, parts []string, q url.Values, actor service.MCPActor) (interface{}, error) {
 	if len(parts) == 0 {
 		filter := domain.LiveSessionFilter{
 			MerchantID: strings.TrimSpace(q.Get("merchantId")),
-			LiveRoomID: queryUint(q, "roomId"),
 			Status:     liveSessionStatus(q.Get("status")),
 			Limit:      queryInt(q, "limit", 20),
 			Offset:     queryInt(q, "offset", 0),
@@ -291,12 +248,12 @@ func queryUint(q url.Values, name string) uint64 {
 
 func auctionFilterFromQuery(q url.Values) domain.AuctionFilter {
 	return domain.AuctionFilter{
-		SellerID:   strings.TrimSpace(q.Get("sellerId")),
-		Status:     auctionStatus(q.Get("status")),
-		ItemID:     queryUint(q, "itemId"),
-		LiveRoomID: queryUint(q, "liveRoomId"),
-		Limit:      queryInt(q, "limit", 20),
-		Offset:     queryInt(q, "offset", 0),
+		SellerID:      strings.TrimSpace(q.Get("sellerId")),
+		Status:        auctionStatus(q.Get("status")),
+		ItemID:        queryUint(q, "itemId"),
+		LiveSessionID: queryUint(q, "liveSessionId"),
+		Limit:         queryInt(q, "limit", 20),
+		Offset:        queryInt(q, "offset", 0),
 	}
 }
 
@@ -341,14 +298,6 @@ func itemStatus(raw string) domain.ItemStatus {
 
 func auctionStatus(raw string) domain.AuctionStatus {
 	status := domain.AuctionStatus(strings.TrimSpace(raw))
-	if status.Valid() {
-		return status
-	}
-	return ""
-}
-
-func liveRoomStatus(raw string) domain.LiveRoomStatus {
-	status := domain.LiveRoomStatus(strings.TrimSpace(raw))
 	if status.Valid() {
 		return status
 	}

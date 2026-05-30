@@ -26,7 +26,6 @@ type auctionCreateRequest struct {
 	AuctionID      uint64                   `json:"auctionId"`
 	ItemID         uint64                   `json:"itemId"`
 	SellerID       string                   `json:"sellerId"`
-	LiveRoomID     uint64                   `json:"liveRoomId"`
 	AuctionType    domain.AuctionType       `json:"auctionType"`
 	StartPrice     int64                    `json:"startPrice"`
 	ReservePrice   int64                    `json:"reservePrice"`
@@ -69,7 +68,6 @@ func (h *AuctionHandler) Create(ctx context.Context, c *app.RequestContext) {
 		AuctionID:      req.AuctionID,
 		ItemID:         req.ItemID,
 		SellerID:       req.SellerID,
-		LiveRoomID:     req.LiveRoomID,
 		AuctionType:    req.AuctionType,
 		StartPrice:     req.StartPrice,
 		ReservePrice:   req.ReservePrice,
@@ -103,8 +101,8 @@ func (h *AuctionHandler) List(ctx context.Context, c *app.RequestContext) {
 	if itemID, ok := parseOptionalUintQuery(c, "itemId"); ok {
 		filter.ItemID = itemID
 	}
-	if roomID, ok := parseOptionalUintQuery(c, "liveRoomId"); ok {
-		filter.LiveRoomID = roomID
+	if sessionID, ok := parseOptionalUintQuery(c, "liveSessionId"); ok {
+		filter.LiveSessionID = sessionID
 	}
 	auctions, err := h.auctions.List(ctx, filter, AuthUserID(c), AuthRole(c))
 	if err != nil {

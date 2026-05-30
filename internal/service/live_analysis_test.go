@@ -60,7 +60,8 @@ func TestLiveAnalysisServiceAuthAndSessionState(t *testing.T) {
 	reports := repository.NewMemoryLiveAnalysisReportRepository()
 	sessions := repository.NewMemoryLiveSessionRepository()
 	ended := createEndedLiveAnalysisSession(t, sessions, "u_2001")
-	live := domain.LiveSession{LiveRoomID: 2, MerchantID: "u_2001", Status: domain.LiveSessionStatusLive, OpenedAt: time.Now().UTC()}
+	openedAt := time.Now().UTC()
+	live := domain.LiveSession{MerchantID: "u_2001", Status: domain.LiveSessionStatusLive, OpenedAt: &openedAt}
 	if err := sessions.Create(context.Background(), &live); err != nil {
 		t.Fatalf("create live session: %v", err)
 	}
@@ -160,11 +161,11 @@ func TestLiveAnalysisServiceRetriesFailedReportUntilMaxAttempts(t *testing.T) {
 func createEndedLiveAnalysisSession(t *testing.T, sessions *repository.MemoryLiveSessionRepository, merchantID string) domain.LiveSession {
 	t.Helper()
 	now := time.Now().UTC()
+	openedAt := now.Add(-time.Hour)
 	session := domain.LiveSession{
-		LiveRoomID: 1,
 		MerchantID: merchantID,
 		Status:     domain.LiveSessionStatusEnded,
-		OpenedAt:   now.Add(-time.Hour),
+		OpenedAt:   &openedAt,
 		ClosedAt:   &now,
 	}
 	if err := sessions.Create(context.Background(), &session); err != nil {

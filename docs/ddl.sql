@@ -62,7 +62,6 @@ CREATE TABLE IF NOT EXISTS `auction_lot` (
   `auction_id`       BIGINT          NOT NULL                  COMMENT '拍品 ID（后端雪花 ID，非自增）',
   `item_id`          BIGINT          NOT NULL                  COMMENT '关联商品 ID（item.id）',
   `seller_id`        BIGINT          NOT NULL                  COMMENT '卖家 ID（user.id）',
-  `live_room_id`     BIGINT UNSIGNED NOT NULL DEFAULT 0        COMMENT '所属直播间 ID（0=未归属）',
   `live_session_id`  BIGINT UNSIGNED DEFAULT NULL              COMMENT '所属直播场次 ID（NULL=未关联场次）',
   `auction_type`     VARCHAR(16)     NOT NULL DEFAULT 'ENGLISH' COMMENT '拍卖类型，MVP 仅支持 ENGLISH',
   `start_price`      BIGINT          NOT NULL                  COMMENT '起拍价（分），允许为 0（0 元起拍）',
@@ -88,7 +87,6 @@ CREATE TABLE IF NOT EXISTS `auction_lot` (
   PRIMARY KEY (`auction_id`),
   KEY `idx_item_id` (`item_id`),
   KEY `idx_seller_id` (`seller_id`),
-  KEY `idx_live_room_status` (`live_room_id`, `status`),
   KEY `idx_live_session` (`live_session_id`),
   KEY `idx_status_end_time` (`status`, `end_time`),
   KEY `idx_winner_id` (`winner_id`)
@@ -235,12 +233,17 @@ CREATE TABLE IF NOT EXISTS `config_item` (
 -- ---------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS `live_session` (
   `id`            BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '直播场次 ID',
-  `live_room_id`  BIGINT UNSIGNED NOT NULL                COMMENT '所属直播间 ID（live_room.id）',
   `merchant_id`   VARCHAR(64)     NOT NULL                COMMENT '商家 ID（冗余便于查询）',
-  `title`         VARCHAR(255)    DEFAULT NULL            COMMENT '开播时直播间标题快照',
-  `status`        VARCHAR(16)     NOT NULL                COMMENT '状态：LIVE/ENDED',
-  `opened_at`     DATETIME(3)     NOT NULL                COMMENT '开播时间',
+  `live_merchant_id` VARCHAR(64) GENERATED ALWAYS AS (CASE WHEN `status` = 'LIVE' THEN `merchant_id` ELSE NULL END) STORED COMMENT '同商家同时仅一个 LIVE 的唯一键列',
+  `title`         VARCHAR(255)    DEFAULT NULL            COMMENT '直播场次标题',
+  `description`   TEXT            DEFAULT NULL            COMMENT '直播场次描述',
+  `cover_url`     VARCHAR(1024)   DEFAULT NULL            COMMENT '直播场次封面 URL',
+  `status`        VARCHAR(16)     NOT NULL                COMMENT '状态：DRAFT/SCHEDULED/LIVE/ENDED/CANCELLED',
+  `active_auction_id` BIGINT UNSIGNED NOT NULL DEFAULT 0  COMMENT '当前讲解/在拍 auction_id，0=无',
+  `opened_at`     DATETIME(3)     DEFAULT NULL            COMMENT '实际开播时间',
   `closed_at`     DATETIME(3)     DEFAULT NULL            COMMENT '闭播时间',
+  `scheduled_start_time` DATETIME(3) DEFAULT NULL         COMMENT '计划开播时间',
+  `planned_duration_sec` INT      NOT NULL DEFAULT 0      COMMENT '计划直播时长（秒）',
   `lots_total`    INT             NOT NULL DEFAULT 0      COMMENT '本场上架/挂载过的拍品数',
   `lots_sold`     INT             NOT NULL DEFAULT 0      COMMENT '本场成交数',
   `lots_unsold`   INT             NOT NULL DEFAULT 0      COMMENT '本场流拍数',
@@ -251,8 +254,10 @@ CREATE TABLE IF NOT EXISTS `live_session` (
   `created_at`    DATETIME(3)     NOT NULL DEFAULT CURRENT_TIMESTAMP(3) COMMENT '创建时间',
   `updated_at`    DATETIME(3)     NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3) COMMENT '更新时间',
   PRIMARY KEY (`id`),
-  KEY `idx_room_status` (`live_room_id`, `status`),
-  KEY `idx_merchant_opened` (`merchant_id`, `opened_at`)
+  UNIQUE KEY `uk_live_session_one_live_per_merchant` (`live_merchant_id`),
+  KEY `idx_merchant_opened` (`merchant_id`, `opened_at`),
+  KEY `idx_live_session_active_auction` (`active_auction_id`),
+  KEY `idx_live_session_status_schedule` (`status`, `scheduled_start_time`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='直播场次（一次开播-闭播）';
 
 -- ---------------------------------------------------------------------

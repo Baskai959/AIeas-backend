@@ -106,7 +106,6 @@ func NewServerWithConfig(cfg appconfig.Config) *server.Hertz {
 		UserRepo:                 userRepo,
 		ItemRepo:                 repository.NewMySQLItemRepository(db),
 		AuctionRepo:              repository.NewMySQLAuctionRepository(db),
-		LiveRoomRepo:             repository.NewMySQLLiveRoomRepository(db),
 		LiveSessionRepo:          repository.NewMySQLLiveSessionRepository(db),
 		LiveAnalysisReportRepo:   repository.NewMySQLLiveAnalysisReportRepository(db),
 		ConfigRepo:               repository.NewMySQLConfigRepository(db),
@@ -118,7 +117,7 @@ func NewServerWithConfig(cfg appconfig.Config) *server.Hertz {
 		AdminDashboardRepo:       repository.NewMySQLAdminDashboardRepository(db),
 		RealtimeStore:            realtimeStore,
 		LiveSessionRealtimeStore: liveSessionRealtimeStore,
-		LiveRoomLock:             redisinfra.NewLiveRoomLock(shardedRT, keys),
+		LiveSessionLock:          redisinfra.NewLiveSessionLock(shardedRT, keys),
 		TxManager:                repository.NewGORMTxManager(db),
 		Hub:                      wstransport.NewHubWithOnlineCounter(onlineCounter),
 		Idempotency:              httptransport.NewRedisIdempotencyStore(rdbCache, "idempotency"),
@@ -159,7 +158,6 @@ type ServerDependencies struct {
 	UserRepo                 repository.UserRepository
 	ItemRepo                 repository.ItemRepository
 	AuctionRepo              repository.AuctionRepository
-	LiveRoomRepo             repository.LiveRoomRepository
 	LiveSessionRepo          repository.LiveSessionRepository
 	LiveAnalysisReportRepo   repository.LiveAnalysisReportRepository
 	ConfigRepo               repository.ConfigRepository
@@ -171,7 +169,7 @@ type ServerDependencies struct {
 	AdminDashboardRepo       repository.AdminDashboardRepository
 	RealtimeStore            repository.AuctionRealtimeStore
 	LiveSessionRealtimeStore repository.LiveSessionRealtimeStore
-	LiveRoomLock             repository.LiveRoomLock
+	LiveSessionLock          repository.LiveSessionLock
 	TxManager                repository.TxManager
 	Hub                      *wstransport.Hub
 	Idempotency              httptransport.IdempotencyStore
@@ -240,9 +238,6 @@ func NewServerWithDependencies(cfg appconfig.Config, deps ServerDependencies) *s
 	if deps.AuctionRepo == nil {
 		deps.AuctionRepo = repository.NewMemoryAuctionRepository()
 	}
-	if deps.LiveRoomRepo == nil {
-		deps.LiveRoomRepo = repository.NewMemoryLiveRoomRepository()
-	}
 	if deps.LiveSessionRepo == nil {
 		deps.LiveSessionRepo = repository.NewMemoryLiveSessionRepository()
 	}
@@ -271,7 +266,7 @@ func NewServerWithDependencies(cfg appconfig.Config, deps ServerDependencies) *s
 		deps.AuditRepo = repository.NewMemoryAuditRepository()
 	}
 	if deps.AdminDashboardRepo == nil {
-		deps.AdminDashboardRepo = repository.NewMemoryAdminDashboardRepository(deps.AuctionRepo, deps.LiveRoomRepo, deps.LiveSessionRepo, deps.BidRepo, deps.OrderRepo, deps.RiskRepo)
+		deps.AdminDashboardRepo = repository.NewMemoryAdminDashboardRepository(deps.AuctionRepo, deps.LiveSessionRepo, deps.BidRepo, deps.OrderRepo, deps.RiskRepo)
 	}
 	if deps.RealtimeStore == nil {
 		deps.RealtimeStore = repository.NewMemoryRealtimeStore()
@@ -279,8 +274,8 @@ func NewServerWithDependencies(cfg appconfig.Config, deps ServerDependencies) *s
 	if deps.LiveSessionRealtimeStore == nil {
 		deps.LiveSessionRealtimeStore = repository.NewMemoryLiveSessionRealtimeStore()
 	}
-	if deps.LiveRoomLock == nil {
-		deps.LiveRoomLock = repository.NewMemoryLiveRoomLock()
+	if deps.LiveSessionLock == nil {
+		deps.LiveSessionLock = repository.NewMemoryLiveSessionLock()
 	}
 	if deps.TxManager == nil {
 		deps.TxManager = repository.NoopTxManager{}
@@ -349,17 +344,16 @@ func NewServerWithDependencies(cfg appconfig.Config, deps ServerDependencies) *s
 	hammerService := service.NewHammerService(deps.AuctionRepo, deps.OrderRepo, deps.DepositRepo, deps.RealtimeStore, deps.TxManager, deps.Hub)
 	timer := service.NewTimerScheduler(deps.RealtimeStore, hammerService, deps.Hub, time.Second)
 	auctionService.SetRealtime(deps.RealtimeStore)
+	auctionService.SetBidRepository(deps.BidRepo)
 	auctionService.SetPublisher(deps.Hub)
 	auctionService.SetTimer(timer)
 	auctionService.SetAuctionConfig(cfg.Auction)
 	auctionService.SetIDGenerator(deps.AuctionIDGen)
 	hammerService.SetOrderIDGenerator(deps.OrderIDGen)
-	liveRoomService := service.NewLiveRoomService(deps.LiveRoomRepo, deps.AuctionRepo, deps.TxManager, deps.LiveRoomLock)
-	liveRoomService.SetAuctionService(auctionService)
-	liveRoomService.SetHammerService(hammerService)
-	liveRoomService.SetStatsDeps(deps.BidRepo, deps.RealtimeStore, deps.Hub)
-	liveSessionService := service.NewLiveSessionService(deps.LiveSessionRepo, deps.LiveRoomRepo, deps.AuctionRepo)
+	liveSessionService := service.NewLiveSessionService(deps.LiveSessionRepo, deps.AuctionRepo)
 	liveSessionService.SetReadDeps(deps.BidRepo, deps.OrderRepo)
+	liveSessionService.SetWriteDeps(deps.TxManager, deps.LiveSessionLock, auctionService)
+	liveSessionService.SetStatsDeps(deps.BidRepo, deps.RealtimeStore, deps.Hub)
 	liveSessionService.SetRealtimeStore(deps.LiveSessionRealtimeStore)
 	liveAnalysisService := service.NewLiveAnalysisService(deps.LiveAnalysisReportRepo, deps.LiveSessionRepo, deps.LiveAnalysisRequester, service.LiveAnalysisOptions{
 		CallbackURL:    cfg.Agent.LiveAnalysisCallbackURL,
@@ -369,13 +363,15 @@ func NewServerWithDependencies(cfg appconfig.Config, deps ServerDependencies) *s
 	itemService.SetLiveAgentHookService(liveAgentHookService)
 	liveSessionService.SetOnEnded(buildLiveSessionEndedHook(deps.Hub, liveAnalysisService))
 	liveSessionService.SetLiveAgentHookService(liveAgentHookService)
-	liveRoomService.SetLiveAgentHookService(liveAgentHookService)
-	liveRoomService.SetLiveSessionService(liveSessionService)
 	hammerService.SetLiveSessionService(liveSessionService)
 	hammerService.SetLiveAgentHookService(liveAgentHookService)
 	hammerService.SetSettlementEventPublisher(deps.SettlementEventPublisher)
-	auctionService.SetOnClose(liveRoomService.OnAuctionClosed)
-	hammerService.SetOnClose(liveRoomService.OnAuctionClosed)
+	auctionService.SetOnClose(func(ctx context.Context, auctionID uint64) {
+		liveSessionService.OnAuctionClosed(ctx, auctionID)
+	})
+	hammerService.SetOnClose(func(ctx context.Context, auctionID uint64) {
+		liveSessionService.OnAuctionClosed(ctx, auctionID)
+	})
 	bidService := service.NewBidService(deps.BidRepo, deps.AuctionRepo, deps.RealtimeStore, riskService, deps.Hub, cfg.Auction)
 	bidService.SetLiveSessionService(liveSessionService)
 	bidService.SetHammerService(hammerService)
@@ -431,26 +427,23 @@ func NewServerWithDependencies(cfg appconfig.Config, deps ServerDependencies) *s
 		Users:       deps.UserRepo,
 		Items:       deps.ItemRepo,
 		Auctions:    deps.AuctionRepo,
-		Rooms:       deps.LiveRoomRepo,
 		Sessions:    deps.LiveSessionRepo,
 		Bids:        deps.BidRepo,
 		Orders:      deps.OrderRepo,
 		Risk:        riskService,
 		AuditLogs:   deps.AuditRepo,
 		AuctionSvc:  auctionService,
-		LiveRoomSvc: liveRoomService,
 		LiveSession: liveSessionService,
 		OrderSvc:    orderService,
 	})
 	mcpControlService := service.NewMCPControlService(service.MCPLiveControlDependencies{
-		Auctions:    deps.AuctionRepo,
-		Rooms:       deps.LiveRoomRepo,
-		Sessions:    deps.LiveSessionRepo,
-		LiveRoomSvc: liveRoomService,
-		AuctionSvc:  auctionService,
-		HammerSvc:   hammerService,
+		Auctions:       deps.AuctionRepo,
+		Sessions:       deps.LiveSessionRepo,
+		LiveSessionSvc: liveSessionService,
+		AuctionSvc:     auctionService,
+		HammerSvc:      hammerService,
 	})
-	h := newServerWithServices(authService, itemService, auctionService, bidService, depositService, hammerService, orderService, adminService, liveRoomService, liveSessionService, liveAnalysisService, mcpReadService, mcpControlService, riskControlService, deps.AuditRepo, deps.Hub, deps.Idempotency, deps.ObjectUploader, deps.DescriptionGen, deps.MetricsRegistry, deps.Tracing, deps.ReadinessProbes, deps.DistributedRateLimiter, deps.FeatureFlags, cfg)
+	h := newServerWithServices(authService, itemService, auctionService, bidService, depositService, hammerService, orderService, adminService, liveSessionService, liveAnalysisService, mcpReadService, mcpControlService, riskControlService, deps.AuditRepo, deps.Hub, deps.Idempotency, deps.ObjectUploader, deps.DescriptionGen, deps.MetricsRegistry, deps.Tracing, deps.ReadinessProbes, deps.DistributedRateLimiter, deps.FeatureFlags, cfg)
 	if stopWorkers != nil {
 		h.OnShutdown = append(h.OnShutdown, func(ctx context.Context) {
 			_ = ctx
@@ -500,15 +493,12 @@ func NewServerWithAuth(authService *service.AuthService) *server.Hertz {
 	auditRepo := repository.NewMemoryAuditRepository()
 	adminService := service.NewAdminService(repository.NewSeedUserRepository(), auctionService, hammerService, orderService, riskService, auditRepo)
 	adminService.SetConfigRepository(configRepo)
-	liveRoomRepo := repository.NewMemoryLiveRoomRepository()
-	liveRoomLock := repository.NewMemoryLiveRoomLock()
-	liveRoomService := service.NewLiveRoomService(liveRoomRepo, auctionRepo, repository.NoopTxManager{}, liveRoomLock)
-	liveRoomService.SetAuctionService(auctionService)
-	liveRoomService.SetHammerService(hammerService)
-	liveRoomService.SetStatsDeps(bidRepo, realtimeStore, hub)
+	liveSessionLock := repository.NewMemoryLiveSessionLock()
 	liveSessionRepo := repository.NewMemoryLiveSessionRepository()
-	liveSessionService := service.NewLiveSessionService(liveSessionRepo, liveRoomRepo, auctionRepo)
+	liveSessionService := service.NewLiveSessionService(liveSessionRepo, auctionRepo)
 	liveSessionService.SetReadDeps(bidRepo, orderRepo)
+	liveSessionService.SetWriteDeps(repository.NoopTxManager{}, liveSessionLock, auctionService)
+	liveSessionService.SetStatsDeps(bidRepo, realtimeStore, hub)
 	liveAnalysisService := service.NewLiveAnalysisService(repository.NewMemoryLiveAnalysisReportRepository(), liveSessionRepo, service.DisabledLiveAnalysisRequester{}, service.LiveAnalysisOptions{
 		CallbackURL:    cfg.Agent.LiveAnalysisCallbackURL,
 		CallbackAPIKey: cfg.Agent.LiveAnalysisCallbackAPIKey,
@@ -516,38 +506,37 @@ func NewServerWithAuth(authService *service.AuthService) *server.Hertz {
 	liveAgentHookService := service.NewLiveAgentHookService(repository.NewMemoryConfigRepository(), repository.NewSeedUserRepository(), service.DisabledLiveAgentHookInvoker{})
 	liveSessionService.SetOnEnded(buildLiveSessionEndedHook(hub, liveAnalysisService))
 	liveSessionService.SetLiveAgentHookService(liveAgentHookService)
-	liveRoomService.SetLiveAgentHookService(liveAgentHookService)
-	liveRoomService.SetLiveSessionService(liveSessionService)
 	hammerService.SetLiveSessionService(liveSessionService)
 	hammerService.SetLiveAgentHookService(liveAgentHookService)
 	bidService.SetLiveSessionService(liveSessionService)
 	bidService.SetLiveAgentHookService(liveAgentHookService)
-	auctionService.SetOnClose(liveRoomService.OnAuctionClosed)
-	hammerService.SetOnClose(liveRoomService.OnAuctionClosed)
+	auctionService.SetOnClose(func(ctx context.Context, auctionID uint64) {
+		liveSessionService.OnAuctionClosed(ctx, auctionID)
+	})
+	hammerService.SetOnClose(func(ctx context.Context, auctionID uint64) {
+		liveSessionService.OnAuctionClosed(ctx, auctionID)
+	})
 	itemService := service.NewItemService(itemRepo)
 	itemService.SetLiveAgentHookService(liveAgentHookService)
 	mcpReadService := service.NewMCPReadService(service.MCPReadDependencies{
 		Users:       repository.NewSeedUserRepository(),
 		Items:       itemRepo,
 		Auctions:    auctionRepo,
-		Rooms:       liveRoomRepo,
 		Sessions:    liveSessionRepo,
 		Bids:        bidRepo,
 		Orders:      orderRepo,
 		Risk:        riskService,
 		AuditLogs:   auditRepo,
 		AuctionSvc:  auctionService,
-		LiveRoomSvc: liveRoomService,
 		LiveSession: liveSessionService,
 		OrderSvc:    orderService,
 	})
 	mcpControlService := service.NewMCPControlService(service.MCPLiveControlDependencies{
-		Auctions:    auctionRepo,
-		Rooms:       liveRoomRepo,
-		Sessions:    liveSessionRepo,
-		LiveRoomSvc: liveRoomService,
-		AuctionSvc:  auctionService,
-		HammerSvc:   hammerService,
+		Auctions:       auctionRepo,
+		Sessions:       liveSessionRepo,
+		LiveSessionSvc: liveSessionService,
+		AuctionSvc:     auctionService,
+		HammerSvc:      hammerService,
 	})
 	return newServerWithServices(
 		authService,
@@ -558,7 +547,6 @@ func NewServerWithAuth(authService *service.AuthService) *server.Hertz {
 		hammerService,
 		orderService,
 		adminService,
-		liveRoomService,
 		liveSessionService,
 		liveAnalysisService,
 		mcpReadService,
@@ -587,7 +575,6 @@ func newServerWithServices(
 	hammerService *service.HammerService,
 	orderService *service.OrderService,
 	adminService *service.AdminService,
-	liveRoomService *service.LiveRoomService,
 	liveSessionService *service.LiveSessionService,
 	liveAnalysisService *service.LiveAnalysisService,
 	mcpReadService *service.MCPReadService,
@@ -668,11 +655,10 @@ func newServerWithServices(
 	auctionHandler := httptransport.NewAuctionHandler(auctionService, depositService, hammerService)
 	orderHandler := httptransport.NewOrderHandler(orderService)
 	adminHandler := httptransport.NewAdminHandler(adminService)
-	liveRoomHandler := httptransport.NewLiveRoomHandler(liveRoomService, objectUploader)
-	liveSessionHandler := httptransport.NewLiveSessionHandler(liveSessionService)
+	liveSessionHandler := httptransport.NewLiveSessionHandler(liveSessionService, objectUploader)
 	liveAnalysisHandler := httptransport.NewLiveAnalysisHandler(liveAnalysisService, cfg.Agent.LiveAnalysisCallbackAPIKey)
 	wsHandler := httptransport.NewWSHandler(hub, bidService, cfg.WebSocket.SendBufferSize, cfg.WebSocket.ReadLimitBytes, cfg.WebSocket.PingInterval.Std(), cfg.WebSocket.PongTimeout.Std())
-	wsHandler.SetLiveRoomService(liveRoomService)
+	wsHandler.SetLiveSessionService(liveSessionService)
 	wsHandler.SetAuctionService(auctionService)
 	idempotencyTTL := cfg.Idempotency.TTL.Std()
 	if idempotencyStore == nil {
@@ -717,18 +703,13 @@ func newServerWithServices(
 		auctions.POST("/:id/cancel", httptransport.WithIdempotency(idempotencyStore, idempotencyTTL, auctionHandler.Cancel))
 		auctions.POST("/:id/hammer", httptransport.WithIdempotency(idempotencyStore, idempotencyTTL, auctionHandler.Hammer))
 
-		liveRoomsPublic := v1.Group("/live-rooms", authHandler.AuthMiddleware())
-		liveRoomsPublic.GET("", liveRoomHandler.List)
-		liveRoomsPublic.GET("/:id", liveRoomHandler.Get)
-		liveRoomsPublic.GET("/:id/lots", liveRoomHandler.Lots)
-		liveRoomsPublic.GET("/:id/stats", liveRoomHandler.Stats)
-		liveRoomsPublic.GET("/:id/sessions", liveSessionHandler.ListByRoom)
-
 		liveSessionsPublic := v1.Group("/live-sessions", authHandler.AuthMiddleware())
-		liveSessionsPublic.GET("/:sessionId", liveSessionHandler.Get)
-		liveSessionsPublic.GET("/:sessionId/lots", liveSessionHandler.Lots)
-		liveSessionsPublic.GET("/:sessionId/bids", liveSessionHandler.Bids)
-		liveSessionsPublic.GET("/:sessionId/orders", liveSessionHandler.Orders)
+		liveSessionsPublic.GET("", liveSessionHandler.List)
+		liveSessionsPublic.GET("/:id", liveSessionHandler.Get)
+		liveSessionsPublic.GET("/:id/lots", liveSessionHandler.Lots)
+		liveSessionsPublic.GET("/:id/bids", liveSessionHandler.Bids)
+		liveSessionsPublic.GET("/:id/orders", liveSessionHandler.Orders)
+		liveSessionsPublic.GET("/:id/stats", liveSessionHandler.Stats)
 
 		merchantSessions := v1.Group("/merchants", authHandler.AuthMiddleware(), httptransport.RoleAuth(domain.RoleMerchant, domain.RoleAdmin))
 		merchantSessions.GET("/:merchantId/live-sessions", liveSessionHandler.ListByMerchant)
@@ -737,18 +718,18 @@ func newServerWithServices(
 		liveAnalysis.POST("/reports", httptransport.WithIdempotency(idempotencyStore, idempotencyTTL, liveAnalysisHandler.CreateReport))
 		liveAnalysis.GET("/reports/:liveSessionId", liveAnalysisHandler.GetReport)
 
-		liveRooms := v1.Group("/live-rooms", authHandler.AuthMiddleware(), httptransport.RoleAuth(domain.RoleMerchant, domain.RoleAdmin))
-		liveRooms.POST("", liveRoomHandler.Create)
-		liveRooms.PATCH("/:id", liveRoomHandler.Update)
-		liveRooms.DELETE("/:id", liveRoomHandler.Delete)
-		liveRooms.POST("/:id/cover", httptransport.WithIdempotency(idempotencyStore, idempotencyTTL, liveRoomHandler.UploadCover))
-		liveRooms.GET("/:id/agent-hook", liveRoomHandler.AgentHookConfig)
-		liveRooms.PATCH("/:id/agent-hook", httptransport.WithIdempotency(idempotencyStore, idempotencyTTL, liveRoomHandler.UpdateAgentHookConfig))
-		liveRooms.POST("/:id/activate", httptransport.WithIdempotency(idempotencyStore, idempotencyTTL, liveRoomHandler.Activate))
-		liveRooms.POST("/:id/deactivate", httptransport.WithIdempotency(idempotencyStore, idempotencyTTL, liveRoomHandler.Deactivate))
-		liveRooms.POST("/lots", httptransport.WithIdempotency(idempotencyStore, idempotencyTTL, liveRoomHandler.MountLotToMerchantRoom))
-		liveRooms.POST("/:id/lots", httptransport.WithIdempotency(idempotencyStore, idempotencyTTL, liveRoomHandler.MountLot))
-		liveRooms.DELETE("/:id/lots/:auctionId", liveRoomHandler.UnmountLot)
+		liveSessions := v1.Group("/live-sessions", authHandler.AuthMiddleware(), httptransport.RoleAuth(domain.RoleMerchant, domain.RoleAdmin))
+		liveSessions.POST("", liveSessionHandler.Create)
+		liveSessions.PATCH("/:id", httptransport.WithIdempotency(idempotencyStore, idempotencyTTL, liveSessionHandler.Update))
+		liveSessions.POST("/:id/start", httptransport.WithIdempotency(idempotencyStore, idempotencyTTL, liveSessionHandler.Start))
+		liveSessions.POST("/:id/end", httptransport.WithIdempotency(idempotencyStore, idempotencyTTL, liveSessionHandler.End))
+		liveSessions.POST("/:id/lots", httptransport.WithIdempotency(idempotencyStore, idempotencyTTL, liveSessionHandler.MountLot))
+		liveSessions.DELETE("/:id/lots/:auctionId", httptransport.WithIdempotency(idempotencyStore, idempotencyTTL, liveSessionHandler.UnmountLot))
+		liveSessions.POST("/:id/activate", httptransport.WithIdempotency(idempotencyStore, idempotencyTTL, liveSessionHandler.Activate))
+		liveSessions.POST("/:id/deactivate", httptransport.WithIdempotency(idempotencyStore, idempotencyTTL, liveSessionHandler.Deactivate))
+		liveSessions.POST("/:id/cover", httptransport.WithIdempotency(idempotencyStore, idempotencyTTL, liveSessionHandler.UploadCover))
+		liveSessions.GET("/:id/agent-hook", liveSessionHandler.AgentHookConfig)
+		liveSessions.PATCH("/:id/agent-hook", httptransport.WithIdempotency(idempotencyStore, idempotencyTTL, liveSessionHandler.UpdateAgentHookConfig))
 
 		orders := v1.Group("/orders", authHandler.AuthMiddleware())
 		orders.GET("", orderHandler.List)
@@ -777,7 +758,7 @@ func newServerWithServices(
 		admin.PATCH("/risk/events/:id", httptransport.WithIdempotency(idempotencyStore, idempotencyTTL, adminHandler.HandleRiskEvent))
 	}
 	h.GET("/ws/auctions/:auction_id", authHandler.AuthMiddleware(), wsHandler.Auction)
-	h.GET("/ws/live-rooms/:room_id", authHandler.AuthMiddleware(), wsHandler.LiveRoom)
+	h.GET("/ws/live-sessions/:session_id", authHandler.AuthMiddleware(), wsHandler.LiveSession)
 
 	return h
 }
@@ -997,7 +978,6 @@ func buildLiveSessionEndedHook(hub *wstransport.Hub, liveAnalysis *service.LiveA
 		if hub != nil {
 			payload, _ := json.Marshal(map[string]interface{}{
 				"liveSessionId": session.ID,
-				"liveRoomId":    session.LiveRoomID,
 				"status":        session.Status,
 			})
 			hub.BroadcastSessionEnd(session.ID, payload)

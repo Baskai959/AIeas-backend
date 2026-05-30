@@ -70,8 +70,10 @@ func (r *MemoryAuctionRepository) List(ctx context.Context, filter domain.Auctio
 		if filter.ItemID != 0 && auction.ItemID != filter.ItemID {
 			continue
 		}
-		if filter.LiveRoomID != 0 && auction.LiveRoomID != filter.LiveRoomID {
-			continue
+		if filter.LiveSessionID != 0 {
+			if auction.LiveSessionID == nil || *auction.LiveSessionID != filter.LiveSessionID {
+				continue
+			}
 		}
 		auctions = append(auctions, cloneAuction(auction))
 	}

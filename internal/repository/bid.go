@@ -17,6 +17,7 @@ type BidRepository interface {
 	Create(ctx context.Context, bid *domain.BidRecord) error
 	FindByRequestID(ctx context.Context, requestID string) (domain.BidRecord, error)
 	ListByAuction(ctx context.Context, auctionID uint64, limit int) ([]domain.BidRecord, error)
+	CountByAuction(ctx context.Context, auctionID uint64) (int, error)
 	ListByLiveSession(ctx context.Context, sessionID uint64, sortBy string, limit, offset int) ([]domain.BidRecord, error)
 }
 
@@ -72,6 +73,14 @@ func (r *MySQLBidRepository) ListByAuction(ctx context.Context, auctionID uint64
 		records = append(records, row.toDomain())
 	}
 	return records, nil
+}
+
+func (r *MySQLBidRepository) CountByAuction(ctx context.Context, auctionID uint64) (int, error) {
+	var count int64
+	if err := r.dbFor(ctx).Table("bid_record").Where("auction_id = ?", auctionID).Count(&count).Error; err != nil {
+		return 0, err
+	}
+	return int(count), nil
 }
 
 func (r *MySQLBidRepository) ListByLiveSession(ctx context.Context, sessionID uint64, sortBy string, limit, offset int) ([]domain.BidRecord, error) {
@@ -221,6 +230,19 @@ func (r *MemoryBidRepository) ListByAuction(ctx context.Context, auctionID uint6
 		records = records[:limit]
 	}
 	return records, nil
+}
+
+func (r *MemoryBidRepository) CountByAuction(ctx context.Context, auctionID uint64) (int, error) {
+	_ = ctx
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	count := 0
+	for _, bid := range r.byID {
+		if bid.AuctionID == auctionID {
+			count++
+		}
+	}
+	return count, nil
 }
 
 func (r *MemoryBidRepository) ListByLiveSession(ctx context.Context, sessionID uint64, sortBy string, limit, offset int) ([]domain.BidRecord, error) {

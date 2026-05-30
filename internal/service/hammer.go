@@ -287,8 +287,8 @@ func (s *HammerService) hammerInternal(ctx context.Context, in domain.HammerInpu
 		payload["orderId"] = order.ID
 	}
 	broadcastJSON(s.publisher, result.AuctionID, "auction.closed", payload)
-	if s.hook != nil && result.Status == domain.AuctionStatusClosedWon && auction.LiveRoomID != 0 {
-		s.hook.EmitHammerWon(ctx, auction.SellerID, auction.LiveRoomID, auction.AuctionID, result.Price)
+	if s.hook != nil && result.Status == domain.AuctionStatusClosedWon && auction.LiveSessionID != nil {
+		s.hook.EmitHammerWon(ctx, auction.SellerID, *auction.LiveSessionID, auction.AuctionID, result.Price)
 	}
 	if s.onClose != nil {
 		s.onClose(ctx, result.AuctionID)

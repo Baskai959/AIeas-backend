@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"time"
@@ -11,23 +12,52 @@ import (
 	"aieas_backend/internal/repository"
 )
 
+var (
+	ErrLiveSessionBusy   = errors.New("live session is busy with another auction")
+	ErrLotAlreadyMounted = errors.New("auction already mounted to another live session")
+)
+
+// OnlineCounter 用于在 Stats 接口中读取某 auction 的在线人数。
+// 通过定义在 service 包中的最小 interface 解耦 transport 层的 Hub。
+type OnlineCounter interface {
+	OnlineCount(auctionID uint64) int
+}
+
 // LiveSessionService 编排直播场次（live_session）领域操作：开播/闭播、统计累加、跨域查询。
 type LiveSessionService struct {
-	sessions repository.LiveSessionRepository
-	rooms    repository.LiveRoomRepository
-	auctions repository.AuctionRepository
-	bids     repository.BidRepository
-	orders   repository.OrderRepository
-	realtime repository.LiveSessionRealtimeStore
-	onEnded  func(ctx context.Context, session domain.LiveSession)
-	hook     *LiveAgentHookService
+	sessions        repository.LiveSessionRepository
+	auctions        repository.AuctionRepository
+	tx              repository.TxManager
+	lock            repository.LiveSessionLock
+	auction         *AuctionService
+	bids            repository.BidRepository
+	orders          repository.OrderRepository
+	auctionRealtime repository.AuctionRealtimeStore
+	hub             OnlineCounter
+	sessionRealtime repository.LiveSessionRealtimeStore
+	onEnded         func(ctx context.Context, session domain.LiveSession)
+	hook            *LiveAgentHookService
 
 	mu sync.Mutex // 保护场次开关与闭播计数 flush 的临界区
 }
 
 // NewLiveSessionService 构造一个直播场次服务。bids/orders 可选，仅在查询时使用。
-func NewLiveSessionService(sessions repository.LiveSessionRepository, rooms repository.LiveRoomRepository, auctions repository.AuctionRepository) *LiveSessionService {
-	return &LiveSessionService{sessions: sessions, rooms: rooms, auctions: auctions}
+func NewLiveSessionService(sessions repository.LiveSessionRepository, auctions repository.AuctionRepository) *LiveSessionService {
+	return &LiveSessionService{sessions: sessions, auctions: auctions, tx: repository.NoopTxManager{}, lock: repository.NewMemoryLiveSessionLock()}
+}
+
+// SetWriteDeps 注入直播场次主链路写操作所需依赖。
+func (s *LiveSessionService) SetWriteDeps(tx repository.TxManager, lock repository.LiveSessionLock, auction *AuctionService) {
+	if s == nil {
+		return
+	}
+	if tx != nil {
+		s.tx = tx
+	}
+	if lock != nil {
+		s.lock = lock
+	}
+	s.auction = auction
 }
 
 // SetReadDeps 注入用于场次详情查询的额外仓储。
@@ -45,7 +75,17 @@ func (s *LiveSessionService) SetRealtimeStore(rt repository.LiveSessionRealtimeS
 	if s == nil {
 		return
 	}
-	s.realtime = rt
+	s.sessionRealtime = rt
+}
+
+// SetStatsDeps 注入 Stats 接口所需依赖。
+func (s *LiveSessionService) SetStatsDeps(bids repository.BidRepository, realtime repository.AuctionRealtimeStore, hub OnlineCounter) {
+	if s == nil {
+		return
+	}
+	s.bids = bids
+	s.auctionRealtime = realtime
+	s.hub = hub
 }
 
 // SetLiveAgentHookService 注入直播拍卖事件 hook。
@@ -66,40 +106,194 @@ func (s *LiveSessionService) SetOnEnded(fn func(ctx context.Context, session dom
 	s.onEnded = fn
 }
 
-// OpenSession 在直播间下开启一个 LIVE 场次：
-//   - 同一 room 下若已存在 LIVE 场次（GetActiveByRoomID）则直接返回它，保证幂等。
-//   - 否则插入 status=LIVE, opened_at=now 的新行，所有计数置零。
-func (s *LiveSessionService) OpenSession(ctx context.Context, roomID uint64, merchantID, title string) (domain.LiveSession, error) {
+type CreateLiveSessionInput struct {
+	ActorID            string
+	ActorRole          domain.Role
+	MerchantID         string
+	Title              string
+	Description        string
+	CoverURL           string
+	Status             domain.LiveSessionStatus
+	ScheduledStartTime *time.Time
+	PlannedDurationSec int
+}
+
+type UpdateLiveSessionInput struct {
+	ActorID            string
+	ActorRole          domain.Role
+	Title              *string
+	Description        *string
+	CoverURL           *string
+	Status             *domain.LiveSessionStatus
+	ScheduledStartTime *time.Time
+	PlannedDurationSec *int
+}
+
+type ActivateLiveSessionAuctionInput struct {
+	SessionID   uint64
+	AuctionID   uint64
+	ActorID     string
+	ActorRole   domain.Role
+	DurationSec int
+}
+
+type LiveSessionStats struct {
+	LiveSessionID        uint64 `json:"liveSessionId"`
+	Online               int    `json:"online"`
+	LotsTotal            int    `json:"lotsTotal"`
+	LotsSold             int    `json:"lotsSold"`
+	LotsUnsold           int    `json:"lotsUnsold"`
+	BidCount             int    `json:"bidCount"`
+	GMVCent              int64  `json:"gmvCent"`
+	ViewerPeak           int    `json:"viewerPeak"`
+	ViewerTotal          int    `json:"viewerTotal"`
+	ActiveAuctionID      uint64 `json:"activeAuctionId"`
+	CurrentBidCount      int    `json:"currentBidCount"`
+	CurrentRemainSeconds int64  `json:"currentRemainSeconds"`
+	CurrentPrice         int64  `json:"currentPrice"`
+}
+
+func (s *LiveSessionService) Create(ctx context.Context, in CreateLiveSessionInput) (domain.LiveSession, error) {
 	if s == nil || s.sessions == nil {
 		return domain.LiveSession{}, domain.ErrInvalidState
 	}
-	if roomID == 0 {
+	title := strings.TrimSpace(in.Title)
+	if title == "" || strings.TrimSpace(in.ActorID) == "" {
 		return domain.LiveSession{}, domain.ErrInvalidArgument
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if existing, err := s.sessions.GetActiveByRoomID(ctx, roomID); err == nil {
-		return existing, nil
-	} else if !errors.Is(err, domain.ErrNotFound) {
-		return domain.LiveSession{}, err
+	merchantID := strings.TrimSpace(in.MerchantID)
+	if in.ActorRole == domain.RoleMerchant {
+		merchantID = in.ActorID
+	}
+	if merchantID == "" {
+		merchantID = in.ActorID
+	}
+	if !canAccessSellerOwned(in.ActorID, in.ActorRole, merchantID) {
+		return domain.LiveSession{}, domain.ErrForbidden
+	}
+	status := in.Status
+	if status == "" {
+		status = domain.LiveSessionStatusDraft
+	}
+	if status != domain.LiveSessionStatusDraft && status != domain.LiveSessionStatusScheduled {
+		return domain.LiveSession{}, domain.ErrInvalidState
+	}
+	if in.PlannedDurationSec < 0 {
+		return domain.LiveSession{}, domain.ErrInvalidArgument
 	}
 	now := time.Now().UTC()
 	session := domain.LiveSession{
-		LiveRoomID: roomID,
-		MerchantID: strings.TrimSpace(merchantID),
-		Title:      strings.TrimSpace(title),
-		Status:     domain.LiveSessionStatusLive,
-		OpenedAt:   now,
-		CreatedAt:  now,
-		UpdatedAt:  now,
+		MerchantID:         merchantID,
+		Title:              title,
+		Description:        strings.TrimSpace(in.Description),
+		CoverURL:           strings.TrimSpace(in.CoverURL),
+		Status:             status,
+		ScheduledStartTime: in.ScheduledStartTime,
+		PlannedDurationSec: in.PlannedDurationSec,
+		CreatedAt:          now,
+		UpdatedAt:          now,
 	}
 	if err := s.sessions.Create(ctx, &session); err != nil {
 		return domain.LiveSession{}, err
 	}
-	if s.hook != nil {
-		s.hook.EmitLiveStarted(ctx, session.MerchantID, session.LiveRoomID, session.ID)
-	}
 	return session, nil
+}
+
+func (s *LiveSessionService) Update(ctx context.Context, id uint64, in UpdateLiveSessionInput) (domain.LiveSession, error) {
+	if id == 0 {
+		return domain.LiveSession{}, domain.ErrInvalidArgument
+	}
+	current, err := s.sessions.Get(ctx, id)
+	if err != nil {
+		return domain.LiveSession{}, err
+	}
+	if !canAccessSellerOwned(in.ActorID, in.ActorRole, current.MerchantID) {
+		return domain.LiveSession{}, domain.ErrForbidden
+	}
+	if current.Status == domain.LiveSessionStatusEnded || current.Status == domain.LiveSessionStatusCancelled {
+		return domain.LiveSession{}, domain.ErrInvalidState
+	}
+	if in.Title != nil {
+		title := strings.TrimSpace(*in.Title)
+		if title == "" {
+			return domain.LiveSession{}, domain.ErrInvalidArgument
+		}
+		current.Title = title
+	}
+	if in.Description != nil {
+		current.Description = strings.TrimSpace(*in.Description)
+	}
+	if in.CoverURL != nil {
+		current.CoverURL = strings.TrimSpace(*in.CoverURL)
+	}
+	if in.ScheduledStartTime != nil {
+		current.ScheduledStartTime = in.ScheduledStartTime
+	}
+	if in.PlannedDurationSec != nil {
+		if *in.PlannedDurationSec < 0 {
+			return domain.LiveSession{}, domain.ErrInvalidArgument
+		}
+		current.PlannedDurationSec = *in.PlannedDurationSec
+	}
+	if in.Status != nil {
+		if !in.Status.Valid() || !domain.CanTransitionLiveSession(current.Status, *in.Status) {
+			return domain.LiveSession{}, domain.ErrInvalidState
+		}
+		current.Status = *in.Status
+	}
+	if err := s.sessions.Update(ctx, &current); err != nil {
+		return domain.LiveSession{}, err
+	}
+	return current, nil
+}
+
+func (s *LiveSessionService) Start(ctx context.Context, sessionID uint64, actorID string, actorRole domain.Role) (domain.LiveSession, error) {
+	if sessionID == 0 {
+		return domain.LiveSession{}, domain.ErrInvalidArgument
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	current, err := s.sessions.Get(ctx, sessionID)
+	if err != nil {
+		return domain.LiveSession{}, err
+	}
+	if !canAccessSellerOwned(actorID, actorRole, current.MerchantID) {
+		return domain.LiveSession{}, domain.ErrForbidden
+	}
+	if current.Status == domain.LiveSessionStatusLive {
+		return current, nil
+	}
+	if current.Status != domain.LiveSessionStatusDraft && current.Status != domain.LiveSessionStatusScheduled {
+		return domain.LiveSession{}, domain.ErrInvalidState
+	}
+	if existing, err := s.sessions.GetActiveByMerchantID(ctx, current.MerchantID); err == nil && existing.ID != current.ID {
+		return domain.LiveSession{}, domain.ErrInvalidState
+	} else if err != nil && !errors.Is(err, domain.ErrNotFound) {
+		return domain.LiveSession{}, err
+	}
+	now := time.Now().UTC()
+	current.Status = domain.LiveSessionStatusLive
+	current.OpenedAt = &now
+	current.ClosedAt = nil
+	current.ActiveAuctionID = 0
+	if err := s.sessions.Update(ctx, &current); err != nil {
+		return domain.LiveSession{}, err
+	}
+	if s.hook != nil {
+		s.hook.EmitLiveStarted(ctx, current.MerchantID, current.ID)
+	}
+	return current, nil
+}
+
+func (s *LiveSessionService) End(ctx context.Context, sessionID uint64, actorID string, actorRole domain.Role) (domain.LiveSession, error) {
+	current, err := s.sessions.Get(ctx, sessionID)
+	if err != nil {
+		return domain.LiveSession{}, err
+	}
+	if !canAccessSellerOwned(actorID, actorRole, current.MerchantID) {
+		return domain.LiveSession{}, domain.ErrForbidden
+	}
+	return s.CloseSession(ctx, sessionID)
 }
 
 // CloseSession 将场次从 LIVE 切换到 ENDED 并写入 closed_at。
@@ -138,11 +332,19 @@ func (s *LiveSessionService) CloseSession(ctx context.Context, sessionID uint64)
 	now := time.Now().UTC()
 	current.Status = domain.LiveSessionStatusEnded
 	current.ClosedAt = &now
+	activeAuctionID := current.ActiveAuctionID
+	current.ActiveAuctionID = 0
 	if err := s.sessions.Update(ctx, &current); err != nil {
 		return domain.LiveSession{}, err
 	}
-	if s.realtime != nil {
-		_ = s.realtime.Reset(ctx, sessionID)
+	if activeAuctionID != 0 && s.lock != nil {
+		_ = s.lock.Release(ctx, sessionID, activeAuctionID)
+	}
+	if err := s.unmountUnfinishedLots(ctx, current.ID, activeAuctionID); err != nil {
+		return domain.LiveSession{}, err
+	}
+	if s.sessionRealtime != nil {
+		_ = s.sessionRealtime.Reset(ctx, sessionID)
 	}
 	if s.onEnded != nil {
 		fn := s.onEnded
@@ -155,23 +357,27 @@ func (s *LiveSessionService) CloseSession(ctx context.Context, sessionID uint64)
 	return current, nil
 }
 
-// CloseActiveByRoom 关闭某直播间下当前的 LIVE 场次（若存在）。无活跃场次时返回 nil。
-func (s *LiveSessionService) CloseActiveByRoom(ctx context.Context, roomID uint64) (domain.LiveSession, bool, error) {
-	if s == nil || s.sessions == nil {
-		return domain.LiveSession{}, false, nil
+func (s *LiveSessionService) unmountUnfinishedLots(ctx context.Context, sessionID, activeAuctionID uint64) error {
+	if s.auctions == nil {
+		return nil
 	}
-	current, err := s.sessions.GetActiveByRoomID(ctx, roomID)
+	lots, err := s.auctions.List(ctx, domain.AuctionFilter{LiveSessionID: sessionID, Limit: 100})
 	if err != nil {
-		if errors.Is(err, domain.ErrNotFound) {
-			return domain.LiveSession{}, false, nil
+		return err
+	}
+	for _, lot := range lots {
+		if lot.AuctionID == activeAuctionID || lot.Status == domain.AuctionStatusClosedWon || lot.Status == domain.AuctionStatusSettled {
+			continue
 		}
-		return domain.LiveSession{}, false, err
+		lot.LiveSessionID = nil
+		if !lot.Status.Terminal() {
+			lot.Status = domain.AuctionStatusReady
+		}
+		if err := s.auctions.Update(ctx, &lot); err != nil {
+			return err
+		}
 	}
-	closed, err := s.CloseSession(ctx, current.ID)
-	if err != nil {
-		return domain.LiveSession{}, false, err
-	}
-	return closed, true, nil
+	return nil
 }
 
 // IncrCounters 对指定场次累加计数。
@@ -185,12 +391,12 @@ func (s *LiveSessionService) IncrCounters(ctx context.Context, sessionID uint64,
 	if s == nil || s.sessions == nil || sessionID == 0 {
 		return nil
 	}
-	if s.realtime != nil {
-		if err := s.realtime.IncrCounters(ctx, sessionID, c); err != nil {
+	if s.sessionRealtime != nil {
+		if err := s.sessionRealtime.IncrCounters(ctx, sessionID, c); err != nil {
 			return err
 		}
 		if c.ViewerPeakAtMin > 0 {
-			if _, err := s.realtime.BumpViewerPeak(ctx, sessionID, c.ViewerPeakAtMin); err != nil {
+			if _, err := s.sessionRealtime.BumpViewerPeak(ctx, sessionID, c.ViewerPeakAtMin); err != nil {
 				return err
 			}
 		}
@@ -229,10 +435,10 @@ func (s *LiveSessionService) FlushCountersToDB(ctx context.Context, sessionID ui
 }
 
 func (s *LiveSessionService) flushCountersLocked(ctx context.Context, sessionID uint64) error {
-	if s.realtime == nil {
+	if s.sessionRealtime == nil {
 		return nil
 	}
-	counters, peak, err := s.realtime.LoadCounters(ctx, sessionID)
+	counters, peak, err := s.sessionRealtime.LoadCounters(ctx, sessionID)
 	if err != nil {
 		return err
 	}
@@ -267,29 +473,7 @@ func (s *LiveSessionService) Get(ctx context.Context, id uint64) (domain.LiveSes
 	return s.sessions.Get(ctx, id)
 }
 
-// ListByRoom 列出指定直播间的场次（最近优先）。
-// 当调用方为商家角色时，需要校验 room 归属；admin 直接放行。
-func (s *LiveSessionService) ListByRoom(ctx context.Context, roomID uint64, status domain.LiveSessionStatus, actorID string, actorRole domain.Role, limit, offset int) ([]domain.LiveSession, error) {
-	if s == nil || s.sessions == nil {
-		return nil, domain.ErrNotFound
-	}
-	if roomID == 0 {
-		return nil, domain.ErrInvalidArgument
-	}
-	if s.rooms != nil {
-		room, err := s.rooms.FindByID(ctx, roomID)
-		if err != nil {
-			return nil, err
-		}
-		if !canAccessSellerOwned(actorID, actorRole, room.MerchantID) {
-			return nil, domain.ErrForbidden
-		}
-	}
-	filter := domain.LiveSessionFilter{LiveRoomID: roomID, Status: status, Limit: limit, Offset: offset}
-	return s.sessions.List(ctx, filter)
-}
-
-// ListByMerchant 列出某商家所有直播间下的场次。
+// ListByMerchant 列出某商家的所有直播场次。
 // 当 actor 为商家时强制 merchantID = actorID；admin 可指定任意 merchantID。
 func (s *LiveSessionService) ListByMerchant(ctx context.Context, merchantID string, status domain.LiveSessionStatus, actorID string, actorRole domain.Role, limit, offset int) ([]domain.LiveSession, error) {
 	if s == nil || s.sessions == nil {
@@ -321,17 +505,11 @@ func (s *LiveSessionService) ListLots(ctx context.Context, sessionID uint64, act
 	if !canAccessSellerOwned(actorID, actorRole, session.MerchantID) {
 		return nil, domain.ErrForbidden
 	}
-	all, err := s.auctions.List(ctx, domain.AuctionFilter{LiveRoomID: session.LiveRoomID, Limit: 100})
+	all, err := s.auctions.List(ctx, domain.AuctionFilter{LiveSessionID: sessionID, Limit: 100})
 	if err != nil {
 		return nil, err
 	}
-	filtered := make([]domain.AuctionLot, 0, len(all))
-	for _, lot := range all {
-		if lot.LiveSessionID != nil && *lot.LiveSessionID == sessionID {
-			filtered = append(filtered, lot)
-		}
-	}
-	return filtered, nil
+	return s.enrichLots(ctx, all), nil
 }
 
 // ListBids 返回某场次的出价记录（按拍品聚合后 limit）。
@@ -387,6 +565,335 @@ func (s *LiveSessionService) ListOrders(ctx context.Context, sessionID uint64, l
 	return s.orders.List(ctx, domain.OrderFilter{SellerID: session.MerchantID, LiveSessionID: sessionID, Limit: limit, Offset: offset})
 }
 
+func (s *LiveSessionService) MountAuction(ctx context.Context, sessionID, auctionID uint64, actorID string, actorRole domain.Role) (domain.AuctionLot, error) {
+	if sessionID == 0 || auctionID == 0 {
+		return domain.AuctionLot{}, domain.ErrInvalidArgument
+	}
+	session, err := s.sessions.Get(ctx, sessionID)
+	if err != nil {
+		return domain.AuctionLot{}, err
+	}
+	if !canAccessSellerOwned(actorID, actorRole, session.MerchantID) {
+		return domain.AuctionLot{}, domain.ErrForbidden
+	}
+	if session.Status == domain.LiveSessionStatusEnded || session.Status == domain.LiveSessionStatusCancelled {
+		return domain.AuctionLot{}, domain.ErrInvalidState
+	}
+	auction, err := s.auctions.FindByID(ctx, auctionID)
+	if err != nil {
+		return domain.AuctionLot{}, err
+	}
+	if auction.SellerID != session.MerchantID {
+		return domain.AuctionLot{}, domain.ErrForbidden
+	}
+	if auction.LiveSessionID != nil && *auction.LiveSessionID != sessionID {
+		return domain.AuctionLot{}, ErrLotAlreadyMounted
+	}
+	switch auction.Status {
+	case domain.AuctionStatusDraft, domain.AuctionStatusPendingAudit, domain.AuctionStatusReady:
+		// allowed
+	default:
+		return domain.AuctionLot{}, domain.ErrInvalidState
+	}
+	if auction.LiveSessionID != nil && *auction.LiveSessionID == sessionID {
+		return auction, nil
+	}
+	auction.LiveSessionID = &sessionID
+	if err := s.auctions.Update(ctx, &auction); err != nil {
+		return domain.AuctionLot{}, err
+	}
+	session.LotsTotal++
+	_ = s.sessions.Update(ctx, &session)
+	return auction, nil
+}
+
+func (s *LiveSessionService) UnmountAuction(ctx context.Context, sessionID, auctionID uint64, actorID string, actorRole domain.Role) error {
+	if sessionID == 0 || auctionID == 0 {
+		return domain.ErrInvalidArgument
+	}
+	session, err := s.sessions.Get(ctx, sessionID)
+	if err != nil {
+		return err
+	}
+	if !canAccessSellerOwned(actorID, actorRole, session.MerchantID) {
+		return domain.ErrForbidden
+	}
+	auction, err := s.auctions.FindByID(ctx, auctionID)
+	if err != nil {
+		return err
+	}
+	if auction.LiveSessionID == nil || *auction.LiveSessionID != sessionID {
+		return domain.ErrNotFound
+	}
+	if session.ActiveAuctionID == auctionID || auction.Status == domain.AuctionStatusRunning || auction.Status == domain.AuctionStatusExtended || auction.Status == domain.AuctionStatusHammerPending {
+		return domain.ErrInvalidState
+	}
+	if auction.Status == domain.AuctionStatusClosedWon || auction.Status == domain.AuctionStatusSettled {
+		return domain.ErrInvalidState
+	}
+	auction.LiveSessionID = nil
+	return s.auctions.Update(ctx, &auction)
+}
+
+func (s *LiveSessionService) ActivateAuctionWithOptions(ctx context.Context, in ActivateLiveSessionAuctionInput) (domain.AuctionLot, error) {
+	if in.SessionID == 0 || in.AuctionID == 0 || in.DurationSec < 0 {
+		return domain.AuctionLot{}, domain.ErrInvalidArgument
+	}
+	session, err := s.sessions.Get(ctx, in.SessionID)
+	if err != nil {
+		return domain.AuctionLot{}, err
+	}
+	if !canAccessSellerOwned(in.ActorID, in.ActorRole, session.MerchantID) {
+		return domain.AuctionLot{}, domain.ErrForbidden
+	}
+	if session.Status != domain.LiveSessionStatusLive {
+		return domain.AuctionLot{}, domain.ErrInvalidState
+	}
+	if session.ActiveAuctionID != 0 && session.ActiveAuctionID != in.AuctionID {
+		return domain.AuctionLot{}, fmt.Errorf("%w: held by auction %d", ErrLiveSessionBusy, session.ActiveAuctionID)
+	}
+	auction, err := s.auctions.FindByID(ctx, in.AuctionID)
+	if err != nil {
+		return domain.AuctionLot{}, err
+	}
+	if auction.SellerID != session.MerchantID {
+		return domain.AuctionLot{}, domain.ErrForbidden
+	}
+	if auction.LiveSessionID == nil || *auction.LiveSessionID != in.SessionID {
+		return domain.AuctionLot{}, domain.ErrInvalidArgument
+	}
+	if auction.Status.Terminal() {
+		return domain.AuctionLot{}, domain.ErrInvalidState
+	}
+	now := time.Now().UTC()
+	var startTime, endTime time.Time
+	if in.DurationSec > 0 {
+		startTime = now
+		endTime = startTime.Add(time.Duration(in.DurationSec) * time.Second)
+		auction.StartTime = startTime
+		auction.EndTime = endTime
+	} else if auction.DurationSec > 0 && (auction.EndTime.IsZero() || !auction.EndTime.After(now)) {
+		startTime = now
+		endTime = startTime.Add(time.Duration(auction.DurationSec) * time.Second)
+		auction.StartTime = startTime
+		auction.EndTime = endTime
+	} else if auction.EndTime.IsZero() || !auction.EndTime.After(now) {
+		return domain.AuctionLot{}, domain.ErrInvalidArgument
+	} else if auction.StartTime.IsZero() {
+		startTime = now
+		endTime = auction.EndTime
+		auction.StartTime = startTime
+	}
+	if s.lock != nil {
+		acquired, holder, err := s.lock.Acquire(ctx, in.SessionID, in.AuctionID, lockTTLForAuction(auction))
+		if err != nil {
+			return domain.AuctionLot{}, err
+		}
+		if !acquired && holder != in.AuctionID {
+			return domain.AuctionLot{}, fmt.Errorf("%w: held by auction %d", ErrLiveSessionBusy, holder)
+		}
+	}
+	session.ActiveAuctionID = in.AuctionID
+	if err := s.sessions.Update(ctx, &session); err != nil {
+		if s.lock != nil {
+			_ = s.lock.Release(ctx, in.SessionID, in.AuctionID)
+		}
+		return domain.AuctionLot{}, err
+	}
+	if s.auction != nil {
+		started, err := s.auction.StartWithTiming(ctx, in.AuctionID, in.ActorID, in.ActorRole, startTime, endTime)
+		if err != nil {
+			if s.lock != nil {
+				_ = s.lock.Release(ctx, in.SessionID, in.AuctionID)
+			}
+			session.ActiveAuctionID = 0
+			_ = s.sessions.Update(ctx, &session)
+			return domain.AuctionLot{}, err
+		}
+		auction = started
+	}
+	return auction, nil
+}
+
+func (s *LiveSessionService) DeactivateAuction(ctx context.Context, sessionID uint64, actorID string, actorRole domain.Role) (domain.LiveSession, error) {
+	session, err := s.sessions.Get(ctx, sessionID)
+	if err != nil {
+		return domain.LiveSession{}, err
+	}
+	if !canAccessSellerOwned(actorID, actorRole, session.MerchantID) {
+		return domain.LiveSession{}, domain.ErrForbidden
+	}
+	if session.ActiveAuctionID != 0 {
+		auction, err := s.auctions.FindByID(ctx, session.ActiveAuctionID)
+		if err != nil {
+			return domain.LiveSession{}, err
+		}
+		if !auction.Status.Terminal() {
+			if err := s.resetAuctionToReady(ctx, &auction); err != nil {
+				return domain.LiveSession{}, err
+			}
+		}
+		if s.lock != nil {
+			_ = s.lock.Release(ctx, sessionID, session.ActiveAuctionID)
+		}
+		session.ActiveAuctionID = 0
+	}
+	if err := s.sessions.Update(ctx, &session); err != nil {
+		return domain.LiveSession{}, err
+	}
+	return session, nil
+}
+
+func (s *LiveSessionService) OnAuctionClosed(ctx context.Context, auctionID uint64) {
+	if s == nil || s.sessions == nil || s.auctions == nil {
+		return
+	}
+	auction, err := s.auctions.FindByID(ctx, auctionID)
+	if err != nil || auction.LiveSessionID == nil {
+		return
+	}
+	sessionID := *auction.LiveSessionID
+	session, err := s.sessions.Get(ctx, sessionID)
+	if err != nil {
+		return
+	}
+	if session.ActiveAuctionID == auctionID {
+		if s.lock != nil {
+			_ = s.lock.Release(ctx, sessionID, auctionID)
+		}
+		session.ActiveAuctionID = 0
+		_ = s.sessions.Update(ctx, &session)
+	}
+}
+
+func (s *LiveSessionService) ActiveAuctionAndSession(ctx context.Context, sessionID uint64) (uint64, uint64, error) {
+	session, err := s.sessions.Get(ctx, sessionID)
+	if err != nil {
+		return 0, 0, err
+	}
+	return session.ActiveAuctionID, session.ID, nil
+}
+
+func (s *LiveSessionService) Stats(ctx context.Context, sessionID uint64, actorID string, actorRole domain.Role) (LiveSessionStats, error) {
+	session, err := s.sessions.Get(ctx, sessionID)
+	if err != nil {
+		return LiveSessionStats{}, err
+	}
+	if !canAccessSellerOwned(actorID, actorRole, session.MerchantID) {
+		return LiveSessionStats{}, domain.ErrForbidden
+	}
+	stats := LiveSessionStats{LiveSessionID: session.ID, LotsTotal: session.LotsTotal, LotsSold: session.LotsSold, LotsUnsold: session.LotsUnsold, BidCount: session.BidCount, GMVCent: session.GMVCent, ViewerPeak: session.ViewerPeak, ViewerTotal: session.ViewerTotal, ActiveAuctionID: session.ActiveAuctionID}
+	if stats.LotsTotal == 0 {
+		lots, err := s.auctions.List(ctx, domain.AuctionFilter{LiveSessionID: sessionID, Limit: 100})
+		if err == nil {
+			stats.LotsTotal = len(lots)
+		}
+	}
+	if session.ActiveAuctionID == 0 {
+		return stats, nil
+	}
+	if s.hub != nil {
+		stats.Online = s.hub.OnlineCount(session.ActiveAuctionID)
+	}
+	if s.bids != nil {
+		if count, err := s.bids.CountByAuction(ctx, session.ActiveAuctionID); err == nil {
+			stats.CurrentBidCount = count
+		}
+	}
+	var endTime time.Time
+	if s.auctionRealtime != nil {
+		if state, ok, err := s.auctionRealtime.GetAuctionState(ctx, session.ActiveAuctionID); err == nil && ok {
+			stats.CurrentPrice = state.CurrentPrice
+			endTime = state.EndTime
+		}
+	}
+	if endTime.IsZero() {
+		if auction, err := s.auctions.FindByID(ctx, session.ActiveAuctionID); err == nil {
+			endTime = auction.EndTime
+		}
+	}
+	if !endTime.IsZero() {
+		remain := int64(time.Until(endTime).Seconds())
+		if remain < 0 {
+			remain = 0
+		}
+		stats.CurrentRemainSeconds = remain
+	}
+	return stats, nil
+}
+
+func (s *LiveSessionService) AgentHookConfig(ctx context.Context, sessionID uint64, actorID string, actorRole domain.Role) (LiveAgentHookConfig, error) {
+	session, err := s.sessions.Get(ctx, sessionID)
+	if err != nil {
+		return LiveAgentHookConfig{}, err
+	}
+	if !canAccessSellerOwned(actorID, actorRole, session.MerchantID) {
+		return LiveAgentHookConfig{}, domain.ErrForbidden
+	}
+	if s.hook == nil {
+		return LiveAgentHookConfig{}, nil
+	}
+	return s.hook.GetConfig(ctx, session.MerchantID)
+}
+
+func (s *LiveSessionService) UpdateAgentHookConfig(ctx context.Context, sessionID uint64, actorID string, actorRole domain.Role, enabled bool) (LiveAgentHookConfig, error) {
+	session, err := s.sessions.Get(ctx, sessionID)
+	if err != nil {
+		return LiveAgentHookConfig{}, err
+	}
+	if !canAccessSellerOwned(actorID, actorRole, session.MerchantID) {
+		return LiveAgentHookConfig{}, domain.ErrForbidden
+	}
+	if s.hook == nil {
+		return LiveAgentHookConfig{}, domain.ErrInvalidState
+	}
+	cfg, err := s.hook.SetConfig(ctx, session.MerchantID, actorID, enabled)
+	if err != nil {
+		return LiveAgentHookConfig{}, err
+	}
+	s.hook.EmitConfigChanged(ctx, session.MerchantID, session.ID, enabled)
+	return cfg, nil
+}
+
+func (s *LiveSessionService) resetAuctionToReady(ctx context.Context, auction *domain.AuctionLot) error {
+	switch auction.Status {
+	case domain.AuctionStatusReady, domain.AuctionStatusWarmingUp, domain.AuctionStatusRunning, domain.AuctionStatusExtended, domain.AuctionStatusHammerPending:
+		// allowed
+	default:
+		return domain.ErrInvalidState
+	}
+	auction.Status = domain.AuctionStatusReady
+	auction.WinnerID = nil
+	auction.DealPrice = nil
+	auction.ClosedAt = nil
+	auction.ClosedBy = ""
+	if auction.DurationSec > 0 {
+		auction.StartTime = time.Time{}
+		auction.EndTime = time.Time{}
+	}
+	if err := s.auctions.Update(ctx, auction); err != nil {
+		return err
+	}
+	realtime := s.auctionRealtime
+	minIncrement := int64(1)
+	if s.auction != nil {
+		realtime = s.auction.realtime
+		minIncrement = s.auction.cfg.MinIncrementCent
+		if s.auction.timer != nil {
+			s.auction.timer.Stop(auction.AuctionID)
+		}
+	}
+	if realtime != nil {
+		if minIncrement <= 0 {
+			minIncrement = 1
+		}
+		if _, err := realtime.InitAuction(ctx, *auction, domain.MinIncrementForPrice(auction.IncrementRule, auction.StartPrice, minIncrement)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func normalizeBidSort(sortBy string) string {
 	switch sortBy {
 	case "timeAsc", "priceDesc":
@@ -394,4 +901,36 @@ func normalizeBidSort(sortBy string) string {
 	default:
 		return "timeDesc"
 	}
+}
+
+func lockTTLForAuction(auction domain.AuctionLot) time.Duration {
+	if auction.EndTime.IsZero() {
+		return time.Hour
+	}
+	d := time.Until(auction.EndTime) + 5*time.Minute
+	if d <= 0 {
+		return time.Hour
+	}
+	return d
+}
+
+func (s *LiveSessionService) enrichLots(ctx context.Context, lots []domain.AuctionLot) []domain.AuctionLot {
+	if len(lots) == 0 || s.bids == nil {
+		return lots
+	}
+	out := make([]domain.AuctionLot, len(lots))
+	for i := range lots {
+		out[i] = lots[i]
+		if count, err := s.bids.CountByAuction(ctx, lots[i].AuctionID); err == nil {
+			out[i].BidCount = count
+		}
+		if records, err := s.bids.ListByAuction(ctx, lots[i].AuctionID, 1); err == nil && len(records) > 0 {
+			out[i].CurrentPrice = records[0].BidPrice
+			out[i].LeaderBidderID = records[0].BidderID
+		}
+		if out[i].CurrentPrice == 0 && out[i].DealPrice != nil {
+			out[i].CurrentPrice = *out[i].DealPrice
+		}
+	}
+	return out
 }

@@ -20,14 +20,12 @@ type MCPReadDependencies struct {
 	Users       repository.UserRepository
 	Items       repository.ItemRepository
 	Auctions    repository.AuctionRepository
-	Rooms       repository.LiveRoomRepository
 	Sessions    repository.LiveSessionRepository
 	Bids        repository.BidRepository
 	Orders      repository.OrderRepository
 	Risk        *RiskService
 	AuditLogs   repository.AuditRepository
 	AuctionSvc  *AuctionService
-	LiveRoomSvc *LiveRoomService
 	LiveSession *LiveSessionService
 	OrderSvc    *OrderService
 }
@@ -39,14 +37,12 @@ type MCPReadService struct {
 	users      repository.UserRepository
 	items      repository.ItemRepository
 	auctions   repository.AuctionRepository
-	rooms      repository.LiveRoomRepository
 	sessions   repository.LiveSessionRepository
 	bids       repository.BidRepository
 	orders     repository.OrderRepository
 	risk       *RiskService
 	audits     repository.AuditRepository
 	auctionSvc *AuctionService
-	roomSvc    *LiveRoomService
 	sessionSvc *LiveSessionService
 	orderSvc   *OrderService
 }
@@ -56,23 +52,20 @@ func NewMCPReadService(deps MCPReadDependencies) *MCPReadService {
 		users:      deps.Users,
 		items:      deps.Items,
 		auctions:   deps.Auctions,
-		rooms:      deps.Rooms,
 		sessions:   deps.Sessions,
 		bids:       deps.Bids,
 		orders:     deps.Orders,
 		risk:       deps.Risk,
 		audits:     deps.AuditLogs,
 		auctionSvc: deps.AuctionSvc,
-		roomSvc:    deps.LiveRoomSvc,
 		sessionSvc: deps.LiveSession,
 		orderSvc:   deps.OrderSvc,
 	}
 }
 
 type MerchantProfile struct {
-	Merchant domain.SafeUser  `json:"merchant"`
-	LiveRoom *domain.LiveRoom `json:"liveRoom,omitempty"`
-	Summary  MerchantSummary  `json:"summary"`
+	Merchant domain.SafeUser `json:"merchant"`
+	Summary  MerchantSummary `json:"summary"`
 }
 
 type MerchantSummary struct {
@@ -169,13 +162,6 @@ func (s *MCPReadService) ReadMerchant(ctx context.Context, merchantID string, ac
 	if actor.Role == domain.RoleBuyer {
 		return profile, nil
 	}
-	if s.rooms != nil {
-		if room, err := s.rooms.FindByMerchantID(ctx, merchantID); err == nil {
-			profile.LiveRoom = &room
-		} else if err != nil && !errors.Is(err, domain.ErrNotFound) {
-			return MerchantProfile{}, err
-		}
-	}
 	if s.sessions != nil {
 		sessions, err := s.sessions.List(ctx, domain.LiveSessionFilter{MerchantID: merchantID, Limit: 100})
 		if err != nil {
@@ -253,14 +239,14 @@ func (s *MCPReadService) ListAuctionLots(ctx context.Context, filter domain.Auct
 	case domain.RoleMerchant:
 		filter.SellerID = actor.ID
 	case domain.RoleBuyer:
-		if filter.LiveRoomID == 0 {
+		if filter.LiveSessionID == 0 {
 			return nil, domain.ErrForbidden
 		}
-		room, err := s.ReadLiveRoom(ctx, filter.LiveRoomID, actor)
+		session, err := s.readAuthorizedLiveSession(ctx, filter.LiveSessionID, actor)
 		if err != nil {
 			return nil, err
 		}
-		if room.Status != domain.LiveRoomStatusLive {
+		if session.Status != domain.LiveSessionStatusLive {
 			return nil, domain.ErrForbidden
 		}
 		filter.SellerID = ""
@@ -280,53 +266,6 @@ func (s *MCPReadService) ReadAuctionState(ctx context.Context, auctionID uint64,
 	return s.auctionSvc.State(ctx, auctionID, actor.ID, actor.Role)
 }
 
-func (s *MCPReadService) ReadLiveRoom(ctx context.Context, roomID uint64, actor MCPActor) (domain.LiveRoom, error) {
-	if err := requireMCPActor(actor); err != nil {
-		return domain.LiveRoom{}, err
-	}
-	if roomID == 0 || s.rooms == nil {
-		return domain.LiveRoom{}, domain.ErrInvalidArgument
-	}
-	room, err := s.rooms.FindByID(ctx, roomID)
-	if err != nil {
-		return domain.LiveRoom{}, err
-	}
-	if err := s.requireLiveRoomReadable(room, actor); err != nil {
-		return domain.LiveRoom{}, err
-	}
-	return room, nil
-}
-
-func (s *MCPReadService) ListLiveRooms(ctx context.Context, filter domain.LiveRoomFilter, actor MCPActor) ([]domain.LiveRoom, error) {
-	if err := requireMCPActor(actor); err != nil {
-		return nil, err
-	}
-	if s.roomSvc == nil {
-		return nil, domain.ErrNotFound
-	}
-	return s.roomSvc.List(ctx, filter, actor.ID, actor.Role)
-}
-
-func (s *MCPReadService) ListLiveRoomLots(ctx context.Context, roomID uint64, actor MCPActor) ([]domain.AuctionLot, error) {
-	if _, err := s.ReadLiveRoom(ctx, roomID, actor); err != nil {
-		return nil, err
-	}
-	if s.roomSvc == nil {
-		return nil, domain.ErrNotFound
-	}
-	return s.roomSvc.ListLots(ctx, roomID)
-}
-
-func (s *MCPReadService) ReadLiveRoomStats(ctx context.Context, roomID uint64, actor MCPActor) (LiveRoomStats, error) {
-	if _, err := s.ReadLiveRoom(ctx, roomID, actor); err != nil {
-		return LiveRoomStats{}, err
-	}
-	if s.roomSvc == nil {
-		return LiveRoomStats{}, domain.ErrNotFound
-	}
-	return s.roomSvc.Stats(ctx, roomID)
-}
-
 func (s *MCPReadService) ListLiveSessions(ctx context.Context, filter domain.LiveSessionFilter, actor MCPActor) ([]domain.LiveSession, error) {
 	if err := requireMCPActor(actor); err != nil {
 		return nil, err
@@ -336,9 +275,6 @@ func (s *MCPReadService) ListLiveSessions(ctx context.Context, filter domain.Liv
 	}
 	if s.sessionSvc == nil {
 		return nil, domain.ErrNotFound
-	}
-	if filter.LiveRoomID != 0 {
-		return s.sessionSvc.ListByRoom(ctx, filter.LiveRoomID, filter.Status, actor.ID, actor.Role, filter.Limit, filter.Offset)
 	}
 	if actor.Role == domain.RoleMerchant || filter.MerchantID != "" {
 		return s.sessionSvc.ListByMerchant(ctx, filter.MerchantID, filter.Status, actor.ID, actor.Role, filter.Limit, filter.Offset)
@@ -505,6 +441,12 @@ func (s *MCPReadService) readAuthorizedLiveSession(ctx context.Context, sessionI
 	if err != nil {
 		return domain.LiveSession{}, err
 	}
+	if canAccessSellerOwned(actor.ID, actor.Role, session.MerchantID) {
+		return session, nil
+	}
+	if actor.Role == domain.RoleBuyer && session.Status == domain.LiveSessionStatusLive {
+		return session, nil
+	}
 	if !canAccessSellerOwned(actor.ID, actor.Role, session.MerchantID) {
 		return domain.LiveSession{}, domain.ErrForbidden
 	}
@@ -537,9 +479,9 @@ func (s *MCPReadService) requireAuctionReadable(ctx context.Context, lot domain.
 	if actor.Role != domain.RoleBuyer {
 		return domain.ErrForbidden
 	}
-	if lot.LiveRoomID != 0 && s.rooms != nil {
-		room, err := s.rooms.FindByID(ctx, lot.LiveRoomID)
-		if err == nil && room.Status == domain.LiveRoomStatusLive {
+	if lot.LiveSessionID != nil && s.sessions != nil {
+		session, err := s.sessions.Get(ctx, *lot.LiveSessionID)
+		if err == nil && session.Status == domain.LiveSessionStatusLive {
 			return nil
 		}
 		if err != nil && !errors.Is(err, domain.ErrNotFound) {
@@ -553,22 +495,6 @@ func (s *MCPReadService) requireAuctionReadable(ctx context.Context, lot domain.
 		}
 		if err != nil && !errors.Is(err, domain.ErrNotFound) {
 			return err
-		}
-	}
-	return domain.ErrForbidden
-}
-
-func (s *MCPReadService) requireLiveRoomReadable(room domain.LiveRoom, actor MCPActor) error {
-	switch actor.Role {
-	case domain.RoleAdmin:
-		return nil
-	case domain.RoleMerchant:
-		if actor.ID == room.MerchantID {
-			return nil
-		}
-	case domain.RoleBuyer:
-		if room.Status == domain.LiveRoomStatusLive {
-			return nil
 		}
 	}
 	return domain.ErrForbidden

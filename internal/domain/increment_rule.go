@@ -14,14 +14,14 @@ const (
 	defaultMaxBidSteps     = 10
 	maxIncrementRuleSteps  = 50
 
-	BidRejectBelowStartPrice   = "BELOW_START_PRICE"
-	BidRejectStepMismatch      = "PRICE_STEP_MISMATCH"
-	BidRejectBelowMinIncrement = "BELOW_MIN_INCREMENT"
-	BidRejectAboveMaxBidSteps  = "ABOVE_MAX_BID_STEPS"
+	BidRejectBelowStartPrice          = "BELOW_START_PRICE"
+	BidRejectStepMismatch             = "PRICE_STEP_MISMATCH"
+	BidRejectBelowMinIncrement        = "BELOW_MIN_INCREMENT"
+	BidRejectAboveMaxBidSteps         = "ABOVE_MAX_BID_STEPS"
 	BidRejectAboveExpectedMaxBidSteps = "ABOVE_EXPECTED_MAX_BID_STEPS"
-	BidRejectAboveCapPrice     = "ABOVE_CAP_PRICE"
-	BidRejectMissingExpectedState = "MISSING_EXPECTED_STATE"
-	BidRejectStaleAuctionState = "STALE_AUCTION_STATE"
+	BidRejectAboveCapPrice            = "ABOVE_CAP_PRICE"
+	BidRejectMissingExpectedState     = "MISSING_EXPECTED_STATE"
+	BidRejectStaleAuctionState        = "STALE_AUCTION_STATE"
 )
 
 // IncrementRule supports fixed increment and ladder increment.

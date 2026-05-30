@@ -58,12 +58,6 @@ func (r *MySQLAdminDashboardRepository) DashboardMetrics(ctx context.Context, fi
 
 func (r *MySQLAdminDashboardRepository) loadCurrent(ctx context.Context, db *gorm.DB, current *domain.AdminDashboardCurrent) error {
 	_ = ctx
-	if err := db.Table("live_room").Count(&current.LiveRoomCount).Error; err != nil {
-		return err
-	}
-	if err := db.Table("live_room").Where("status = ?", domain.LiveRoomStatusLive).Count(&current.LiveRoomLiveCount).Error; err != nil {
-		return err
-	}
 	if err := db.Table("live_session").Where("status = ?", domain.LiveSessionStatusLive).Count(&current.ActiveLiveSessionCount).Error; err != nil {
 		return err
 	}
@@ -340,17 +334,15 @@ type bucketValueRow struct {
 
 type MemoryAdminDashboardRepository struct {
 	auctions AuctionRepository
-	rooms    LiveRoomRepository
 	sessions LiveSessionRepository
 	bids     BidRepository
 	orders   OrderRepository
 	risk     RiskRepository
 }
 
-func NewMemoryAdminDashboardRepository(auctions AuctionRepository, rooms LiveRoomRepository, sessions LiveSessionRepository, bids BidRepository, orders OrderRepository, risk RiskRepository) *MemoryAdminDashboardRepository {
+func NewMemoryAdminDashboardRepository(auctions AuctionRepository, sessions LiveSessionRepository, bids BidRepository, orders OrderRepository, risk RiskRepository) *MemoryAdminDashboardRepository {
 	return &MemoryAdminDashboardRepository{
 		auctions: auctions,
-		rooms:    rooms,
 		sessions: sessions,
 		bids:     bids,
 		orders:   orders,
@@ -372,17 +364,11 @@ func (r *MemoryAdminDashboardRepository) DashboardMetrics(ctx context.Context, f
 	payStatus := make(map[string]int64)
 	riskStatus := make(map[string]int64)
 
-	for _, room := range r.snapshotRooms() {
-		result.Current.LiveRoomCount++
-		if room.Status == domain.LiveRoomStatusLive {
-			result.Current.LiveRoomLiveCount++
-		}
-	}
 	for _, session := range r.snapshotSessions() {
 		if session.Status == domain.LiveSessionStatusLive {
 			result.Current.ActiveLiveSessionCount++
 		}
-		if !inDashboardRange(session.OpenedAt, filter.StartTime, filter.EndTime) {
+		if session.OpenedAt == nil || !inDashboardRange(*session.OpenedAt, filter.StartTime, filter.EndTime) {
 			continue
 		}
 		result.Summary.LiveSessionCount++
@@ -488,20 +474,6 @@ func (r *MemoryAdminDashboardRepository) snapshotAuctions() []domain.AuctionLot 
 	out := make([]domain.AuctionLot, 0, len(repo.auctions))
 	for _, auction := range repo.auctions {
 		out = append(out, cloneAuction(auction))
-	}
-	return out
-}
-
-func (r *MemoryAdminDashboardRepository) snapshotRooms() []domain.LiveRoom {
-	repo, ok := r.rooms.(*MemoryLiveRoomRepository)
-	if !ok || repo == nil {
-		return nil
-	}
-	repo.mu.RLock()
-	defer repo.mu.RUnlock()
-	out := make([]domain.LiveRoom, 0, len(repo.rooms))
-	for _, room := range repo.rooms {
-		out = append(out, room)
 	}
 	return out
 }

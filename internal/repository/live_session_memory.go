@@ -50,7 +50,7 @@ func (r *MemoryLiveSessionRepository) Get(ctx context.Context, id uint64) (domai
 	return session, nil
 }
 
-func (r *MemoryLiveSessionRepository) GetActiveByRoomID(ctx context.Context, roomID uint64) (domain.LiveSession, error) {
+func (r *MemoryLiveSessionRepository) GetActiveByMerchantID(ctx context.Context, merchantID string) (domain.LiveSession, error) {
 	_ = ctx
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -59,7 +59,7 @@ func (r *MemoryLiveSessionRepository) GetActiveByRoomID(ctx context.Context, roo
 		latestSet bool
 	)
 	for _, session := range r.sessions {
-		if session.LiveRoomID != roomID || session.Status != domain.LiveSessionStatusLive {
+		if session.MerchantID != merchantID || session.Status != domain.LiveSessionStatusLive {
 			continue
 		}
 		if !latestSet || session.ID > latest.ID {
@@ -97,19 +97,16 @@ func (r *MemoryLiveSessionRepository) List(ctx context.Context, filter domain.Li
 	sessions := make([]domain.LiveSession, 0, len(ids))
 	for _, id := range ids {
 		session := r.sessions[id]
-		if filter.LiveRoomID != 0 && session.LiveRoomID != filter.LiveRoomID {
-			continue
-		}
 		if filter.MerchantID != "" && session.MerchantID != filter.MerchantID {
 			continue
 		}
 		if filter.Status.Valid() && session.Status != filter.Status {
 			continue
 		}
-		if filter.OpenedFrom != nil && session.OpenedAt.Before(*filter.OpenedFrom) {
+		if filter.OpenedFrom != nil && (session.OpenedAt == nil || session.OpenedAt.Before(*filter.OpenedFrom)) {
 			continue
 		}
-		if filter.OpenedTo != nil && session.OpenedAt.After(*filter.OpenedTo) {
+		if filter.OpenedTo != nil && (session.OpenedAt == nil || session.OpenedAt.After(*filter.OpenedTo)) {
 			continue
 		}
 		sessions = append(sessions, session)

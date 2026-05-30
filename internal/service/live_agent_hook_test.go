@@ -22,44 +22,40 @@ func TestLiveAgentHookServiceEmitsHighestBidWithNickname(t *testing.T) {
 	hook.EmitHighestBid(ctx, "u_2001", 90001, "u_1001", 12345)
 
 	msg := invoker.wait(t)
-	if !strings.Contains(msg, "直播间90001") || !strings.Contains(msg, "竞拍用户001") || !strings.Contains(msg, "12345分") {
+	if !strings.Contains(msg, "直播场次90001") || !strings.Contains(msg, "竞拍用户001") || !strings.Contains(msg, "12345分") {
 		t.Fatalf("unexpected highest bid hook message: %q", msg)
 	}
 }
 
-func TestLiveRoomSessionAndItemEmitLiveAgentHooks(t *testing.T) {
+func TestLiveSessionAndItemEmitLiveAgentHooks(t *testing.T) {
 	ctx := context.Background()
 	invoker := newRecordingLiveAgentHookInvoker()
 	hook := NewLiveAgentHookService(repository.NewMemoryConfigRepository(), repository.NewSeedUserRepository(), invoker)
 
 	auctionRepo := repository.NewMemoryAuctionRepository()
-	roomRepo := repository.NewMemoryLiveRoomRepository()
-	roomSvc := NewLiveRoomService(roomRepo, auctionRepo, repository.NoopTxManager{}, repository.NewMemoryLiveRoomLock())
-	roomSvc.SetLiveAgentHookService(hook)
-	sessionSvc := NewLiveSessionService(repository.NewMemoryLiveSessionRepository(), roomRepo, auctionRepo)
+	sessionSvc := NewLiveSessionService(repository.NewMemoryLiveSessionRepository(), auctionRepo)
 	sessionSvc.SetLiveAgentHookService(hook)
 
-	room, err := roomSvc.Create(ctx, CreateLiveRoomInput{
+	session, err := sessionSvc.Create(ctx, CreateLiveSessionInput{
 		ActorID:   "u_2001",
 		ActorRole: domain.RoleMerchant,
-		Title:     "直播间",
+		Title:     "直播场次",
 	})
 	if err != nil {
-		t.Fatalf("create room: %v", err)
+		t.Fatalf("create session: %v", err)
 	}
-	if _, err := roomSvc.UpdateAgentHookConfig(ctx, room.ID, "u_2001", domain.RoleMerchant, true); err != nil {
+	if _, err := sessionSvc.UpdateAgentHookConfig(ctx, session.ID, "u_2001", domain.RoleMerchant, true); err != nil {
 		t.Fatalf("enable hook: %v", err)
 	}
-	if msg := invoker.wait(t); msg != "直播间"+strconv.FormatUint(room.ID, 10)+"AI直播助手已开启" {
+	if msg := invoker.wait(t); msg != "直播场次"+strconv.FormatUint(session.ID, 10)+"AI直播助手已开启" {
 		t.Fatalf("unexpected hook config changed message: %q", msg)
 	}
 
-	session, err := sessionSvc.OpenSession(ctx, room.ID, room.MerchantID, room.Title)
+	started, err := sessionSvc.Start(ctx, session.ID, "u_2001", domain.RoleMerchant)
 	if err != nil {
-		t.Fatalf("open session: %v", err)
+		t.Fatalf("start session: %v", err)
 	}
-	roomIDText := strconv.FormatUint(room.ID, 10)
-	if msg := invoker.wait(t); !strings.Contains(msg, "直播间"+roomIDText+"的直播场次") || !strings.Contains(msg, "开播了") || !strings.Contains(msg, strconv.FormatUint(session.ID, 10)) {
+	if msg := invoker.wait(t); !strings.Contains(msg, "直播场次"+strconv.FormatUint(started.ID, 10)) || !strings.Contains(msg, "开播了") {
 		t.Fatalf("unexpected live started hook message: %q", msg)
 	}
 
@@ -67,7 +63,7 @@ func TestLiveRoomSessionAndItemEmitLiveAgentHooks(t *testing.T) {
 	itemSvc := NewItemService(itemRepo)
 	itemSvc.SetLiveAgentHookService(hook)
 	item := domain.Item{
-		SellerID:       room.MerchantID,
+		SellerID:       started.MerchantID,
 		Title:          "商品",
 		Category:       "分类",
 		ConditionGrade: domain.ConditionNew,
@@ -93,7 +89,7 @@ func TestLiveRoomSessionAndItemEmitLiveAgentHooks(t *testing.T) {
 		t.Fatalf("unexpected item offline hook message: %q", msg)
 	}
 
-	if _, err := roomSvc.UpdateAgentHookConfig(ctx, room.ID, "u_2001", domain.RoleMerchant, false); err != nil {
+	if _, err := sessionSvc.UpdateAgentHookConfig(ctx, session.ID, "u_2001", domain.RoleMerchant, false); err != nil {
 		t.Fatalf("disable hook: %v", err)
 	}
 	select {

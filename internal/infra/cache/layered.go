@@ -4,7 +4,7 @@
 //  1. 防穿透 —— 数据库也不存在的 key 写入负缓存（占位 + 短 TTL），L1/L2 同步保留。
 //  2. 防击穿 —— 通过 singleflight 合并对同一 key 的并发回源；只有一个 goroutine 真的打 DB。
 //  3. 防雪崩 —— 所有写入 L1/L2 的 TTL 都叠加 ±jitter（默认 ±10%），让批量同时写入的
-//                key 的过期时间错开，避免雪崩回源。
+//     key 的过期时间错开，避免雪崩回源。
 //
 // 调用方拿到的是 Cache[T] 接口；本文件提供唯一实现 LayeredCache[T] 与构造方法 New。
 package cache
@@ -31,7 +31,7 @@ var negativePayload = []byte{0x00}
 // 任何字段留零值时使用稳健默认值，便于业务调用 New 时只配最关心的项。
 type Options struct {
 	// Name 是缓存命名空间，用于 L2 key 前缀（"<Name>:<key>"）和 Observer 标签。
-	// 推荐使用领域名（"item" / "live_room"）。空值会被替换为 "cache"。
+	// 推荐使用领域名（"item" / "live_session"）。空值会被替换为 "cache"。
 	Name string
 
 	// L1Capacity 是 L1 LRU 容量；<=0 时使用 1024。

@@ -56,7 +56,7 @@ func OpenCache(ctx context.Context, cfg config.RedisInstanceConfig) (*RedisCache
 // 路由约定：
 //   - auction:<id>:* → ForAuction(id)
 //   - live_session:<id>:* → ForSession(id)
-//   - live_room:<id>:* → ForRoom(id)
+//   - live_session:<id>:* → ForRoom(id)
 //   - 全局 key（ws:instances / ws:instance:<id> / online:instance:<id> / DLQ /
 //     auction:active_streams） → ForGlobal()，固定 shard 0；active_streams 是
 //     例外：每 shard 一份，由 EventLog 的 per-shard 实例分别维护。

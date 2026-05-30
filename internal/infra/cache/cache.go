@@ -10,7 +10,7 @@
 //     - 穿透：用 negative cache（短 TTL 的占位值）吸收 "数据库也没有" 的 key。
 //     - 击穿：基于 singleflight 合并对同一 key 的并发回源，避免热 key 把 DB 打挂。
 //     - 雪崩：所有 TTL 在写入前叠加 ±jitter（默认 ±10%），让批量同时写入的缓存
-//             过期时间散开，避免同一时刻雪崩回源。
+//     过期时间散开，避免同一时刻雪崩回源。
 //
 //  3. 业务可拼装：暴露的是泛型 Cache[T any] 接口（通过 []byte 序列化层），上层
 //     业务（ItemService 等）持有自己的具体缓存包装（如 ItemCache），通过 GetOrLoad
@@ -38,10 +38,10 @@ var ErrNegativeHit = errors.New("cache: negative hit")
 type Source string
 
 const (
-	SourceL1       Source = "l1"        // 命中 L1（进程内）
-	SourceL2       Source = "l2"        // 命中 L2（Redis）
-	SourceLoader   Source = "loader"    // 缓存全部 miss，调用 loader 回源
-	SourceNegative Source = "negative"  // 命中负缓存（占位 nil）
+	SourceL1       Source = "l1"       // 命中 L1（进程内）
+	SourceL2       Source = "l2"       // 命中 L2（Redis）
+	SourceLoader   Source = "loader"   // 缓存全部 miss，调用 loader 回源
+	SourceNegative Source = "negative" // 命中负缓存（占位 nil）
 )
 
 // Loader 是 GetOrLoad 在缓存全 miss 时回源使用的函数。
@@ -94,6 +94,6 @@ type Observer interface {
 // nopObserver 在未注入 Observer 时使用，所有方法 no-op。
 type nopObserver struct{}
 
-func (nopObserver) ObserveGet(string, Source, time.Duration)    {}
-func (nopObserver) ObserveSet(string, time.Duration, error)     {}
+func (nopObserver) ObserveGet(string, Source, time.Duration)       {}
+func (nopObserver) ObserveSet(string, time.Duration, error)        {}
 func (nopObserver) ObserveInvalidate(string, time.Duration, error) {}

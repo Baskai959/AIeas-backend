@@ -329,8 +329,8 @@ func (s *BidService) place(ctx context.Context, in PlaceBidInput) (domain.BidRes
 			result.RiskResult = domain.BidRiskReject
 		}
 	}
-	if result.Accepted && !result.Duplicate && s.hook != nil && auction.LiveRoomID != 0 {
-		s.hook.EmitHighestBid(ctx, auction.SellerID, auction.LiveRoomID, result.BidderID, result.CurrentPrice)
+	if result.Accepted && !result.Duplicate && s.hook != nil && auction.LiveSessionID != nil {
+		s.hook.EmitHighestBid(ctx, auction.SellerID, *auction.LiveSessionID, result.BidderID, result.CurrentPrice)
 	}
 	if !streamEnabled {
 		s.persistBid(ctx, in, result, now)

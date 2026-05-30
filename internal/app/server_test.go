@@ -200,7 +200,6 @@ func TestMCPReadLiveSessionBidsAuthorization(t *testing.T) {
 	userRepo := repository.NewSeedUserRepository()
 	itemRepo := repository.NewMemoryItemRepository()
 	auctionRepo := repository.NewMemoryAuctionRepository()
-	roomRepo := repository.NewMemoryLiveRoomRepository()
 	sessionRepo := repository.NewMemoryLiveSessionRepository()
 	bidRepo := repository.NewMemoryBidRepository()
 	orderRepo := repository.NewMemoryOrderRepository()
@@ -209,12 +208,9 @@ func TestMCPReadLiveSessionBidsAuthorization(t *testing.T) {
 	if err := itemRepo.Create(ctx, &item); err != nil {
 		t.Fatalf("create item: %v", err)
 	}
-	room := domain.LiveRoom{MerchantID: "u_2001", Title: "春拍专场", Status: domain.LiveRoomStatusLive}
-	if err := roomRepo.Create(ctx, &room); err != nil {
-		t.Fatalf("create room: %v", err)
-	}
 	closedAt := time.Now().UTC()
-	session := domain.LiveSession{LiveRoomID: room.ID, MerchantID: "u_2001", Title: "春拍专场", Status: domain.LiveSessionStatusEnded, OpenedAt: closedAt.Add(-time.Hour), ClosedAt: &closedAt, LotsTotal: 1, LotsSold: 1, BidCount: 1, GMVCent: 120000}
+	openedAt := closedAt.Add(-time.Hour)
+	session := domain.LiveSession{MerchantID: "u_2001", Title: "春拍专场", Status: domain.LiveSessionStatusEnded, OpenedAt: &openedAt, ClosedAt: &closedAt, LotsTotal: 1, LotsSold: 1, BidCount: 1, GMVCent: 120000}
 	if err := sessionRepo.Create(ctx, &session); err != nil {
 		t.Fatalf("create session: %v", err)
 	}
@@ -222,7 +218,6 @@ func TestMCPReadLiveSessionBidsAuthorization(t *testing.T) {
 		AuctionID:     10001,
 		ItemID:        item.ID,
 		SellerID:      "u_2001",
-		LiveRoomID:    room.ID,
 		LiveSessionID: &session.ID,
 		AuctionType:   domain.AuctionTypeEnglish,
 		StartPrice:    100000,
@@ -256,7 +251,6 @@ func TestMCPReadLiveSessionBidsAuthorization(t *testing.T) {
 		UserRepo:        userRepo,
 		ItemRepo:        itemRepo,
 		AuctionRepo:     auctionRepo,
-		LiveRoomRepo:    roomRepo,
 		LiveSessionRepo: sessionRepo,
 		BidRepo:         bidRepo,
 		OrderRepo:       orderRepo,
@@ -294,7 +288,6 @@ func TestMCPReadLiveSessionBidsAuthorization(t *testing.T) {
 		UserRepo:        userRepo,
 		ItemRepo:        itemRepo,
 		AuctionRepo:     auctionRepo,
-		LiveRoomRepo:    roomRepo,
 		LiveSessionRepo: sessionRepo,
 		BidRepo:         bidRepo,
 		OrderRepo:       orderRepo,
@@ -316,15 +309,11 @@ func TestMCPLiveControlContextAndOperations(t *testing.T) {
 	ctx := context.Background()
 	userRepo := repository.NewSeedUserRepository()
 	auctionRepo := repository.NewMemoryAuctionRepository()
-	roomRepo := repository.NewMemoryLiveRoomRepository()
 	sessionRepo := repository.NewMemoryLiveSessionRepository()
 	now := time.Now().UTC()
 
-	room := domain.LiveRoom{MerchantID: "u_2001", Title: "直播控制台", Status: domain.LiveRoomStatusLive}
-	if err := roomRepo.Create(ctx, &room); err != nil {
-		t.Fatalf("create room: %v", err)
-	}
-	session := domain.LiveSession{LiveRoomID: room.ID, MerchantID: "u_2001", Title: "直播控制台", Status: domain.LiveSessionStatusLive, OpenedAt: now.Add(-time.Minute)}
+	openedAt := now.Add(-time.Minute)
+	session := domain.LiveSession{MerchantID: "u_2001", Title: "直播控制台", Status: domain.LiveSessionStatusLive, OpenedAt: &openedAt}
 	if err := sessionRepo.Create(ctx, &session); err != nil {
 		t.Fatalf("create session: %v", err)
 	}
@@ -356,7 +345,6 @@ func TestMCPLiveControlContextAndOperations(t *testing.T) {
 	h := NewServerWithDependencies(cfg, ServerDependencies{
 		UserRepo:        userRepo,
 		AuctionRepo:     auctionRepo,
-		LiveRoomRepo:    roomRepo,
 		LiveSessionRepo: sessionRepo,
 		ObjectUploader:  objectstorage.NewMemoryUploader(""),
 		ProductAuditor:  service.DisabledProductAuditor{},
@@ -368,7 +356,7 @@ func TestMCPLiveControlContextAndOperations(t *testing.T) {
 		t.Fatalf("expected live context success, status=%d raw=%s", contextResp.status, contextResp.raw)
 	}
 	contextPayload := decodeMCPToolEnvelope[service.MCPLiveControlContext](t, contextResp)
-	if contextPayload.Data.Room.ID != room.ID || contextPayload.Data.Session == nil || contextPayload.Data.Session.ID != session.ID {
+	if contextPayload.Data.Session == nil || contextPayload.Data.Session.ID != session.ID {
 		t.Fatalf("unexpected live context: %+v", contextPayload.Data)
 	}
 	if len(contextPayload.Data.Lots.CandidateLots) != 1 || contextPayload.Data.Lots.CandidateLots[0].AuctionID != lot.AuctionID {
@@ -381,7 +369,7 @@ func TestMCPLiveControlContextAndOperations(t *testing.T) {
 		t.Fatalf("expected onShelf success, status=%d raw=%s", onShelfResp.status, onShelfResp.raw)
 	}
 	onShelf := decodeMCPToolEnvelope[service.MCPLiveLotOperationResult](t, onShelfResp)
-	if onShelf.Data.Lot == nil || onShelf.Data.Lot.LiveRoomID != room.ID || onShelf.Data.Context == nil || len(onShelf.Data.Context.Lots.UpcomingLots) != 1 {
+	if onShelf.Data.Lot == nil || onShelf.Data.Lot.LiveSessionID == nil || *onShelf.Data.Lot.LiveSessionID != session.ID || onShelf.Data.Context == nil || len(onShelf.Data.Context.Lots.UpcomingLots) != 1 {
 		t.Fatalf("unexpected onShelf result: %+v", onShelf.Data)
 	}
 
@@ -522,39 +510,39 @@ func TestItemCRUDRoutes(t *testing.T) {
 	}
 }
 
-func TestLiveRoomCoverUploadRoute(t *testing.T) {
+func TestLiveSessionCoverUploadRoute(t *testing.T) {
 	h := newTestServer()
 	token := loginForToken(t, h.Engine, "merchant001", "Passw0rd!", "merchant")
 
-	create := doJSONWithHeaders(t, h.Engine, consts.MethodPost, "/api/v1/live-rooms", `{"title":"商家直播间"}`, ut.Header{Key: "Authorization", Value: "Bearer " + token})
+	create := doJSONWithHeaders(t, h.Engine, consts.MethodPost, "/api/v1/live-sessions", `{"title":"商家直播场次"}`, ut.Header{Key: "Authorization", Value: "Bearer " + token})
 	if create.status != 200 || create.body.Code != 0 {
-		t.Fatalf("expected live room create success, got status=%d raw=%s", create.status, create.raw)
+		t.Fatalf("expected live session create success, got status=%d raw=%s", create.status, create.raw)
 	}
-	var room struct {
+	var session struct {
 		ID       uint64 `json:"id"`
 		CoverURL string `json:"coverUrl"`
 	}
-	mustDecodeData(t, create.body.Data, &room)
-	if room.ID == 0 {
-		t.Fatalf("expected live room id, got %+v", room)
+	mustDecodeData(t, create.body.Data, &session)
+	if session.ID == 0 {
+		t.Fatalf("expected live session id, got %+v", session)
 	}
 
-	upload := doMultipartWithHeaders(t, h.Engine, consts.MethodPost, "/api/v1/live-rooms/"+strconv.FormatUint(room.ID, 10)+"/cover", nil, []multipartTestFile{
-		{FieldName: "image", Filename: "live-cover.jpg", Body: "live room cover bytes"},
-	}, ut.Header{Key: "Authorization", Value: "Bearer " + token}, ut.Header{Key: "Idempotency-Key", Value: "live-room-cover-1"})
+	upload := doMultipartWithHeaders(t, h.Engine, consts.MethodPost, "/api/v1/live-sessions/"+strconv.FormatUint(session.ID, 10)+"/cover", nil, []multipartTestFile{
+		{FieldName: "image", Filename: "live-cover.jpg", Body: "live session cover bytes"},
+	}, ut.Header{Key: "Authorization", Value: "Bearer " + token}, ut.Header{Key: "Idempotency-Key", Value: "live-session-cover-1"})
 	if upload.status != 200 || upload.body.Code != 0 {
-		t.Fatalf("expected live room cover upload success, got status=%d raw=%s", upload.status, upload.raw)
+		t.Fatalf("expected live session cover upload success, got status=%d raw=%s", upload.status, upload.raw)
 	}
 	var updated struct {
 		ID       uint64 `json:"id"`
 		CoverURL string `json:"coverUrl"`
 	}
 	mustDecodeData(t, upload.body.Data, &updated)
-	if updated.ID != room.ID || !strings.HasPrefix(updated.CoverURL, "/api/v1/images/") {
+	if updated.ID != session.ID || !strings.HasPrefix(updated.CoverURL, "/api/v1/images/") {
 		t.Fatalf("expected updated cover URL, got %+v", updated)
 	}
 	imageResp := ut.PerformRequest(h.Engine, consts.MethodGet, updated.CoverURL, nil)
-	if imageResp.Code != 200 || imageResp.Body.String() != "live room cover bytes" {
+	if imageResp.Code != 200 || imageResp.Body.String() != "live session cover bytes" {
 		t.Fatalf("expected uploaded cover proxy success, got status=%d body=%q", imageResp.Code, imageResp.Body.String())
 	}
 }
@@ -889,18 +877,18 @@ func TestAuctionCreateAndUpdateReadyWithoutAudit(t *testing.T) {
 	}
 }
 
-func TestLiveRoomAutoMountLotRoute(t *testing.T) {
+func TestLiveSessionMountLotRoute(t *testing.T) {
 	h := newTestServer()
 	merchantToken := loginForToken(t, h.Engine, "merchant001", "Passw0rd!", "merchant")
 
-	createRoom := doJSONWithHeaders(t, h.Engine, consts.MethodPost, "/api/v1/live-rooms", `{"title":"自动上架直播间"}`, ut.Header{Key: "Authorization", Value: "Bearer " + merchantToken})
-	if createRoom.status != 200 || createRoom.body.Code != 0 {
-		t.Fatalf("expected live room create success, got status=%d raw=%s", createRoom.status, createRoom.raw)
+	createSession := doJSONWithHeaders(t, h.Engine, consts.MethodPost, "/api/v1/live-sessions", `{"title":"自动上架直播场次"}`, ut.Header{Key: "Authorization", Value: "Bearer " + merchantToken})
+	if createSession.status != 200 || createSession.body.Code != 0 {
+		t.Fatalf("expected live session create success, got status=%d raw=%s", createSession.status, createSession.raw)
 	}
-	var roomData struct {
+	var sessionData struct {
 		ID uint64 `json:"id"`
 	}
-	mustDecodeData(t, createRoom.body.Data, &roomData)
+	mustDecodeData(t, createSession.body.Data, &sessionData)
 
 	item := doMultipartWithHeaders(t, h.Engine, consts.MethodPost, "/api/v1/items", map[string]string{
 		"title":          "Auto Mount Lot",
@@ -925,19 +913,19 @@ func TestLiveRoomAutoMountLotRoute(t *testing.T) {
 	}
 	mustDecodeData(t, createAuction.body.Data, &auctionData)
 
-	mount := doJSONWithHeaders(t, h.Engine, consts.MethodPost, "/api/v1/live-rooms/lots", `{"auctionId":`+strconv.FormatUint(auctionData.AuctionID, 10)+`}`, ut.Header{Key: "Authorization", Value: "Bearer " + merchantToken}, ut.Header{Key: "Idempotency-Key", Value: "auto-mount-lot-1"})
+	mount := doJSONWithHeaders(t, h.Engine, consts.MethodPost, "/api/v1/live-sessions/"+strconv.FormatUint(sessionData.ID, 10)+"/lots", `{"auctionId":`+strconv.FormatUint(auctionData.AuctionID, 10)+`}`, ut.Header{Key: "Authorization", Value: "Bearer " + merchantToken}, ut.Header{Key: "Idempotency-Key", Value: "session-mount-lot-1"})
 	if mount.status != 200 || mount.body.Code != 0 {
 		t.Fatalf("expected auto mount success, got status=%d raw=%s", mount.status, mount.raw)
 	}
 	var mountData struct {
 		Lot struct {
-			AuctionID  uint64 `json:"auctionId"`
-			LiveRoomID uint64 `json:"liveRoomId"`
+			AuctionID     uint64  `json:"auctionId"`
+			LiveSessionID *uint64 `json:"liveSessionId"`
 		} `json:"lot"`
 	}
 	mustDecodeData(t, mount.body.Data, &mountData)
-	if mountData.Lot.AuctionID != auctionData.AuctionID || mountData.Lot.LiveRoomID != roomData.ID {
-		t.Fatalf("unexpected mount response: %+v want auction=%d room=%d", mountData, auctionData.AuctionID, roomData.ID)
+	if mountData.Lot.AuctionID != auctionData.AuctionID || mountData.Lot.LiveSessionID == nil || *mountData.Lot.LiveSessionID != sessionData.ID {
+		t.Fatalf("unexpected mount response: %+v want auction=%d session=%d", mountData, auctionData.AuctionID, sessionData.ID)
 	}
 }
 
@@ -1071,11 +1059,11 @@ func TestLiveAnalysisReportRoutes(t *testing.T) {
 	reportRepo := repository.NewMemoryLiveAnalysisReportRepository()
 	sessionRepo := repository.NewMemoryLiveSessionRepository()
 	closedAt := time.Now().UTC()
+	openedAt := closedAt.Add(-time.Hour)
 	session := domain.LiveSession{
-		LiveRoomID:  9001,
 		MerchantID:  "u_2001",
 		Status:      domain.LiveSessionStatusEnded,
-		OpenedAt:    closedAt.Add(-time.Hour),
+		OpenedAt:    &openedAt,
 		ClosedAt:    &closedAt,
 		LotsTotal:   3,
 		LotsSold:    2,
@@ -1148,11 +1136,11 @@ func TestLiveSessionEndedHookStartsLiveAnalysis(t *testing.T) {
 	reportRepo := repository.NewMemoryLiveAnalysisReportRepository()
 	sessionRepo := repository.NewMemoryLiveSessionRepository()
 	closedAt := time.Now().UTC()
+	openedAt := closedAt.Add(-30 * time.Minute)
 	session := domain.LiveSession{
-		LiveRoomID: 9002,
 		MerchantID: "u_2001",
 		Status:     domain.LiveSessionStatusEnded,
-		OpenedAt:   closedAt.Add(-30 * time.Minute),
+		OpenedAt:   &openedAt,
 		ClosedAt:   &closedAt,
 	}
 	if err := sessionRepo.Create(t.Context(), &session); err != nil {
@@ -1332,22 +1320,17 @@ func TestAdminDashboardMetrics(t *testing.T) {
 
 	userRepo := repository.NewSeedUserRepository()
 	auctionRepo := repository.NewMemoryAuctionRepository()
-	roomRepo := repository.NewMemoryLiveRoomRepository()
 	sessionRepo := repository.NewMemoryLiveSessionRepository()
 	bidRepo := repository.NewMemoryBidRepository()
 	orderRepo := repository.NewMemoryOrderRepository()
 	riskRepo := repository.NewMemoryRiskRepository()
 
-	room := domain.LiveRoom{MerchantID: "u_2001", Title: "监控测试直播间", Status: domain.LiveRoomStatusLive}
-	if err := roomRepo.Create(ctx, &room); err != nil {
-		t.Fatalf("create room: %v", err)
-	}
+	openedAt := start.Add(5 * time.Minute)
 	session := domain.LiveSession{
-		LiveRoomID:  room.ID,
 		MerchantID:  "u_2001",
 		Title:       "监控测试场次",
 		Status:      domain.LiveSessionStatusLive,
-		OpenedAt:    start.Add(5 * time.Minute),
+		OpenedAt:    &openedAt,
 		LotsTotal:   3,
 		LotsSold:    1,
 		LotsUnsold:  1,
@@ -1363,7 +1346,6 @@ func TestAdminDashboardMetrics(t *testing.T) {
 		AuctionID:     99001,
 		ItemID:        1,
 		SellerID:      "u_2001",
-		LiveRoomID:    room.ID,
 		LiveSessionID: &session.ID,
 		AuctionType:   domain.AuctionTypeEnglish,
 		StartPrice:    1000,
@@ -1444,7 +1426,6 @@ func TestAdminDashboardMetrics(t *testing.T) {
 	h := NewServerWithDependencies(appconfig.Default(), ServerDependencies{
 		UserRepo:        userRepo,
 		AuctionRepo:     auctionRepo,
-		LiveRoomRepo:    roomRepo,
 		LiveSessionRepo: sessionRepo,
 		BidRepo:         bidRepo,
 		OrderRepo:       orderRepo,
@@ -1482,7 +1463,7 @@ func TestAdminDashboardMetrics(t *testing.T) {
 	if data.Summary.BidCount != 2 || data.Summary.ActiveBidderCount != 2 || data.Summary.RiskEventCount != 2 {
 		t.Fatalf("unexpected bid/risk summary: %+v", data.Summary)
 	}
-	if data.Current.LiveRoomLiveCount != 1 || data.Current.ActiveLiveSessionCount != 1 || data.Current.RunningAuctionCount != 1 || data.Current.PendingRiskEventCount != 1 {
+	if data.Current.ActiveLiveSessionCount != 1 || data.Current.RunningAuctionCount != 1 || data.Current.PendingRiskEventCount != 1 {
 		t.Fatalf("unexpected current stats: %+v", data.Current)
 	}
 	if !hasStatusCount(data.Breakdowns.OrderStatus, string(domain.OrderStatusPaid), 1) || !hasStatusCount(data.Breakdowns.PayStatus, string(domain.PayStatusUnpaid), 1) {

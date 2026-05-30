@@ -10,12 +10,7 @@ func resourceTemplates() []resourceTemplate {
 		{URITemplate: "aieas://items?sellerId={sellerId}&status={status}&category={category}&limit={limit}&offset={offset}", Name: "items-list", Description: "商品列表", MIMEType: "application/json"},
 		{URITemplate: "aieas://auction-lots/{auctionId}", Name: "auction-lot", Description: "拍品详情", MIMEType: "application/json"},
 		{URITemplate: "aieas://auction-lots/{auctionId}/state", Name: "auction-state", Description: "拍品实时状态", MIMEType: "application/json"},
-		{URITemplate: "aieas://auction-lots?sellerId={sellerId}&status={status}&itemId={itemId}&liveRoomId={liveRoomId}&limit={limit}&offset={offset}", Name: "auction-lots-list", Description: "拍品列表", MIMEType: "application/json"},
-		{URITemplate: "aieas://live-rooms/{roomId}", Name: "live-room", Description: "直播间详情", MIMEType: "application/json"},
-		{URITemplate: "aieas://live-rooms?merchantId={merchantId}&status={status}&limit={limit}&offset={offset}", Name: "live-rooms-list", Description: "直播间列表", MIMEType: "application/json"},
-		{URITemplate: "aieas://live-rooms/{roomId}/lots", Name: "live-room-lots", Description: "直播间挂载拍品", MIMEType: "application/json"},
-		{URITemplate: "aieas://live-rooms/{roomId}/stats", Name: "live-room-stats", Description: "直播间当前统计", MIMEType: "application/json"},
-		{URITemplate: "aieas://live-rooms/{roomId}/live-sessions?status={status}&limit={limit}&offset={offset}", Name: "live-room-sessions", Description: "某直播间场次列表", MIMEType: "application/json"},
+		{URITemplate: "aieas://auction-lots?sellerId={sellerId}&status={status}&itemId={itemId}&liveSessionId={liveSessionId}&limit={limit}&offset={offset}", Name: "auction-lots-list", Description: "拍品列表", MIMEType: "application/json"},
 		{URITemplate: "aieas://live-sessions/{sessionId}", Name: "live-session", Description: "直播场次详情", MIMEType: "application/json"},
 		{URITemplate: "aieas://live-sessions/{sessionId}/lots", Name: "live-session-lots", Description: "场次内拍品", MIMEType: "application/json"},
 		{URITemplate: "aieas://live-sessions/{sessionId}/bids?limit={limit}&offset={offset}&sort={sort}", Name: "live-session-bids", Description: "场次出价记录", MIMEType: "application/json"},
@@ -50,14 +45,10 @@ func readToolDefinitions() []toolDefinition {
 		tool("read_merchant", "读取商家资料和经营概览。只读，无副作用。", objectSchema(map[string]interface{}{"merchantId": stringProp("商家用户 ID")}, nil)),
 		tool("read_items", "查询商品列表。只读，无副作用。", pagedSchema(map[string]interface{}{"sellerId": stringProp("商家用户 ID"), "status": stringProp("商品状态"), "category": stringProp("类目")}, nil)),
 		tool("read_item", "读取商品详情。只读，无副作用。", objectSchema(map[string]interface{}{"itemId": integerProp("商品 ID")}, []string{"itemId"})),
-		tool("read_auction_lots", "查询拍品列表。只读，无副作用。", pagedSchema(map[string]interface{}{"sellerId": stringProp("商家用户 ID"), "status": stringProp("拍品状态"), "itemId": integerProp("商品 ID"), "liveRoomId": integerProp("直播间 ID")}, nil)),
+		tool("read_auction_lots", "查询拍品列表。只读，无副作用。", pagedSchema(map[string]interface{}{"sellerId": stringProp("商家用户 ID"), "status": stringProp("拍品状态"), "itemId": integerProp("商品 ID"), "liveSessionId": integerProp("直播场次 ID")}, nil)),
 		tool("read_auction_lot", "读取拍品详情。只读，无副作用。", objectSchema(map[string]interface{}{"auctionId": integerProp("拍品 ID")}, []string{"auctionId"})),
 		tool("read_auction_state", "读取拍品实时状态。只读，无副作用。", objectSchema(map[string]interface{}{"auctionId": integerProp("拍品 ID")}, []string{"auctionId"})),
-		tool("read_live_rooms", "查询直播间列表。只读，无副作用。", pagedSchema(map[string]interface{}{"merchantId": stringProp("商家用户 ID"), "status": stringProp("直播间状态")}, nil)),
-		tool("read_live_room", "读取直播间详情。只读，无副作用。", objectSchema(map[string]interface{}{"roomId": integerProp("直播间 ID")}, []string{"roomId"})),
-		tool("read_live_room_lots", "读取直播间挂载拍品。只读，无副作用。", objectSchema(map[string]interface{}{"roomId": integerProp("直播间 ID")}, []string{"roomId"})),
-		tool("read_live_room_stats", "读取直播间当前统计。只读，无副作用。", objectSchema(map[string]interface{}{"roomId": integerProp("直播间 ID")}, []string{"roomId"})),
-		tool("read_live_sessions", "查询直播场次。只读，无副作用。", pagedSchema(map[string]interface{}{"merchantId": stringProp("商家用户 ID"), "roomId": integerProp("直播间 ID"), "status": stringProp("场次状态")}, nil)),
+		tool("read_live_sessions", "查询直播场次。只读，无副作用。", pagedSchema(map[string]interface{}{"merchantId": stringProp("商家用户 ID"), "status": stringProp("场次状态")}, nil)),
 		tool("read_live_session", "读取直播场次详情。只读，无副作用。", objectSchema(map[string]interface{}{"sessionId": integerProp("直播场次 ID")}, []string{"sessionId"})),
 		tool("read_live_session_lots", "读取场次内拍品。只读，无副作用。", objectSchema(map[string]interface{}{"sessionId": integerProp("直播场次 ID")}, []string{"sessionId"})),
 		tool("read_live_session_bids", "读取场次出价记录。只读，无副作用。", pagedSchema(map[string]interface{}{"sessionId": integerProp("直播场次 ID"), "sort": enumProp([]string{"timeDesc", "timeAsc", "priceDesc"})}, []string{"sessionId"})),
@@ -72,7 +63,7 @@ func readToolDefinitions() []toolDefinition {
 
 func controlToolDefinitions() []toolDefinition {
 	return []toolDefinition{
-		tool("get_merchant_live_control_context", "获取商家当前直播间控制台上下文。参数只需要 merchantId，返回直播间、当前场次、讲解中拍品、成交/流拍/待讲解/可上架拍品。", objectSchema(map[string]interface{}{"merchantId": stringProp("商家用户 ID")}, []string{"merchantId"})),
+		tool("get_merchant_live_control_context", "获取商家当前直播场次控制台上下文。参数只需要 merchantId，返回当前场次、讲解中拍品、成交/流拍/待讲解/可上架拍品。", objectSchema(map[string]interface{}{"merchantId": stringProp("商家用户 ID")}, []string{"merchantId"})),
 		tool("operate_live_session_lot", "模拟商家直播中的拍品操作。支持 onShelf 上架、offShelf 下架、startExplain 开始讲解、hammer 落槌、endLive 下播。", objectSchema(map[string]interface{}{"liveSessionId": integerProp("直播场次 ID"), "auctionId": integerProp("拍品 ID"), "action": enumProp([]string{"onShelf", "offShelf", "startExplain", "hammer", "endLive"}), "durationSec": optionalIntegerProp("开始讲解时可指定讲解/拍卖时长，单位秒"), "force": booleanProp("hammer/endLive 时是否强制结束；hammer 默认 true"), "requestId": stringProp("可选幂等请求 ID，建议 hammer 时传入")}, []string{"liveSessionId", "auctionId", "action"})),
 	}
 }
