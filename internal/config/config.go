@@ -148,6 +148,7 @@ type ObjectStorageConfig struct {
 
 type AgentConfig struct {
 	ProductDescriptionURL      string   `yaml:"productDescriptionURL"`
+	ProductAuditEnabled        bool     `yaml:"productAuditEnabled"`
 	ProductAuditURL            string   `yaml:"productAuditURL"`
 	ProductAuditCallbackURL    string   `yaml:"productAuditCallbackURL"`
 	LiveAnalysisURL            string   `yaml:"liveAnalysisURL"`
@@ -306,6 +307,7 @@ func Default() Config {
 		},
 		Agent: AgentConfig{
 			ProductDescriptionURL:      "http://127.0.0.1:8000/api/v1/product-description",
+			ProductAuditEnabled:        true,
 			ProductAuditURL:            "http://127.0.0.1:8000/api/v1/product-audit",
 			ProductAuditCallbackURL:    "http://127.0.0.1:8080/api/v1/auctions/audit/callback",
 			LiveAnalysisURL:            "http://127.0.0.1:8000/api/v1/live-analysis/async",
@@ -480,17 +482,19 @@ func (c Config) Validate() error {
 	if err := validateHTTPURL(c.Agent.ProductDescriptionURL, "agent.productDescriptionURL"); err != nil {
 		return err
 	}
-	if strings.TrimSpace(c.Agent.ProductAuditURL) == "" {
-		return fmt.Errorf("agent.productAuditURL is required")
-	}
-	if err := validateHTTPURL(c.Agent.ProductAuditURL, "agent.productAuditURL"); err != nil {
-		return err
-	}
-	if strings.TrimSpace(c.Agent.ProductAuditCallbackURL) == "" {
-		return fmt.Errorf("agent.productAuditCallbackURL is required")
-	}
-	if err := validateHTTPURL(c.Agent.ProductAuditCallbackURL, "agent.productAuditCallbackURL"); err != nil {
-		return err
+	if c.Agent.ProductAuditEnabled {
+		if strings.TrimSpace(c.Agent.ProductAuditURL) == "" {
+			return fmt.Errorf("agent.productAuditURL is required")
+		}
+		if err := validateHTTPURL(c.Agent.ProductAuditURL, "agent.productAuditURL"); err != nil {
+			return err
+		}
+		if strings.TrimSpace(c.Agent.ProductAuditCallbackURL) == "" {
+			return fmt.Errorf("agent.productAuditCallbackURL is required")
+		}
+		if err := validateHTTPURL(c.Agent.ProductAuditCallbackURL, "agent.productAuditCallbackURL"); err != nil {
+			return err
+		}
 	}
 	if strings.TrimSpace(c.Agent.LiveAnalysisURL) == "" {
 		return fmt.Errorf("agent.liveAnalysisURL is required")
@@ -757,6 +761,9 @@ func (c *Config) applyEnv() error {
 	setString("OBJECT_STORAGE_OBJECT_PREFIX", &c.ObjectStorage.ObjectPrefix)
 
 	setString("AGENT_PRODUCT_DESCRIPTION_URL", &c.Agent.ProductDescriptionURL)
+	if err := setBool("AGENT_PRODUCT_AUDIT_ENABLED", &c.Agent.ProductAuditEnabled); err != nil {
+		return err
+	}
 	setString("AGENT_PRODUCT_AUDIT_URL", &c.Agent.ProductAuditURL)
 	setString("AGENT_PRODUCT_AUDIT_CALLBACK_URL", &c.Agent.ProductAuditCallbackURL)
 	setString("AGENT_LIVE_ANALYSIS_URL", &c.Agent.LiveAnalysisURL)

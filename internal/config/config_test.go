@@ -48,6 +48,7 @@ jwt:
 	t.Setenv("OBJECT_STORAGE_ACCESS_KEY", "ak")
 	t.Setenv("OBJECT_STORAGE_SECRET_KEY", "sk")
 	t.Setenv("AGENT_PRODUCT_DESCRIPTION_URL", "http://127.0.0.1:9000/api/v1/product-description")
+	t.Setenv("AGENT_PRODUCT_AUDIT_ENABLED", "false")
 	t.Setenv("AGENT_PRODUCT_AUDIT_URL", "http://127.0.0.1:9000/api/v1/product-audit")
 	t.Setenv("AGENT_PRODUCT_AUDIT_CALLBACK_URL", "http://127.0.0.1:7070/api/v1/auctions/audit/callback")
 	t.Setenv("AGENT_LIVE_ANALYSIS_URL", "http://127.0.0.1:9000/api/v1/live-analysis/async")
@@ -104,6 +105,7 @@ jwt:
 		t.Fatalf("unexpected object storage config: %+v", cfg.ObjectStorage)
 	}
 	if cfg.Agent.ProductDescriptionURL != "http://127.0.0.1:9000/api/v1/product-description" ||
+		cfg.Agent.ProductAuditEnabled ||
 		cfg.Agent.ProductAuditURL != "http://127.0.0.1:9000/api/v1/product-audit" ||
 		cfg.Agent.ProductAuditCallbackURL != "http://127.0.0.1:7070/api/v1/auctions/audit/callback" ||
 		cfg.Agent.LiveAnalysisURL != "http://127.0.0.1:9000/api/v1/live-analysis/async" ||
@@ -369,6 +371,16 @@ func TestValidateRejectsInvalidAgentProductAuditCallbackURL(t *testing.T) {
 	cfg.Agent.ProductAuditCallbackURL = "127.0.0.1:8080/api/v1/auctions/audit/callback"
 	if err := cfg.Validate(); err == nil {
 		t.Fatal("expected invalid agent.productAuditCallbackURL to be rejected")
+	}
+}
+
+func TestValidateAllowsMissingProductAuditURLsWhenDisabled(t *testing.T) {
+	cfg := Default()
+	cfg.Agent.ProductAuditEnabled = false
+	cfg.Agent.ProductAuditURL = ""
+	cfg.Agent.ProductAuditCallbackURL = ""
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("expected disabled product audit to allow missing URLs, got %v", err)
 	}
 }
 

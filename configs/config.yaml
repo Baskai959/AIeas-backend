@@ -76,6 +76,8 @@ objectStorage:
 
 agent:
   productDescriptionURL: "http://127.0.0.1:8000/api/v1/product-description"
+  # true: 提交拍品后调用 AI 审核；false: 不调用 AI，提交审核时默认直接通过。
+  productAuditEnabled: true
   productAuditURL: "http://127.0.0.1:8000/api/v1/product-audit"
   productAuditCallbackURL: "http://127.0.0.1:8888/api/v1/auctions/audit/callback"
   liveAnalysisURL: "http://127.0.0.1:8000/api/v1/live-analysis/async"

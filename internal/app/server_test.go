@@ -751,6 +751,34 @@ func TestAuctionCreateTriggersLotContentAudit(t *testing.T) {
 	}
 }
 
+func TestAuctionCreateSkipsLotContentAuditWhenDisabled(t *testing.T) {
+	auditor := &captureProductAuditor{result: service.ProductAuditResult{Success: true, RequestID: "agent-lot-audit-disabled", Status: "ACCEPTED"}, called: make(chan struct{}, 1)}
+	cfg := appconfig.Default()
+	cfg.Agent.ProductAuditEnabled = false
+	cfg.Agent.ProductAuditURL = ""
+	cfg.Agent.ProductAuditCallbackURL = ""
+	h := NewServerWithDependencies(cfg, ServerDependencies{
+		UserRepo:       repository.NewSeedUserRepository(),
+		ObjectUploader: objectstorage.NewMemoryUploader(""),
+		ProductAuditor: auditor,
+	})
+	token := loginForToken(t, h.Engine, "merchant001", "Passw0rd!", "merchant")
+
+	resp := doJSONWithHeaders(t, h.Engine, consts.MethodPost, "/api/v1/auctions", auctionCreateJSON("免审核测试拍品", "collectible"), ut.Header{Key: "Authorization", Value: "Bearer " + token})
+	if resp.status != 200 || resp.body.Code != 0 {
+		t.Fatalf("expected auction create success, got status=%d raw=%s", resp.status, resp.raw)
+	}
+	var lot struct {
+		AuctionID uint64               `json:"auctionId"`
+		Status    domain.AuctionStatus `json:"status"`
+	}
+	mustDecodeData(t, resp.body.Data, &lot)
+	if lot.AuctionID == 0 || lot.Status != domain.AuctionStatusReady {
+		t.Fatalf("expected product audit disabled to auto approve as READY, got %+v", lot)
+	}
+	auditor.assertNoInput(t, 100*time.Millisecond)
+}
+
 func TestAuctionDraftDoesNotTriggerAuditUntilPublish(t *testing.T) {
 	auditor := &captureProductAuditor{result: service.ProductAuditResult{Success: true, RequestID: "agent-lot-audit-1", Status: "ACCEPTED"}, called: make(chan struct{}, 1)}
 	h := NewServerWithDependencies(appconfig.Default(), ServerDependencies{
@@ -782,6 +810,46 @@ func TestAuctionDraftDoesNotTriggerAuditUntilPublish(t *testing.T) {
 	if input.CallbackContext["scope"] != "auction_lot_content" {
 		t.Fatalf("unexpected audit input after publish: %+v", input)
 	}
+}
+
+func TestAuctionDraftPublishSkipsLotContentAuditWhenDisabled(t *testing.T) {
+	auditor := &captureProductAuditor{result: service.ProductAuditResult{Success: true, RequestID: "agent-lot-audit-disabled", Status: "ACCEPTED"}, called: make(chan struct{}, 1)}
+	cfg := appconfig.Default()
+	cfg.Agent.ProductAuditEnabled = false
+	cfg.Agent.ProductAuditURL = ""
+	cfg.Agent.ProductAuditCallbackURL = ""
+	h := NewServerWithDependencies(cfg, ServerDependencies{
+		UserRepo:       repository.NewSeedUserRepository(),
+		ObjectUploader: objectstorage.NewMemoryUploader(""),
+		ProductAuditor: auditor,
+	})
+	token := loginForToken(t, h.Engine, "merchant001", "Passw0rd!", "merchant")
+
+	resp := doJSONWithHeaders(t, h.Engine, consts.MethodPost, "/api/v1/auctions", auctionCreateJSONWithStatus("免审核草稿拍品", "collectible", domain.AuctionStatusDraft), ut.Header{Key: "Authorization", Value: "Bearer " + token})
+	if resp.status != 200 || resp.body.Code != 0 {
+		t.Fatalf("expected draft auction create success, got status=%d raw=%s", resp.status, resp.raw)
+	}
+	var lot struct {
+		AuctionID uint64               `json:"auctionId"`
+		Status    domain.AuctionStatus `json:"status"`
+	}
+	mustDecodeData(t, resp.body.Data, &lot)
+	if lot.Status != domain.AuctionStatusDraft {
+		t.Fatalf("expected draft status, got %+v", lot)
+	}
+
+	patch := doJSONWithHeaders(t, h.Engine, consts.MethodPatch, "/api/v1/auctions/"+strconv.FormatUint(lot.AuctionID, 10), `{"status":"PENDING_AUDIT"}`, ut.Header{Key: "Authorization", Value: "Bearer " + token})
+	if patch.status != 200 || patch.body.Code != 0 {
+		t.Fatalf("expected publish success, got status=%d raw=%s", patch.status, patch.raw)
+	}
+	var updated struct {
+		Status domain.AuctionStatus `json:"status"`
+	}
+	mustDecodeData(t, patch.body.Data, &updated)
+	if updated.Status != domain.AuctionStatusReady {
+		t.Fatalf("expected product audit disabled draft publish to auto approve as READY, got %+v", updated)
+	}
+	auditor.assertNoInput(t, 100*time.Millisecond)
 }
 
 func TestAuctionUpdateReadyLotRouteReturnsPendingAudit(t *testing.T) {

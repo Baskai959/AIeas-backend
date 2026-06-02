@@ -18,18 +18,19 @@ import (
 )
 
 type AuctionService struct {
-	auctions         repository.AuctionRepository
-	auditor          ProductAuditor
-	auditImageLoader ProductAuditImageLoader
-	bids             repository.BidRepository
-	tx               repository.TxManager
-	idGen            AuctionIDGenerator
-	realtime         repository.AuctionRealtimeStore
-	publisher        EventPublisher
-	timer            *TimerScheduler
-	onClose          func(ctx context.Context, auctionID uint64)
-	hook             *LiveAgentHookService
-	cfg              appconfig.AuctionConfig
+	auctions            repository.AuctionRepository
+	auditor             ProductAuditor
+	productAuditEnabled bool
+	auditImageLoader    ProductAuditImageLoader
+	bids                repository.BidRepository
+	tx                  repository.TxManager
+	idGen               AuctionIDGenerator
+	realtime            repository.AuctionRealtimeStore
+	publisher           EventPublisher
+	timer               *TimerScheduler
+	onClose             func(ctx context.Context, auctionID uint64)
+	hook                *LiveAgentHookService
+	cfg                 appconfig.AuctionConfig
 }
 
 type AuctionIDGenerator interface {
@@ -116,7 +117,7 @@ func NewAuctionService(auctions repository.AuctionRepository, tx repository.TxMa
 	if tx == nil {
 		tx = repository.NoopTxManager{}
 	}
-	return &AuctionService{auctions: auctions, tx: tx, realtime: repository.NoopRealtimeStore{}, cfg: appconfig.Default().Auction}
+	return &AuctionService{auctions: auctions, tx: tx, realtime: repository.NoopRealtimeStore{}, cfg: appconfig.Default().Auction, productAuditEnabled: true}
 }
 
 func (s *AuctionService) SetRealtime(realtime repository.AuctionRealtimeStore) {
@@ -156,6 +157,10 @@ func (s *AuctionService) SetIDGenerator(idGen AuctionIDGenerator) {
 
 func (s *AuctionService) SetProductAuditor(auditor ProductAuditor) {
 	s.auditor = auditor
+}
+
+func (s *AuctionService) SetProductAuditEnabled(enabled bool) {
+	s.productAuditEnabled = enabled
 }
 
 func (s *AuctionService) SetProductAuditImageLoader(loader ProductAuditImageLoader) {
@@ -269,6 +274,7 @@ func (s *AuctionService) Create(ctx context.Context, in CreateAuctionInput) (dom
 	if !in.allowSystemStatus && !isClientWritableAuctionStatus(in.Status) {
 		return domain.AuctionLot{}, domain.ErrInvalidArgument
 	}
+	in.Status = s.statusAfterProductAuditGate(in.Status)
 	startTime, endTime, durationSec, err := normalizeAuctionTiming(in.StartTime, in.EndTime, in.DurationSec)
 	if err != nil {
 		return domain.AuctionLot{}, domain.ErrInvalidArgument
@@ -491,6 +497,7 @@ func (s *AuctionService) Update(ctx context.Context, id uint64, in UpdateAuction
 			}
 			current.Status = nextStatus
 		}
+		current.Status = s.statusAfterProductAuditGate(current.Status)
 		if current.Status == domain.AuctionStatusPendingAudit && (hasLotDisplayPatch(in) || current.Status != originalStatus) {
 			current.AuditTaskID = newAuctionAuditTaskID(current.AuctionID)
 			shouldAudit = true
@@ -823,6 +830,13 @@ func isEditableAuctionStatus(status domain.AuctionStatus) bool {
 func normalizeClientAuctionStatus(status domain.AuctionStatus) domain.AuctionStatus {
 	if status == "" {
 		return domain.AuctionStatusPendingAudit
+	}
+	return status
+}
+
+func (s *AuctionService) statusAfterProductAuditGate(status domain.AuctionStatus) domain.AuctionStatus {
+	if s != nil && !s.productAuditEnabled && status == domain.AuctionStatusPendingAudit {
+		return domain.AuctionStatusReady
 	}
 	return status
 }

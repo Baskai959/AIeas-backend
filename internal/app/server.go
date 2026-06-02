@@ -298,8 +298,10 @@ func NewServerWithDependencies(cfg appconfig.Config, deps ServerDependencies) *s
 	if deps.DescriptionGen == nil {
 		deps.DescriptionGen = agent.NewProductDescriptionClient(cfg.Agent)
 	}
-	if deps.ProductAuditor == nil {
+	if deps.ProductAuditor == nil && cfg.Agent.ProductAuditEnabled {
 		deps.ProductAuditor = agent.NewProductAuditClient(cfg.Agent)
+	} else if deps.ProductAuditor == nil {
+		deps.ProductAuditor = service.DisabledProductAuditor{}
 	}
 	if deps.LiveAnalysisRequester == nil {
 		deps.LiveAnalysisRequester = agent.NewLiveAnalysisClient(cfg.Agent)
@@ -337,6 +339,7 @@ func NewServerWithDependencies(cfg appconfig.Config, deps ServerDependencies) *s
 	jwtManager := jwtpkg.NewManager(cfg.JWT.Secret, cfg.JWT.AccessTokenTTL.Std())
 	authService := service.NewAuthService(deps.UserRepo, jwtManager)
 	auctionService := service.NewAuctionService(deps.AuctionRepo, deps.TxManager)
+	auctionService.SetProductAuditEnabled(cfg.Agent.ProductAuditEnabled)
 	auctionService.SetProductAuditor(deps.ProductAuditor)
 	auctionService.SetProductAuditImageLoader(productAuditImageLoader{uploader: deps.ObjectUploader})
 	riskService := service.NewRiskService(deps.RiskRepo, deps.RealtimeStore, deps.Hub)
