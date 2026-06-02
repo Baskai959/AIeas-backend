@@ -85,6 +85,14 @@ func (b KeyBuilder) OnlineAuction(auctionID uint64) string {
 	return b.key("online:auction:%d", auctionID)
 }
 
+func (b KeyBuilder) OnlineAuctionUsers(auctionID uint64) string {
+	return b.key("online:auction:%d:users", auctionID)
+}
+
+func (b KeyBuilder) OnlineAuctionUserConns(auctionID uint64, userID string) string {
+	return b.key("online:auction:%d:user:%s:conns", auctionID, userID)
+}
+
 func (b KeyBuilder) BidFrequency(userID string, auctionID uint64) string {
 	return b.key("risk:freq:bid:%s:%d", userID, auctionID)
 }

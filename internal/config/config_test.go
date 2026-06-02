@@ -39,6 +39,7 @@ jwt:
 	t.Setenv("JWT_SECRET", "from-env")
 	t.Setenv("REDIS_RT_SHARD_0_DB", "3")
 	t.Setenv("IDEMPOTENCY_TTL", "30m")
+	t.Setenv("AUCTION_BID_IDEMPOTENCY_TTL", "45s")
 	t.Setenv("OBJECT_STORAGE_ENABLED", "true")
 	t.Setenv("OBJECT_STORAGE_ENDPOINT", "https://tos-cn-boe.volces.com")
 	t.Setenv("OBJECT_STORAGE_REGION", "cn-guilin-boe")
@@ -48,12 +49,15 @@ jwt:
 	t.Setenv("OBJECT_STORAGE_SECRET_KEY", "sk")
 	t.Setenv("AGENT_PRODUCT_DESCRIPTION_URL", "http://127.0.0.1:9000/api/v1/product-description")
 	t.Setenv("AGENT_PRODUCT_AUDIT_URL", "http://127.0.0.1:9000/api/v1/product-audit")
-	t.Setenv("AGENT_PRODUCT_AUDIT_CALLBACK_URL", "http://127.0.0.1:7070/api/v1/items/audit/callback")
+	t.Setenv("AGENT_PRODUCT_AUDIT_CALLBACK_URL", "http://127.0.0.1:7070/api/v1/auctions/audit/callback")
 	t.Setenv("AGENT_LIVE_ANALYSIS_URL", "http://127.0.0.1:9000/api/v1/live-analysis/async")
 	t.Setenv("AGENT_LIVE_ANALYSIS_CALLBACK_URL", "http://127.0.0.1:7070/api/v1/live-analysis/callback")
 	t.Setenv("AGENT_LIVE_ANALYSIS_CALLBACK_API_KEY", "callback-from-env")
 	t.Setenv("AGENT_LIVE_AUCTION_HOOK_URL", "http://127.0.0.1:9000/api/v1/live-auction-hook")
 	t.Setenv("AGENT_TIMEOUT", "5s")
+	t.Setenv("DOUBAO_TTS_APP_ID", "doubao-appid")
+	t.Setenv("DOUBAO_TTS_ACK_TOKEN", "doubao-acktoken")
+	t.Setenv("DOUBAO_TTS_VOICE", "zh_female_vv_jupiter_bigtts")
 	t.Setenv("MCP_READ_API_KEY", "mcp-read-from-env")
 	t.Setenv("MCP_READ_ACTOR_ID", "u_9001")
 	t.Setenv("MCP_READ_ACTOR_ROLE", "admin")
@@ -93,12 +97,15 @@ jwt:
 	if cfg.Idempotency.TTL.Std() != 30*time.Minute {
 		t.Fatalf("expected idempotency ttl env override, got %s", cfg.Idempotency.TTL.Std())
 	}
+	if cfg.Auction.BidIdempotencyTTL.Std() != 45*time.Second {
+		t.Fatalf("expected auction bid idempotency ttl env override, got %s", cfg.Auction.BidIdempotencyTTL.Std())
+	}
 	if !cfg.ObjectStorage.Enabled || cfg.ObjectStorage.Bucket != "aieas" || cfg.ObjectStorage.BucketURL != "https://aieas.tos-cn-boe.volces.com" {
 		t.Fatalf("unexpected object storage config: %+v", cfg.ObjectStorage)
 	}
 	if cfg.Agent.ProductDescriptionURL != "http://127.0.0.1:9000/api/v1/product-description" ||
 		cfg.Agent.ProductAuditURL != "http://127.0.0.1:9000/api/v1/product-audit" ||
-		cfg.Agent.ProductAuditCallbackURL != "http://127.0.0.1:7070/api/v1/items/audit/callback" ||
+		cfg.Agent.ProductAuditCallbackURL != "http://127.0.0.1:7070/api/v1/auctions/audit/callback" ||
 		cfg.Agent.LiveAnalysisURL != "http://127.0.0.1:9000/api/v1/live-analysis/async" ||
 		cfg.Agent.LiveAnalysisCallbackURL != "http://127.0.0.1:7070/api/v1/live-analysis/callback" ||
 		cfg.Agent.LiveAnalysisCallbackAPIKey != "callback-from-env" ||
@@ -109,6 +116,9 @@ jwt:
 	if cfg.MCP.Read.APIKey != "mcp-read-from-env" || cfg.MCP.Read.ActorID != "u_9001" || cfg.MCP.Read.ActorRole != "admin" ||
 		cfg.MCP.Control.APIKey != "mcp-control-from-env" || cfg.MCP.Control.ActorID != "u_9001" || cfg.MCP.Control.ActorRole != "admin" {
 		t.Fatalf("unexpected mcp config: %+v", cfg.MCP)
+	}
+	if cfg.DoubaoTTS.AppID != "doubao-appid" || cfg.DoubaoTTS.AckToken != "doubao-acktoken" || cfg.DoubaoTTS.Voice != "zh_female_vv_jupiter_bigtts" {
+		t.Fatalf("unexpected doubao tts config: %+v", cfg.DoubaoTTS)
 	}
 	if !cfg.Kafka.Enabled || len(cfg.Kafka.Brokers) != 2 || cfg.Kafka.Brokers[0] != "127.0.0.1:9092" || cfg.Kafka.BidEventsTopic != "test.bid.events" {
 		t.Fatalf("unexpected kafka config: %+v", cfg.Kafka)
@@ -185,6 +195,16 @@ func TestValidateRejectsObjectStorageBucketURLPointingToRedis(t *testing.T) {
 
 	if err := cfg.Validate(); err == nil {
 		t.Fatal("expected object storage bucketURL pointing to redis to be rejected")
+	}
+}
+
+func TestValidateRejectsPartialDoubaoTTSConfig(t *testing.T) {
+	cfg := Default()
+	cfg.DoubaoTTS.AppID = "doubao-appid"
+	cfg.DoubaoTTS.AckToken = ""
+
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected partial doubao tts config to be rejected")
 	}
 }
 
@@ -346,7 +366,7 @@ func TestValidateRejectsInvalidAgentLiveAnalysisURL(t *testing.T) {
 
 func TestValidateRejectsInvalidAgentProductAuditCallbackURL(t *testing.T) {
 	cfg := Default()
-	cfg.Agent.ProductAuditCallbackURL = "127.0.0.1:8080/api/v1/items/audit/callback"
+	cfg.Agent.ProductAuditCallbackURL = "127.0.0.1:8080/api/v1/auctions/audit/callback"
 	if err := cfg.Validate(); err == nil {
 		t.Fatal("expected invalid agent.productAuditCallbackURL to be rejected")
 	}

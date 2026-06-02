@@ -21,6 +21,7 @@ type AuctionStatus string
 const (
 	AuctionStatusDraft         AuctionStatus = "DRAFT"
 	AuctionStatusPendingAudit  AuctionStatus = "PENDING_AUDIT"
+	AuctionStatusAuditRejected AuctionStatus = "AUDIT_REJECTED"
 	AuctionStatusReady         AuctionStatus = "READY"
 	AuctionStatusWarmingUp     AuctionStatus = "WARMING_UP"
 	AuctionStatusRunning       AuctionStatus = "RUNNING"
@@ -52,7 +53,7 @@ func NormalizeAuctionExtendMode(m AuctionExtendMode) AuctionExtendMode {
 
 func (s AuctionStatus) Valid() bool {
 	switch s {
-	case AuctionStatusDraft, AuctionStatusPendingAudit, AuctionStatusReady,
+	case AuctionStatusDraft, AuctionStatusPendingAudit, AuctionStatusAuditRejected, AuctionStatusReady,
 		AuctionStatusWarmingUp, AuctionStatusRunning, AuctionStatusExtended,
 		AuctionStatusHammerPending, AuctionStatusClosedWon, AuctionStatusClosedFailed,
 		AuctionStatusSettled:
@@ -77,11 +78,13 @@ func CanTransitionAuction(from, to AuctionStatus) bool {
 	}
 	switch from {
 	case AuctionStatusDraft:
-		return to == AuctionStatusPendingAudit || to == AuctionStatusReady || to == AuctionStatusClosedFailed
+		return to == AuctionStatusPendingAudit || to == AuctionStatusClosedFailed
 	case AuctionStatusPendingAudit:
-		return to == AuctionStatusReady || to == AuctionStatusClosedFailed
+		return to == AuctionStatusReady || to == AuctionStatusAuditRejected || to == AuctionStatusClosedFailed
+	case AuctionStatusAuditRejected:
+		return to == AuctionStatusDraft || to == AuctionStatusPendingAudit || to == AuctionStatusReady || to == AuctionStatusClosedFailed
 	case AuctionStatusReady:
-		return to == AuctionStatusWarmingUp || to == AuctionStatusRunning || to == AuctionStatusClosedFailed
+		return to == AuctionStatusPendingAudit || to == AuctionStatusWarmingUp || to == AuctionStatusRunning || to == AuctionStatusClosedFailed
 	case AuctionStatusWarmingUp:
 		return to == AuctionStatusRunning || to == AuctionStatusClosedFailed
 	case AuctionStatusRunning:
@@ -99,9 +102,15 @@ func CanTransitionAuction(from, to AuctionStatus) bool {
 
 type AuctionLot struct {
 	AuctionID      uint64            `json:"auctionId"`
-	ItemID         uint64            `json:"itemId"`
 	SellerID       string            `json:"sellerId"`
 	LiveSessionID  *uint64           `json:"liveSessionId,omitempty"`
+	Title          string            `json:"title"`
+	Description    string            `json:"description,omitempty"`
+	Category       string            `json:"category"`
+	Brand          string            `json:"brand,omitempty"`
+	ConditionGrade ConditionGrade    `json:"condition"`
+	ImageURLs      []string          `json:"imageUrls"`
+	CoverURL       string            `json:"coverUrl,omitempty"`
 	AuctionType    AuctionType       `json:"auctionType"`
 	StartPrice     int64             `json:"startPrice"`
 	ReservePrice   int64             `json:"reservePrice"`
@@ -113,6 +122,7 @@ type AuctionLot struct {
 	DepositAmount  int64             `json:"depositAmount"`
 	Status         AuctionStatus     `json:"status"`
 	RuleSnapshot   json.RawMessage   `json:"ruleSnapshot"`
+	AuditTaskID    string            `json:"-"`
 	StartTime      time.Time         `json:"startTime"`
 	EndTime        time.Time         `json:"endTime"`
 	DurationSec    int               `json:"durationSec,omitempty"`
@@ -132,13 +142,21 @@ type AuctionLot struct {
 type AuctionFilter struct {
 	SellerID      string
 	Status        AuctionStatus
-	ItemID        uint64
+	Category      string
+	Keyword       string
 	LiveSessionID uint64
 	Limit         int
 	Offset        int
 }
 
 type AuctionPatch struct {
+	Title          *string
+	Description    *string
+	Category       *string
+	Brand          *string
+	ConditionGrade *ConditionGrade
+	ImageURLs      *[]string
+	CoverURL       *string
 	StartPrice     *int64
 	ReservePrice   *int64
 	CapPrice       *int64
@@ -154,16 +172,21 @@ type AuctionPatch struct {
 }
 
 type AuctionState struct {
-	AuctionID      uint64        `json:"auctionId"`
-	Status         AuctionStatus `json:"status"`
-	CurrentPrice   int64         `json:"currentPrice"`
-	LeaderBidderID string        `json:"leaderBidderId,omitempty"`
-	StartTime      time.Time     `json:"startTime"`
-	EndTime        time.Time     `json:"endTime"`
-	LastBidTSMS    int64         `json:"lastBidTsMs"`
-	ExtendCount    int           `json:"extendCount"`
-	Version        int64         `json:"version"`
-	Source         string        `json:"source"`
+	AuctionID      uint64          `json:"auctionId"`
+	LiveSessionID  uint64          `json:"liveSessionId,omitempty"`
+	Status         AuctionStatus   `json:"status"`
+	StartPrice     int64           `json:"startPrice"`
+	CapPrice       int64           `json:"capPrice"`
+	IncrementRule  json.RawMessage `json:"incrementRule,omitempty"`
+	CurrentPrice   int64           `json:"currentPrice"`
+	LeaderBidderID string          `json:"leaderBidderId,omitempty"`
+	BidCount       int             `json:"bidCount,omitempty"`
+	StartTime      time.Time       `json:"startTime"`
+	EndTime        time.Time       `json:"endTime"`
+	LastBidTSMS    int64           `json:"lastBidTsMs"`
+	ExtendCount    int             `json:"extendCount"`
+	Version        int64           `json:"version"`
+	Source         string          `json:"source"`
 }
 
 type BidRiskResult string

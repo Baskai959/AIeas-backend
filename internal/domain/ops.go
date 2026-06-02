@@ -14,6 +14,36 @@ const (
 	OrderStatusCancelled OrderStatus = "CANCELLED"
 )
 
+func (s OrderStatus) Valid() bool {
+	switch s {
+	case OrderStatusCreated, OrderStatusPaid, OrderStatusTimeout, OrderStatusCancelled:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s OrderStatus) Terminal() bool {
+	switch s {
+	case OrderStatusPaid, OrderStatusTimeout, OrderStatusCancelled:
+		return true
+	default:
+		return false
+	}
+}
+
+func CanTransitionOrder(from, to OrderStatus) bool {
+	if from == to {
+		return true
+	}
+	switch from {
+	case OrderStatusCreated:
+		return to == OrderStatusPaid || to == OrderStatusTimeout || to == OrderStatusCancelled
+	default:
+		return false
+	}
+}
+
 type PayStatus string
 
 const (
@@ -23,20 +53,60 @@ const (
 )
 
 type OrderDeal struct {
-	ID            uint64      `json:"id"`
-	AuctionID     uint64      `json:"auctionId"`
-	LiveSessionID *uint64     `json:"liveSessionId,omitempty"`
-	WinnerID      string      `json:"winnerId"`
-	SellerID      string      `json:"sellerId"`
-	DealPrice     int64       `json:"dealPrice"`
-	DepositAmount int64       `json:"depositAmount"`
-	Status        OrderStatus `json:"status"`
-	PayStatus     PayStatus   `json:"payStatus"`
-	PayDeadline   *time.Time  `json:"payDeadline,omitempty"`
-	PaidAt        *time.Time  `json:"paidAt,omitempty"`
-	ClosedAt      *time.Time  `json:"closedAt,omitempty"`
-	CreatedAt     time.Time   `json:"createdAt"`
-	UpdatedAt     time.Time   `json:"updatedAt"`
+	ID             uint64          `json:"id"`
+	AuctionID      uint64          `json:"auctionId"`
+	LiveSessionID  *uint64         `json:"liveSessionId,omitempty"`
+	LotSnapshot    json.RawMessage `json:"lotSnapshot,omitempty"`
+	WinnerID       string          `json:"winnerId"`
+	WinnerNickname string          `json:"winnerNickname,omitempty"`
+	SellerID       string          `json:"sellerId"`
+	DealPrice      int64           `json:"dealPrice"`
+	DepositAmount  int64           `json:"depositAmount"`
+	Status         OrderStatus     `json:"status"`
+	PayStatus      PayStatus       `json:"payStatus"`
+	PayDeadline    *time.Time      `json:"payDeadline,omitempty"`
+	PaidAt         *time.Time      `json:"paidAt,omitempty"`
+	ClosedAt       *time.Time      `json:"closedAt,omitempty"`
+	Version        int64           `json:"version,omitempty"`
+	CreatedAt      time.Time       `json:"createdAt"`
+	UpdatedAt      time.Time       `json:"updatedAt"`
+}
+
+func (o OrderDeal) PaymentExpired(now time.Time) bool {
+	return o.PayDeadline != nil && !now.UTC().Before(o.PayDeadline.UTC())
+}
+
+func (o *OrderDeal) MarkPaid(now time.Time) error {
+	if o == nil {
+		return ErrInvalidArgument
+	}
+	if o.Status == OrderStatusPaid && o.PayStatus == PayStatusPaid {
+		return nil
+	}
+	if !CanTransitionOrder(o.Status, OrderStatusPaid) {
+		return ErrInvalidState
+	}
+	paidAt := now.UTC()
+	o.Status = OrderStatusPaid
+	o.PayStatus = PayStatusPaid
+	o.PaidAt = &paidAt
+	return nil
+}
+
+func (o *OrderDeal) MarkTimeout(now time.Time) error {
+	if o == nil {
+		return ErrInvalidArgument
+	}
+	if o.Status == OrderStatusTimeout {
+		return nil
+	}
+	if !CanTransitionOrder(o.Status, OrderStatusTimeout) || o.PayStatus != PayStatusUnpaid {
+		return ErrInvalidState
+	}
+	closedAt := now.UTC()
+	o.Status = OrderStatusTimeout
+	o.ClosedAt = &closedAt
+	return nil
 }
 
 type OrderFilter struct {

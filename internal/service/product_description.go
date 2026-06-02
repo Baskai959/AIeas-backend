@@ -40,6 +40,13 @@ type ProductAuditInput struct {
 	CallbackContext map[string]interface{}
 }
 
+type ProductAuditImage struct {
+	ImageName   string
+	ContentType string
+	ImageSize   int64
+	Image       []byte
+}
+
 type ProductAuditResult struct {
 	Success      bool    `json:"success"`
 	IsApproved   bool    `json:"is_approved"`
@@ -51,6 +58,10 @@ type ProductAuditResult struct {
 
 type ProductAuditor interface {
 	AuditProduct(ctx context.Context, in ProductAuditInput) (ProductAuditResult, error)
+}
+
+type ProductAuditImageLoader interface {
+	LoadProductAuditImage(ctx context.Context, imageURL string) (ProductAuditImage, error)
 }
 
 type LiveAnalysisAsyncInput struct {

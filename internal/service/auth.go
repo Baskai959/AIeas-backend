@@ -161,6 +161,8 @@ func HTTPStatusAndCode(err error) (int, int, string) {
 		return 404, 20004, "资源不存在"
 	case errors.Is(err, domain.ErrConflict):
 		return 409, 20009, "资源冲突"
+	case errors.Is(err, domain.ErrOptimisticConflict):
+		return 409, 20009, "资源冲突"
 	case errors.Is(err, domain.ErrInvalidState):
 		return 409, 20010, "状态不允许"
 	case errors.Is(err, domain.ErrIdempotencyKey):

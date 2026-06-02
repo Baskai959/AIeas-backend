@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"aieas_backend/internal/domain"
@@ -19,6 +20,8 @@ import (
 )
 
 const websocketWriteTimeout = 5 * time.Second
+
+var nextWSClientSeq atomic.Uint64
 
 type WSHandler struct {
 	hub            *corews.Hub
@@ -86,11 +89,7 @@ func (h *WSHandler) LiveSession(ctx context.Context, c *app.RequestContext) {
 		writeLiveSessionError(c, err)
 		return
 	}
-	if auctionID == 0 {
-		WriteError(c, 409, 32004, "直播场次当前无在拍品", nil)
-		return
-	}
-	clientID := fmt.Sprintf("ws_%d", time.Now().UnixNano())
+	clientID := nextWSClientID()
 	userID := AuthUserID(c)
 	if userID == "" {
 		userID = "anonymous"
@@ -99,14 +98,20 @@ func (h *WSHandler) LiveSession(ctx context.Context, c *app.RequestContext) {
 	client := corews.NewClientWithSession(clientID, userID, auctionID, liveSessionID, h.sendBufferSize)
 	client.CountOnline = role == domain.RoleBuyer
 	lastSeq := parseLastSeq(c)
-	if err := h.hub.Subscribe(auctionID, client); err != nil {
-		WriteError(c, consts.StatusInternalServerError, 90001, "系统内部错误", nil)
-		return
-	}
 	if err := h.upgrader.Upgrade(c, func(conn *websocket.Conn) {
+		if auctionID == 0 {
+			client.CountOnline = false
+			if err := h.hub.SubscribeLiveSessionOnly(liveSessionID, client); err != nil {
+				_ = conn.Close()
+				return
+			}
+		} else if err := h.hub.Subscribe(auctionID, client); err != nil {
+			_ = conn.Close()
+			return
+		}
 		h.serveConn(context.Background(), conn, client, lastSeq)
 	}); err != nil {
-		h.hub.Unsubscribe(auctionID, client.ID)
+		return
 	}
 }
 
@@ -116,7 +121,7 @@ func (h *WSHandler) Auction(ctx context.Context, c *app.RequestContext) {
 	if !ok {
 		return
 	}
-	clientID := fmt.Sprintf("ws_%d", time.Now().UnixNano())
+	clientID := nextWSClientID()
 	userID := AuthUserID(c)
 	if userID == "" {
 		userID = "anonymous"
@@ -125,20 +130,21 @@ func (h *WSHandler) Auction(ctx context.Context, c *app.RequestContext) {
 	client := corews.NewClient(clientID, userID, auctionID, h.sendBufferSize)
 	client.CountOnline = role == domain.RoleBuyer
 	lastSeq := parseLastSeq(c)
-	if err := h.hub.Subscribe(auctionID, client); err != nil {
-		WriteError(c, consts.StatusInternalServerError, 90001, "系统内部错误", nil)
-		return
-	}
 	if err := h.upgrader.Upgrade(c, func(conn *websocket.Conn) {
+		if err := h.hub.Subscribe(auctionID, client); err != nil {
+			_ = conn.Close()
+			return
+		}
 		h.serveConn(context.Background(), conn, client, lastSeq)
 	}); err != nil {
-		h.hub.Unsubscribe(auctionID, client.ID)
+		return
 	}
 }
 
 func (h *WSHandler) serveConn(ctx context.Context, conn *websocket.Conn, client *corews.Client, lastSeq int64) {
 	defer func() {
-		h.hub.Unsubscribe(client.AuctionID, client.ID)
+		h.hub.UnsubscribeClient(client)
+		_ = writeCloseFrame(conn, client.CloseReason())
 		_ = conn.Close()
 	}()
 	conn.SetReadLimit(int64(h.readLimitBytes))
@@ -157,7 +163,12 @@ func (h *WSHandler) serveConn(ctx context.Context, conn *websocket.Conn, client 
 	done := make(chan struct{})
 	writeDone := make(chan struct{})
 	go func() {
-		defer close(writeDone)
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				client.MarkSendFailure()
+			}
+			close(writeDone)
+		}()
 		ticker := time.NewTicker(h.pingInterval)
 		defer ticker.Stop()
 		h.replayMissed(client, lastSeq)
@@ -167,17 +178,12 @@ func (h *WSHandler) serveConn(ctx context.Context, conn *websocket.Conn, client 
 				if !ok {
 					return
 				}
-				if err := conn.SetWriteDeadline(time.Now().Add(websocketWriteTimeout)); err != nil {
-					client.MarkSendFailure()
-					return
-				}
-				if err := conn.WriteJSON(env); err != nil {
+				if err := writeJSONWithDeadline(conn, env); err != nil {
 					client.MarkSendFailure()
 					return
 				}
 			case <-ticker.C:
-				_ = conn.SetWriteDeadline(time.Now().Add(websocketWriteTimeout))
-				if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				if err := writePingWithDeadline(conn); err != nil {
 					client.MarkSendFailure()
 					return
 				}
@@ -185,9 +191,14 @@ func (h *WSHandler) serveConn(ctx context.Context, conn *websocket.Conn, client 
 		}
 	}()
 	go func() {
-		defer close(done)
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				client.MarkSendFailure()
+			}
+			close(done)
+		}()
 		for {
-			messageType, payload, err := conn.ReadMessage()
+			messageType, payload, err := readMessage(conn)
 			if err != nil {
 				return
 			}
@@ -208,6 +219,7 @@ func (h *WSHandler) serveConn(ctx context.Context, conn *websocket.Conn, client 
 	select {
 	case <-done:
 		client.CloseWithReason("read_closed")
+		waitWriteDone(writeDone)
 	case <-writeDone:
 		client.CloseWithReason("write_closed")
 	}
@@ -227,6 +239,80 @@ func (h *WSHandler) replayMissed(client *corews.Client, lastSeq int64) {
 	}
 }
 
+type websocketFrameWriter interface {
+	SetWriteDeadline(time.Time) error
+	WriteJSON(v interface{}) error
+	WriteMessage(messageType int, data []byte) error
+}
+
+type websocketControlWriter interface {
+	WriteControl(messageType int, data []byte, deadline time.Time) error
+}
+
+type websocketFrameReader interface {
+	ReadMessage() (messageType int, p []byte, err error)
+}
+
+func readMessage(conn websocketFrameReader) (messageType int, payload []byte, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("websocket read panic: %v", recovered)
+		}
+	}()
+	return conn.ReadMessage()
+}
+
+func writeJSONWithDeadline(conn websocketFrameWriter, env corews.Envelope) (err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("websocket write json panic: %v", recovered)
+		}
+	}()
+	if err := conn.SetWriteDeadline(time.Now().Add(websocketWriteTimeout)); err != nil {
+		return err
+	}
+	return conn.WriteJSON(env)
+}
+
+func writePingWithDeadline(conn websocketFrameWriter) (err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("websocket write ping panic: %v", recovered)
+		}
+	}()
+	if err := conn.SetWriteDeadline(time.Now().Add(websocketWriteTimeout)); err != nil {
+		return err
+	}
+	return conn.WriteMessage(websocket.PingMessage, nil)
+}
+
+func writeCloseFrame(conn websocketControlWriter, reason string) (err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("websocket close frame panic: %v", recovered)
+		}
+	}()
+	if reason == "" {
+		reason = "closed"
+	}
+	return conn.WriteControl(
+		websocket.CloseMessage,
+		websocket.FormatCloseMessage(websocket.CloseNormalClosure, reason),
+		time.Now().Add(time.Second),
+	)
+}
+
+func waitWriteDone(writeDone <-chan struct{}) {
+	select {
+	case <-writeDone:
+	case <-time.After(websocketWriteTimeout):
+	}
+}
+
+func nextWSClientID() string {
+	return fmt.Sprintf("ws_%d_%d", time.Now().UnixNano(), nextWSClientSeq.Add(1))
+}
+
 // deliverRoomSnapshot 在握手完成后立即下发一帧 room.snapshot：
 // 优先 RT (auctionService.State 内部已 RT-first → DB fallback)，并基于
 // 返回的 Source=="redis"/"db" 推断是否退化。state 加载失败、auction 不存在
@@ -235,7 +321,7 @@ func (h *WSHandler) replayMissed(client *corews.Client, lastSeq int64) {
 // snapshot 帧的 seq 字段填当前 Hub Room 的 CurrentSeq()，让客户端把它
 // 当作"已对齐到此点"，后续 broadcast 只要 seq 严格递增即可保证不重不漏。
 func (h *WSHandler) deliverRoomSnapshot(ctx context.Context, client *corews.Client) {
-	if client == nil || h.auctions == nil {
+	if client == nil || client.AuctionID == 0 || h.auctions == nil {
 		return
 	}
 	state, err := h.auctions.State(ctx, client.AuctionID, client.UserID, domain.RoleBuyer)
@@ -252,6 +338,8 @@ func (h *WSHandler) deliverRoomSnapshot(ctx context.Context, client *corews.Clie
 	payload := map[string]interface{}{
 		"auctionId":      state.AuctionID,
 		"status":         state.Status,
+		"startPrice":     state.StartPrice,
+		"capPrice":       state.CapPrice,
 		"currentPrice":   state.CurrentPrice,
 		"leaderBidderId": state.LeaderBidderID,
 		"startTime":      state.StartTime.UTC().UnixMilli(),
@@ -262,6 +350,9 @@ func (h *WSHandler) deliverRoomSnapshot(ctx context.Context, client *corews.Clie
 		"serverTime":     time.Now().UTC().UnixMilli(),
 		"source":         state.Source,
 		"degraded":       degraded,
+	}
+	if len(state.IncrementRule) > 0 {
+		payload["incrementRule"] = json.RawMessage(state.IncrementRule)
 	}
 	client.Deliver(jsonEnvelope(corews.TypeRoomSnapshot, "", payload))
 }

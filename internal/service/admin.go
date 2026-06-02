@@ -17,7 +17,6 @@ type AdminService struct {
 	risk      *RiskService
 	audits    repository.AuditRepository
 	dashboard repository.AdminDashboardRepository
-	items     repository.ItemRepository
 	sessions  repository.LiveSessionRepository
 	configs   repository.ConfigRepository
 	flags     *FeatureFlagService
@@ -31,8 +30,7 @@ func (s *AdminService) SetDashboardRepository(repo repository.AdminDashboardRepo
 	s.dashboard = repo
 }
 
-func (s *AdminService) SetLookupRepositories(items repository.ItemRepository, sessions repository.LiveSessionRepository) {
-	s.items = items
+func (s *AdminService) SetLookupRepositories(sessions repository.LiveSessionRepository) {
 	s.sessions = sessions
 }
 
@@ -49,7 +47,7 @@ func (s *AdminService) ListAuctions(ctx context.Context, filter domain.AuctionFi
 }
 
 func (s *AdminService) AuditAuction(ctx context.Context, auctionID uint64, approved bool, actorID string) (domain.AuctionLot, error) {
-	status := domain.AuctionStatusClosedFailed
+	status := domain.AuctionStatusAuditRejected
 	if approved {
 		status = domain.AuctionStatusReady
 	}
@@ -81,13 +79,6 @@ func (s *AdminService) AuctionByID(ctx context.Context, auctionID uint64) (domai
 		return domain.AuctionLot{}, domain.ErrInvalidArgument
 	}
 	return s.auctions.Get(ctx, auctionID, "admin", domain.RoleAdmin)
-}
-
-func (s *AdminService) ItemByID(ctx context.Context, itemID uint64) (domain.Item, error) {
-	if itemID == 0 || s.items == nil {
-		return domain.Item{}, domain.ErrInvalidArgument
-	}
-	return s.items.FindByID(ctx, itemID)
 }
 
 func (s *AdminService) LiveSessionByID(ctx context.Context, sessionID uint64) (domain.LiveSession, error) {

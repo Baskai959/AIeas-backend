@@ -24,7 +24,7 @@
           "Auction"
         ],
         "summary": "创建拍品",
-        "description": "需要 merchant 或 admin 角色。status 只能传 DRAFT 或 PENDING_AUDIT；不传默认 DRAFT。不能通过该接口直接创建 READY 拍品。",
+        "description": "需要 merchant 或 admin 角色。status 只能传 DRAFT 或 PENDING_AUDIT；不传默认 PENDING_AUDIT。不能通过该接口直接创建 READY 拍品。",
         "operationId": "createAuctionStatusRestricted",
         "requestBody": {
           "required": true,
@@ -132,7 +132,7 @@
           "DRAFT",
           "PENDING_AUDIT"
         ],
-        "description": "创建/编辑拍品接口允许传入的状态。READY 只能由后台审核接口生成。"
+        "description": "创建/编辑拍品接口允许传入的状态。READY 只能由后台审核接口或 AI 审核回调生成。"
       },
       "AuctionCreateRequest": {
         "type": "object",

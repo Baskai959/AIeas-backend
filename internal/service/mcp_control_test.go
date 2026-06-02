@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -11,10 +12,12 @@ import (
 )
 
 type mcpControlFixture struct {
-	svc      *MCPControlService
-	auctions *repository.MemoryAuctionRepository
-	sessions *repository.MemoryLiveSessionRepository
-	session  domain.LiveSession
+	svc         *MCPControlService
+	auctions    *repository.MemoryAuctionRepository
+	sessions    *repository.MemoryLiveSessionRepository
+	session     domain.LiveSession
+	synthesizer *fakeLiveVoiceSynthesizer
+	broadcaster *fakeLiveVoiceBroadcaster
 }
 
 func newMCPControlFixture(t *testing.T) mcpControlFixture {
@@ -23,7 +26,7 @@ func newMCPControlFixture(t *testing.T) mcpControlFixture {
 	auctionRepo := repository.NewMemoryAuctionRepository()
 	sessionRepo := repository.NewMemoryLiveSessionRepository()
 	realtimeStore := repository.NewMemoryRealtimeStore()
-	auctionSvc := NewAuctionService(auctionRepo, nil, repository.NoopTxManager{})
+	auctionSvc := NewAuctionService(auctionRepo, repository.NoopTxManager{})
 	auctionSvc.SetRealtime(realtimeStore)
 	sessionSvc := NewLiveSessionService(sessionRepo, auctionRepo)
 	sessionSvc.SetWriteDeps(repository.NoopTxManager{}, repository.NewMemoryLiveSessionLock(), auctionSvc)
@@ -38,13 +41,25 @@ func newMCPControlFixture(t *testing.T) mcpControlFixture {
 	if err := sessionRepo.Create(ctx, &session); err != nil {
 		t.Fatalf("create session: %v", err)
 	}
+	synthesizer := &fakeLiveVoiceSynthesizer{result: LiveVoiceSynthesisResult{
+		Audio:       []byte{0x01, 0x02, 0x03},
+		AudioFormat: "pcm_s16le",
+		Encoding:    "pcm_s16le",
+		SampleRate:  24000,
+		Channels:    1,
+		Voice:       "zh_female_vv_jupiter_bigtts",
+		Provider:    "doubao",
+	}}
+	broadcaster := &fakeLiveVoiceBroadcaster{delivered: 1}
 	svc := NewMCPControlService(MCPLiveControlDependencies{
-		Auctions:       auctionRepo,
-		Sessions:       sessionRepo,
-		LiveSessionSvc: sessionSvc,
-		AuctionSvc:     auctionSvc,
+		Auctions:             auctionRepo,
+		Sessions:             sessionRepo,
+		LiveSessionSvc:       sessionSvc,
+		AuctionSvc:           auctionSvc,
+		LiveVoiceSynthesizer: synthesizer,
+		LiveVoiceBroadcaster: broadcaster,
 	})
-	return mcpControlFixture{svc: svc, auctions: auctionRepo, sessions: sessionRepo, session: session}
+	return mcpControlFixture{svc: svc, auctions: auctionRepo, sessions: sessionRepo, session: session, synthesizer: synthesizer, broadcaster: broadcaster}
 }
 
 func TestMCPControlServiceReadAndOperate(t *testing.T) {
@@ -83,10 +98,10 @@ func TestMCPControlServiceReadAndOperate(t *testing.T) {
 	}
 
 	result, err = fixture.svc.OperateLiveSessionLot(ctx, MCPLiveLotOperationInput{
-		LiveSessionID: fixture.session.ID,
-		AuctionID:     lot.AuctionID,
-		Action:        "startExplain",
-		DurationSec:   600,
+		LiveSessionID:      fixture.session.ID,
+		AuctionID:          lot.AuctionID,
+		Action:             "startExplain",
+		AuctionDurationSec: 600,
 	}, actor)
 	if err != nil {
 		t.Fatalf("operate start explain: %v", err)
@@ -99,6 +114,21 @@ func TestMCPControlServiceReadAndOperate(t *testing.T) {
 	}
 	if result.Context.CurrentAuctionState.RemainSeconds <= 0 {
 		t.Fatalf("expected positive remain seconds, got %+v", result.Context.CurrentAuctionState)
+	}
+
+	voice, err := fixture.svc.CreateLiveVoiceBroadcast(ctx, MCPLiveVoiceBroadcastInput{
+		LiveSessionID: fixture.session.ID,
+		Text:          "请大家关注当前拍品的品相细节。",
+		RequestID:     "voice-1",
+	}, actor)
+	if err != nil {
+		t.Fatalf("create live voice broadcast: %v", err)
+	}
+	if voice.Status != "BROADCASTED" || voice.LiveSessionID != fixture.session.ID || voice.RequestID != "voice-1" || voice.Text == "" || voice.AudioBytes != 3 || voice.Delivered != 1 {
+		t.Fatalf("unexpected voice broadcast result: %+v", voice)
+	}
+	if fixture.synthesizer.input.Text != voice.Text || fixture.broadcaster.payload.AudioBase64 == "" {
+		t.Fatalf("expected synthesized audio payload, input=%+v payload=%+v", fixture.synthesizer.input, fixture.broadcaster.payload)
 	}
 
 }
@@ -146,6 +176,37 @@ func TestMCPControlServiceErrors(t *testing.T) {
 			},
 			wantErr: domain.ErrInvalidArgument,
 		},
+		{
+			name: "start explain requires auction duration",
+			run: func(ctx context.Context, fixture mcpControlFixture) error {
+				lot := mcpControlReadyLot(91004, "m_1")
+				if err := fixture.auctions.Create(ctx, &lot); err != nil {
+					return err
+				}
+				if _, err := fixture.svc.OperateLiveSessionLot(ctx, MCPLiveLotOperationInput{LiveSessionID: fixture.session.ID, AuctionID: lot.AuctionID, Action: "onShelf"}, MCPActor{ID: "m_1", Role: domain.RoleMerchant}); err != nil {
+					return err
+				}
+				_, err := fixture.svc.OperateLiveSessionLot(ctx, MCPLiveLotOperationInput{LiveSessionID: fixture.session.ID, AuctionID: lot.AuctionID, Action: "startExplain"}, MCPActor{ID: "m_1", Role: domain.RoleMerchant})
+				return err
+			},
+			wantErr: domain.ErrInvalidArgument,
+		},
+		{
+			name: "voice rejects empty text",
+			run: func(ctx context.Context, fixture mcpControlFixture) error {
+				_, err := fixture.svc.CreateLiveVoiceBroadcast(ctx, MCPLiveVoiceBroadcastInput{LiveSessionID: fixture.session.ID, Text: "   "}, MCPActor{ID: "m_1", Role: domain.RoleMerchant})
+				return err
+			},
+			wantErr: domain.ErrInvalidArgument,
+		},
+		{
+			name: "voice rejects buyer actor",
+			run: func(ctx context.Context, fixture mcpControlFixture) error {
+				_, err := fixture.svc.CreateLiveVoiceBroadcast(ctx, MCPLiveVoiceBroadcastInput{LiveSessionID: fixture.session.ID, Text: "hello"}, MCPActor{ID: "u_1", Role: domain.RoleBuyer})
+				return err
+			},
+			wantErr: domain.ErrForbidden,
+		},
 	}
 
 	for _, tt := range tests {
@@ -157,11 +218,27 @@ func TestMCPControlServiceErrors(t *testing.T) {
 	}
 }
 
+func TestMCPLiveLotActionMessagesUseLotName(t *testing.T) {
+	lotName := "复古机械表"
+	messages := []string{
+		mcpLiveLotActionApprovalMessage("startExplain", lotName),
+		mcpLiveLotActionRunningMessage("startExplain", lotName),
+		mcpLiveLotActionCompletedMessage("startExplain", lotName),
+	}
+	for _, message := range messages {
+		if !strings.Contains(message, lotName) {
+			t.Fatalf("expected message to contain lot name %q, got %q", lotName, message)
+		}
+		if strings.Contains(message, "91001") {
+			t.Fatalf("expected message not to expose auction id, got %q", message)
+		}
+	}
+}
+
 func mcpControlReadyLot(id uint64, sellerID string) domain.AuctionLot {
 	now := time.Now().UTC()
 	return domain.AuctionLot{
 		AuctionID:     id,
-		ItemID:        id + 1000,
 		SellerID:      sellerID,
 		AuctionType:   domain.AuctionTypeEnglish,
 		StartPrice:    1000,
@@ -171,4 +248,29 @@ func mcpControlReadyLot(id uint64, sellerID string) domain.AuctionLot {
 		EndTime:       now.Add(time.Hour),
 		DurationSec:   600,
 	}
+}
+
+type fakeLiveVoiceSynthesizer struct {
+	input  LiveVoiceSynthesisInput
+	result LiveVoiceSynthesisResult
+	err    error
+}
+
+func (f *fakeLiveVoiceSynthesizer) SynthesizeLiveVoice(ctx context.Context, in LiveVoiceSynthesisInput) (LiveVoiceSynthesisResult, error) {
+	_ = ctx
+	f.input = in
+	return f.result, f.err
+}
+
+type fakeLiveVoiceBroadcaster struct {
+	delivered int
+	payload   LiveVoiceBroadcastPayload
+	err       error
+}
+
+func (f *fakeLiveVoiceBroadcaster) BroadcastLiveVoice(ctx context.Context, liveSessionID uint64, payload LiveVoiceBroadcastPayload) (int, error) {
+	_ = ctx
+	_ = liveSessionID
+	f.payload = payload
+	return f.delivered, f.err
 }

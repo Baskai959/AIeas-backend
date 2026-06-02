@@ -1,30 +1,6 @@
 package domain
 
-import (
-	"encoding/json"
-	"time"
-)
-
-type ItemStatus string
-
-const (
-	ItemStatusDraft        ItemStatus = "DRAFT"
-	ItemStatusPendingAudit ItemStatus = "PENDING_AUDIT"
-	ItemStatusReady        ItemStatus = "READY"
-	ItemStatusRejected     ItemStatus = "REJECTED"
-	ItemStatusListed       ItemStatus = "LISTED"
-	ItemStatusOffline      ItemStatus = "OFFLINE"
-)
-
-func (s ItemStatus) Valid() bool {
-	switch s {
-	case ItemStatusDraft, ItemStatusPendingAudit, ItemStatusReady, ItemStatusRejected, ItemStatusListed, ItemStatusOffline:
-		return true
-	default:
-		return false
-	}
-}
-
+// ConditionGrade 表示拍品成色值对象。
 type ConditionGrade string
 
 const (
@@ -41,36 +17,4 @@ func (g ConditionGrade) Valid() bool {
 	default:
 		return false
 	}
-}
-
-type Item struct {
-	ID             uint64          `json:"id"`
-	SellerID       string          `json:"sellerId"`
-	Title          string          `json:"title"`
-	Category       string          `json:"category"`
-	Brand          string          `json:"brand,omitempty"`
-	ConditionGrade ConditionGrade  `json:"conditionGrade"`
-	Images         json.RawMessage `json:"images"`
-	Description    string          `json:"description,omitempty"`
-	Status         ItemStatus      `json:"status"`
-	CreatedAt      time.Time       `json:"createdAt"`
-	UpdatedAt      time.Time       `json:"updatedAt"`
-}
-
-type ItemFilter struct {
-	SellerID string
-	Status   ItemStatus
-	Category string
-	Limit    int
-	Offset   int
-}
-
-type ItemPatch struct {
-	Title          *string
-	Category       *string
-	Brand          *string
-	ConditionGrade *ConditionGrade
-	Images         *json.RawMessage
-	Description    *string
-	Status         *ItemStatus
 }

@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 	"time"
@@ -107,15 +108,40 @@ func TestLiveSessionServiceListByMerchantOverridesForMerchantRole(t *testing.T) 
 	}
 }
 
+func TestLiveSessionServiceListVisibleAllowsBuyerLiveSessionsOnly(t *testing.T) {
+	svc, _, _ := newLiveSessionFixture(t)
+	ctx := context.Background()
+	live := createStartedLiveSession(t, svc, "m_public", "live")
+	if _, err := svc.Create(ctx, CreateLiveSessionInput{ActorID: "m_public", ActorRole: domain.RoleMerchant, Title: "draft"}); err != nil {
+		t.Fatalf("create draft session: %v", err)
+	}
+
+	sessions, err := svc.ListVisible(ctx, "", "", "u_buyer", domain.RoleBuyer, 20, 0)
+	if err != nil {
+		t.Fatalf("list visible as buyer: %v", err)
+	}
+	if len(sessions) != 1 || sessions[0].ID != live.ID {
+		t.Fatalf("buyer should see only LIVE sessions, got %#v", sessions)
+	}
+
+	sessions, err = svc.ListVisible(ctx, "", domain.LiveSessionStatusDraft, "u_buyer", domain.RoleBuyer, 20, 0)
+	if err != nil {
+		t.Fatalf("list draft as buyer: %v", err)
+	}
+	if len(sessions) != 0 {
+		t.Fatalf("buyer should not see DRAFT sessions, got %#v", sessions)
+	}
+}
+
 func TestLiveSessionServiceListLotsFilterBySession(t *testing.T) {
 	svc, _, auctionRepo := newLiveSessionFixture(t)
 	ctx := context.Background()
 	opened := createStartedLiveSession(t, svc, "m_x", "live")
 	now := time.Now().UTC()
 	other := uint64(99999)
-	in := domain.AuctionLot{AuctionID: 7001, ItemID: 1, SellerID: "m_x", AuctionType: domain.AuctionTypeEnglish, Status: domain.AuctionStatusReady, LiveSessionID: &opened.ID, StartTime: now, EndTime: now.Add(time.Hour)}
-	out := domain.AuctionLot{AuctionID: 7002, ItemID: 2, SellerID: "m_x", AuctionType: domain.AuctionTypeEnglish, Status: domain.AuctionStatusReady, LiveSessionID: &other, StartTime: now, EndTime: now.Add(time.Hour)}
-	none := domain.AuctionLot{AuctionID: 7003, ItemID: 3, SellerID: "m_x", AuctionType: domain.AuctionTypeEnglish, Status: domain.AuctionStatusReady, StartTime: now, EndTime: now.Add(time.Hour)}
+	in := domain.AuctionLot{AuctionID: 7001, SellerID: "m_x", AuctionType: domain.AuctionTypeEnglish, Status: domain.AuctionStatusReady, LiveSessionID: &opened.ID, StartTime: now, EndTime: now.Add(time.Hour)}
+	out := domain.AuctionLot{AuctionID: 7002, SellerID: "m_x", AuctionType: domain.AuctionTypeEnglish, Status: domain.AuctionStatusReady, LiveSessionID: &other, StartTime: now, EndTime: now.Add(time.Hour)}
+	none := domain.AuctionLot{AuctionID: 7003, SellerID: "m_x", AuctionType: domain.AuctionTypeEnglish, Status: domain.AuctionStatusReady, StartTime: now, EndTime: now.Add(time.Hour)}
 	for _, lot := range []domain.AuctionLot{in, out, none} {
 		l := lot
 		if err := auctionRepo.Create(ctx, &l); err != nil {
@@ -128,6 +154,74 @@ func TestLiveSessionServiceListLotsFilterBySession(t *testing.T) {
 	}
 	if len(lots) != 1 || lots[0].AuctionID != 7001 {
 		t.Fatalf("expected only AuctionID 7001, got %#v", lots)
+	}
+}
+
+func TestLiveSessionServiceListLotsAllowsBuyerForLiveSessionWithIncrementRule(t *testing.T) {
+	svc, _, auctionRepo := newLiveSessionFixture(t)
+	ctx := context.Background()
+	live := createStartedLiveSession(t, svc, "m_public_lots", "live")
+	now := time.Now().UTC()
+	rule := json.RawMessage(`{"type":"ladder","maxBidSteps":3,"steps":[{"min":0,"max":10000,"amount":500},{"min":10000,"amount":1000}]}`)
+	lot := domain.AuctionLot{
+		AuctionID:      7101,
+		SellerID:       "m_public_lots",
+		LiveSessionID:  &live.ID,
+		Title:          "公开直播拍品",
+		Category:       "collectible",
+		ConditionGrade: domain.ConditionGood,
+		AuctionType:    domain.AuctionTypeEnglish,
+		StartPrice:     1000,
+		ReservePrice:   1000,
+		CapPrice:       20000,
+		IncrementRule:  rule,
+		Status:         domain.AuctionStatusReady,
+		StartTime:      now,
+		EndTime:        now.Add(time.Hour),
+	}
+	if err := auctionRepo.Create(ctx, &lot); err != nil {
+		t.Fatalf("create lot: %v", err)
+	}
+
+	lots, err := svc.ListLots(ctx, live.ID, "u_buyer", domain.RoleBuyer)
+	if err != nil {
+		t.Fatalf("list lots as buyer: %v", err)
+	}
+	if len(lots) != 1 || lots[0].AuctionID != lot.AuctionID {
+		t.Fatalf("expected buyer to see live lot, got %#v", lots)
+	}
+	if string(lots[0].IncrementRule) != string(rule) {
+		t.Fatalf("incrementRule missing from buyer lot response: %s", string(lots[0].IncrementRule))
+	}
+
+	draft, err := svc.Create(ctx, CreateLiveSessionInput{ActorID: "m_public_lots", ActorRole: domain.RoleMerchant, Title: "draft"})
+	if err != nil {
+		t.Fatalf("create draft session: %v", err)
+	}
+	if _, err := svc.ListLots(ctx, draft.ID, "u_buyer", domain.RoleBuyer); !errors.Is(err, domain.ErrForbidden) {
+		t.Fatalf("buyer should not list draft session lots, got %v", err)
+	}
+}
+
+func TestLiveSessionServiceStatsAllowsBuyerForLiveSession(t *testing.T) {
+	svc, _, _ := newLiveSessionFixture(t)
+	ctx := context.Background()
+	live := createStartedLiveSession(t, svc, "m_stats_public", "live")
+
+	stats, err := svc.Stats(ctx, live.ID, "u_buyer", domain.RoleBuyer)
+	if err != nil {
+		t.Fatalf("stats as buyer for LIVE session: %v", err)
+	}
+	if stats.LiveSessionID != live.ID {
+		t.Fatalf("stats liveSessionId=%d, want %d", stats.LiveSessionID, live.ID)
+	}
+
+	draft, err := svc.Create(ctx, CreateLiveSessionInput{ActorID: "m_stats_public", ActorRole: domain.RoleMerchant, Title: "draft"})
+	if err != nil {
+		t.Fatalf("create draft session: %v", err)
+	}
+	if _, err := svc.Stats(ctx, draft.ID, "u_buyer", domain.RoleBuyer); !errors.Is(err, domain.ErrForbidden) {
+		t.Fatalf("buyer stats for DRAFT should be forbidden, got %v", err)
 	}
 }
 
@@ -159,6 +253,13 @@ func TestLiveSessionServiceIncrCountersGoesThroughRealtimeStore(t *testing.T) {
 	}
 	if got.LotsTotal != 0 || got.BidCount != 0 || got.GMVCent != 0 || got.ViewerPeak != 0 {
 		t.Fatalf("expected MySQL row untouched until flush, got %+v", got)
+	}
+	stats, err := svc.Stats(ctx, opened.ID, "m_rt", domain.RoleMerchant)
+	if err != nil {
+		t.Fatalf("stats: %v", err)
+	}
+	if stats.LotsTotal != 1 || stats.BidCount != 4 || stats.GMVCent != 100 || stats.ViewerPeak != 5 {
+		t.Fatalf("stats should include realtime counters, got %+v", stats)
 	}
 	// store 内累积可见
 	counters, peak, err := store.LoadCounters(ctx, opened.ID)
@@ -321,7 +422,7 @@ func TestLiveSessionServiceMountActivateDeactivateAndUnmountRules(t *testing.T) 
 		t.Fatalf("start session: %v", err)
 	}
 	now := time.Now().UTC()
-	lot := domain.AuctionLot{AuctionID: 8101, ItemID: 1, SellerID: "m_lot", AuctionType: domain.AuctionTypeEnglish, Status: domain.AuctionStatusReady, StartPrice: 100, StartTime: now, EndTime: now.Add(time.Hour)}
+	lot := domain.AuctionLot{AuctionID: 8101, SellerID: "m_lot", AuctionType: domain.AuctionTypeEnglish, Status: domain.AuctionStatusReady, StartPrice: 100, StartTime: now, EndTime: now.Add(time.Hour)}
 	if err := auctionRepo.Create(ctx, &lot); err != nil {
 		t.Fatalf("create lot: %v", err)
 	}
@@ -350,6 +451,110 @@ func TestLiveSessionServiceMountActivateDeactivateAndUnmountRules(t *testing.T) 
 	}
 }
 
+func TestLiveSessionServiceRestartClosedFailedLot(t *testing.T) {
+	svc, _, auctionRepo := newLiveSessionFixture(t)
+	ctx := context.Background()
+	session, err := svc.Create(ctx, CreateLiveSessionInput{ActorID: "m_restart", ActorRole: domain.RoleMerchant, Title: "重开场"})
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	if _, err := svc.Start(ctx, session.ID, "m_restart", domain.RoleMerchant); err != nil {
+		t.Fatalf("start session: %v", err)
+	}
+	now := time.Now().UTC()
+	closedAt := now.Add(-time.Minute)
+	dealPrice := int64(100)
+	lot := domain.AuctionLot{
+		AuctionID:     8102,
+		SellerID:      "m_restart",
+		LiveSessionID: &session.ID,
+		AuctionType:   domain.AuctionTypeEnglish,
+		Status:        domain.AuctionStatusClosedFailed,
+		StartPrice:    100,
+		DurationSec:   600,
+		StartTime:     now.Add(-time.Minute),
+		EndTime:       now,
+		DealPrice:     &dealPrice,
+		ClosedAt:      &closedAt,
+		ClosedBy:      "merchant",
+	}
+	if err := auctionRepo.Create(ctx, &lot); err != nil {
+		t.Fatalf("create lot: %v", err)
+	}
+	active, err := svc.ActivateAuctionWithOptions(ctx, ActivateLiveSessionAuctionInput{SessionID: session.ID, AuctionID: lot.AuctionID, ActorID: "m_restart", ActorRole: domain.RoleMerchant, DurationSec: 600})
+	if err != nil {
+		t.Fatalf("restart closed failed lot: %v", err)
+	}
+	if active.Status != domain.AuctionStatusReady {
+		t.Fatalf("expected reset status READY, got %s", active.Status)
+	}
+	if active.DealPrice != nil || active.ClosedAt != nil || active.ClosedBy != "" {
+		t.Fatalf("closed fields should be cleared: %+v", active)
+	}
+	gotSession, err := svc.Get(ctx, session.ID)
+	if err != nil {
+		t.Fatalf("get session: %v", err)
+	}
+	if gotSession.ActiveAuctionID != lot.AuctionID {
+		t.Fatalf("active auction id=%d, want %d", gotSession.ActiveAuctionID, lot.AuctionID)
+	}
+}
+
+func TestLiveSessionServiceListAuctionBidsUsesCurrentRound(t *testing.T) {
+	svc, sessionRepo, auctionRepo := newLiveSessionFixture(t)
+	ctx := context.Background()
+	bidRepo := repository.NewMemoryBidRepository()
+	svc.SetStatsDeps(bidRepo, nil, nil)
+	session := createStartedLiveSession(t, svc, "m_round", "重拍场")
+	now := time.Now().UTC()
+	lot := domain.AuctionLot{
+		AuctionID:     8103,
+		SellerID:      "m_round",
+		LiveSessionID: &session.ID,
+		AuctionType:   domain.AuctionTypeEnglish,
+		Status:        domain.AuctionStatusRunning,
+		StartPrice:    100,
+		StartTime:     now,
+		EndTime:       now.Add(10 * time.Minute),
+	}
+	if err := auctionRepo.Create(ctx, &lot); err != nil {
+		t.Fatalf("create lot: %v", err)
+	}
+	session.ActiveAuctionID = lot.AuctionID
+	if err := sessionRepo.Update(ctx, &session); err != nil {
+		t.Fatalf("mark active auction: %v", err)
+	}
+	oldBid := domain.BidRecord{RequestID: "old-round", AuctionID: lot.AuctionID, LiveSessionID: &session.ID, BidderID: "u_old", BidPrice: 500, BidTSMS: now.Add(-time.Minute).UnixMilli(), RiskResult: domain.BidRiskAllow}
+	newBid := domain.BidRecord{RequestID: "new-round", AuctionID: lot.AuctionID, LiveSessionID: &session.ID, BidderID: "u_new", BidPrice: 200, BidTSMS: now.Add(time.Second).UnixMilli(), RiskResult: domain.BidRiskAllow}
+	if err := bidRepo.Create(ctx, &oldBid); err != nil {
+		t.Fatalf("create old bid: %v", err)
+	}
+	if err := bidRepo.Create(ctx, &newBid); err != nil {
+		t.Fatalf("create new bid: %v", err)
+	}
+	records, err := svc.ListAuctionBids(ctx, session.ID, lot.AuctionID, 10, "m_round", domain.RoleMerchant)
+	if err != nil {
+		t.Fatalf("list auction bids: %v", err)
+	}
+	if len(records) != 1 || records[0].RequestID != "new-round" {
+		t.Fatalf("expected only current round bid, got %+v", records)
+	}
+	lots, err := svc.ListLots(ctx, session.ID, "m_round", domain.RoleMerchant)
+	if err != nil {
+		t.Fatalf("list lots: %v", err)
+	}
+	if len(lots) != 1 || lots[0].BidCount != 1 || lots[0].CurrentPrice != newBid.BidPrice || lots[0].LeaderBidderID != newBid.BidderID {
+		t.Fatalf("expected lot stats from current round only, got %+v", lots)
+	}
+	stats, err := svc.Stats(ctx, session.ID, "m_round", domain.RoleMerchant)
+	if err != nil {
+		t.Fatalf("stats: %v", err)
+	}
+	if stats.CurrentBidCount != 1 {
+		t.Fatalf("expected current round bid count 1, got %+v", stats)
+	}
+}
+
 func TestLiveSessionServiceSoldLotCannotUnmountAndSessionQueries(t *testing.T) {
 	svc, _, auctionRepo := newLiveSessionFixture(t)
 	ctx := context.Background()
@@ -359,7 +564,7 @@ func TestLiveSessionServiceSoldLotCannotUnmountAndSessionQueries(t *testing.T) {
 	}
 	sid := session.ID
 	price := int64(500)
-	lot := domain.AuctionLot{AuctionID: 8201, ItemID: 1, SellerID: "m_sold", AuctionType: domain.AuctionTypeEnglish, Status: domain.AuctionStatusClosedWon, LiveSessionID: &sid, DealPrice: &price}
+	lot := domain.AuctionLot{AuctionID: 8201, SellerID: "m_sold", AuctionType: domain.AuctionTypeEnglish, Status: domain.AuctionStatusClosedWon, LiveSessionID: &sid, DealPrice: &price}
 	if err := auctionRepo.Create(ctx, &lot); err != nil {
 		t.Fatalf("create sold lot: %v", err)
 	}
@@ -379,6 +584,63 @@ func TestLiveSessionServiceSoldLotCannotUnmountAndSessionQueries(t *testing.T) {
 	}
 	if stats.LotsTotal != 1 {
 		t.Fatalf("stats should aggregate by liveSessionId, got %+v", stats)
+	}
+}
+
+func TestLiveSessionServiceStatsPreferRealtimeBidCount(t *testing.T) {
+	svc, sessionRepo, auctionRepo := newLiveSessionFixture(t)
+	ctx := context.Background()
+	realtime := repository.NewMemoryRealtimeStore()
+	svc.SetStatsDeps(repository.NewMemoryBidRepository(), realtime, nil)
+
+	session := createStartedLiveSession(t, svc, "m_stats", "实时统计场")
+	now := time.Now().UTC()
+	lot := domain.AuctionLot{
+		AuctionID:     8301,
+		SellerID:      "m_stats",
+		LiveSessionID: &session.ID,
+		AuctionType:   domain.AuctionTypeEnglish,
+		Status:        domain.AuctionStatusRunning,
+		StartPrice:    1000,
+		ReservePrice:  1000,
+		IncrementRule: json.RawMessage(`{"type":"fixed","amount":100,"maxBidSteps":3}`),
+		StartTime:     now.Add(-time.Second),
+		EndTime:       now.Add(5 * time.Minute),
+	}
+	if err := auctionRepo.Create(ctx, &lot); err != nil {
+		t.Fatalf("create lot: %v", err)
+	}
+	session.ActiveAuctionID = lot.AuctionID
+	if err := sessionRepo.Update(ctx, &session); err != nil {
+		t.Fatalf("mark active auction: %v", err)
+	}
+	if _, err := realtime.InitAuction(ctx, lot, 100); err != nil {
+		t.Fatalf("init realtime auction: %v", err)
+	}
+	if err := realtime.MarkEnrollment(ctx, lot.AuctionID, "u_stats"); err != nil {
+		t.Fatalf("mark enrollment: %v", err)
+	}
+	bid, err := realtime.PlaceBid(ctx, domain.BidInput{
+		RequestID:            "stats-bid-1",
+		AuctionID:            lot.AuctionID,
+		LiveSessionID:        session.ID,
+		BidderID:             "u_stats",
+		Price:                1100,
+		ExpectedCurrentPrice: expectedCurrentPrice(1000),
+		Now:                  now,
+		MinIncrement:         100,
+		Source:               "live_ws",
+	})
+	if err != nil || !bid.Accepted {
+		t.Fatalf("place bid: result=%+v err=%v", bid, err)
+	}
+
+	stats, err := svc.Stats(ctx, session.ID, "m_stats", domain.RoleMerchant)
+	if err != nil {
+		t.Fatalf("stats: %v", err)
+	}
+	if stats.CurrentPrice != 1100 || stats.CurrentBidCount != 1 {
+		t.Fatalf("expected realtime price/count, got %+v", stats)
 	}
 }
 

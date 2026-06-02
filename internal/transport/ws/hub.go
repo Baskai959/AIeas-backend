@@ -11,13 +11,15 @@ import (
 
 const defaultEventWindow = 256
 const defaultOnlineCounterTimeout = 200 * time.Millisecond
+const defaultPresenceBroadcastDelay = 200 * time.Millisecond
+const defaultPresenceImmediateFanoutLimit = 16
 
 var nextHubInstanceID atomic.Uint64
 
 type OnlineCounter interface {
-	Join(ctx context.Context, auctionID uint64, connectionID string) (int, error)
-	Touch(ctx context.Context, auctionID uint64, connectionID string) (int, error)
-	Leave(ctx context.Context, auctionID uint64, connectionID string) (int, error)
+	Join(ctx context.Context, auctionID uint64, connectionID, userID string) (int, error)
+	Touch(ctx context.Context, auctionID uint64, connectionID, userID string) (int, error)
+	Leave(ctx context.Context, auctionID uint64, connectionID, userID string) (int, error)
 	Count(ctx context.Context, auctionID uint64) (int, error)
 }
 
@@ -44,6 +46,15 @@ type Hub struct {
 	onlineTimeout  time.Duration
 	instancePrefix string
 	metrics        HubMetrics
+	presenceMu     sync.Mutex
+	presenceDelay  time.Duration
+	presenceLimit  int
+	presenceTimers map[uint64]*presenceUpdate
+}
+
+type presenceUpdate struct {
+	room  *Room
+	timer *time.Timer
 }
 
 func (h *Hub) SetReplaySource(source ReplaySource) {
@@ -71,6 +82,7 @@ type Room struct {
 
 type removedClient struct {
 	ID            string
+	UserID        string
 	LiveSessionID uint64
 	CountOnline   bool
 }
@@ -113,7 +125,28 @@ func NewHubWithEventWindowAndOnlineCounter(eventWindow int, counter OnlineCounte
 		onlineCounter:  counter,
 		onlineTimeout:  defaultOnlineCounterTimeout,
 		instancePrefix: fmt.Sprintf("hub-%d-%d", time.Now().UnixNano(), seq),
+		presenceDelay:  defaultPresenceBroadcastDelay,
+		presenceLimit:  defaultPresenceImmediateFanoutLimit,
+		presenceTimers: make(map[uint64]*presenceUpdate),
 	}
+}
+
+func (h *Hub) SetPresenceBroadcastDelay(delay time.Duration) {
+	if h == nil {
+		return
+	}
+	h.presenceMu.Lock()
+	defer h.presenceMu.Unlock()
+	h.presenceDelay = delay
+}
+
+func (h *Hub) SetPresenceImmediateFanoutLimit(limit int) {
+	if h == nil {
+		return
+	}
+	h.presenceMu.Lock()
+	defer h.presenceMu.Unlock()
+	h.presenceLimit = limit
 }
 
 func NewClient(id, userID string, auctionID uint64, bufferSize int) *Client {
@@ -170,9 +203,22 @@ func (h *Hub) Subscribe(auctionID uint64, client *Client) error {
 	fallback := room.OnlineClientCount()
 	online := h.onlineCount(auctionID, fallback)
 	if client.CountOnline {
-		online = h.joinOnline(auctionID, client.ID, fallback)
+		online = h.joinOnline(auctionID, client.ID, client.UserID, fallback)
 	}
-	h.broadcastPresence(room, online)
+	h.emitPresence(room, online)
+	if reg := h.metricsSnapshot(); reg != nil {
+		reg.IncWSConnect()
+	}
+	return nil
+}
+
+func (h *Hub) SubscribeLiveSessionOnly(liveSessionID uint64, client *Client) error {
+	if h == nil || client == nil || client.ID == "" || liveSessionID == 0 {
+		return fmt.Errorf("live session client is required")
+	}
+	client.AuctionID = 0
+	client.LiveSessionID = liveSessionID
+	h.registerSessionClient(client)
 	if reg := h.metricsSnapshot(); reg != nil {
 		reg.IncWSConnect()
 	}
@@ -180,20 +226,58 @@ func (h *Hub) Subscribe(auctionID uint64, client *Client) error {
 }
 
 func (h *Hub) Unsubscribe(auctionID uint64, clientID string) {
+	if auctionID == 0 {
+		h.unregisterSessionClientByID(clientID)
+		if reg := h.metricsSnapshot(); reg != nil {
+			reg.IncWSDisconnect("unsubscribe")
+		}
+		return
+	}
 	room, ok := h.Room(auctionID)
 	if !ok {
 		return
 	}
-	if removed, sessionID, countOnline := room.removeReturning(clientID); removed {
+	if removed, sessionID, countOnline, userID := room.removeReturning(clientID); removed {
 		if sessionID != 0 {
 			h.unregisterSessionClient(sessionID, clientID)
 		}
 		fallback := room.OnlineClientCount()
 		online := h.onlineCount(auctionID, fallback)
 		if countOnline {
-			online = h.leaveOnline(auctionID, clientID, fallback)
+			online = h.leaveOnline(auctionID, clientID, userID, fallback)
 		}
-		h.broadcastPresence(room, online)
+		h.emitPresence(room, online)
+		if reg := h.metricsSnapshot(); reg != nil {
+			reg.IncWSDisconnect("unsubscribe")
+		}
+	}
+}
+
+func (h *Hub) UnsubscribeClient(client *Client) {
+	if h == nil || client == nil {
+		return
+	}
+	if client.AuctionID == 0 {
+		h.unregisterSessionClient(client.LiveSessionID, client.ID)
+		if reg := h.metricsSnapshot(); reg != nil {
+			reg.IncWSDisconnect("unsubscribe")
+		}
+		return
+	}
+	room, ok := h.Room(client.AuctionID)
+	if !ok {
+		return
+	}
+	if removed, sessionID, countOnline, userID := room.removeClientReturning(client); removed {
+		if sessionID != 0 {
+			h.unregisterSessionClient(sessionID, client.ID)
+		}
+		fallback := room.OnlineClientCount()
+		online := h.onlineCount(client.AuctionID, fallback)
+		if countOnline {
+			online = h.leaveOnline(client.AuctionID, client.ID, userID, fallback)
+		}
+		h.emitPresence(room, online)
 		if reg := h.metricsSnapshot(); reg != nil {
 			reg.IncWSDisconnect("unsubscribe")
 		}
@@ -214,13 +298,14 @@ func (h *Hub) Broadcast(auctionID uint64, env Envelope) int {
 	}
 	if len(removed) > 0 {
 		for _, client := range removed {
-			removed, sessionID, countOnline := room.removeReturning(client.ID)
+			removed, sessionID, countOnline, userID := room.removeReturning(client.ID)
 			if !removed {
 				countOnline = client.CountOnline
 				sessionID = client.LiveSessionID
+				userID = client.UserID
 			}
 			if countOnline {
-				_ = h.leaveOnline(auctionID, client.ID, room.OnlineClientCount())
+				_ = h.leaveOnline(auctionID, client.ID, userID, room.OnlineClientCount())
 			}
 			if sessionID != 0 {
 				h.unregisterSessionClient(sessionID, client.ID)
@@ -228,7 +313,35 @@ func (h *Hub) Broadcast(auctionID uint64, env Envelope) int {
 				h.unregisterSessionClientByID(client.ID)
 			}
 		}
-		h.broadcastPresence(room, h.onlineCount(auctionID, room.OnlineClientCount()))
+		h.emitPresence(room, h.onlineCount(auctionID, room.OnlineClientCount()))
+	}
+	return delivered
+}
+
+// BroadcastLiveSession 把事件推送给订阅了某 liveSessionId 的客户端。
+//
+// 与 BroadcastSessionEnd 不同，它不会清理 session 反查表，适合直播过程中的
+// 控制台事件，例如语音播报。
+func (h *Hub) BroadcastLiveSession(liveSessionID uint64, env Envelope) int {
+	if h == nil || liveSessionID == 0 {
+		return 0
+	}
+	env.LiveSessionID = liveSessionID
+	h.mu.RLock()
+	bucket := h.sessionClients[liveSessionID]
+	clients := make([]*Client, 0, len(bucket))
+	for _, c := range bucket {
+		clients = append(clients, c)
+	}
+	h.mu.RUnlock()
+	if len(clients) == 0 {
+		return 0
+	}
+	delivered := 0
+	for _, c := range clients {
+		if c.Deliver(env) {
+			delivered++
+		}
 	}
 	return delivered
 }
@@ -379,13 +492,16 @@ func (h *Hub) ReplaySince(auctionID uint64, lastSeq int64) ([]Envelope, bool) {
 func (h *Hub) Touch(auctionID uint64, clientID string) int {
 	room, ok := h.Room(auctionID)
 	fallback := 0
+	userID := ""
 	if ok {
 		fallback = room.OnlineClientCount()
-		if !room.ClientCountsOnline(clientID) {
+		countOnline, foundUserID := room.ClientPresence(clientID)
+		if !countOnline {
 			return h.onlineCount(auctionID, fallback)
 		}
+		userID = foundUserID
 	}
-	return h.touchOnline(auctionID, clientID, fallback)
+	return h.touchOnline(auctionID, clientID, userID, fallback)
 }
 
 func (h *Hub) OnlineCount(auctionID uint64) int {
@@ -396,39 +512,39 @@ func (h *Hub) OnlineCount(auctionID uint64) int {
 	return h.onlineCount(auctionID, room.OnlineClientCount())
 }
 
-func (h *Hub) joinOnline(auctionID uint64, clientID string, fallback int) int {
+func (h *Hub) joinOnline(auctionID uint64, clientID, userID string, fallback int) int {
 	if h.onlineCounter == nil {
 		return fallback
 	}
 	ctx, cancel := h.onlineCounterContext()
 	defer cancel()
-	count, err := h.onlineCounter.Join(ctx, auctionID, h.onlineMemberID(clientID))
+	count, err := h.onlineCounter.Join(ctx, auctionID, h.onlineMemberID(clientID), userID)
 	if err != nil || count < 0 {
 		return fallback
 	}
 	return count
 }
 
-func (h *Hub) leaveOnline(auctionID uint64, clientID string, fallback int) int {
+func (h *Hub) leaveOnline(auctionID uint64, clientID, userID string, fallback int) int {
 	if h.onlineCounter == nil {
 		return fallback
 	}
 	ctx, cancel := h.onlineCounterContext()
 	defer cancel()
-	count, err := h.onlineCounter.Leave(ctx, auctionID, h.onlineMemberID(clientID))
+	count, err := h.onlineCounter.Leave(ctx, auctionID, h.onlineMemberID(clientID), userID)
 	if err != nil || count < 0 {
 		return fallback
 	}
 	return count
 }
 
-func (h *Hub) touchOnline(auctionID uint64, clientID string, fallback int) int {
+func (h *Hub) touchOnline(auctionID uint64, clientID, userID string, fallback int) int {
 	if h.onlineCounter == nil {
 		return fallback
 	}
 	ctx, cancel := h.onlineCounterContext()
 	defer cancel()
-	count, err := h.onlineCounter.Touch(ctx, auctionID, h.onlineMemberID(clientID))
+	count, err := h.onlineCounter.Touch(ctx, auctionID, h.onlineMemberID(clientID), userID)
 	if err != nil || count < 0 {
 		return fallback
 	}
@@ -468,7 +584,7 @@ func (h *Hub) broadcastPresence(room *Room, online int) {
 	for attempts := 0; len(removed) > 0 && attempts < 3; attempts++ {
 		for _, client := range removed {
 			if client.CountOnline {
-				_ = h.leaveOnline(room.AuctionID, client.ID, room.OnlineClientCount())
+				_ = h.leaveOnline(room.AuctionID, client.ID, client.UserID, room.OnlineClientCount())
 			}
 			if client.LiveSessionID != 0 {
 				h.unregisterSessionClient(client.LiveSessionID, client.ID)
@@ -478,6 +594,87 @@ func (h *Hub) broadcastPresence(room *Room, online int) {
 		}
 		removed = room.BroadcastPresence(h.onlineCount(room.AuctionID, room.OnlineClientCount()))
 	}
+}
+
+func (h *Hub) emitPresence(room *Room, online int) {
+	if h == nil || room == nil {
+		return
+	}
+	if h.shouldBroadcastPresenceImmediately(room) {
+		h.cancelScheduledPresence(room.AuctionID)
+		h.broadcastPresence(room, online)
+		return
+	}
+	h.schedulePresence(room)
+}
+
+func (h *Hub) shouldBroadcastPresenceImmediately(room *Room) bool {
+	h.presenceMu.Lock()
+	limit := h.presenceLimit
+	h.presenceMu.Unlock()
+	if limit <= 0 {
+		return true
+	}
+	return room.ClientCount() <= limit
+}
+
+func (h *Hub) schedulePresence(room *Room) {
+	h.presenceMu.Lock()
+	delay := h.presenceDelay
+	if delay <= 0 {
+		h.presenceMu.Unlock()
+		online := h.onlineCount(room.AuctionID, room.OnlineClientCount())
+		h.broadcastPresence(room, online)
+		return
+	}
+	if h.presenceTimers == nil {
+		h.presenceTimers = make(map[uint64]*presenceUpdate)
+	}
+	update := h.presenceTimers[room.AuctionID]
+	if update == nil {
+		update = &presenceUpdate{}
+		h.presenceTimers[room.AuctionID] = update
+	}
+	update.room = room
+	if update.timer != nil {
+		h.presenceMu.Unlock()
+		return
+	}
+	auctionID := room.AuctionID
+	update.timer = time.AfterFunc(delay, func() {
+		h.flushPresence(auctionID)
+	})
+	h.presenceMu.Unlock()
+}
+
+func (h *Hub) flushPresence(auctionID uint64) {
+	h.presenceMu.Lock()
+	update := h.presenceTimers[auctionID]
+	if update == nil {
+		h.presenceMu.Unlock()
+		return
+	}
+	delete(h.presenceTimers, auctionID)
+	room := update.room
+	h.presenceMu.Unlock()
+	if room == nil {
+		return
+	}
+	online := h.onlineCount(auctionID, room.OnlineClientCount())
+	h.broadcastPresence(room, online)
+}
+
+func (h *Hub) cancelScheduledPresence(auctionID uint64) {
+	h.presenceMu.Lock()
+	defer h.presenceMu.Unlock()
+	update := h.presenceTimers[auctionID]
+	if update == nil {
+		return
+	}
+	if update.timer != nil {
+		update.timer.Stop()
+	}
+	delete(h.presenceTimers, auctionID)
 }
 
 func (h *Hub) DisconnectCount(auctionID uint64) int64 {
@@ -562,24 +759,44 @@ func (r *Room) Add(client *Client) {
 }
 
 func (r *Room) Remove(clientID string) bool {
-	removed, _, _ := r.removeReturning(clientID)
+	removed, _, _, _ := r.removeReturning(clientID)
 	return removed
 }
 
 // removeReturning 与 Remove 一致，但额外返回该 client 关联的 LiveSessionID，
 // 供 Hub 同步清理 session 反查表。
-func (r *Room) removeReturning(clientID string) (bool, uint64, bool) {
+func (r *Room) removeReturning(clientID string) (bool, uint64, bool, string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if client := r.clients[clientID]; client != nil {
 		sessionID := client.LiveSessionID
 		countOnline := client.CountOnline
+		userID := client.UserID
 		client.CloseWithReason("unsubscribe")
 		delete(r.clients, clientID)
 		r.disconnects.Add(1)
-		return true, sessionID, countOnline
+		return true, sessionID, countOnline, userID
 	}
-	return false, 0, false
+	return false, 0, false, ""
+}
+
+func (r *Room) removeClientReturning(target *Client) (bool, uint64, bool, string) {
+	if target == nil {
+		return false, 0, false, ""
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	client := r.clients[target.ID]
+	if client == nil || client != target {
+		return false, 0, false, ""
+	}
+	sessionID := client.LiveSessionID
+	countOnline := client.CountOnline
+	userID := client.UserID
+	client.CloseWithReason("unsubscribe")
+	delete(r.clients, client.ID)
+	r.disconnects.Add(1)
+	return true, sessionID, countOnline, userID
 }
 
 func (r *Room) Broadcast(env Envelope) (int, []removedClient) {
@@ -606,7 +823,7 @@ func (r *Room) Broadcast(env Envelope) (int, []removedClient) {
 		if client.Deliver(env) {
 			delivered++
 		} else if client.Closed() {
-			slow = append(slow, removedClient{ID: client.ID, LiveSessionID: client.LiveSessionID, CountOnline: client.CountOnline})
+			slow = append(slow, removedClient{ID: client.ID, UserID: client.UserID, LiveSessionID: client.LiveSessionID, CountOnline: client.CountOnline})
 		}
 	}
 	if len(slow) > 0 {
@@ -667,11 +884,14 @@ func (r *Room) OnlineClientCount() int {
 	return count
 }
 
-func (r *Room) ClientCountsOnline(clientID string) bool {
+func (r *Room) ClientPresence(clientID string) (bool, string) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	client := r.clients[clientID]
-	return client != nil && client.CountOnline
+	if client == nil {
+		return false, ""
+	}
+	return client.CountOnline, client.UserID
 }
 
 func (r *Room) ReplaySince(lastSeq int64) ([]Envelope, bool) {
@@ -729,7 +949,7 @@ func (r *Room) broadcastPresenceLocked(online int) []removedClient {
 		if !client.Deliver(env) && client.Closed() {
 			delete(r.clients, client.ID)
 			r.disconnects.Add(1)
-			removed = append(removed, removedClient{ID: client.ID, LiveSessionID: client.LiveSessionID, CountOnline: client.CountOnline})
+			removed = append(removed, removedClient{ID: client.ID, UserID: client.UserID, LiveSessionID: client.LiveSessionID, CountOnline: client.CountOnline})
 		}
 	}
 	return removed

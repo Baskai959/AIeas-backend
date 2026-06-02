@@ -31,22 +31,19 @@ func (f *failingInitRealtime) InitAuction(ctx context.Context, auction domain.Au
 // 不回滚到 READY，也不前进到 RUNNING；error 上抛供监控告警观察。
 func TestAuctionStartTCCKeepsWarmingUpOnInitFailure(t *testing.T) {
 	ctx := context.Background()
-	itemRepo := repository.NewMemoryItemRepository()
 	auctionRepo := repository.NewMemoryAuctionRepository()
-	svc := NewAuctionService(auctionRepo, itemRepo, repository.NoopTxManager{})
+	svc := NewAuctionService(auctionRepo, repository.NoopTxManager{})
 	initErr := errors.New("init auction failure")
 	svc.SetRealtime(&failingInitRealtime{err: initErr})
-
-	item := domain.Item{SellerID: "u_2001", Title: "Watch", Category: "luxury", ConditionGrade: domain.ConditionNew, Status: domain.ItemStatusReady}
-	if err := itemRepo.Create(ctx, &item); err != nil {
-		t.Fatalf("create item: %v", err)
-	}
 
 	now := time.Now().UTC()
 	auction, err := svc.Create(ctx, CreateAuctionInput{
 		ActorID:           "u_2001",
 		ActorRole:         domain.RoleMerchant,
-		ItemID:            item.ID,
+		Title:             "Watch",
+		Category:          "luxury",
+		ConditionGrade:    domain.ConditionNew,
+		Description:       "rare watch",
 		AuctionType:       domain.AuctionTypeEnglish,
 		StartPrice:        1000,
 		ReservePrice:      1000,
@@ -86,21 +83,18 @@ func TestAuctionStartTCCKeepsWarmingUpOnInitFailure(t *testing.T) {
 // startWithTiming 成功时状态推进 READY → WARMING_UP → RUNNING，最终落到 RUNNING。
 func TestAuctionStartTCCAdvancesToRunningOnSuccess(t *testing.T) {
 	ctx := context.Background()
-	itemRepo := repository.NewMemoryItemRepository()
 	auctionRepo := repository.NewMemoryAuctionRepository()
-	svc := NewAuctionService(auctionRepo, itemRepo, repository.NoopTxManager{})
+	svc := NewAuctionService(auctionRepo, repository.NoopTxManager{})
 	svc.SetRealtime(repository.NewMemoryRealtimeStore())
-
-	item := domain.Item{SellerID: "u_2001", Title: "Watch", Category: "luxury", ConditionGrade: domain.ConditionNew, Status: domain.ItemStatusReady}
-	if err := itemRepo.Create(ctx, &item); err != nil {
-		t.Fatalf("create item: %v", err)
-	}
 
 	now := time.Now().UTC()
 	auction, err := svc.Create(ctx, CreateAuctionInput{
 		ActorID:           "u_2001",
 		ActorRole:         domain.RoleMerchant,
-		ItemID:            item.ID,
+		Title:             "Watch",
+		Category:          "luxury",
+		ConditionGrade:    domain.ConditionNew,
+		Description:       "rare watch",
 		AuctionType:       domain.AuctionTypeEnglish,
 		StartPrice:        1000,
 		ReservePrice:      1000,

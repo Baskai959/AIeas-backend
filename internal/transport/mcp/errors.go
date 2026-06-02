@@ -42,6 +42,12 @@ func rpcErrorFor(err error, traceID string) *rpcError {
 	case errors.Is(err, domain.ErrConflict), errors.Is(err, domain.ErrInvalidState):
 		code = rpcConflict
 		message = "conflict"
+	case errors.Is(err, service.ErrAIAssistantUserRejected):
+		code = rpcForbidden
+		message = "用户拒绝执行"
+	case errors.Is(err, service.ErrAIAssistantApprovalTimeout):
+		code = rpcConflict
+		message = "用户未确认执行"
 	case httpStatus >= 500:
 		message = "internal error"
 	}
@@ -86,6 +92,10 @@ func mcpStatusFromError(err error) string {
 		return "not_found"
 	case errors.Is(err, domain.ErrConflict), errors.Is(err, domain.ErrInvalidState):
 		return "conflict"
+	case errors.Is(err, service.ErrAIAssistantUserRejected):
+		return "user_rejected"
+	case errors.Is(err, service.ErrAIAssistantApprovalTimeout):
+		return "approval_timeout"
 	default:
 		return "error"
 	}

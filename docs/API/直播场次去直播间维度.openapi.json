@@ -148,7 +148,7 @@
       "patch": {
         "tags": ["LiveSessions"],
         "summary": "设置 AI Agent Hook 开关",
-        "description": "开启时触发一次 Hook：直播场次{id}AI直播助手已开启；关闭只更新配置，不触发 Hook。",
+        "description": "开启时触发一次 Hook：直播场次{id}AI直播助手已开启；关闭只更新配置，不触发 Hook。开启后，开播、拍品上架/下架、开始拍卖/讲解、取消拍卖/讲解、拍品取消、流拍、落锤成交、自动落锤及最高有效出价会触发 AI Agent Hook。最高有效出价按商家 + 直播场次做 5 秒静默防抖，只发送连续 5 秒无新最高价后的最后一条。",
         "parameters": [{ "$ref": "#/components/parameters/LiveSessionId" }, { "$ref": "#/components/parameters/IdempotencyKey" }],
         "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/AgentHookPatchRequest" } } } },
         "responses": { "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/AgentHookConfigResponse" } } } } }

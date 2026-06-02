@@ -5,6 +5,8 @@ import (
 	"testing"
 
 	redisinfra "aieas_backend/internal/infra/redis"
+
+	redisgo "github.com/redis/go-redis/v9"
 )
 
 func TestEventRelayBroadcastsStreamFactsAndSkipsDuplicates(t *testing.T) {
@@ -17,6 +19,7 @@ func TestEventRelayBroadcastsStreamFactsAndSkipsDuplicates(t *testing.T) {
 	<-client.Outbound()
 	log := &fakeRelayLog{events: []redisinfra.BidEvent{
 		{AuctionID: 10001, Seq: 7, StreamID: "7-0", EventType: "bid.accepted", RequestID: "r1", BidderID: "u_1001", BidPrice: 1100, Accepted: true},
+		{AuctionID: 10001, Seq: 8, StreamID: "8-0", EventType: "bid.rejected", RequestID: "r2", BidderID: "u_1002", BidPrice: 1100, RejectReason: "BELOW_MIN_INCREMENT"},
 	}}
 	relay := NewEventRelay(log, hub, 0)
 
@@ -30,7 +33,7 @@ func TestEventRelayBroadcastsStreamFactsAndSkipsDuplicates(t *testing.T) {
 		t.Fatal("expected first relay broadcast")
 	}
 	if len(client.Outbound()) != 0 {
-		t.Fatalf("unexpected extra outbound events: %d", len(client.Outbound()))
+		t.Fatalf("rejected stream event should not be broadcast, outbound events: %d", len(client.Outbound()))
 	}
 
 	relay.poll(ctx)
@@ -39,8 +42,27 @@ func TestEventRelayBroadcastsStreamFactsAndSkipsDuplicates(t *testing.T) {
 		t.Fatalf("duplicate stream event should not be rebroadcast: %+v", env)
 	default:
 	}
-	if len(log.lastSeqs) != 2 || log.lastSeqs[0] != 0 || log.lastSeqs[1] != 7 {
+	if len(log.lastSeqs) != 2 || log.lastSeqs[0] != 0 || log.lastSeqs[1] != 8 {
 		t.Fatalf("relay should replay from previous stream seq, got %+v", log.lastSeqs)
+	}
+}
+
+func TestPubSubBroadcasterSkipsRejectedBid(t *testing.T) {
+	hub := NewHub()
+	client := NewClient("c1", "u_1001", 10001, 4)
+	if err := hub.Subscribe(10001, client); err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	<-client.Outbound()
+	broadcaster := &PubSubBroadcaster{hub: hub}
+	broadcaster.handleMessage(&redisgo.Message{
+		Channel: "auction:10001:events",
+		Payload: `{"auctionId":10001,"event":"bid.rejected","seq":11,"accepted":false,"reason":"BELOW_MIN_INCREMENT"}`,
+	})
+	select {
+	case env := <-client.Outbound():
+		t.Fatalf("rejected pubsub event should not be broadcast: %+v", env)
+	default:
 	}
 }
 

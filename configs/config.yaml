@@ -53,9 +53,10 @@ auction:
   maxExtendCount: 20
   freqLimitCount: 10
   freqWindowMs: 1000
+  bidIdempotencyTTL: 30s
 
 riskControl:
-  enabled: true
+  enabled: false
 
 websocket:
   readLimitBytes: 65536
@@ -76,12 +77,17 @@ objectStorage:
 agent:
   productDescriptionURL: "http://127.0.0.1:8000/api/v1/product-description"
   productAuditURL: "http://127.0.0.1:8000/api/v1/product-audit"
-  productAuditCallbackURL: "http://127.0.0.1:8888/api/v1/items/audit/callback"
+  productAuditCallbackURL: "http://127.0.0.1:8888/api/v1/auctions/audit/callback"
   liveAnalysisURL: "http://127.0.0.1:8000/api/v1/live-analysis/async"
   liveAnalysisCallbackURL: "http://127.0.0.1:8888/api/v1/live-analysis/callback"
   liveAnalysisCallbackAPIKey: "change-me-in-local-dev-live-analysis-callback"
-  liveAuctionHookURL: ""
+  liveAuctionHookURL: "http://127.0.0.1:8000/api/v1/live-assistant"
   timeout: 30s
+
+doubaoTTS:
+  appID: ""
+  ackToken: ""
+  voice: "zh_female_vv_jupiter_bigtts"
 
 kafka:
   enabled: true

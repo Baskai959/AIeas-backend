@@ -173,7 +173,7 @@ func (b *RedisBidEventKafkaBridge) handleEvent(parentCtx context.Context, event 
 	)
 	defer span.End()
 
-	if event.EventType != "bid.accepted" && event.EventType != "bid.rejected" {
+	if event.EventType != "bid.accepted" || !event.Accepted {
 		_ = b.log.AckConsumerGroup(ctx, event.AuctionID, b.group, event.StreamID)
 		span.SetAttributes(attribute.String("kafka_publish.result", "skip"))
 		b.observeWorker("skip")
@@ -269,7 +269,7 @@ func (w *KafkaBidRecordWriter) handleEvent(parentCtx context.Context, event redi
 	)
 	defer span.End()
 
-	if event.EventType != "bid.accepted" && event.EventType != "bid.rejected" {
+	if event.EventType != "bid.accepted" || !event.Accepted {
 		if ack != nil {
 			_ = ack(ctx)
 		}
@@ -282,6 +282,9 @@ func (w *KafkaBidRecordWriter) handleEvent(parentCtx context.Context, event redi
 		result, err := WriteBidRecordIdempotent(ctx, w.repo, event)
 		w.observeWrite(time.Since(writeStart))
 		switch result {
+		case BidRecordWriteSkipped:
+			span.SetAttributes(attribute.String("bid_record.result", "skip"))
+			w.observeConsume("skip")
 		case BidRecordWriteOK:
 			span.SetAttributes(attribute.String("bid_record.result", "ok"))
 			w.observeConsume("ok")

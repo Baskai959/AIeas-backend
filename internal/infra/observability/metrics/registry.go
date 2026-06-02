@@ -34,6 +34,7 @@ type Registry struct {
 	// Bid
 	bidTotal          *prometheus.CounterVec
 	bidDuration       prometheus.Histogram
+	bidStageDuration  *prometheus.HistogramVec
 	bidRejectTotal    *prometheus.CounterVec
 	bidDuplicateTotal prometheus.Counter
 	bidFreqLimitTotal prometheus.Counter
@@ -59,6 +60,16 @@ type Registry struct {
 	redisCommandErrors   *prometheus.CounterVec
 	redisLuaDuration     *prometheus.HistogramVec
 	redisLuaErrors       *prometheus.CounterVec
+
+	// Redis connection pool
+	redisPoolTotalConns        *prometheus.GaugeVec
+	redisPoolIdleConns         *prometheus.GaugeVec
+	redisPoolStaleConns        *prometheus.GaugeVec
+	redisPoolWaitCount         *prometheus.GaugeVec
+	redisPoolWaitDurationTotal *prometheus.GaugeVec
+	redisPoolTimeouts          *prometheus.GaugeVec
+	redisPoolHits              *prometheus.GaugeVec
+	redisPoolMisses            *prometheus.GaugeVec
 
 	// Worker (Redis Stream)
 	workerBidRecordConsumeTotal  *prometheus.CounterVec
@@ -177,6 +188,10 @@ func (r *Registry) register() {
 		Namespace: ns, Name: "auction_bid_duration_seconds", Help: "Bid handler duration",
 		Buckets: durBucketsFast,
 	})
+	r.bidStageDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Namespace: ns, Name: "auction_bid_stage_duration_seconds", Help: "Bid handler stage duration",
+		Buckets: durBucketsFast,
+	}, []string{"stage", "result"})
 	r.bidRejectTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: ns, Name: "auction_bid_reject_total", Help: "Bid rejection by reason",
 	}, []string{"reason"})
@@ -247,6 +262,32 @@ func (r *Registry) register() {
 		Namespace: ns, Name: "redis_lua_errors_total", Help: "Redis Lua script errors",
 	}, []string{"script", "error"})
 
+	// Redis connection pool --------------------------------------------------
+	r.redisPoolTotalConns = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: ns, Name: "redis_pool_total_conns", Help: "Redis pool total connections",
+	}, []string{"instance"})
+	r.redisPoolIdleConns = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: ns, Name: "redis_pool_idle_conns", Help: "Redis pool idle connections",
+	}, []string{"instance"})
+	r.redisPoolStaleConns = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: ns, Name: "redis_pool_stale_conns", Help: "Redis pool stale connections",
+	}, []string{"instance"})
+	r.redisPoolWaitCount = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: ns, Name: "redis_pool_wait_count_total", Help: "Redis pool cumulative wait count",
+	}, []string{"instance"})
+	r.redisPoolWaitDurationTotal = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: ns, Name: "redis_pool_wait_duration_seconds_total", Help: "Redis pool cumulative wait duration in seconds",
+	}, []string{"instance"})
+	r.redisPoolTimeouts = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: ns, Name: "redis_pool_timeouts_total", Help: "Redis pool cumulative timeouts",
+	}, []string{"instance"})
+	r.redisPoolHits = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: ns, Name: "redis_pool_hits_total", Help: "Redis pool cumulative connection hits",
+	}, []string{"instance"})
+	r.redisPoolMisses = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: ns, Name: "redis_pool_misses_total", Help: "Redis pool cumulative connection misses",
+	}, []string{"instance"})
+
 	// Worker ---------------------------------------------------------------
 	r.workerBidRecordConsumeTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: ns, Name: "worker_bid_record_consume_total", Help: "Bid record worker consume outcome",
@@ -292,7 +333,7 @@ func (r *Registry) register() {
 	collectors := []prometheus.Collector{
 		r.httpRequestsTotal, r.httpRequestDuration, r.httpInflight,
 		r.httpRequestBodyBytes, r.httpResponseBytes,
-		r.bidTotal, r.bidDuration, r.bidRejectTotal,
+		r.bidTotal, r.bidDuration, r.bidStageDuration, r.bidRejectTotal,
 		r.bidDuplicateTotal, r.bidFreqLimitTotal,
 		r.hammerTotal, r.hammerDuration,
 		r.hammerMySQLTxDuration, r.hammerDuplicateTotal,
@@ -302,6 +343,9 @@ func (r *Registry) register() {
 		r.depositReconcileTotal, r.depositReconcileLagSeconds,
 		r.redisCommandDuration, r.redisCommandErrors, r.redisLuaDuration,
 		r.redisLuaErrors,
+		r.redisPoolTotalConns, r.redisPoolIdleConns, r.redisPoolStaleConns,
+		r.redisPoolWaitCount, r.redisPoolWaitDurationTotal, r.redisPoolTimeouts,
+		r.redisPoolHits, r.redisPoolMisses,
 		r.workerBidRecordConsumeTotal, r.workerBidRecordWriteDuration,
 		r.workerBidRecordDLQTotal,
 		r.workerTaskTotal,

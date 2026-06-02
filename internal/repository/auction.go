@@ -2,7 +2,9 @@ package repository
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"strings"
 	"time"
 
 	"aieas_backend/internal/domain"
@@ -68,8 +70,12 @@ func (r *MySQLAuctionRepository) List(ctx context.Context, filter domain.Auction
 	if filter.Status.Valid() {
 		query = query.Where("status = ?", filter.Status)
 	}
-	if filter.ItemID != 0 {
-		query = query.Where("item_id = ?", filter.ItemID)
+	if filter.Category != "" {
+		query = query.Where("category = ?", strings.TrimSpace(filter.Category))
+	}
+	if filter.Keyword != "" {
+		keyword := "%" + strings.TrimSpace(filter.Keyword) + "%"
+		query = query.Where("title LIKE ? OR description LIKE ? OR brand LIKE ?", keyword, keyword, keyword)
 	}
 	if filter.LiveSessionID != 0 {
 		query = query.Where("live_session_id = ?", filter.LiveSessionID)
@@ -94,9 +100,15 @@ func (r *MySQLAuctionRepository) List(ctx context.Context, filter domain.Auction
 func (r *MySQLAuctionRepository) Update(ctx context.Context, auction *domain.AuctionLot) error {
 	row := auctionRowFromDomain(*auction)
 	updates := map[string]interface{}{
-		"item_id":          row.ItemID,
 		"seller_id":        row.SellerID,
 		"live_session_id":  row.LiveSessionID,
+		"title":            row.Title,
+		"description":      row.Description,
+		"category":         row.Category,
+		"brand":            row.Brand,
+		"condition_grade":  row.ConditionGrade,
+		"image_urls":       row.ImageURLs,
+		"cover_url":        row.CoverURL,
 		"auction_type":     row.AuctionType,
 		"start_price":      row.StartPrice,
 		"reserve_price":    row.ReservePrice,
@@ -108,6 +120,7 @@ func (r *MySQLAuctionRepository) Update(ctx context.Context, auction *domain.Auc
 		"deposit_amount":   row.DepositAmount,
 		"status":           row.Status,
 		"rule_snapshot":    row.RuleSnapshot,
+		"audit_task_id":    row.AuditTaskID,
 		"start_time":       row.StartTime,
 		"end_time":         row.EndTime,
 		"duration_sec":     row.DurationSec,
@@ -192,9 +205,15 @@ func (r *MySQLAuctionRepository) CloseWithVersion(ctx context.Context, auction *
 
 type auctionRow struct {
 	AuctionID      uint64                   `gorm:"column:auction_id;primaryKey"`
-	ItemID         uint64                   `gorm:"column:item_id"`
 	SellerID       string                   `gorm:"column:seller_id"`
 	LiveSessionID  *uint64                  `gorm:"column:live_session_id"`
+	Title          string                   `gorm:"column:title"`
+	Description    string                   `gorm:"column:description"`
+	Category       string                   `gorm:"column:category"`
+	Brand          string                   `gorm:"column:brand"`
+	ConditionGrade domain.ConditionGrade    `gorm:"column:condition_grade"`
+	ImageURLs      []byte                   `gorm:"column:image_urls"`
+	CoverURL       string                   `gorm:"column:cover_url"`
 	AuctionType    domain.AuctionType       `gorm:"column:auction_type"`
 	StartPrice     int64                    `gorm:"column:start_price"`
 	ReservePrice   int64                    `gorm:"column:reserve_price"`
@@ -206,6 +225,7 @@ type auctionRow struct {
 	DepositAmount  int64                    `gorm:"column:deposit_amount"`
 	Status         domain.AuctionStatus     `gorm:"column:status"`
 	RuleSnapshot   []byte                   `gorm:"column:rule_snapshot"`
+	AuditTaskID    string                   `gorm:"column:audit_task_id"`
 	StartTime      *time.Time               `gorm:"column:start_time"`
 	EndTime        *time.Time               `gorm:"column:end_time"`
 	DurationSec    int                      `gorm:"column:duration_sec"`
@@ -219,11 +239,18 @@ type auctionRow struct {
 }
 
 func auctionRowFromDomain(auction domain.AuctionLot) auctionRow {
+	imageURLs, _ := json.Marshal(auction.ImageURLs)
 	return auctionRow{
 		AuctionID:      auction.AuctionID,
-		ItemID:         auction.ItemID,
 		SellerID:       normalizeUserIDForDB(auction.SellerID),
 		LiveSessionID:  cloneUint64Ptr(auction.LiveSessionID),
+		Title:          auction.Title,
+		Description:    auction.Description,
+		Category:       auction.Category,
+		Brand:          auction.Brand,
+		ConditionGrade: auction.ConditionGrade,
+		ImageURLs:      imageURLs,
+		CoverURL:       auction.CoverURL,
 		AuctionType:    auction.AuctionType,
 		StartPrice:     auction.StartPrice,
 		ReservePrice:   auction.ReservePrice,
@@ -235,6 +262,7 @@ func auctionRowFromDomain(auction domain.AuctionLot) auctionRow {
 		DepositAmount:  auction.DepositAmount,
 		Status:         auction.Status,
 		RuleSnapshot:   []byte(auction.RuleSnapshot),
+		AuditTaskID:    auction.AuditTaskID,
 		StartTime:      timePtrOrNil(auction.StartTime),
 		EndTime:        timePtrOrNil(auction.EndTime),
 		DurationSec:    auction.DurationSec,
@@ -272,11 +300,19 @@ func timeValueOrZero(t *time.Time) time.Time {
 }
 
 func (r auctionRow) toDomain() domain.AuctionLot {
+	var imageURLs []string
+	_ = json.Unmarshal(r.ImageURLs, &imageURLs)
 	return domain.AuctionLot{
 		AuctionID:      r.AuctionID,
-		ItemID:         r.ItemID,
 		SellerID:       r.SellerID,
 		LiveSessionID:  cloneUint64Ptr(r.LiveSessionID),
+		Title:          r.Title,
+		Description:    r.Description,
+		Category:       r.Category,
+		Brand:          r.Brand,
+		ConditionGrade: r.ConditionGrade,
+		ImageURLs:      append([]string(nil), imageURLs...),
+		CoverURL:       r.CoverURL,
 		AuctionType:    r.AuctionType,
 		StartPrice:     r.StartPrice,
 		ReservePrice:   r.ReservePrice,
@@ -288,6 +324,7 @@ func (r auctionRow) toDomain() domain.AuctionLot {
 		DepositAmount:  r.DepositAmount,
 		Status:         r.Status,
 		RuleSnapshot:   append([]byte(nil), r.RuleSnapshot...),
+		AuditTaskID:    r.AuditTaskID,
 		StartTime:      timeValueOrZero(r.StartTime),
 		EndTime:        timeValueOrZero(r.EndTime),
 		DurationSec:    r.DurationSec,

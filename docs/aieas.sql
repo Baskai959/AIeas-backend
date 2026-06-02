@@ -34,7 +34,7 @@ CREATE TABLE `auction_lot` (
   `anti_sniping_sec` int NOT NULL DEFAULT '15' COMMENT '反狙击触发窗口（秒）',
   `anti_extend_sec` int NOT NULL DEFAULT '30' COMMENT '反狙击延长时长（秒）',
   `deposit_amount` bigint NOT NULL COMMENT '保证金金额（分）',
-  `status` varchar(32) NOT NULL COMMENT '状态：DRAFT/PENDING_AUDIT/READY/WARMING_UP/RUNNING/EXTENDED/HAMMER_PENDING/CLOSED_WON/CLOSED_FAILED/SETTLED',
+  `status` varchar(32) NOT NULL COMMENT '状态：DRAFT/PENDING_AUDIT/AUDIT_REJECTED/READY/WARMING_UP/RUNNING/EXTENDED/HAMMER_PENDING/CLOSED_WON/CLOSED_FAILED/SETTLED',
   `rule_snapshot` json NOT NULL COMMENT '规则快照（不可变）JSON',
   `start_time` datetime(3) NOT NULL COMMENT '开拍时间',
   `end_time` datetime(3) NOT NULL COMMENT '计划结束时间（可被反狙击延长）',
@@ -226,7 +226,7 @@ CREATE TABLE `config_item` (
 BEGIN;
 INSERT INTO `config_item` VALUES ('default.anti_sniping', '{\"extendSec\": 30, \"triggerSec\": 15}', '默认反狙击参数', NULL, '2026-05-25 14:04:00.486');
 INSERT INTO `config_item` VALUES ('default.deposit_ratio', '{\"max\": 100000, \"min\": 1000, \"ratio\": 0.1}', '默认保证金比例（按起拍价 10%，最小 10 元最大 1000 元）', NULL, '2026-05-25 14:04:00.486');
-INSERT INTO `config_item` VALUES ('order.pay_timeout_sec', '{\"value\": 1800}', '订单支付超时（秒）', NULL, '2026-05-25 14:04:00.486');
+INSERT INTO `config_item` VALUES ('order.pay_timeout_sec', '{\"value\": 1200}', '订单支付超时（秒）', NULL, '2026-05-25 14:04:00.486');
 COMMIT;
 
 -- ----------------------------
@@ -409,6 +409,7 @@ CREATE TABLE `order_deal` (
   `pay_deadline` datetime(3) DEFAULT NULL COMMENT '支付截止时间',
   `paid_at` datetime(3) DEFAULT NULL COMMENT '支付完成时间',
   `closed_at` datetime(3) DEFAULT NULL COMMENT '订单关闭时间',
+  `version` bigint NOT NULL DEFAULT '0' COMMENT '行级乐观锁版本号，支付/超时关单 CAS 路径递增',
   `created_at` datetime(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) COMMENT '创建时间',
   `updated_at` datetime(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3) COMMENT '更新时间',
   PRIMARY KEY (`id`),
@@ -423,10 +424,10 @@ CREATE TABLE `order_deal` (
 -- Records of order_deal
 -- ----------------------------
 BEGIN;
-INSERT INTO `order_deal` VALUES (90001, 90001, NULL, 1001, 2001, 50000, 8000, 'PAID', 'PAID', '2025-11-02 20:10:30.000', '2025-11-01 20:15:30.000', '2025-11-01 20:15:30.000', '2025-11-01 20:10:30.000', '2025-11-01 20:15:30.000');
-INSERT INTO `order_deal` VALUES (90002, 90002, NULL, 1003, 2001, 145000, 15000, 'CREATED', 'UNPAID', '2025-11-02 20:21:00.000', NULL, NULL, '2025-11-01 20:21:00.000', '2025-11-01 20:21:00.000');
-INSERT INTO `order_deal` VALUES (90003, 90004, NULL, 1004, 2001, 320000, 40000, 'CREATED', 'UNPAID', '2025-11-02 20:42:00.000', NULL, NULL, '2025-11-01 20:42:00.000', '2025-11-01 20:42:00.000');
-INSERT INTO `order_deal` VALUES (90004, 90005, NULL, 1005, 2001, 720000, 60000, 'CREATED', 'UNPAID', '2025-11-02 20:52:30.000', NULL, NULL, '2025-11-01 20:52:30.000', '2025-11-01 20:52:30.000');
+INSERT INTO `order_deal` VALUES (90001, 90001, NULL, 1001, 2001, 50000, 8000, 'PAID', 'PAID', '2025-11-02 20:10:30.000', '2025-11-01 20:15:30.000', '2025-11-01 20:15:30.000', 0, '2025-11-01 20:10:30.000', '2025-11-01 20:15:30.000');
+INSERT INTO `order_deal` VALUES (90002, 90002, NULL, 1003, 2001, 145000, 15000, 'CREATED', 'UNPAID', '2025-11-02 20:21:00.000', NULL, NULL, 0, '2025-11-01 20:21:00.000', '2025-11-01 20:21:00.000');
+INSERT INTO `order_deal` VALUES (90003, 90004, NULL, 1004, 2001, 320000, 40000, 'CREATED', 'UNPAID', '2025-11-02 20:42:00.000', NULL, NULL, 0, '2025-11-01 20:42:00.000', '2025-11-01 20:42:00.000');
+INSERT INTO `order_deal` VALUES (90004, 90005, NULL, 1005, 2001, 720000, 60000, 'CREATED', 'UNPAID', '2025-11-02 20:52:30.000', NULL, NULL, 0, '2025-11-01 20:52:30.000', '2025-11-01 20:52:30.000');
 COMMIT;
 
 -- ----------------------------

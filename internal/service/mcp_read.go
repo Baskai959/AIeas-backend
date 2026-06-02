@@ -18,7 +18,6 @@ type MCPActor struct {
 // MCPReadDependencies 汇总只读 MCP facade 需要的服务和仓储。
 type MCPReadDependencies struct {
 	Users       repository.UserRepository
-	Items       repository.ItemRepository
 	Auctions    repository.AuctionRepository
 	Sessions    repository.LiveSessionRepository
 	Bids        repository.BidRepository
@@ -35,7 +34,6 @@ type MCPReadDependencies struct {
 // 该类型不包含 MCP/JSON-RPC 协议细节；协议解析和返回格式由 transport/mcp 负责。
 type MCPReadService struct {
 	users      repository.UserRepository
-	items      repository.ItemRepository
 	auctions   repository.AuctionRepository
 	sessions   repository.LiveSessionRepository
 	bids       repository.BidRepository
@@ -50,7 +48,6 @@ type MCPReadService struct {
 func NewMCPReadService(deps MCPReadDependencies) *MCPReadService {
 	return &MCPReadService{
 		users:      deps.Users,
-		items:      deps.Items,
 		auctions:   deps.Auctions,
 		sessions:   deps.Sessions,
 		bids:       deps.Bids,
@@ -174,40 +171,6 @@ func (s *MCPReadService) ReadMerchant(ctx context.Context, merchantID string, ac
 		}
 	}
 	return profile, nil
-}
-
-func (s *MCPReadService) ReadItem(ctx context.Context, itemID uint64, actor MCPActor) (domain.Item, error) {
-	if err := requireMCPActor(actor); err != nil {
-		return domain.Item{}, err
-	}
-	if itemID == 0 || s.items == nil {
-		return domain.Item{}, domain.ErrInvalidArgument
-	}
-	item, err := s.items.FindByID(ctx, itemID)
-	if err != nil {
-		return domain.Item{}, err
-	}
-	if err := s.requireItemReadable(ctx, item, actor); err != nil {
-		return domain.Item{}, err
-	}
-	return item, nil
-}
-
-func (s *MCPReadService) ListItems(ctx context.Context, filter domain.ItemFilter, actor MCPActor) ([]domain.Item, error) {
-	if err := requireMCPActor(actor); err != nil {
-		return nil, err
-	}
-	if s.items == nil {
-		return nil, domain.ErrNotFound
-	}
-	switch actor.Role {
-	case domain.RoleAdmin:
-	case domain.RoleMerchant:
-		filter.SellerID = actor.ID
-	default:
-		return nil, domain.ErrForbidden
-	}
-	return s.items.List(ctx, filter)
 }
 
 func (s *MCPReadService) ReadAuctionLot(ctx context.Context, auctionID uint64, actor MCPActor) (domain.AuctionLot, error) {
@@ -451,25 +414,6 @@ func (s *MCPReadService) readAuthorizedLiveSession(ctx context.Context, sessionI
 		return domain.LiveSession{}, domain.ErrForbidden
 	}
 	return session, nil
-}
-
-func (s *MCPReadService) requireItemReadable(ctx context.Context, item domain.Item, actor MCPActor) error {
-	if canAccessSellerOwned(actor.ID, actor.Role, item.SellerID) {
-		return nil
-	}
-	if actor.Role != domain.RoleBuyer || s.auctions == nil {
-		return domain.ErrForbidden
-	}
-	lots, err := s.auctions.List(ctx, domain.AuctionFilter{ItemID: item.ID, Limit: 100})
-	if err != nil {
-		return err
-	}
-	for _, lot := range lots {
-		if s.requireAuctionReadable(ctx, lot, actor) == nil {
-			return nil
-		}
-	}
-	return domain.ErrForbidden
 }
 
 func (s *MCPReadService) requireAuctionReadable(ctx context.Context, lot domain.AuctionLot, actor MCPActor) error {

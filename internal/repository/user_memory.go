@@ -23,10 +23,10 @@ type MemoryUserRepository struct {
 
 func NewSeedUserRepository() *MemoryUserRepository {
 	users := []domain.User{
-		{ID: "u_1001", Account: "buyer001", Nickname: "竞拍用户001", Role: domain.RoleBuyer, Status: domain.UserStatusActive, PasswordHash: HashPassword("Passw0rd!")},
-		{ID: "u_2001", Account: "merchant001", Nickname: "商家001", Role: domain.RoleMerchant, Status: domain.UserStatusActive, PasswordHash: HashPassword("Passw0rd!")},
-		{ID: "u_9001", Account: "admin001", Nickname: "管理员001", Role: domain.RoleAdmin, Status: domain.UserStatusActive, PasswordHash: HashPassword("AdminPassw0rd!")},
-		{ID: "u_1002", Account: "disabled001", Nickname: "停用用户001", Role: domain.RoleBuyer, Status: domain.UserStatusDisabled, PasswordHash: HashPassword("Passw0rd!")},
+		{ID: "u_1001", Account: "buyer001", Nickname: "竞拍用户001", Role: domain.RoleBuyer, Status: domain.UserStatusActive, AIPermission: domain.MerchantAIPermissionAsk, PasswordHash: HashPassword("Passw0rd!")},
+		{ID: "u_2001", Account: "merchant001", Nickname: "商家001", Role: domain.RoleMerchant, Status: domain.UserStatusActive, AIPermission: domain.MerchantAIPermissionAsk, PasswordHash: HashPassword("Passw0rd!")},
+		{ID: "u_9001", Account: "admin001", Nickname: "管理员001", Role: domain.RoleAdmin, Status: domain.UserStatusActive, AIPermission: domain.MerchantAIPermissionAsk, PasswordHash: HashPassword("AdminPassw0rd!")},
+		{ID: "u_1002", Account: "disabled001", Nickname: "停用用户001", Role: domain.RoleBuyer, Status: domain.UserStatusDisabled, AIPermission: domain.MerchantAIPermissionAsk, PasswordHash: HashPassword("Passw0rd!")},
 	}
 	repo := &MemoryUserRepository{byID: make(map[string]domain.User, len(users)), byAccount: make(map[string]string, len(users))}
 	for _, user := range users {
@@ -107,6 +107,7 @@ func (r *MemoryUserRepository) Update(user *domain.User) error {
 	if user.PasswordHash == "" {
 		user.PasswordHash = existing.PasswordHash
 	}
+	user.AIPermission = domain.NormalizeMerchantAIPermission(user.AIPermission)
 	r.byID[user.ID] = *user
 	r.byAccount[accountRoleKey(user.Account, user.Role)] = user.ID
 	return nil

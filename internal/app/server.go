@@ -5,9 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"mime"
 	"net/http"
+	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -23,6 +27,7 @@ import (
 	"aieas_backend/internal/infra/observability/metrics"
 	"aieas_backend/internal/infra/observability/tracing"
 	redisinfra "aieas_backend/internal/infra/redis"
+	ttsinfr "aieas_backend/internal/infra/tts"
 	"aieas_backend/internal/repository"
 	"aieas_backend/internal/service"
 	httptransport "aieas_backend/internal/transport/http"
@@ -83,7 +88,7 @@ func NewServerWithConfig(cfg appconfig.Config) *server.Hertz {
 	}
 	keys := redisinfra.NewKeyBuilder("")
 	realtimeStore := redisinfra.NewAuctionRealtimeStore(shardedRT, scripts, keys)
-	onlineCounter := redisinfra.NewOnlineCounter(shardedRT, keys, 24*time.Hour)
+	onlineCounter := redisinfra.NewOnlineCounter(shardedRT, keys, redisinfra.DefaultOnlineCounterTTL)
 	eventLog := redisinfra.NewEventLog(shardedRT, keys)
 	liveSessionRealtimeStore := redisinfra.NewLiveSessionRealtimeStore(shardedRT, keys)
 	kafkaProducer, kafkaBidReader, err := openKafkaClients(cfg)
@@ -94,49 +99,51 @@ func NewServerWithConfig(cfg appconfig.Config) *server.Hertz {
 		panic(err)
 	}
 
-	// ItemCache：默认 5 分钟 TTL + 30 秒负缓存 + 1024 条 L1，足以吸收商品详情读热点。
-	// 真正注册到 ItemService 在 NewServerWithDependencies 内做，便于测试场景手动覆盖。
-	itemCache := newItemLayeredCache(rdbCache)
 	// BlacklistCache：把黑名单查询挂到 LayeredCache（L1+L2+singleflight+负缓存），
 	// 通过 SetBlacklistCache 注入到 RiskService（在 NewServerWithDependencies 内）。
 	blacklistCache := newBlacklistLayeredCache(rdbCache)
 
 	userRepo := repository.NewMySQLUserRepository(db)
 	deps := ServerDependencies{
-		UserRepo:                 userRepo,
-		ItemRepo:                 repository.NewMySQLItemRepository(db),
-		AuctionRepo:              repository.NewMySQLAuctionRepository(db),
-		LiveSessionRepo:          repository.NewMySQLLiveSessionRepository(db),
-		LiveAnalysisReportRepo:   repository.NewMySQLLiveAnalysisReportRepository(db),
-		ConfigRepo:               repository.NewMySQLConfigRepository(db),
-		BidRepo:                  repository.NewMySQLBidRepository(db),
-		DepositRepo:              repository.NewMySQLDepositRepository(db),
-		OrderRepo:                repository.NewMySQLOrderRepository(db),
-		RiskRepo:                 repository.NewMySQLRiskRepository(db),
-		AuditRepo:                repository.NewMySQLAuditRepository(db),
-		AdminDashboardRepo:       repository.NewMySQLAdminDashboardRepository(db),
-		RealtimeStore:            realtimeStore,
-		LiveSessionRealtimeStore: liveSessionRealtimeStore,
-		LiveSessionLock:          redisinfra.NewLiveSessionLock(shardedRT, keys),
-		TxManager:                repository.NewGORMTxManager(db),
-		Hub:                      wstransport.NewHubWithOnlineCounter(onlineCounter),
-		Idempotency:              httptransport.NewRedisIdempotencyStore(rdbCache, "idempotency"),
-		EventLog:                 eventLog,
-		OnlineCounter:            onlineCounter,
-		DistributedRateLimiter:   redisinfra.NewDistributedRateLimiter(scripts, keys),
-		FeatureFlags:             service.NewFeatureFlagService(repository.NewMySQLConfigRepository(db), rdbCache),
-		PubSubClients:            pubSubClientsFromShards(shardedRT),
-		MetricsRegistry:          metricsRegistry,
-		Tracing:                  tracingProvider,
-		ReadinessProbes:          buildReadinessProbes(db, shardedRT, rdbCache, scripts, kafkaProducer),
-		ItemCache:                itemCache,
-		BlacklistCache:           blacklistCache,
-		DepositReconcilerEnabled: true,
-		BidEventKafkaProducer:    kafkaProducer,
-		BidEventKafkaConsumer:    kafkaBidReader,
-		SettlementEventPublisher: kafkaProducer,
+		UserRepo:                  userRepo,
+		AuctionRepo:               repository.NewMySQLAuctionRepository(db),
+		LiveSessionRepo:           repository.NewMySQLLiveSessionRepository(db),
+		LiveAnalysisReportRepo:    repository.NewMySQLLiveAnalysisReportRepository(db),
+		ConfigRepo:                repository.NewMySQLConfigRepository(db),
+		BidRepo:                   repository.NewMySQLBidRepository(db),
+		DepositRepo:               repository.NewMySQLDepositRepository(db),
+		OrderRepo:                 repository.NewMySQLOrderRepository(db),
+		RiskRepo:                  repository.NewMySQLRiskRepository(db),
+		AuditRepo:                 repository.NewMySQLAuditRepository(db),
+		AdminDashboardRepo:        repository.NewMySQLAdminDashboardRepository(db),
+		RealtimeStore:             realtimeStore,
+		LiveSessionRealtimeStore:  liveSessionRealtimeStore,
+		LiveSessionLock:           redisinfra.NewLiveSessionLock(shardedRT, keys),
+		TxManager:                 repository.NewGORMTxManager(db),
+		Hub:                       wstransport.NewHubWithOnlineCounter(onlineCounter),
+		Idempotency:               httptransport.NewRedisIdempotencyStore(rdbCache, "idempotency"),
+		EventLog:                  eventLog,
+		OnlineCounter:             onlineCounter,
+		DistributedRateLimiter:    redisinfra.NewDistributedRateLimiter(scripts, keys),
+		FeatureFlags:              service.NewFeatureFlagService(repository.NewMySQLConfigRepository(db), rdbCache),
+		PubSubClients:             pubSubClientsFromShards(shardedRT),
+		MetricsRegistry:           metricsRegistry,
+		Tracing:                   tracingProvider,
+		ReadinessProbes:           buildReadinessProbes(db, shardedRT, rdbCache, scripts, kafkaProducer),
+		BlacklistCache:            blacklistCache,
+		DepositReconcilerEnabled:  true,
+		OrderTimeoutWorkerEnabled: true,
+		BidEventKafkaProducer:     kafkaProducer,
+		BidEventKafkaConsumer:     kafkaBidReader,
+		SettlementEventPublisher:  kafkaProducer,
 	}
 	h := NewServerWithDependencies(cfg, deps)
+	poolStatsCtx, stopPoolStats := context.WithCancel(context.Background())
+	redisinfra.StartPoolStatsCollector(poolStatsCtx, metricsRegistry, shardedRT, rdbCache)
+	h.OnShutdown = append(h.OnShutdown, func(ctx context.Context) {
+		_ = ctx
+		stopPoolStats()
+	})
 	h.OnShutdown = append(h.OnShutdown, func(ctx context.Context) {
 		_ = shardedRT.Close()
 		_ = rdbCache.Close()
@@ -156,7 +163,6 @@ func NewServerWithConfig(cfg appconfig.Config) *server.Hertz {
 
 type ServerDependencies struct {
 	UserRepo                 repository.UserRepository
-	ItemRepo                 repository.ItemRepository
 	AuctionRepo              repository.AuctionRepository
 	LiveSessionRepo          repository.LiveSessionRepository
 	LiveAnalysisReportRepo   repository.LiveAnalysisReportRepository
@@ -183,6 +189,8 @@ type ServerDependencies struct {
 	ProductAuditor           service.ProductAuditor
 	LiveAnalysisRequester    service.LiveAnalysisRequester
 	LiveAgentHookInvoker     service.LiveAgentHookInvoker
+	LiveVoiceSynthesizer     service.LiveVoiceSynthesizer
+	LiveVoiceBroadcaster     service.LiveVoiceBroadcaster
 	AuctionIDGen             service.AuctionIDGenerator
 	OrderIDGen               service.OrderIDGenerator
 	// MetricsRegistry 与 Tracing 由 NewServerWithConfig 在启动时构造并注入。
@@ -193,9 +201,6 @@ type ServerDependencies struct {
 	// ReadinessProbes 是 /readyz 检查的依赖列表（key=component，value=probe）。
 	// nil/空时 /readyz 仍可用，仅返回固定 ok（无依赖时视为就绪）。
 	ReadinessProbes map[string]httptransport.ReadinessProbe
-	// ItemCache 是 ItemService 的查询缓存；nil 时 ItemService 直接走 repo。
-	// NewServerWithConfig 用 RedisCacheClient + LayeredCache 构造默认实现。
-	ItemCache service.ItemCache
 	// BlacklistCache 是 RiskService 的黑名单查询缓存（L1+L2+singleflight+负缓存）。
 	// nil 时 RiskService 直接读 MySQL。NewServerWithConfig 默认基于 RedisCacheClient
 	// 注入 LayeredCache[bool]；测试场景可以传 nil。
@@ -204,15 +209,18 @@ type ServerDependencies struct {
 	// NewServerWithConfig 走"线上"路径默认 true；测试经 NewServerWithDependencies
 	// 显式不传时默认 false，避免内存夹具里多跑一根 goroutine 干扰断言。
 	DepositReconcilerEnabled bool
-	BidEventKafkaProducer    service.BidEventKafkaProducer
-	BidEventKafkaConsumer    service.BidEventKafkaConsumer
-	SettlementEventPublisher service.SettlementEventPublisher
+	// OrderTimeoutWorkerEnabled 控制是否启动订单 20 分钟超时关单 worker。
+	// NewServerWithConfig 走线上路径默认 true；测试经 NewServerWithDependencies
+	// 默认 false，避免后台 goroutine 干扰时间敏感断言。
+	OrderTimeoutWorkerEnabled bool
+	BidEventKafkaProducer     service.BidEventKafkaProducer
+	BidEventKafkaConsumer     service.BidEventKafkaConsumer
+	SettlementEventPublisher  service.SettlementEventPublisher
 }
 
 func NewServerWithUserRepository(cfg appconfig.Config, userRepo repository.UserRepository) *server.Hertz {
 	return NewServerWithDependencies(cfg, ServerDependencies{
 		UserRepo:      userRepo,
-		ItemRepo:      repository.NewMemoryItemRepository(),
 		AuctionRepo:   repository.NewMemoryAuctionRepository(),
 		BidRepo:       repository.NewMemoryBidRepository(),
 		DepositRepo:   repository.NewMemoryDepositRepository(),
@@ -231,9 +239,6 @@ func NewServerWithDependencies(cfg appconfig.Config, deps ServerDependencies) *s
 	}
 	if deps.UserRepo == nil {
 		deps.UserRepo = repository.NewSeedUserRepository()
-	}
-	if deps.ItemRepo == nil {
-		deps.ItemRepo = repository.NewMemoryItemRepository()
 	}
 	if deps.AuctionRepo == nil {
 		deps.AuctionRepo = repository.NewMemoryAuctionRepository()
@@ -302,6 +307,12 @@ func NewServerWithDependencies(cfg appconfig.Config, deps ServerDependencies) *s
 	if deps.LiveAgentHookInvoker == nil {
 		deps.LiveAgentHookInvoker = agent.NewLiveAuctionHookClient(cfg.Agent)
 	}
+	if deps.LiveVoiceSynthesizer == nil {
+		deps.LiveVoiceSynthesizer = ttsinfr.NewDoubaoClient(cfg.DoubaoTTS)
+	}
+	if deps.LiveVoiceBroadcaster == nil && deps.Hub != nil {
+		deps.LiveVoiceBroadcaster = liveVoiceHubBroadcaster{hub: deps.Hub}
+	}
 	if deps.AuctionIDGen == nil || deps.OrderIDGen == nil {
 		generator, err := idgen.NewSnowflake(cfg.IDGen.WorkerID)
 		if err != nil {
@@ -325,14 +336,9 @@ func NewServerWithDependencies(cfg appconfig.Config, deps ServerDependencies) *s
 	}
 	jwtManager := jwtpkg.NewManager(cfg.JWT.Secret, cfg.JWT.AccessTokenTTL.Std())
 	authService := service.NewAuthService(deps.UserRepo, jwtManager)
-	itemService := service.NewItemService(deps.ItemRepo)
-	itemService.SetAuctionRepository(deps.AuctionRepo)
-	itemService.SetProductAuditor(deps.ProductAuditor)
-	itemService.SetProductAuditCallback(cfg.Agent.ProductAuditCallbackURL, cfg.Agent.LiveAnalysisCallbackAPIKey)
-	if deps.ItemCache != nil {
-		itemService.SetCache(deps.ItemCache)
-	}
-	auctionService := service.NewAuctionService(deps.AuctionRepo, deps.ItemRepo, deps.TxManager)
+	auctionService := service.NewAuctionService(deps.AuctionRepo, deps.TxManager)
+	auctionService.SetProductAuditor(deps.ProductAuditor)
+	auctionService.SetProductAuditImageLoader(productAuditImageLoader{uploader: deps.ObjectUploader})
 	riskService := service.NewRiskService(deps.RiskRepo, deps.RealtimeStore, deps.Hub)
 	if deps.BlacklistCache != nil {
 		riskService.SetBlacklistCache(deps.BlacklistCache)
@@ -341,6 +347,7 @@ func NewServerWithDependencies(cfg appconfig.Config, deps ServerDependencies) *s
 	depositService := service.NewDepositService(deps.DepositRepo, deps.AuctionRepo, deps.RealtimeStore, riskService, deps.TxManager)
 	depositService.SetRiskControlService(riskControlService)
 	orderService := service.NewOrderService(deps.OrderRepo, deps.TxManager)
+	orderService.SetUserRepository(deps.UserRepo)
 	hammerService := service.NewHammerService(deps.AuctionRepo, deps.OrderRepo, deps.DepositRepo, deps.RealtimeStore, deps.TxManager, deps.Hub)
 	timer := service.NewTimerScheduler(deps.RealtimeStore, hammerService, deps.Hub, time.Second)
 	auctionService.SetRealtime(deps.RealtimeStore)
@@ -360,10 +367,12 @@ func NewServerWithDependencies(cfg appconfig.Config, deps ServerDependencies) *s
 		CallbackURL:    cfg.Agent.LiveAnalysisCallbackURL,
 		CallbackAPIKey: cfg.Agent.LiveAnalysisCallbackAPIKey,
 	})
+	aiAssistantService := service.NewAIAssistantService(deps.UserRepo, aiAssistantHubNotifier{hub: deps.Hub})
 	liveAgentHookService := service.NewLiveAgentHookService(deps.ConfigRepo, deps.UserRepo, deps.LiveAgentHookInvoker)
-	itemService.SetLiveAgentHookService(liveAgentHookService)
 	liveSessionService.SetOnEnded(buildLiveSessionEndedHook(deps.Hub, liveAnalysisService))
 	liveSessionService.SetLiveAgentHookService(liveAgentHookService)
+	liveSessionService.SetAIAssistantSwitchNotifier(aiAssistantService)
+	auctionService.SetLiveAgentHookService(liveAgentHookService)
 	hammerService.SetLiveSessionService(liveSessionService)
 	hammerService.SetLiveAgentHookService(liveAgentHookService)
 	hammerService.SetSettlementEventPublisher(deps.SettlementEventPublisher)
@@ -389,6 +398,9 @@ func NewServerWithDependencies(cfg appconfig.Config, deps ServerDependencies) *s
 	}
 	workerCtx, stopWorkers := context.WithCancel(context.Background())
 	deps.FeatureFlags.StartInvalidationSubscriber(workerCtx)
+	if deps.OrderTimeoutWorkerEnabled {
+		orderService.StartTimeoutWorker(workerCtx, service.DefaultOrderTimeoutScanInterval, service.DefaultOrderTimeoutScanBatchSize)
+	}
 	if deps.EventLog != nil && deps.EventLog.Enabled() {
 		wstransport.NewEventRelay(deps.EventLog, deps.Hub, 200*time.Millisecond).Start(workerCtx)
 		for _, pubSubClient := range deps.PubSubClients {
@@ -423,12 +435,11 @@ func NewServerWithDependencies(cfg appconfig.Config, deps ServerDependencies) *s
 	}
 	adminService := service.NewAdminService(deps.UserRepo, auctionService, hammerService, orderService, riskService, deps.AuditRepo)
 	adminService.SetDashboardRepository(deps.AdminDashboardRepo)
-	adminService.SetLookupRepositories(deps.ItemRepo, deps.LiveSessionRepo)
+	adminService.SetLookupRepositories(deps.LiveSessionRepo)
 	adminService.SetConfigRepository(deps.ConfigRepo)
 	adminService.SetFeatureFlagService(deps.FeatureFlags)
 	mcpReadService := service.NewMCPReadService(service.MCPReadDependencies{
 		Users:       deps.UserRepo,
-		Items:       deps.ItemRepo,
 		Auctions:    deps.AuctionRepo,
 		Sessions:    deps.LiveSessionRepo,
 		Bids:        deps.BidRepo,
@@ -440,13 +451,16 @@ func NewServerWithDependencies(cfg appconfig.Config, deps ServerDependencies) *s
 		OrderSvc:    orderService,
 	})
 	mcpControlService := service.NewMCPControlService(service.MCPLiveControlDependencies{
-		Auctions:       deps.AuctionRepo,
-		Sessions:       deps.LiveSessionRepo,
-		LiveSessionSvc: liveSessionService,
-		AuctionSvc:     auctionService,
-		HammerSvc:      hammerService,
+		Auctions:             deps.AuctionRepo,
+		Sessions:             deps.LiveSessionRepo,
+		LiveSessionSvc:       liveSessionService,
+		AuctionSvc:           auctionService,
+		HammerSvc:            hammerService,
+		LiveVoiceSynthesizer: deps.LiveVoiceSynthesizer,
+		LiveVoiceBroadcaster: deps.LiveVoiceBroadcaster,
+		AIAssistant:          aiAssistantService,
 	})
-	h := newServerWithServices(authService, itemService, auctionService, bidService, depositService, hammerService, orderService, adminService, liveSessionService, liveAnalysisService, mcpReadService, mcpControlService, riskControlService, deps.AuditRepo, deps.Hub, deps.Idempotency, deps.ObjectUploader, deps.DescriptionGen, deps.MetricsRegistry, deps.Tracing, deps.ReadinessProbes, deps.DistributedRateLimiter, deps.FeatureFlags, cfg)
+	h := newServerWithServices(authService, auctionService, bidService, depositService, hammerService, orderService, adminService, liveSessionService, liveAnalysisService, aiAssistantService, mcpReadService, mcpControlService, riskControlService, deps.AuditRepo, deps.Hub, deps.Idempotency, deps.ObjectUploader, deps.DescriptionGen, deps.MetricsRegistry, deps.Tracing, deps.ReadinessProbes, deps.DistributedRateLimiter, deps.FeatureFlags, cfg)
 	if stopWorkers != nil {
 		h.OnShutdown = append(h.OnShutdown, func(ctx context.Context) {
 			_ = ctx
@@ -465,7 +479,6 @@ func NewServerWithDependencies(cfg appconfig.Config, deps ServerDependencies) *s
 func NewServerWithAuth(authService *service.AuthService) *server.Hertz {
 	cfg := appconfig.Default()
 	userRepo := repository.NewSeedUserRepository()
-	itemRepo := repository.NewMemoryItemRepository()
 	auctionRepo := repository.NewMemoryAuctionRepository()
 	bidRepo := repository.NewMemoryBidRepository()
 	depositRepo := repository.NewMemoryDepositRepository()
@@ -479,8 +492,9 @@ func NewServerWithAuth(authService *service.AuthService) *server.Hertz {
 	depositService := service.NewDepositService(depositRepo, auctionRepo, realtimeStore, riskService, repository.NoopTxManager{})
 	depositService.SetRiskControlService(riskControlService)
 	orderService := service.NewOrderService(orderRepo, repository.NoopTxManager{})
+	orderService.SetUserRepository(userRepo)
 	hammerService := service.NewHammerService(auctionRepo, orderRepo, depositRepo, realtimeStore, repository.NoopTxManager{}, hub)
-	auctionService := service.NewAuctionService(auctionRepo, itemRepo, repository.NoopTxManager{})
+	auctionService := service.NewAuctionService(auctionRepo, repository.NoopTxManager{})
 	auctionService.SetRealtime(realtimeStore)
 	auctionService.SetPublisher(hub)
 	auctionService.SetTimer(service.NewTimerScheduler(realtimeStore, hammerService, hub, time.Second))
@@ -499,7 +513,7 @@ func NewServerWithAuth(authService *service.AuthService) *server.Hertz {
 	adminService.SetConfigRepository(configRepo)
 	liveSessionLock := repository.NewMemoryLiveSessionLock()
 	liveSessionRepo := repository.NewMemoryLiveSessionRepository()
-	adminService.SetLookupRepositories(itemRepo, liveSessionRepo)
+	adminService.SetLookupRepositories(liveSessionRepo)
 	liveSessionService := service.NewLiveSessionService(liveSessionRepo, auctionRepo)
 	liveSessionService.SetReadDeps(bidRepo, orderRepo)
 	liveSessionService.SetWriteDeps(repository.NoopTxManager{}, liveSessionLock, auctionService)
@@ -508,10 +522,13 @@ func NewServerWithAuth(authService *service.AuthService) *server.Hertz {
 		CallbackURL:    cfg.Agent.LiveAnalysisCallbackURL,
 		CallbackAPIKey: cfg.Agent.LiveAnalysisCallbackAPIKey,
 	})
+	aiAssistantService := service.NewAIAssistantService(userRepo, aiAssistantHubNotifier{hub: hub})
 	liveAgentHookService := service.NewLiveAgentHookService(repository.NewMemoryConfigRepository(), userRepo, service.DisabledLiveAgentHookInvoker{})
 	liveSessionService.SetOnEnded(buildLiveSessionEndedHook(hub, liveAnalysisService))
 	liveSessionService.SetLiveAgentHookService(liveAgentHookService)
+	liveSessionService.SetAIAssistantSwitchNotifier(aiAssistantService)
 	liveSessionService.SetUserRepository(userRepo)
+	auctionService.SetLiveAgentHookService(liveAgentHookService)
 	hammerService.SetLiveSessionService(liveSessionService)
 	hammerService.SetLiveAgentHookService(liveAgentHookService)
 	bidService.SetLiveSessionService(liveSessionService)
@@ -523,11 +540,8 @@ func NewServerWithAuth(authService *service.AuthService) *server.Hertz {
 	hammerService.SetOnClose(func(ctx context.Context, auctionID uint64) {
 		liveSessionService.OnAuctionClosed(ctx, auctionID)
 	})
-	itemService := service.NewItemService(itemRepo)
-	itemService.SetLiveAgentHookService(liveAgentHookService)
 	mcpReadService := service.NewMCPReadService(service.MCPReadDependencies{
 		Users:       repository.NewSeedUserRepository(),
-		Items:       itemRepo,
 		Auctions:    auctionRepo,
 		Sessions:    liveSessionRepo,
 		Bids:        bidRepo,
@@ -539,15 +553,17 @@ func NewServerWithAuth(authService *service.AuthService) *server.Hertz {
 		OrderSvc:    orderService,
 	})
 	mcpControlService := service.NewMCPControlService(service.MCPLiveControlDependencies{
-		Auctions:       auctionRepo,
-		Sessions:       liveSessionRepo,
-		LiveSessionSvc: liveSessionService,
-		AuctionSvc:     auctionService,
-		HammerSvc:      hammerService,
+		Auctions:             auctionRepo,
+		Sessions:             liveSessionRepo,
+		LiveSessionSvc:       liveSessionService,
+		AuctionSvc:           auctionService,
+		HammerSvc:            hammerService,
+		LiveVoiceSynthesizer: ttsinfr.NewDoubaoClient(cfg.DoubaoTTS),
+		LiveVoiceBroadcaster: liveVoiceHubBroadcaster{hub: hub},
+		AIAssistant:          aiAssistantService,
 	})
 	return newServerWithServices(
 		authService,
-		itemService,
 		auctionService,
 		bidService,
 		depositService,
@@ -556,6 +572,7 @@ func NewServerWithAuth(authService *service.AuthService) *server.Hertz {
 		adminService,
 		liveSessionService,
 		liveAnalysisService,
+		aiAssistantService,
 		mcpReadService,
 		mcpControlService,
 		riskControlService,
@@ -575,7 +592,6 @@ func NewServerWithAuth(authService *service.AuthService) *server.Hertz {
 
 func newServerWithServices(
 	authService *service.AuthService,
-	itemService *service.ItemService,
 	auctionService *service.AuctionService,
 	bidService *service.BidService,
 	depositService *service.DepositService,
@@ -584,6 +600,7 @@ func newServerWithServices(
 	adminService *service.AdminService,
 	liveSessionService *service.LiveSessionService,
 	liveAnalysisService *service.LiveAnalysisService,
+	aiAssistantService *service.AIAssistantService,
 	mcpReadService *service.MCPReadService,
 	mcpControlService *service.MCPControlService,
 	riskControlService *service.RiskControlService,
@@ -644,6 +661,7 @@ func newServerWithServices(
 		},
 	})
 	mcpReadHandler.SetMetrics(metricsRegistry)
+	mcpReadHandler.SetAIAssistant(aiAssistantService)
 	mcpControlHandler := mcptransport.NewControlHandler(mcpControlService, mcptransport.APIKeyAuthConfig{
 		APIKey: cfg.MCP.Control.APIKey,
 		Actor: service.MCPActor{
@@ -658,12 +676,12 @@ func newServerWithServices(
 	h.GET("/mcp/control", mcpControlHandler.Get)
 
 	authHandler := httptransport.NewAuthHandler(authService)
-	itemHandler := httptransport.NewItemHandler(itemService, objectUploader, descriptionGen, cfg.Agent.LiveAnalysisCallbackAPIKey)
-	auctionHandler := httptransport.NewAuctionHandler(auctionService, depositService, hammerService)
+	auctionHandler := httptransport.NewAuctionHandler(auctionService, depositService, hammerService, objectUploader, descriptionGen, cfg.Agent.LiveAnalysisCallbackAPIKey)
 	orderHandler := httptransport.NewOrderHandler(orderService)
 	adminHandler := httptransport.NewAdminHandler(adminService)
 	liveSessionHandler := httptransport.NewLiveSessionHandler(liveSessionService, objectUploader)
 	liveAnalysisHandler := httptransport.NewLiveAnalysisHandler(liveAnalysisService, cfg.Agent.LiveAnalysisCallbackAPIKey)
+	aiAssistantHandler := httptransport.NewAIAssistantHandler(aiAssistantService)
 	wsHandler := httptransport.NewWSHandler(hub, bidService, cfg.WebSocket.SendBufferSize, cfg.WebSocket.ReadLimitBytes, cfg.WebSocket.PingInterval.Std(), cfg.WebSocket.PongTimeout.Std())
 	wsHandler.SetLiveSessionService(liveSessionService)
 	wsHandler.SetAuctionService(auctionService)
@@ -678,9 +696,9 @@ func newServerWithServices(
 		v1.POST("/auth/refresh", authHandler.Refresh)
 		v1.POST("/admin/auth/login", authHandler.AdminLogin)
 
-		v1.GET("/images/*key", itemHandler.Image)
+		v1.GET("/images/*key", auctionHandler.Image)
 		v1.POST("/live-analysis/callback", liveAnalysisHandler.Callback)
-		v1.POST("/items/audit/callback", itemHandler.AuditCallback)
+		v1.POST("/auctions/audit/callback", auctionHandler.AuditCallback)
 
 		protected := v1.Group("/auth", authHandler.AuthMiddleware())
 		protected.GET("/me", authHandler.Me)
@@ -688,19 +706,13 @@ func newServerWithServices(
 
 		v1.GET("/audit-logs", authHandler.AuthMiddleware(), httptransport.RoleAuth(domain.RoleMerchant, domain.RoleAdmin), adminHandler.ListOwnAuditLogs)
 
-		items := v1.Group("/items", authHandler.AuthMiddleware(), httptransport.RoleAuth(domain.RoleMerchant, domain.RoleAdmin))
-		items.POST("/description/optimize", itemHandler.OptimizeDescription)
-		items.POST("", itemHandler.Create)
-		items.GET("", itemHandler.List)
-		items.GET("/:id", itemHandler.Get)
-		items.PATCH("/:id", itemHandler.Update)
-		items.DELETE("/:id", itemHandler.Delete)
-
 		auctionState := v1.Group("/auctions", authHandler.AuthMiddleware())
 		auctionState.GET("/:id/state", auctionHandler.State)
 		auctionState.POST("/:id/enroll", httptransport.RoleAuth(domain.RoleBuyer), auctionHandler.Enroll)
 
 		auctions := v1.Group("/auctions", authHandler.AuthMiddleware(), httptransport.RoleAuth(domain.RoleMerchant, domain.RoleAdmin))
+		auctions.POST("/description/optimize", auctionHandler.OptimizeDescription)
+		auctions.POST("/images", auctionHandler.UploadImages)
 		auctions.POST("", auctionHandler.Create)
 		auctions.GET("", auctionHandler.List)
 		auctions.GET("/:id", auctionHandler.Get)
@@ -724,6 +736,11 @@ func newServerWithServices(
 		liveAnalysis := v1.Group("/live-analysis", authHandler.AuthMiddleware(), httptransport.RoleAuth(domain.RoleMerchant, domain.RoleAdmin))
 		liveAnalysis.POST("/reports", httptransport.WithIdempotency(idempotencyStore, idempotencyTTL, liveAnalysisHandler.CreateReport))
 		liveAnalysis.GET("/reports/:liveSessionId", liveAnalysisHandler.GetReport)
+
+		aiAssistant := v1.Group("/ai-assistant", authHandler.AuthMiddleware(), httptransport.RoleAuth(domain.RoleMerchant, domain.RoleAdmin))
+		aiAssistant.GET("/permission", aiAssistantHandler.Permission)
+		aiAssistant.PATCH("/permission", httptransport.WithIdempotency(idempotencyStore, idempotencyTTL, aiAssistantHandler.UpdatePermission))
+		aiAssistant.POST("/approvals/:requestId/decision", httptransport.WithIdempotency(idempotencyStore, idempotencyTTL, aiAssistantHandler.DecideApproval))
 
 		liveSessions := v1.Group("/live-sessions", authHandler.AuthMiddleware(), httptransport.RoleAuth(domain.RoleMerchant, domain.RoleAdmin))
 		liveSessions.POST("", liveSessionHandler.Create)
@@ -995,44 +1012,55 @@ func buildLiveSessionEndedHook(hub *wstransport.Hub, liveAnalysis *service.LiveA
 	}
 }
 
-// newItemLayeredCache 构造默认的 Item 缓存实现：基于 LayeredCache + JSONCodec，
-// 通过 itemCacheAdapter 适配到 service.ItemCache 接口。
-func newItemLayeredCache(rdbCache *redisinfra.RedisCacheClient) service.ItemCache {
-	if rdbCache == nil {
-		return nil
+type liveVoiceHubBroadcaster struct {
+	hub *wstransport.Hub
+}
+
+type aiAssistantHubNotifier struct {
+	hub *wstransport.Hub
+}
+
+func (n aiAssistantHubNotifier) NotifyAIAssistantEvent(ctx context.Context, liveSessionID uint64, event service.AIAssistantEvent) (int, error) {
+	_ = ctx
+	if n.hub == nil || liveSessionID == 0 {
+		return 0, nil
 	}
-	lc := cache.New[domain.Item](rdbCache, cache.JSONCodec[domain.Item]{}, cache.Options{
-		Name:        "item",
-		L1Capacity:  1024,
-		TTL:         5 * time.Minute,
-		L1TTL:       30 * time.Second,
-		NegativeTTL: 30 * time.Second,
-	})
-	return &itemCacheAdapter{inner: lc}
-}
-
-// itemCacheAdapter 把泛型的 *cache.LayeredCache[domain.Item] 适配为 service.ItemCache。
-//
-// 适配点：
-//   - GetOrLoad 的 loader 签名差异；
-//   - cache.ErrNegativeHit → service.ErrItemNotCached（避免 service 层反向依赖 cache 包）。
-type itemCacheAdapter struct {
-	inner *cache.LayeredCache[domain.Item]
-}
-
-func (a *itemCacheAdapter) GetOrLoad(ctx context.Context, key string, loader func(ctx context.Context) (domain.Item, bool, error)) (domain.Item, error) {
-	value, _, err := a.inner.GetOrLoad(ctx, key, cache.Loader[domain.Item](loader))
+	raw, err := json.Marshal(event)
 	if err != nil {
-		if errors.Is(err, cache.ErrNegativeHit) {
-			return domain.Item{}, service.ErrItemNotCached
-		}
-		return domain.Item{}, err
+		return 0, err
 	}
-	return value, nil
+	eventType := wstransport.TypeAIAssistantStatus
+	switch event.Kind {
+	case "permission":
+		if event.Status == "pending" {
+			eventType = wstransport.TypeAIAssistantPermissionRequest
+		}
+	case "broadcast":
+		eventType = wstransport.TypeAIAssistantBroadcast
+	case "switch":
+		eventType = wstransport.TypeAIAssistantSwitch
+	}
+	return n.hub.BroadcastLiveSession(liveSessionID, wstransport.Envelope{
+		Type:      eventType,
+		RequestID: event.RequestID,
+		Payload:   raw,
+	}), nil
 }
 
-func (a *itemCacheAdapter) Invalidate(ctx context.Context, keys ...string) error {
-	return a.inner.Invalidate(ctx, keys...)
+func (b liveVoiceHubBroadcaster) BroadcastLiveVoice(ctx context.Context, liveSessionID uint64, payload service.LiveVoiceBroadcastPayload) (int, error) {
+	_ = ctx
+	if b.hub == nil || liveSessionID == 0 {
+		return 0, nil
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return 0, err
+	}
+	return b.hub.BroadcastLiveSession(liveSessionID, wstransport.Envelope{
+		Type:      wstransport.TypeLiveVoiceBroadcast,
+		RequestID: payload.RequestID,
+		Payload:   raw,
+	}), nil
 }
 
 // newBlacklistLayeredCache 构造默认的黑名单缓存：基于 LayeredCache[bool] +
@@ -1099,6 +1127,61 @@ func serverOptions(cfg appconfig.ServerConfig) []hertzconfig.Option {
 		options = append(options, server.WithExitWaitTime(cfg.ShutdownTimeout.Std()))
 	}
 	return options
+}
+
+type productAuditImageLoader struct {
+	uploader objectstorage.Uploader
+}
+
+func (l productAuditImageLoader) LoadProductAuditImage(ctx context.Context, imageURL string) (service.ProductAuditImage, error) {
+	if l.uploader == nil {
+		return service.ProductAuditImage{}, objectstorage.ErrDisabled
+	}
+	key, err := objectKeyFromProxyImageURL(imageURL)
+	if err != nil {
+		return service.ProductAuditImage{}, err
+	}
+	out, err := l.uploader.Download(ctx, key)
+	if err != nil {
+		return service.ProductAuditImage{}, err
+	}
+	defer out.Content.Close()
+	image, err := io.ReadAll(out.Content)
+	if err != nil {
+		return service.ProductAuditImage{}, err
+	}
+	contentType := strings.TrimSpace(out.ContentType)
+	if contentType == "" {
+		contentType = mime.TypeByExtension(strings.ToLower(filepath.Ext(key)))
+	}
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
+	return service.ProductAuditImage{
+		ImageName:   filepath.Base(key),
+		ContentType: contentType,
+		ImageSize:   int64(len(image)),
+		Image:       image,
+	}, nil
+}
+
+func objectKeyFromProxyImageURL(imageURL string) (string, error) {
+	value := strings.TrimSpace(imageURL)
+	if value == "" {
+		return "", domain.ErrInvalidArgument
+	}
+	if parsed, err := url.Parse(value); err == nil && parsed.Path != "" {
+		value = parsed.Path
+	}
+	prefix := objectstorage.ProxyPathPrefix()
+	if !strings.HasPrefix(value, prefix) {
+		return "", domain.ErrInvalidArgument
+	}
+	key := strings.TrimSpace(strings.TrimPrefix(value, prefix))
+	if key == "" || strings.Contains(key, "..") {
+		return "", domain.ErrInvalidArgument
+	}
+	return key, nil
 }
 
 func openClients(ctx context.Context, cfg appconfig.Config, logger *slog.Logger, metricsRegistry *metrics.Registry, tracingProvider *tracing.Provider) (*gorm.DB, *redisinfra.ShardedRTClient, *redisinfra.RedisCacheClient, error) {

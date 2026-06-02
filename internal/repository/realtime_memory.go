@@ -62,13 +62,19 @@ func (s *MemoryRealtimeStore) InitAuction(ctx context.Context, auction domain.Au
 		}
 	}
 	state := domain.AuctionState{
-		AuctionID:    auction.AuctionID,
-		Status:       auction.Status,
-		CurrentPrice: auction.StartPrice,
-		StartTime:    auction.StartTime,
-		EndTime:      auction.EndTime,
-		Version:      time.Now().UTC().UnixMilli(),
-		Source:       "redis",
+		AuctionID:     auction.AuctionID,
+		Status:        auction.Status,
+		StartPrice:    auction.StartPrice,
+		CapPrice:      auction.CapPrice,
+		IncrementRule: append([]byte(nil), auction.IncrementRule...),
+		CurrentPrice:  auction.StartPrice,
+		StartTime:     auction.StartTime,
+		EndTime:       auction.EndTime,
+		Version:       time.Now().UTC().UnixMilli(),
+		Source:        "redis",
+	}
+	if auction.LiveSessionID != nil {
+		state.LiveSessionID = *auction.LiveSessionID
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -159,7 +165,7 @@ func (s *MemoryRealtimeStore) PlaceBid(ctx context.Context, input domain.BidInpu
 	defer s.mu.Unlock()
 	auction := s.auctions[input.AuctionID]
 	if auction == nil {
-		return rejectBid(input, "AUCTION_NOT_READY", 0, "", time.Time{}, 0), nil
+		return rejectBid(input, "AUCTION_NOT_READY", domain.AuctionState{AuctionID: input.AuctionID}), nil
 	}
 	if existing, ok := auction.idempotency[input.RequestID]; ok && input.RequestID != "" {
 		existing.Duplicate = true
@@ -167,17 +173,17 @@ func (s *MemoryRealtimeStore) PlaceBid(ctx context.Context, input domain.BidInpu
 	}
 	state := auction.state
 	if state.Status != domain.AuctionStatusRunning && state.Status != domain.AuctionStatusExtended {
-		result := rejectBid(input, "INVALID_STATE", state.CurrentPrice, state.LeaderBidderID, state.EndTime, state.ExtendCount)
+		result := rejectBid(input, "INVALID_STATE", state)
 		auction.storeBidResult(input.RequestID, result)
 		return result, nil
 	}
 	if _, ok := auction.enrolled[input.BidderID]; !ok {
-		result := rejectBid(input, "NOT_ENROLLED", state.CurrentPrice, state.LeaderBidderID, state.EndTime, state.ExtendCount)
+		result := rejectBid(input, "NOT_ENROLLED", state)
 		auction.storeBidResult(input.RequestID, result)
 		return result, nil
 	}
 	if _, ok := auction.deposits[input.BidderID]; !ok {
-		result := rejectBid(input, "DEPOSIT_NOT_READY", state.CurrentPrice, state.LeaderBidderID, state.EndTime, state.ExtendCount)
+		result := rejectBid(input, "DEPOSIT_NOT_READY", state)
 		auction.storeBidResult(input.RequestID, result)
 		return result, nil
 	}
@@ -197,12 +203,12 @@ func (s *MemoryRealtimeStore) PlaceBid(ctx context.Context, input domain.BidInpu
 		capPrice = auction.capPrice
 	}
 	if input.ExpectedCurrentPrice == nil {
-		result := rejectBid(input, domain.BidRejectMissingExpectedState, state.CurrentPrice, state.LeaderBidderID, state.EndTime, state.ExtendCount)
+		result := rejectBid(input, domain.BidRejectMissingExpectedState, state)
 		auction.storeBidResult(input.RequestID, result)
 		return result, nil
 	}
 	if reason := domain.ValidateBidExpectedCurrentPrice(*input.ExpectedCurrentPrice, state.CurrentPrice, capPrice, input.Price, rule); reason != "" {
-		result := rejectBid(input, reason, state.CurrentPrice, state.LeaderBidderID, state.EndTime, state.ExtendCount)
+		result := rejectBid(input, reason, state)
 		auction.storeBidResult(input.RequestID, result)
 		return result, nil
 	}
@@ -215,19 +221,20 @@ func (s *MemoryRealtimeStore) PlaceBid(ctx context.Context, input domain.BidInpu
 		}
 		auction.frequency[input.BidderID] = freq
 		if freq.count > input.FreqLimitCount {
-			result := rejectBid(input, "FREQ_LIMIT", state.CurrentPrice, state.LeaderBidderID, state.EndTime, state.ExtendCount)
+			result := rejectBid(input, "FREQ_LIMIT", state)
 			auction.storeBidResult(input.RequestID, result)
 			return result, nil
 		}
 	}
 	if reason := domain.ValidateBidPrice(startPrice, state.CurrentPrice, capPrice, input.Price, rule); reason != "" {
-		result := rejectBid(input, reason, state.CurrentPrice, state.LeaderBidderID, state.EndTime, state.ExtendCount)
+		result := rejectBid(input, reason, state)
 		auction.storeBidResult(input.RequestID, result)
 		return result, nil
 	}
 
 	state.CurrentPrice = input.Price
 	state.LeaderBidderID = input.BidderID
+	state.BidCount++
 	state.LastBidTSMS = nowMS
 	state.Version++
 	extended := false
@@ -378,7 +385,7 @@ func (a *memoryRealtimeAuction) storeBidResult(requestID string, result domain.B
 	a.idempotency[requestID] = result
 }
 
-func rejectBid(input domain.BidInput, reason string, currentPrice int64, leaderID string, endTime time.Time, extendCount int) domain.BidResult {
+func rejectBid(input domain.BidInput, reason string, state domain.AuctionState) domain.BidResult {
 	return domain.BidResult{
 		RequestID:      input.RequestID,
 		AuctionID:      input.AuctionID,
@@ -388,10 +395,12 @@ func rejectBid(input domain.BidInput, reason string, currentPrice int64, leaderI
 		Price:          input.Price,
 		Accepted:       false,
 		Reason:         reason,
-		CurrentPrice:   currentPrice,
-		LeaderBidderID: leaderID,
-		EndTime:        endTime,
-		ExtendCount:    extendCount,
+		CurrentPrice:   state.CurrentPrice,
+		LeaderBidderID: state.LeaderBidderID,
+		EndTime:        state.EndTime,
+		ExtendCount:    state.ExtendCount,
+		Version:        state.Version,
+		AuctionStatus:  state.Status,
 		Event:          "bid.rejected",
 		RiskResult:     domain.BidRiskReject,
 	}

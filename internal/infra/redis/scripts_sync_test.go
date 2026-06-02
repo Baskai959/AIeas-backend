@@ -26,7 +26,7 @@ func TestLuaFilesMatchEmbeddedScripts(t *testing.T) {
 	}
 }
 
-func TestBidLuaPublishesSamePayloadToAuctionChannel(t *testing.T) {
+func TestBidLuaAcceptedBidWritesStreamBeforePublish(t *testing.T) {
 	body := DefaultScripts()[ScriptBidPlace]
 	for _, needle := range []string{
 		`local payload = build_result`,
@@ -39,5 +39,26 @@ func TestBidLuaPublishesSamePayloadToAuctionChannel(t *testing.T) {
 	}
 	if strings.Index(body, `redis.call("XADD"`) > strings.Index(body, `redis.call("PUBLISH"`) {
 		t.Fatalf("bid lua must XADD before PUBLISH to keep stream as source of truth")
+	}
+}
+
+func TestBidLuaRejectPathIsLightweight(t *testing.T) {
+	body := DefaultScripts()[ScriptBidPlace]
+	if strings.Contains(body, `redis.call("TYPE"`) {
+		t.Fatalf("bid lua hot path should not run key TYPE checks")
+	}
+	rejectStart := strings.Index(body, `local function reject(reason)`)
+	if rejectStart < 0 {
+		t.Fatalf("bid lua missing reject function")
+	}
+	rejectEnd := strings.Index(body[rejectStart:], `if status ~= "RUNNING"`)
+	if rejectEnd < 0 {
+		t.Fatalf("could not find reject function end")
+	}
+	rejectBody := body[rejectStart : rejectStart+rejectEnd]
+	for _, forbidden := range []string{`append_event`, `XADD`, `PUBLISH`, `SADD`} {
+		if strings.Contains(rejectBody, forbidden) {
+			t.Fatalf("reject path should not call %s", forbidden)
+		}
 	}
 }

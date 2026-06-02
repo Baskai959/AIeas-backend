@@ -26,14 +26,21 @@ type NoopRealtimeStore struct{}
 func (NoopRealtimeStore) InitAuction(ctx context.Context, auction domain.AuctionLot, minIncrement int64) (domain.AuctionState, error) {
 	_ = ctx
 	_ = minIncrement
-	return domain.AuctionState{
-		AuctionID:    auction.AuctionID,
-		Status:       auction.Status,
-		CurrentPrice: auction.StartPrice,
-		StartTime:    auction.StartTime,
-		EndTime:      auction.EndTime,
-		Source:       "db",
-	}, nil
+	state := domain.AuctionState{
+		AuctionID:     auction.AuctionID,
+		Status:        auction.Status,
+		StartPrice:    auction.StartPrice,
+		CapPrice:      auction.CapPrice,
+		IncrementRule: append([]byte(nil), auction.IncrementRule...),
+		CurrentPrice:  auction.StartPrice,
+		StartTime:     auction.StartTime,
+		EndTime:       auction.EndTime,
+		Source:        "db",
+	}
+	if auction.LiveSessionID != nil {
+		state.LiveSessionID = *auction.LiveSessionID
+	}
+	return state, nil
 }
 
 func (NoopRealtimeStore) GetAuctionState(ctx context.Context, auctionID uint64) (domain.AuctionState, bool, error) {

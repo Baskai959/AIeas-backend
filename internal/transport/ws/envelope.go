@@ -9,6 +9,16 @@ const (
 	// 一次性推给客户端，避免连上后等出价/extend 才能感知房间状态。
 	// 若 RT 不可用导致退化到 MySQL 兜底，payload.degraded=true。
 	TypeRoomSnapshot = "room.snapshot"
+	// TypeLiveVoiceBroadcast 是直播语音播报帧，payload 携带已合成的音频内容。
+	TypeLiveVoiceBroadcast = "live.voice_broadcast"
+	// TypeAIAssistantStatus 是 AI 助手运行状态帧。
+	TypeAIAssistantStatus = "ai.assistant.status"
+	// TypeAIAssistantPermissionRequest 是 AI 助手执行控制操作前的商家确认帧。
+	TypeAIAssistantPermissionRequest = "ai.assistant.permission_request"
+	// TypeAIAssistantBroadcast 是 AI 助手准备播报的文本提示帧。
+	TypeAIAssistantBroadcast = "ai.assistant.broadcast"
+	// TypeAIAssistantSwitch 是 AI 直播助手开关变更帧，用户端可据此切换 AI 直播状态。
+	TypeAIAssistantSwitch = "ai.assistant.switch"
 )
 
 type Envelope struct {

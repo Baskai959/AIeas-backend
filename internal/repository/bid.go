@@ -11,6 +11,7 @@ import (
 	"aieas_backend/internal/domain"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 type BidRepository interface {
@@ -19,6 +20,11 @@ type BidRepository interface {
 	ListByAuction(ctx context.Context, auctionID uint64, limit int) ([]domain.BidRecord, error)
 	CountByAuction(ctx context.Context, auctionID uint64) (int, error)
 	ListByLiveSession(ctx context.Context, sessionID uint64, sortBy string, limit, offset int) ([]domain.BidRecord, error)
+}
+
+type BidRoundRepository interface {
+	ListByAuctionSince(ctx context.Context, auctionID uint64, sinceTSMS int64, limit int) ([]domain.BidRecord, error)
+	CountByAuctionSince(ctx context.Context, auctionID uint64, sinceTSMS int64) (int, error)
 }
 
 type MySQLBidRepository struct {
@@ -46,6 +52,19 @@ func (r *MySQLBidRepository) Create(ctx context.Context, bid *domain.BidRecord) 
 	}
 	*bid = row.toDomain()
 	return nil
+}
+
+func (r *MySQLBidRepository) CreateIgnore(ctx context.Context, bid *domain.BidRecord) (bool, error) {
+	row := bidRecordRowFromDomain(*bid)
+	tx := r.dbFor(ctx).Table("bid_record").Clauses(clause.Insert{Modifier: "IGNORE"}).Create(&row)
+	if tx.Error != nil {
+		return false, tx.Error
+	}
+	if tx.RowsAffected == 0 {
+		return false, nil
+	}
+	*bid = row.toDomain()
+	return true, nil
 }
 
 func (r *MySQLBidRepository) FindByRequestID(ctx context.Context, requestID string) (domain.BidRecord, error) {
@@ -80,12 +99,50 @@ func (r *MySQLBidRepository) ListByAuction(ctx context.Context, auctionID uint64
 	return records, nil
 }
 
+func (r *MySQLBidRepository) ListByAuctionSince(ctx context.Context, auctionID uint64, sinceTSMS int64, limit int) ([]domain.BidRecord, error) {
+	if limit <= 0 || limit > 100 {
+		limit = 20
+	}
+	var rows []bidRecordRow
+	query := r.dbFor(ctx).
+		Table("bid_record").
+		Where("auction_id = ? AND risk_result = ? AND reject_reason = ''", auctionID, domain.BidRiskAllow)
+	if sinceTSMS > 0 {
+		query = query.Where("bid_ts_ms >= ?", sinceTSMS)
+	}
+	if err := query.
+		Order("bid_price DESC, bid_ts_ms ASC").
+		Limit(limit).
+		Find(&rows).Error; err != nil {
+		return nil, err
+	}
+	records := make([]domain.BidRecord, 0, len(rows))
+	for _, row := range rows {
+		records = append(records, row.toDomain())
+	}
+	return records, nil
+}
+
 func (r *MySQLBidRepository) CountByAuction(ctx context.Context, auctionID uint64) (int, error) {
 	var count int64
 	if err := r.dbFor(ctx).
 		Table("bid_record").
 		Where("auction_id = ? AND risk_result = ? AND reject_reason = ''", auctionID, domain.BidRiskAllow).
 		Count(&count).Error; err != nil {
+		return 0, err
+	}
+	return int(count), nil
+}
+
+func (r *MySQLBidRepository) CountByAuctionSince(ctx context.Context, auctionID uint64, sinceTSMS int64) (int, error) {
+	var count int64
+	query := r.dbFor(ctx).
+		Table("bid_record").
+		Where("auction_id = ? AND risk_result = ? AND reject_reason = ''", auctionID, domain.BidRiskAllow)
+	if sinceTSMS > 0 {
+		query = query.Where("bid_ts_ms >= ?", sinceTSMS)
+	}
+	if err := query.Count(&count).Error; err != nil {
 		return 0, err
 	}
 	return int(count), nil
@@ -204,6 +261,29 @@ func (r *MemoryBidRepository) Create(ctx context.Context, bid *domain.BidRecord)
 	return nil
 }
 
+func (r *MemoryBidRepository) CreateIgnore(ctx context.Context, bid *domain.BidRecord) (bool, error) {
+	_ = ctx
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if bid.RequestID != "" {
+		if _, ok := r.byRequest[bid.RequestID]; ok {
+			return false, nil
+		}
+	}
+	if bid.ID == 0 {
+		bid.ID = r.nextID
+		r.nextID++
+	}
+	if bid.CreatedAt.IsZero() {
+		bid.CreatedAt = time.Now().UTC()
+	}
+	r.byID[bid.ID] = cloneBidRecord(*bid)
+	if bid.RequestID != "" {
+		r.byRequest[bid.RequestID] = bid.ID
+	}
+	return true, nil
+}
+
 func (r *MemoryBidRepository) FindByRequestID(ctx context.Context, requestID string) (domain.BidRecord, error) {
 	_ = ctx
 	r.mu.RLock()
@@ -240,6 +320,31 @@ func (r *MemoryBidRepository) ListByAuction(ctx context.Context, auctionID uint6
 	return records, nil
 }
 
+func (r *MemoryBidRepository) ListByAuctionSince(ctx context.Context, auctionID uint64, sinceTSMS int64, limit int) ([]domain.BidRecord, error) {
+	_ = ctx
+	if limit <= 0 || limit > 100 {
+		limit = 20
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	records := make([]domain.BidRecord, 0)
+	for _, bid := range r.byID {
+		if bid.AuctionID == auctionID && bid.BidTSMS >= sinceTSMS && bid.RiskResult == domain.BidRiskAllow && bid.RejectReason == "" {
+			records = append(records, cloneBidRecord(bid))
+		}
+	}
+	sort.Slice(records, func(i, j int) bool {
+		if records[i].BidPrice == records[j].BidPrice {
+			return records[i].BidTSMS < records[j].BidTSMS
+		}
+		return records[i].BidPrice > records[j].BidPrice
+	})
+	if len(records) > limit {
+		records = records[:limit]
+	}
+	return records, nil
+}
+
 func (r *MemoryBidRepository) CountByAuction(ctx context.Context, auctionID uint64) (int, error) {
 	_ = ctx
 	r.mu.RLock()
@@ -247,6 +352,19 @@ func (r *MemoryBidRepository) CountByAuction(ctx context.Context, auctionID uint
 	count := 0
 	for _, bid := range r.byID {
 		if bid.AuctionID == auctionID && bid.RiskResult == domain.BidRiskAllow && bid.RejectReason == "" {
+			count++
+		}
+	}
+	return count, nil
+}
+
+func (r *MemoryBidRepository) CountByAuctionSince(ctx context.Context, auctionID uint64, sinceTSMS int64) (int, error) {
+	_ = ctx
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	count := 0
+	for _, bid := range r.byID {
+		if bid.AuctionID == auctionID && bid.BidTSMS >= sinceTSMS && bid.RiskResult == domain.BidRiskAllow && bid.RejectReason == "" {
 			count++
 		}
 	}

@@ -30,11 +30,13 @@ services:
       - -c
       - |
         if [ -n "$$REDIS_RT_SHARD_0_PASSWORD" ]; then
-          exec redis-server --appendonly yes --appendfsync everysec --save 60 1000 --maxmemory-policy noeviction --requirepass "$$REDIS_RT_SHARD_0_PASSWORD"
+          exec redis-server --appendonly yes --appendfsync everysec --save 60 1000 --maxmemory-policy noeviction --protected-mode no --requirepass "$$REDIS_RT_SHARD_0_PASSWORD"
         fi
-        exec redis-server --appendonly yes --appendfsync everysec --save 60 1000 --maxmemory-policy noeviction
+        exec redis-server --appendonly yes --appendfsync everysec --save 60 1000 --maxmemory-policy noeviction --protected-mode no
     volumes:
       - redis-rt-1-data:/data
+    ports:
+      - "0.0.0.0:6381:6379"
     healthcheck:
       test: ["CMD-SHELL", "if [ -n \"$${REDIS_RT_SHARD_0_PASSWORD}\" ]; then REDISCLI_AUTH=\"$${REDIS_RT_SHARD_0_PASSWORD}\" redis-cli ping; else redis-cli ping; fi"]
       interval: 10s
@@ -51,11 +53,13 @@ services:
       - -c
       - |
         if [ -n "$$REDIS_RT_SHARD_1_PASSWORD" ]; then
-          exec redis-server --appendonly yes --appendfsync everysec --save 60 1000 --maxmemory-policy noeviction --requirepass "$$REDIS_RT_SHARD_1_PASSWORD"
+          exec redis-server --appendonly yes --appendfsync everysec --save 60 1000 --maxmemory-policy noeviction --protected-mode no --requirepass "$$REDIS_RT_SHARD_1_PASSWORD"
         fi
-        exec redis-server --appendonly yes --appendfsync everysec --save 60 1000 --maxmemory-policy noeviction
+        exec redis-server --appendonly yes --appendfsync everysec --save 60 1000 --maxmemory-policy noeviction --protected-mode no
     volumes:
       - redis-rt-2-data:/data
+    ports:
+      - "0.0.0.0:6382:6379"
     healthcheck:
       test: ["CMD-SHELL", "if [ -n \"$${REDIS_RT_SHARD_1_PASSWORD}\" ]; then REDISCLI_AUTH=\"$${REDIS_RT_SHARD_1_PASSWORD}\" redis-cli ping; else redis-cli ping; fi"]
       interval: 10s
@@ -72,11 +76,13 @@ services:
       - -c
       - |
         if [ -n "$$REDIS_CACHE_PASSWORD" ]; then
-          exec redis-server --appendonly yes --appendfsync everysec --save 60 1000 --maxmemory-policy allkeys-lfu --requirepass "$$REDIS_CACHE_PASSWORD"
+          exec redis-server --appendonly yes --appendfsync everysec --save 60 1000 --maxmemory-policy allkeys-lfu --protected-mode no --requirepass "$$REDIS_CACHE_PASSWORD"
         fi
-        exec redis-server --appendonly yes --appendfsync everysec --save 60 1000 --maxmemory-policy allkeys-lfu
+        exec redis-server --appendonly yes --appendfsync everysec --save 60 1000 --maxmemory-policy allkeys-lfu --protected-mode no
     volumes:
       - redis-cache-data:/data
+    ports:
+      - "0.0.0.0:6380:6379"
     healthcheck:
       test: ["CMD-SHELL", "if [ -n \"$${REDIS_CACHE_PASSWORD}\" ]; then REDISCLI_AUTH=\"$${REDIS_CACHE_PASSWORD}\" redis-cli ping; else redis-cli ping; fi"]
       interval: 10s
@@ -92,9 +98,9 @@ services:
       KAFKA_NODE_ID: "1"
       KAFKA_PROCESS_ROLES: "broker,controller"
       KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka:9093"
-      KAFKA_LISTENERS: "INTERNAL://:9092,CONTROLLER://:9093"
-      KAFKA_ADVERTISED_LISTENERS: "INTERNAL://kafka:9092"
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "INTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT"
+      KAFKA_LISTENERS: "INTERNAL://:9092,CONTROLLER://:9093,EXTERNAL://:9094"
+      KAFKA_ADVERTISED_LISTENERS: "INTERNAL://kafka:9092,EXTERNAL://${KAFKA_EXTERNAL_HOST:-127.0.0.1}:9092"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "INTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT"
       KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
       KAFKA_INTER_BROKER_LISTENER_NAME: "INTERNAL"
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
@@ -106,6 +112,8 @@ services:
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
     volumes:
       - kafka-data:/tmp/kraft-combined-logs
+    ports:
+      - "0.0.0.0:9092:9094"
     healthcheck:
       test:
         [
@@ -127,7 +135,7 @@ services:
       KAFKA_CLUSTERS_0_NAME: "aieas"
       KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: "kafka:9092"
     ports:
-      - "127.0.0.1:8082:8080"
+      - "0.0.0.0:8082:8080"
 
   app:
     build:
@@ -187,7 +195,7 @@ services:
     volumes:
       - prometheus-data:/prometheus
     ports:
-      - "127.0.0.1:9090:9090"
+      - "0.0.0.0:9090:9090"
 
   grafana:
     image: grafana/grafana:11.4.0

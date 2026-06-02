@@ -24,8 +24,10 @@ type ProductDescriptionClient struct {
 }
 
 type ProductAuditClient struct {
-	endpoint string
-	client   *http.Client
+	endpoint       string
+	callbackURL    string
+	callbackAPIKey string
+	client         *http.Client
 }
 
 type LiveAnalysisClient struct {
@@ -52,7 +54,9 @@ func NewProductDescriptionClient(cfg appconfig.AgentConfig) *ProductDescriptionC
 func NewProductAuditClient(cfg appconfig.AgentConfig) *ProductAuditClient {
 	timeout := cfg.Timeout.Std()
 	return &ProductAuditClient{
-		endpoint: strings.TrimSpace(cfg.ProductAuditURL),
+		endpoint:       strings.TrimSpace(cfg.ProductAuditURL),
+		callbackURL:    strings.TrimSpace(cfg.ProductAuditCallbackURL),
+		callbackAPIKey: strings.TrimSpace(cfg.LiveAnalysisCallbackAPIKey),
 		client: &http.Client{
 			Timeout:   timeout,
 			Transport: newAgentTransport("agent.product_audit"),
@@ -154,20 +158,32 @@ func (c *ProductAuditClient) AuditProduct(ctx context.Context, in service.Produc
 	if c == nil || c.client == nil || c.endpoint == "" {
 		return service.ProductAuditResult{}, service.ErrProductAuditUnavailable
 	}
-	if strings.TrimSpace(in.ProductText) == "" || len(in.Image) == 0 || strings.TrimSpace(in.CallbackURL) == "" {
+	callbackURL := strings.TrimSpace(in.CallbackURL)
+	if callbackURL == "" {
+		callbackURL = c.callbackURL
+	}
+	if strings.TrimSpace(in.ProductText) == "" || callbackURL == "" {
 		return service.ProductAuditResult{}, domain.ErrInvalidArgument
 	}
 
 	var body bytes.Buffer
 	writer := multipart.NewWriter(&body)
-	if err := writeImagePart(writer, "image", in.ImageName, in.ContentType, bytes.NewReader(in.Image)); err != nil {
-		return service.ProductAuditResult{}, err
+	if len(in.Image) > 0 {
+		if err := writeImagePart(writer, "image", in.ImageName, in.ContentType, bytes.NewReader(in.Image)); err != nil {
+			return service.ProductAuditResult{}, err
+		}
 	}
 	if err := writer.WriteField("product_text", strings.TrimSpace(in.ProductText)); err != nil {
 		return service.ProductAuditResult{}, err
 	}
-	if err := writer.WriteField("callback_url", strings.TrimSpace(in.CallbackURL)); err != nil {
+	if err := writer.WriteField("callback_url", callbackURL); err != nil {
 		return service.ProductAuditResult{}, err
+	}
+	if len(in.CallbackHeaders) == 0 && c.callbackAPIKey != "" {
+		in.CallbackHeaders = map[string]string{
+			"X-Callback-Key": c.callbackAPIKey,
+			"Authorization":  "Bearer " + c.callbackAPIKey,
+		}
 	}
 	if len(in.CallbackHeaders) > 0 {
 		headers, err := json.Marshal(in.CallbackHeaders)
@@ -294,15 +310,16 @@ func (c *LiveAnalysisClient) RequestLiveAnalysis(ctx context.Context, in service
 	}, nil
 }
 
-func (c *LiveAuctionHookClient) InvokeLiveAgentHook(ctx context.Context, message string) error {
+func (c *LiveAuctionHookClient) InvokeLiveAgentHook(ctx context.Context, sessionID, question string) error {
 	if c == nil || c.client == nil || c.endpoint == "" {
 		return nil
 	}
-	message = strings.TrimSpace(message)
-	if message == "" {
+	sessionID = strings.TrimSpace(sessionID)
+	question = strings.TrimSpace(question)
+	if sessionID == "" || question == "" {
 		return domain.ErrInvalidArgument
 	}
-	payload, err := json.Marshal(liveAuctionHookRequest{Message: message})
+	payload, err := json.Marshal(liveAuctionHookRequest{SessionID: sessionID, Question: question})
 	if err != nil {
 		return err
 	}
@@ -333,7 +350,8 @@ type liveAnalysisAsyncRequest struct {
 }
 
 type liveAuctionHookRequest struct {
-	Message string `json:"message"`
+	SessionID string `json:"session_id"`
+	Question  string `json:"question"`
 }
 
 func writeImagePart(writer *multipart.Writer, fieldName, imageName, contentType string, image io.Reader) error {

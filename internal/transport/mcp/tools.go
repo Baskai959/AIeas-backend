@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"time"
 
@@ -34,6 +35,10 @@ func (h *Handler) callTool(ctx context.Context, name string, arguments json.RawM
 	}
 	start := time.Now()
 	defer span.End()
+	liveSessionID, assistantMessage := h.readToolAssistantStatus(toolName, arguments)
+	if liveSessionID != 0 && assistantMessage != "" {
+		h.notifyReadAssistantStatus(ctx, liveSessionID, actor.ID, toolName, "running", assistantMessage)
+	}
 
 	data, err := h.toolData(ctx, toolName, arguments, actor)
 	elapsed := time.Since(start)
@@ -47,7 +52,32 @@ func (h *Handler) callTool(ctx context.Context, name string, arguments json.RawM
 	if h.metrics != nil {
 		h.metrics.ObserveAgentToolCall(toolName, status, elapsed)
 	}
+	if liveSessionID != 0 && assistantMessage != "" {
+		resultStatus := "completed"
+		resultMessage := strings.Replace(assistantMessage, "正在", "", 1) + "完成"
+		if err != nil {
+			resultStatus = "failed"
+			resultMessage = strings.Replace(assistantMessage, "正在", "", 1) + "失败"
+		}
+		h.notifyReadAssistantStatus(ctx, liveSessionID, actor.ID, toolName, resultStatus, resultMessage)
+	}
 	if err != nil {
+		if errors.Is(err, service.ErrAIAssistantUserRejected) || errors.Is(err, service.ErrAIAssistantApprovalTimeout) {
+			message := "用户拒绝执行"
+			if errors.Is(err, service.ErrAIAssistantApprovalTimeout) {
+				message = "用户未确认执行"
+			}
+			text, encodeErr := h.payloadText(traceID, map[string]interface{}{
+				"message": message,
+				"reason":  err.Error(),
+			})
+			if encodeErr != nil {
+				span.RecordError(encodeErr)
+				span.SetStatus(codes.Error, encodeErr.Error())
+				return toolCallResult{}, encodeErr
+			}
+			return toolCallResult{Content: []textContent{{Type: "text", MIMEType: "application/json", Text: text}}, IsError: true}, nil
+		}
 		return toolCallResult{}, err
 	}
 	text, err := h.payloadText(traceID, data)
@@ -57,6 +87,49 @@ func (h *Handler) callTool(ctx context.Context, name string, arguments json.RawM
 		return toolCallResult{}, err
 	}
 	return toolCallResult{Content: []textContent{{Type: "text", MIMEType: "application/json", Text: text}}}, nil
+}
+
+func (h *Handler) notifyReadAssistantStatus(ctx context.Context, liveSessionID uint64, actorID, toolName, status, message string) {
+	if h == nil || h.assistant == nil || h.read == nil || h.control != nil || liveSessionID == 0 {
+		return
+	}
+	h.assistant.NotifyStatus(ctx, liveSessionID, actorID, toolName, status, message, "")
+}
+
+func (h *Handler) readToolAssistantStatus(name string, arguments json.RawMessage) (uint64, string) {
+	if h == nil || h.assistant == nil || h.read == nil || h.control != nil {
+		return 0, ""
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(arguments, &raw); err != nil {
+		return 0, ""
+	}
+	var sessionID uint64
+	for _, key := range []string{"sessionId", "liveSessionId"} {
+		if value, ok := raw[key]; ok {
+			_ = json.Unmarshal(value, &sessionID)
+			if sessionID != 0 {
+				break
+			}
+		}
+	}
+	if sessionID == 0 {
+		return 0, ""
+	}
+	switch strings.TrimSpace(name) {
+	case "read_live_session":
+		return sessionID, "正在查询直播场次信息"
+	case "read_live_session_lots":
+		return sessionID, "正在查询直播场次拍品"
+	case "read_live_session_bids":
+		return sessionID, "正在查询直播场次出价记录"
+	case "read_live_session_orders":
+		return sessionID, "正在查询直播场次订单"
+	case "read_live_session_settlement":
+		return sessionID, "正在查询直播场次成交汇总"
+	default:
+		return sessionID, "正在调用直播场次查询工具"
+	}
 }
 
 func (h *Handler) toolData(ctx context.Context, name string, arguments json.RawMessage, actor service.MCPActor) (interface{}, error) {
@@ -100,34 +173,6 @@ func (h *Handler) toolData(ctx context.Context, name string, arguments json.RawM
 			return nil, domain.ErrInvalidArgument
 		}
 		return h.read.ReadMerchant(ctx, in.MerchantID, actor)
-	case "read_item":
-		if h.read == nil {
-			return nil, domain.ErrNotFound
-		}
-		var in struct {
-			ItemID uint64 `json:"itemId"`
-		}
-		if err := decodeParams(arguments, &in); err != nil || in.ItemID == 0 {
-			return nil, domain.ErrInvalidArgument
-		}
-		return h.read.ReadItem(ctx, in.ItemID, actor)
-	case "read_items":
-		if h.read == nil {
-			return nil, domain.ErrNotFound
-		}
-		var in struct {
-			SellerID string            `json:"sellerId"`
-			Status   domain.ItemStatus `json:"status"`
-			Category string            `json:"category"`
-			Limit    int               `json:"limit"`
-			Offset   int               `json:"offset"`
-		}
-		if err := decodeParams(arguments, &in); err != nil {
-			return nil, domain.ErrInvalidArgument
-		}
-		filter := domain.ItemFilter{SellerID: strings.TrimSpace(in.SellerID), Status: in.Status, Category: strings.TrimSpace(in.Category), Limit: normalizeLimit(in.Limit, 20), Offset: normalizeOffset(in.Offset)}
-		items, err := h.read.ListItems(ctx, filter, actor)
-		return pagePayload(items, filter.Limit, filter.Offset, len(items)), err
 	case "read_auction_lot":
 		if h.read == nil {
 			return nil, domain.ErrNotFound
@@ -157,7 +202,6 @@ func (h *Handler) toolData(ctx context.Context, name string, arguments json.RawM
 		var in struct {
 			SellerID      string               `json:"sellerId"`
 			Status        domain.AuctionStatus `json:"status"`
-			ItemID        uint64               `json:"itemId"`
 			LiveSessionID uint64               `json:"liveSessionId"`
 			Limit         int                  `json:"limit"`
 			Offset        int                  `json:"offset"`
@@ -165,7 +209,7 @@ func (h *Handler) toolData(ctx context.Context, name string, arguments json.RawM
 		if err := decodeParams(arguments, &in); err != nil {
 			return nil, domain.ErrInvalidArgument
 		}
-		filter := domain.AuctionFilter{SellerID: strings.TrimSpace(in.SellerID), Status: in.Status, ItemID: in.ItemID, LiveSessionID: in.LiveSessionID, Limit: normalizeLimit(in.Limit, 20), Offset: normalizeOffset(in.Offset)}
+		filter := domain.AuctionFilter{SellerID: strings.TrimSpace(in.SellerID), Status: in.Status, LiveSessionID: in.LiveSessionID, Limit: normalizeLimit(in.Limit, 20), Offset: normalizeOffset(in.Offset)}
 		items, err := h.read.ListAuctionLots(ctx, filter, actor)
 		return pagePayload(items, filter.Limit, filter.Offset, len(items)), err
 	case "read_live_sessions":
@@ -268,12 +312,12 @@ func (h *Handler) toolData(ctx context.Context, name string, arguments json.RawM
 			return nil, domain.ErrNotFound
 		}
 		var in struct {
-			LiveSessionID uint64 `json:"liveSessionId"`
-			AuctionID     uint64 `json:"auctionId"`
-			Action        string `json:"action"`
-			DurationSec   int    `json:"durationSec"`
-			Force         *bool  `json:"force"`
-			RequestID     string `json:"requestId"`
+			LiveSessionID      uint64 `json:"liveSessionId"`
+			AuctionID          uint64 `json:"auctionId"`
+			Action             string `json:"action"`
+			AuctionDurationSec int    `json:"auctionDurationSec"`
+			Force              *bool  `json:"force"`
+			RequestID          string `json:"requestId"`
 		}
 		if err := decodeParams(arguments, &in); err != nil || in.LiveSessionID == 0 || in.AuctionID == 0 || strings.TrimSpace(in.Action) == "" {
 			return nil, domain.ErrInvalidArgument
@@ -283,11 +327,28 @@ func (h *Handler) toolData(ctx context.Context, name string, arguments json.RawM
 			force = *in.Force
 		}
 		return h.control.OperateLiveSessionLot(ctx, service.MCPLiveLotOperationInput{
+			LiveSessionID:      in.LiveSessionID,
+			AuctionID:          in.AuctionID,
+			Action:             in.Action,
+			AuctionDurationSec: in.AuctionDurationSec,
+			Force:              force,
+			RequestID:          in.RequestID,
+		}, actor)
+	case "live_voice_broadcast":
+		if h.control == nil {
+			return nil, domain.ErrNotFound
+		}
+		var in struct {
+			LiveSessionID uint64 `json:"liveSessionId"`
+			Text          string `json:"text"`
+			RequestID     string `json:"requestId"`
+		}
+		if err := decodeParams(arguments, &in); err != nil || in.LiveSessionID == 0 || strings.TrimSpace(in.Text) == "" {
+			return nil, domain.ErrInvalidArgument
+		}
+		return h.control.CreateLiveVoiceBroadcast(ctx, service.MCPLiveVoiceBroadcastInput{
 			LiveSessionID: in.LiveSessionID,
-			AuctionID:     in.AuctionID,
-			Action:        in.Action,
-			DurationSec:   in.DurationSec,
-			Force:         force,
+			Text:          in.Text,
 			RequestID:     in.RequestID,
 		}, actor)
 	case "read_order":

@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -67,8 +68,15 @@ func (r *MemoryAuctionRepository) List(ctx context.Context, filter domain.Auctio
 		if filter.Status.Valid() && auction.Status != filter.Status {
 			continue
 		}
-		if filter.ItemID != 0 && auction.ItemID != filter.ItemID {
+		if filter.Category != "" && auction.Category != filter.Category {
 			continue
+		}
+		if filter.Keyword != "" {
+			keyword := strings.ToLower(strings.TrimSpace(filter.Keyword))
+			haystack := strings.ToLower(auction.Title + " " + auction.Description + " " + auction.Brand)
+			if !strings.Contains(haystack, keyword) {
+				continue
+			}
 		}
 		if filter.LiveSessionID != 0 {
 			if auction.LiveSessionID == nil || *auction.LiveSessionID != filter.LiveSessionID {
@@ -152,6 +160,7 @@ func statusInList(s domain.AuctionStatus, list []domain.AuctionStatus) bool {
 func cloneAuction(auction domain.AuctionLot) domain.AuctionLot {
 	auction.IncrementRule = append([]byte(nil), auction.IncrementRule...)
 	auction.RuleSnapshot = append([]byte(nil), auction.RuleSnapshot...)
+	auction.ImageURLs = append([]string(nil), auction.ImageURLs...)
 	auction.LiveSessionID = cloneUint64Ptr(auction.LiveSessionID)
 	return auction
 }

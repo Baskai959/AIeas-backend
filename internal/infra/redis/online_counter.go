@@ -11,14 +11,16 @@ import (
 	redisgo "github.com/redis/go-redis/v9"
 )
 
-const defaultOnlineCounterTTL = 24 * time.Hour
+// DefaultOnlineCounterTTL controls how long stale websocket presence survives
+// when a process exits before it can remove its connections.
+const DefaultOnlineCounterTTL = 90 * time.Second
 
 var nextOnlineCounterInstance atomic.Uint64
 
-// OnlineCounter 维护"在线会话"集合：每个 (auction, instance, conn) 三元组一份
-// ZSET 成员，TTL 自然清理。
+// OnlineCounter 维护"在线用户"集合：auction 维度按 userID 去重计数，
+// 同一用户的多个连接记录在 user connection set 中，TTL 自然清理。
 //
-// v2 起按 auctionID 走分片：online:auction:<id> 落到 ForAuction(id) 的 shard，
+// v2 起按 auctionID 走分片：online:auction:<id>:users 落到 ForAuction(id) 的 shard，
 // 而 ws:instances / ws:instance:<id> / online:instance:<id>:conns 这些"按 instance"
 // 的全局 key 固定到 ForGlobal()（shard 0），保证多实例 Janitor 仍可枚举所有 instance。
 type OnlineCounter struct {
@@ -30,7 +32,7 @@ type OnlineCounter struct {
 
 func NewOnlineCounter(sharded *ShardedRTClient, keys KeyBuilder, ttl time.Duration) *OnlineCounter {
 	if ttl <= 0 {
-		ttl = defaultOnlineCounterTTL
+		ttl = DefaultOnlineCounterTTL
 	}
 	instanceID := fmt.Sprintf("inst-%d-%d", time.Now().UTC().UnixNano(), nextOnlineCounterInstance.Add(1))
 	return &OnlineCounter{sharded: sharded, keys: keys, ttl: ttl, instanceID: instanceID}
@@ -54,7 +56,7 @@ func (c *OnlineCounter) globalShard() *RedisRTClient {
 	return c.sharded.ForGlobal()
 }
 
-func (c *OnlineCounter) Join(ctx context.Context, auctionID uint64, connectionID string) (int, error) {
+func (c *OnlineCounter) Join(ctx context.Context, auctionID uint64, connectionID, userID string) (int, error) {
 	if err := c.validate(connectionID); err != nil {
 		return 0, err
 	}
@@ -65,22 +67,26 @@ func (c *OnlineCounter) Join(ctx context.Context, auctionID uint64, connectionID
 		instanceID = c.instanceID
 		connectionID = instanceID + ":" + connectionID
 	}
+	userID = normalizeOnlineUserID(userID, connectionID)
 	// 全局 key 上写 instance 心跳与 conn 索引（按 instance 而非 auction 路由）。
 	gShard := c.globalShard()
 	gPipe := gShard.Pipeline()
 	gPipe.Set(ctx, c.keys.WSInstanceHeartbeat(instanceID), "1", c.ttl)
 	gPipe.SAdd(ctx, c.keys.WSInstances(), instanceID)
-	gPipe.SAdd(ctx, c.keys.OnlineInstanceConns(instanceID), fmt.Sprintf("%d|%s", auctionID, connectionID))
+	gPipe.SAdd(ctx, c.keys.OnlineInstanceConns(instanceID), onlineIndexMember(auctionID, connectionID, userID))
 	gPipe.Expire(ctx, c.keys.OnlineInstanceConns(instanceID), c.ttl+time.Hour)
 	if _, err := gPipe.Exec(ctx); err != nil {
 		return 0, err
 	}
-	// 拍卖维度的 ZSET 落到 auction 的 shard。
+	// 拍卖维度的用户 ZSET 落到 auction 的 shard；同一 userID 多连接只算一次。
 	aShard := c.auctionShard(auctionID)
-	key := c.keys.OnlineAuction(auctionID)
+	key := c.keys.OnlineAuctionUsers(auctionID)
+	userConnsKey := c.keys.OnlineAuctionUserConns(auctionID, userID)
 	aPipe := aShard.Pipeline()
 	aPipe.ZRemRangeByScore(ctx, key, "-inf", strconv.FormatInt(nowMS, 10))
-	aPipe.ZAdd(ctx, key, redisgo.Z{Score: float64(expiresMS), Member: connectionID})
+	aPipe.SAdd(ctx, userConnsKey, connectionID)
+	aPipe.Expire(ctx, userConnsKey, c.ttl+time.Hour)
+	aPipe.ZAdd(ctx, key, redisgo.Z{Score: float64(expiresMS), Member: userID})
 	aPipe.Expire(ctx, key, c.ttl+time.Hour)
 	card := aPipe.ZCard(ctx, key)
 	if _, err := aPipe.Exec(ctx); err != nil {
@@ -89,23 +95,37 @@ func (c *OnlineCounter) Join(ctx context.Context, auctionID uint64, connectionID
 	return clampNonNegative(card.Val()), nil
 }
 
-func (c *OnlineCounter) Leave(ctx context.Context, auctionID uint64, connectionID string) (int, error) {
+func (c *OnlineCounter) Leave(ctx context.Context, auctionID uint64, connectionID, userID string) (int, error) {
 	if err := c.validate(connectionID); err != nil {
 		return 0, err
 	}
 	nowMS := time.Now().UTC().UnixMilli()
 	instanceID, _ := splitOnlineMember(connectionID)
-	if instanceID != "" {
-		gShard := c.globalShard()
-		if err := gShard.SRem(ctx, c.keys.OnlineInstanceConns(instanceID), fmt.Sprintf("%d|%s", auctionID, connectionID)).Err(); err != nil {
-			return 0, err
-		}
+	if instanceID == "" {
+		instanceID = c.instanceID
+		connectionID = instanceID + ":" + connectionID
+	}
+	userID = normalizeOnlineUserID(userID, connectionID)
+	gShard := c.globalShard()
+	if err := gShard.SRem(ctx, c.keys.OnlineInstanceConns(instanceID), onlineIndexMember(auctionID, connectionID, userID)).Err(); err != nil {
+		return 0, err
 	}
 	aShard := c.auctionShard(auctionID)
-	key := c.keys.OnlineAuction(auctionID)
+	key := c.keys.OnlineAuctionUsers(auctionID)
+	userConnsKey := c.keys.OnlineAuctionUserConns(auctionID, userID)
+	if err := aShard.SRem(ctx, userConnsKey, connectionID).Err(); err != nil {
+		return 0, err
+	}
+	remaining, err := aShard.SCard(ctx, userConnsKey).Result()
+	if err != nil {
+		return 0, err
+	}
 	pipe := aShard.Pipeline()
-	pipe.ZRem(ctx, key, connectionID)
 	pipe.ZRemRangeByScore(ctx, key, "-inf", strconv.FormatInt(nowMS, 10))
+	if remaining <= 0 {
+		pipe.ZRem(ctx, key, userID)
+		pipe.Del(ctx, userConnsKey)
+	}
 	card := pipe.ZCard(ctx, key)
 	if _, err := pipe.Exec(ctx); err != nil {
 		return 0, err
@@ -113,7 +133,7 @@ func (c *OnlineCounter) Leave(ctx context.Context, auctionID uint64, connectionI
 	return clampNonNegative(card.Val()), nil
 }
 
-func (c *OnlineCounter) Touch(ctx context.Context, auctionID uint64, connectionID string) (int, error) {
+func (c *OnlineCounter) Touch(ctx context.Context, auctionID uint64, connectionID, userID string) (int, error) {
 	if err := c.validate(connectionID); err != nil {
 		return 0, err
 	}
@@ -124,20 +144,25 @@ func (c *OnlineCounter) Touch(ctx context.Context, auctionID uint64, connectionI
 		instanceID = c.instanceID
 		connectionID = instanceID + ":" + connectionID
 	}
+	userID = normalizeOnlineUserID(userID, connectionID)
 	gShard := c.globalShard()
 	gPipe := gShard.Pipeline()
 	gPipe.Set(ctx, c.keys.WSInstanceHeartbeat(instanceID), "1", c.ttl)
 	gPipe.SAdd(ctx, c.keys.WSInstances(), instanceID)
-	gPipe.SAdd(ctx, c.keys.OnlineInstanceConns(instanceID), fmt.Sprintf("%d|%s", auctionID, connectionID))
+	gPipe.SAdd(ctx, c.keys.OnlineInstanceConns(instanceID), onlineIndexMember(auctionID, connectionID, userID))
 	gPipe.Expire(ctx, c.keys.OnlineInstanceConns(instanceID), c.ttl+time.Hour)
 	if _, err := gPipe.Exec(ctx); err != nil {
 		return 0, err
 	}
 	aShard := c.auctionShard(auctionID)
-	key := c.keys.OnlineAuction(auctionID)
+	key := c.keys.OnlineAuctionUsers(auctionID)
+	userConnsKey := c.keys.OnlineAuctionUserConns(auctionID, userID)
 	aPipe := aShard.Pipeline()
 	aPipe.ZRemRangeByScore(ctx, key, "-inf", strconv.FormatInt(nowMS, 10))
-	aPipe.ZAdd(ctx, key, redisgo.Z{Score: float64(expiresMS), Member: connectionID})
+	aPipe.SAdd(ctx, userConnsKey, connectionID)
+	aPipe.Expire(ctx, userConnsKey, c.ttl+time.Hour)
+	aPipe.ZAdd(ctx, key, redisgo.Z{Score: float64(expiresMS), Member: userID})
+	aPipe.Expire(ctx, key, c.ttl+time.Hour)
 	card := aPipe.ZCard(ctx, key)
 	if _, err := aPipe.Exec(ctx); err != nil {
 		return 0, err
@@ -166,35 +191,12 @@ func (c *OnlineCounter) CleanupDeadInstances(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		// 按 auction 分桶，分别下到对应 shard。
-		buckets := make(map[*RedisRTClient][]struct {
-			key    string
-			member string
-		})
 		for _, member := range members {
-			parts := strings.SplitN(member, "|", 2)
-			if len(parts) != 2 {
+			auctionID, connectionID, userID, ok := splitOnlineIndexMember(member)
+			if !ok {
 				continue
 			}
-			auctionID, err := strconv.ParseUint(parts[0], 10, 64)
-			if err != nil {
-				continue
-			}
-			shard := c.auctionShard(auctionID)
-			if shard == nil {
-				continue
-			}
-			buckets[shard] = append(buckets[shard], struct {
-				key    string
-				member string
-			}{key: c.keys.OnlineAuction(auctionID), member: parts[1]})
-		}
-		for shard, ops := range buckets {
-			pipe := shard.Pipeline()
-			for _, op := range ops {
-				pipe.ZRem(ctx, op.key, op.member)
-			}
-			if _, err := pipe.Exec(ctx); err != nil {
+			if err := c.removeUserConnection(ctx, auctionID, connectionID, userID, time.Now().UTC().UnixMilli()); err != nil {
 				return err
 			}
 		}
@@ -232,7 +234,7 @@ func (c *OnlineCounter) Count(ctx context.Context, auctionID uint64) (int, error
 	}
 	nowMS := time.Now().UTC().UnixMilli()
 	aShard := c.auctionShard(auctionID)
-	key := c.keys.OnlineAuction(auctionID)
+	key := c.keys.OnlineAuctionUsers(auctionID)
 	pipe := aShard.Pipeline()
 	pipe.ZRemRangeByScore(ctx, key, "-inf", strconv.FormatInt(nowMS, 10))
 	card := pipe.ZCard(ctx, key)
@@ -240,6 +242,30 @@ func (c *OnlineCounter) Count(ctx context.Context, auctionID uint64) (int, error
 		return 0, err
 	}
 	return clampNonNegative(card.Val()), nil
+}
+
+func (c *OnlineCounter) removeUserConnection(ctx context.Context, auctionID uint64, connectionID, userID string, nowMS int64) error {
+	aShard := c.auctionShard(auctionID)
+	if aShard == nil {
+		return nil
+	}
+	key := c.keys.OnlineAuctionUsers(auctionID)
+	userConnsKey := c.keys.OnlineAuctionUserConns(auctionID, userID)
+	if err := aShard.SRem(ctx, userConnsKey, connectionID).Err(); err != nil {
+		return err
+	}
+	remaining, err := aShard.SCard(ctx, userConnsKey).Result()
+	if err != nil {
+		return err
+	}
+	pipe := aShard.Pipeline()
+	pipe.ZRemRangeByScore(ctx, key, "-inf", strconv.FormatInt(nowMS, 10))
+	if remaining <= 0 {
+		pipe.ZRem(ctx, key, userID)
+		pipe.Del(ctx, userConnsKey)
+	}
+	_, err = pipe.Exec(ctx)
+	return err
 }
 
 func (c *OnlineCounter) validate(connectionID string) error {
@@ -265,4 +291,34 @@ func splitOnlineMember(member string) (string, string) {
 		return "", member
 	}
 	return member[:idx], member[idx+1:]
+}
+
+func normalizeOnlineUserID(userID, connectionID string) string {
+	if strings.TrimSpace(userID) == "" {
+		return "conn:" + connectionID
+	}
+	return "user:" + userID
+}
+
+func onlineIndexMember(auctionID uint64, connectionID, userID string) string {
+	return fmt.Sprintf("%d|%s|%s", auctionID, connectionID, userID)
+}
+
+func splitOnlineIndexMember(member string) (uint64, string, string, bool) {
+	parts := strings.SplitN(member, "|", 3)
+	if len(parts) < 2 {
+		return 0, "", "", false
+	}
+	auctionID, err := strconv.ParseUint(parts[0], 10, 64)
+	if err != nil {
+		return 0, "", "", false
+	}
+	connectionID := parts[1]
+	userID := ""
+	if len(parts) == 3 {
+		userID = parts[2]
+	} else {
+		userID = normalizeOnlineUserID("", connectionID)
+	}
+	return auctionID, connectionID, userID, true
 }

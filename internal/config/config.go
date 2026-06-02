@@ -56,6 +56,7 @@ type Config struct {
 	WebSocket     WebSocketConfig     `yaml:"websocket"`
 	ObjectStorage ObjectStorageConfig `yaml:"objectStorage"`
 	Agent         AgentConfig         `yaml:"agent"`
+	DoubaoTTS     DoubaoTTSConfig     `yaml:"doubaoTTS"`
 	Kafka         KafkaConfig         `yaml:"kafka"`
 	MCP           MCPConfig           `yaml:"mcp"`
 	Observability ObservabilityConfig `yaml:"observability"`
@@ -114,12 +115,13 @@ type IDGenConfig struct {
 }
 
 type AuctionConfig struct {
-	MinIncrementCent int64 `yaml:"minIncrementCent"`
-	AntiSnipeMs      int64 `yaml:"antiSnipeMs"`
-	ExtendMs         int64 `yaml:"extendMs"`
-	MaxExtendCount   int   `yaml:"maxExtendCount"`
-	FreqLimitCount   int   `yaml:"freqLimitCount"`
-	FreqWindowMs     int64 `yaml:"freqWindowMs"`
+	MinIncrementCent  int64    `yaml:"minIncrementCent"`
+	AntiSnipeMs       int64    `yaml:"antiSnipeMs"`
+	ExtendMs          int64    `yaml:"extendMs"`
+	MaxExtendCount    int      `yaml:"maxExtendCount"`
+	FreqLimitCount    int      `yaml:"freqLimitCount"`
+	FreqWindowMs      int64    `yaml:"freqWindowMs"`
+	BidIdempotencyTTL Duration `yaml:"bidIdempotencyTTL"`
 }
 
 type RiskControlConfig struct {
@@ -153,6 +155,12 @@ type AgentConfig struct {
 	LiveAnalysisCallbackAPIKey string   `yaml:"liveAnalysisCallbackAPIKey"`
 	LiveAuctionHookURL         string   `yaml:"liveAuctionHookURL"`
 	Timeout                    Duration `yaml:"timeout"`
+}
+
+type DoubaoTTSConfig struct {
+	AppID    string `yaml:"appID"`
+	AckToken string `yaml:"ackToken"`
+	Voice    string `yaml:"voice"`
 }
 
 type KafkaConfig struct {
@@ -271,12 +279,13 @@ func Default() Config {
 			WorkerID: 1,
 		},
 		Auction: AuctionConfig{
-			MinIncrementCent: 100,
-			AntiSnipeMs:      30000,
-			ExtendMs:         30000,
-			MaxExtendCount:   20,
-			FreqLimitCount:   10,
-			FreqWindowMs:     1000,
+			MinIncrementCent:  100,
+			AntiSnipeMs:       30000,
+			ExtendMs:          30000,
+			MaxExtendCount:    20,
+			FreqLimitCount:    10,
+			FreqWindowMs:      1000,
+			BidIdempotencyTTL: Duration(30 * time.Second),
 		},
 		RiskControl: RiskControlConfig{
 			Enabled: true,
@@ -298,12 +307,15 @@ func Default() Config {
 		Agent: AgentConfig{
 			ProductDescriptionURL:      "http://127.0.0.1:8000/api/v1/product-description",
 			ProductAuditURL:            "http://127.0.0.1:8000/api/v1/product-audit",
-			ProductAuditCallbackURL:    "http://127.0.0.1:8080/api/v1/items/audit/callback",
+			ProductAuditCallbackURL:    "http://127.0.0.1:8080/api/v1/auctions/audit/callback",
 			LiveAnalysisURL:            "http://127.0.0.1:8000/api/v1/live-analysis/async",
 			LiveAnalysisCallbackURL:    "http://127.0.0.1:8080/api/v1/live-analysis/callback",
 			LiveAnalysisCallbackAPIKey: "change-me-in-local-dev-live-analysis-callback",
-			LiveAuctionHookURL:         "",
+			LiveAuctionHookURL:         "http://127.0.0.1:8000/api/v1/live-auction-hook",
 			Timeout:                    Duration(30 * time.Second),
+		},
+		DoubaoTTS: DoubaoTTSConfig{
+			Voice: "zh_female_vv_jupiter_bigtts",
 		},
 		Kafka: KafkaConfig{
 			Enabled:            false,
@@ -444,6 +456,9 @@ func (c Config) Validate() error {
 	if c.Idempotency.TTL.Std() <= 0 {
 		return fmt.Errorf("idempotency.ttl must be positive")
 	}
+	if c.Auction.BidIdempotencyTTL.Std() <= 0 {
+		return fmt.Errorf("auction.bidIdempotencyTTL must be positive")
+	}
 	if c.IDGen.WorkerID < 0 || c.IDGen.WorkerID > 255 {
 		return fmt.Errorf("idgen.workerID must be between 0 and 255")
 	}
@@ -500,6 +515,9 @@ func (c Config) Validate() error {
 	if c.Agent.Timeout.Std() <= 0 {
 		return fmt.Errorf("agent.timeout must be positive")
 	}
+	if err := c.DoubaoTTS.validate(); err != nil {
+		return err
+	}
 	c.Kafka.normalize()
 	if err := c.Kafka.validate(); err != nil {
 		return err
@@ -552,6 +570,24 @@ func validateMCPAuthConfig(prefix string, auth MCPAuthConfig) error {
 	case "buyer", "merchant", "admin":
 	default:
 		return fmt.Errorf("%s.actorRole must be one of buyer, merchant, admin", prefix)
+	}
+	return nil
+}
+
+func (c DoubaoTTSConfig) validate() error {
+	appID := strings.TrimSpace(c.AppID)
+	ackToken := strings.TrimSpace(c.AckToken)
+	if appID == "" && ackToken == "" {
+		return nil
+	}
+	if appID == "" {
+		return fmt.Errorf("doubaoTTS.appID is required when doubao TTS is enabled")
+	}
+	if ackToken == "" {
+		return fmt.Errorf("doubaoTTS.ackToken is required when doubao TTS is enabled")
+	}
+	if strings.TrimSpace(c.Voice) == "" {
+		return fmt.Errorf("doubaoTTS.voice is required when doubao TTS is enabled")
 	}
 	return nil
 }
@@ -689,6 +725,9 @@ func (c *Config) applyEnv() error {
 	if err := setInt64("AUCTION_FREQ_WINDOW_MS", &c.Auction.FreqWindowMs); err != nil {
 		return err
 	}
+	if err := setDuration("AUCTION_BID_IDEMPOTENCY_TTL", &c.Auction.BidIdempotencyTTL); err != nil {
+		return err
+	}
 	if err := setBool("RISK_CONTROL_ENABLED", &c.RiskControl.Enabled); err != nil {
 		return err
 	}
@@ -727,6 +766,10 @@ func (c *Config) applyEnv() error {
 	if err := setDuration("AGENT_TIMEOUT", &c.Agent.Timeout); err != nil {
 		return err
 	}
+
+	setString("DOUBAO_TTS_APP_ID", &c.DoubaoTTS.AppID)
+	setString("DOUBAO_TTS_ACK_TOKEN", &c.DoubaoTTS.AckToken)
+	setString("DOUBAO_TTS_VOICE", &c.DoubaoTTS.Voice)
 
 	if err := setBool("KAFKA_ENABLED", &c.Kafka.Enabled); err != nil {
 		return err

@@ -7,7 +7,7 @@
 --   API/domain ID : u_91000001 ~ u_91000100
 --
 -- 登录信息：
---   account  : loadbuyer001 ~ loadbuyer100
+--   account  : loadbuyer0001 ~ loadbuyer0100
 --   password : Passw0rd!
 --
 -- 可重放性：
@@ -18,13 +18,29 @@
 SET NAMES utf8mb4;
 SET time_zone = '+08:00';
 
+-- 统一成 4 位补零账号格式：loadbuyer0001 ~ loadbuyer0100。
+UPDATE `user` AS u
+LEFT JOIN `user` AS c
+  ON c.`account` = CONCAT('loadbuyer', LPAD(u.`id` - 91000000, 4, '0'))
+ AND c.`id` <> u.`id`
+SET
+  u.`account` = CONCAT('loadbuyer', LPAD(u.`id` - 91000000, 4, '0')),
+  u.`nickname` = CONCAT('压测买家', LPAD(u.`id` - 91000000, 4, '0'))
+WHERE u.`id` BETWEEN 91000001 AND 91000100
+  AND u.`role` = 'buyer'
+  AND c.`id` IS NULL
+  AND (
+    u.`account` <> CONCAT('loadbuyer', LPAD(u.`id` - 91000000, 4, '0'))
+    OR u.`nickname` <> CONCAT('压测买家', LPAD(u.`id` - 91000000, 4, '0'))
+  );
+
 INSERT IGNORE INTO `user`
   (`id`, `account`, `phone`, `nickname`, `password_hash`, `role`, `status`)
 SELECT
   91000000 + seq.n AS `id`,
-  CONCAT('loadbuyer', LPAD(seq.n, 3, '0')) AS `account`,
+  CONCAT('loadbuyer', LPAD(seq.n, 4, '0')) AS `account`,
   CONCAT('13991', LPAD(seq.n, 6, '0')) AS `phone`,
-  CONCAT('压测买家', LPAD(seq.n, 3, '0')) AS `nickname`,
+  CONCAT('压测买家', LPAD(seq.n, 4, '0')) AS `nickname`,
   'e027cbdb3f9674449886392eaefd930e17d60411538b6fd2b7612431134e7fca' AS `password_hash`,
   'buyer' AS `role`,
   'ACTIVE' AS `status`

@@ -421,6 +421,9 @@ func TestHammerAndOrderPayAreIdempotent(t *testing.T) {
 	if closed.Status != domain.AuctionStatusClosedWon || closed.WinnerID != "u_1001" || order == nil || order.ID == 0 {
 		t.Fatalf("unexpected hammer result=%+v order=%+v", closed, order)
 	}
+	if order.PayDeadline == nil || !order.PayDeadline.Equal(order.CreatedAt.Add(DefaultOrderPayTimeout)) {
+		t.Fatalf("expected %s pay deadline, got order=%+v", DefaultOrderPayTimeout, order)
+	}
 	again, orderAgain, err := fixture.hammers.Hammer(ctx, domain.HammerInput{RequestID: "hammer-1", AuctionID: fixture.auctionID, ActorID: "u_2001", ActorRole: domain.RoleMerchant, ClosedBy: "u_2001"})
 	if err != nil {
 		t.Fatalf("hammer duplicate: %v", err)
@@ -575,7 +578,6 @@ func newRealtimeAuctionFixtureWithTiming(t *testing.T, cfg appconfig.AuctionConf
 func newRealtimeAuctionFixtureWithRule(t *testing.T, cfg appconfig.AuctionConfig, endOffset time.Duration, reservePrice int64, rule json.RawMessage) realtimeAuctionFixture {
 	t.Helper()
 	ctx := context.Background()
-	itemRepo := repository.NewMemoryItemRepository()
 	auctionRepo := repository.NewMemoryAuctionRepository()
 	bidRepo := repository.NewMemoryBidRepository()
 	depositRepo := repository.NewMemoryDepositRepository()
@@ -589,7 +591,7 @@ func newRealtimeAuctionFixtureWithRule(t *testing.T, cfg appconfig.AuctionConfig
 	depositSvc.SetRiskControlService(riskControlSvc)
 	orderSvc := NewOrderService(orderRepo, repository.NoopTxManager{})
 	hammerSvc := NewHammerService(auctionRepo, orderRepo, depositRepo, realtime, repository.NoopTxManager{}, nil)
-	auctionSvc := NewAuctionService(auctionRepo, itemRepo, repository.NoopTxManager{})
+	auctionSvc := NewAuctionService(auctionRepo, repository.NoopTxManager{})
 	auctionSvc.SetRealtime(realtime)
 	auctionSvc.SetAuctionConfig(cfg)
 	bidSvc := NewBidService(bidRepo, auctionRepo, realtime, riskSvc, nil, cfg)
@@ -597,10 +599,6 @@ func newRealtimeAuctionFixtureWithRule(t *testing.T, cfg appconfig.AuctionConfig
 	bidSvc.SetConfigRepository(configRepo)
 	bidSvc.SetRiskControlService(riskControlSvc)
 
-	item := domain.Item{SellerID: "u_2001", Title: "Watch", Category: "luxury", ConditionGrade: domain.ConditionNew, Status: domain.ItemStatusReady}
-	if err := itemRepo.Create(ctx, &item); err != nil {
-		t.Fatalf("create item: %v", err)
-	}
 	now := time.Now().UTC()
 	endTime := now.Add(endOffset)
 	startTime := now.Add(-time.Minute)
@@ -610,7 +608,10 @@ func newRealtimeAuctionFixtureWithRule(t *testing.T, cfg appconfig.AuctionConfig
 	auction, err := auctionSvc.Create(ctx, CreateAuctionInput{
 		ActorID:           "u_2001",
 		ActorRole:         domain.RoleMerchant,
-		ItemID:            item.ID,
+		Title:             "Watch",
+		Category:          "luxury",
+		ConditionGrade:    domain.ConditionNew,
+		Description:       "rare watch",
 		AuctionType:       domain.AuctionTypeEnglish,
 		StartPrice:        1000,
 		ReservePrice:      reservePrice,

@@ -19,7 +19,7 @@ func TestOnlineCounterTouchHeartbeatIndexJanitorAndFallback(t *testing.T) {
 	sharded := NewShardedRTClientFromShards([]*RedisRTClient{rt})
 	counter := NewOnlineCounter(sharded, keys, 100*time.Millisecond)
 
-	count, err := counter.Touch(ctx, 10001, "conn-1")
+	count, err := counter.Touch(ctx, 10001, "conn-1", "u_1001")
 	if err != nil || count != 1 {
 		t.Fatalf("touch count=%d err=%v", count, err)
 	}
@@ -30,12 +30,13 @@ func TestOnlineCounterTouchHeartbeatIndexJanitorAndFallback(t *testing.T) {
 	if exists, err := client.Exists(ctx, keys.WSInstanceHeartbeat(counter.InstanceID())).Result(); err != nil || exists != 1 {
 		t.Fatalf("heartbeat missing exists=%d err=%v", exists, err)
 	}
-	if ok, err := client.SIsMember(ctx, keys.OnlineInstanceConns(counter.InstanceID()), "10001|"+member).Result(); err != nil || !ok {
+	userID := normalizeOnlineUserID("u_1001", member)
+	if ok, err := client.SIsMember(ctx, keys.OnlineInstanceConns(counter.InstanceID()), onlineIndexMember(10001, member, userID)).Result(); err != nil || !ok {
 		t.Fatalf("instance connection index missing ok=%v err=%v", ok, err)
 	}
 	firstTTL := mr.TTL(keys.WSInstanceHeartbeat(counter.InstanceID()))
 	mr.FastForward(50 * time.Millisecond)
-	if _, err := counter.Touch(ctx, 10001, member); err != nil {
+	if _, err := counter.Touch(ctx, 10001, member, "u_1001"); err != nil {
 		t.Fatalf("refresh touch: %v", err)
 	}
 	if refreshedTTL := mr.TTL(keys.WSInstanceHeartbeat(counter.InstanceID())); refreshedTTL <= firstTTL/2 {
@@ -51,7 +52,53 @@ func TestOnlineCounterTouchHeartbeatIndexJanitorAndFallback(t *testing.T) {
 	}
 
 	_ = client.Close()
-	if _, err := counter.Touch(ctx, 10001, "conn-fallback"); err == nil {
+	if _, err := counter.Touch(ctx, 10001, "conn-fallback", "u_1001"); err == nil {
 		t.Fatal("expected redis failure to surface so hub can fall back to local count")
+	}
+}
+
+func TestOnlineCounterCountsDistinctUsers(t *testing.T) {
+	ctx := context.Background()
+	mr := miniredis.RunT(t)
+	client := redisgo.NewClient(&redisgo.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = client.Close() })
+	keys := NewKeyBuilder("test")
+	rt := &RedisRTClient{Client: client}
+	sharded := NewShardedRTClientFromShards([]*RedisRTClient{rt})
+	counter := NewOnlineCounter(sharded, keys, time.Minute)
+
+	if count, err := counter.Join(ctx, 10001, "conn-1", "u_1001"); err != nil || count != 1 {
+		t.Fatalf("join first count=%d err=%v", count, err)
+	}
+	if count, err := counter.Join(ctx, 10001, "conn-2", "u_1001"); err != nil || count != 1 {
+		t.Fatalf("same user should still count once, count=%d err=%v", count, err)
+	}
+	if count, err := counter.Join(ctx, 10001, "conn-3", "u_1002"); err != nil || count != 2 {
+		t.Fatalf("second user count=%d err=%v", count, err)
+	}
+	if count, err := counter.Leave(ctx, 10001, counter.InstanceID()+":conn-1", "u_1001"); err != nil || count != 2 {
+		t.Fatalf("leaving one duplicate connection should keep user online, count=%d err=%v", count, err)
+	}
+	if count, err := counter.Leave(ctx, 10001, counter.InstanceID()+":conn-2", "u_1001"); err != nil || count != 1 {
+		t.Fatalf("leaving last duplicate connection should remove user, count=%d err=%v", count, err)
+	}
+}
+
+func TestOnlineCounterDefaultTTLIsShort(t *testing.T) {
+	ctx := context.Background()
+	mr := miniredis.RunT(t)
+	client := redisgo.NewClient(&redisgo.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = client.Close() })
+	keys := NewKeyBuilder("test")
+	rt := &RedisRTClient{Client: client}
+	sharded := NewShardedRTClientFromShards([]*RedisRTClient{rt})
+	counter := NewOnlineCounter(sharded, keys, 0)
+
+	if _, err := counter.Touch(ctx, 10001, "conn-1", "u_1001"); err != nil {
+		t.Fatalf("touch: %v", err)
+	}
+	ttl := mr.TTL(keys.WSInstanceHeartbeat(counter.InstanceID()))
+	if ttl <= time.Minute || ttl > DefaultOnlineCounterTTL {
+		t.Fatalf("expected default heartbeat ttl in (1m,%s], got %s", DefaultOnlineCounterTTL, ttl)
 	}
 }

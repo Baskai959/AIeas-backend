@@ -24,6 +24,7 @@ type Handler struct {
 	serverName    string
 	schemaVersion string
 	metrics       *metrics.Registry
+	assistant     *service.AIAssistantService
 }
 
 type APIKeyAuthConfig struct {
@@ -59,6 +60,10 @@ func (h *Handler) SetMetrics(reg *metrics.Registry) {
 		return
 	}
 	h.metrics = reg
+}
+
+func (h *Handler) SetAIAssistant(assistant *service.AIAssistantService) {
+	h.assistant = assistant
 }
 
 type rpcRequest struct {

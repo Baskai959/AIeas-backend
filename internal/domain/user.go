@@ -26,12 +26,37 @@ const (
 	UserStatusDisabled UserStatus = "DISABLED"
 )
 
+type MerchantAIPermission string
+
+const (
+	MerchantAIPermissionAsk   MerchantAIPermission = "ASK"
+	MerchantAIPermissionAllow MerchantAIPermission = "ALLOW"
+	MerchantAIPermissionDeny  MerchantAIPermission = "DENY"
+)
+
+func (p MerchantAIPermission) Valid() bool {
+	switch p {
+	case MerchantAIPermissionAsk, MerchantAIPermissionAllow, MerchantAIPermissionDeny:
+		return true
+	default:
+		return false
+	}
+}
+
+func NormalizeMerchantAIPermission(permission MerchantAIPermission) MerchantAIPermission {
+	if permission.Valid() {
+		return permission
+	}
+	return MerchantAIPermissionAsk
+}
+
 type User struct {
 	ID           string
 	Account      string
 	Nickname     string
 	Role         Role
 	Status       UserStatus
+	AIPermission MerchantAIPermission
 	PasswordHash string
 }
 
@@ -44,14 +69,15 @@ type UserFilter struct {
 }
 
 type SafeUser struct {
-	ID       string     `json:"id"`
-	Nickname string     `json:"nickname"`
-	Role     Role       `json:"role"`
-	Status   UserStatus `json:"status,omitempty"`
+	ID           string               `json:"id"`
+	Nickname     string               `json:"nickname"`
+	Role         Role                 `json:"role"`
+	Status       UserStatus           `json:"status,omitempty"`
+	AIPermission MerchantAIPermission `json:"aiPermission,omitempty"`
 }
 
 func (u User) Safe() SafeUser {
-	return SafeUser{ID: u.ID, Nickname: u.Nickname, Role: u.Role, Status: u.Status}
+	return SafeUser{ID: u.ID, Nickname: u.Nickname, Role: u.Role, Status: u.Status, AIPermission: NormalizeMerchantAIPermission(u.AIPermission)}
 }
 
 var (

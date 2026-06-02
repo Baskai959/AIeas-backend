@@ -1,6 +1,10 @@
 package metrics
 
-import "time"
+import (
+	"time"
+
+	redisgo "github.com/redis/go-redis/v9"
+)
 
 // statusBucket 把 HTTP 状态码归入低基数桶，避免使用具体的 400/401/... 字符串。
 func statusBucket(status int) string {
@@ -64,6 +68,19 @@ func (r *Registry) ObserveBid(result, reason string, elapsed time.Duration) {
 	}
 	r.bidTotal.WithLabelValues(result, reason).Inc()
 	r.bidDuration.Observe(elapsed.Seconds())
+}
+
+func (r *Registry) ObserveBidStage(stage, result string, elapsed time.Duration) {
+	if !r.Enabled() {
+		return
+	}
+	if stage == "" {
+		stage = "unknown"
+	}
+	if result == "" {
+		result = "ok"
+	}
+	r.bidStageDuration.WithLabelValues(stage, result).Observe(elapsed.Seconds())
 }
 
 func (r *Registry) IncBidReject(reason string) {
@@ -189,6 +206,25 @@ func (r *Registry) ObserveRedisLua(script string, elapsed time.Duration, errClas
 	if errClass != "" {
 		r.redisLuaErrors.WithLabelValues(script, errClass).Inc()
 	}
+}
+
+// ObserveRedisPoolStats 把某个 Redis 实例的连接池快照写入 gauge（带 instance 维度）。
+// WaitDurationNs 换算为秒；instance 空串时回退到 "default"。
+func (r *Registry) ObserveRedisPoolStats(instance string, st *redisgo.PoolStats) {
+	if !r.Enabled() || st == nil {
+		return
+	}
+	if instance == "" {
+		instance = "default"
+	}
+	r.redisPoolTotalConns.WithLabelValues(instance).Set(float64(st.TotalConns))
+	r.redisPoolIdleConns.WithLabelValues(instance).Set(float64(st.IdleConns))
+	r.redisPoolStaleConns.WithLabelValues(instance).Set(float64(st.StaleConns))
+	r.redisPoolWaitCount.WithLabelValues(instance).Set(float64(st.WaitCount))
+	r.redisPoolWaitDurationTotal.WithLabelValues(instance).Set(float64(st.WaitDurationNs) / 1e9)
+	r.redisPoolTimeouts.WithLabelValues(instance).Set(float64(st.Timeouts))
+	r.redisPoolHits.WithLabelValues(instance).Set(float64(st.Hits))
+	r.redisPoolMisses.WithLabelValues(instance).Set(float64(st.Misses))
 }
 
 // ----- Worker -----

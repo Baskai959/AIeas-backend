@@ -29,7 +29,6 @@ type IDType uint8
 
 const (
 	IDTypeAuction IDType = 1
-	IDTypeItem    IDType = 2
 	IDTypeOrder   IDType = 3
 	IDTypeRoom    IDType = 4
 )

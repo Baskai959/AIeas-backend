@@ -17,7 +17,9 @@ type OrderRepository interface {
 	FindByAuctionID(ctx context.Context, auctionID uint64) (domain.OrderDeal, error)
 	FindByID(ctx context.Context, id uint64) (domain.OrderDeal, error)
 	List(ctx context.Context, filter domain.OrderFilter) ([]domain.OrderDeal, error)
+	ListPayTimeoutCandidates(ctx context.Context, now time.Time, limit int) ([]domain.OrderDeal, error)
 	Update(ctx context.Context, order *domain.OrderDeal) error
+	UpdateStatusWithVersion(ctx context.Context, order *domain.OrderDeal, expectedVersion int64, allowedFromStatuses []domain.OrderStatus) error
 }
 
 type MySQLOrderRepository struct {
@@ -109,6 +111,26 @@ func (r *MySQLOrderRepository) List(ctx context.Context, filter domain.OrderFilt
 	return orders, nil
 }
 
+func (r *MySQLOrderRepository) ListPayTimeoutCandidates(ctx context.Context, now time.Time, limit int) ([]domain.OrderDeal, error) {
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	var rows []orderRow
+	err := r.dbFor(ctx).Table("order_deal").
+		Where("status = ? AND pay_status = ? AND pay_deadline IS NOT NULL AND pay_deadline <= ?", domain.OrderStatusCreated, domain.PayStatusUnpaid, now.UTC()).
+		Order("pay_deadline ASC, id ASC").
+		Limit(limit).
+		Find(&rows).Error
+	if err != nil {
+		return nil, err
+	}
+	orders := make([]domain.OrderDeal, 0, len(rows))
+	for _, row := range rows {
+		orders = append(orders, row.toDomain())
+	}
+	return orders, nil
+}
+
 func (r *MySQLOrderRepository) Update(ctx context.Context, order *domain.OrderDeal) error {
 	row := orderRowFromDomain(*order)
 	row.UpdatedAt = time.Now().UTC()
@@ -127,10 +149,47 @@ func (r *MySQLOrderRepository) Update(ctx context.Context, order *domain.OrderDe
 	return nil
 }
 
+func (r *MySQLOrderRepository) UpdateStatusWithVersion(ctx context.Context, order *domain.OrderDeal, expectedVersion int64, allowedFromStatuses []domain.OrderStatus) error {
+	if order == nil || order.ID == 0 {
+		return domain.ErrInvalidArgument
+	}
+	now := time.Now().UTC()
+	updates := map[string]interface{}{
+		"status":     order.Status,
+		"pay_status": order.PayStatus,
+		"paid_at":    order.PaidAt,
+		"closed_at":  order.ClosedAt,
+		"version":    gorm.Expr("version + 1"),
+		"updated_at": now,
+	}
+	query := r.dbFor(ctx).Table("order_deal").Where("id = ? AND version = ?", order.ID, expectedVersion)
+	if len(allowedFromStatuses) > 0 {
+		query = query.Where("status IN ?", allowedFromStatuses)
+	}
+	res := query.Updates(updates)
+	if res.Error != nil {
+		return res.Error
+	}
+	if res.RowsAffected == 0 {
+		current, err := r.FindByID(ctx, order.ID)
+		if err != nil {
+			return err
+		}
+		if current.Status.Terminal() {
+			return domain.ErrInvalidState
+		}
+		return domain.ErrOptimisticConflict
+	}
+	order.Version = expectedVersion + 1
+	order.UpdatedAt = now
+	return nil
+}
+
 type orderRow struct {
 	ID            uint64             `gorm:"column:id;primaryKey"`
 	AuctionID     uint64             `gorm:"column:auction_id"`
 	LiveSessionID *uint64            `gorm:"column:live_session_id"`
+	LotSnapshot   []byte             `gorm:"column:lot_snapshot"`
 	WinnerID      string             `gorm:"column:winner_id"`
 	SellerID      string             `gorm:"column:seller_id"`
 	DealPrice     int64              `gorm:"column:deal_price"`
@@ -140,6 +199,7 @@ type orderRow struct {
 	PayDeadline   *time.Time         `gorm:"column:pay_deadline"`
 	PaidAt        *time.Time         `gorm:"column:paid_at"`
 	ClosedAt      *time.Time         `gorm:"column:closed_at"`
+	Version       int64              `gorm:"column:version;not null;default:0"`
 	CreatedAt     time.Time          `gorm:"column:created_at"`
 	UpdatedAt     time.Time          `gorm:"column:updated_at"`
 }
@@ -149,6 +209,7 @@ func orderRowFromDomain(order domain.OrderDeal) orderRow {
 		ID:            order.ID,
 		AuctionID:     order.AuctionID,
 		LiveSessionID: cloneUint64Ptr(order.LiveSessionID),
+		LotSnapshot:   []byte(order.LotSnapshot),
 		WinnerID:      normalizeUserIDForDB(order.WinnerID),
 		SellerID:      normalizeUserIDForDB(order.SellerID),
 		DealPrice:     order.DealPrice,
@@ -158,6 +219,7 @@ func orderRowFromDomain(order domain.OrderDeal) orderRow {
 		PayDeadline:   order.PayDeadline,
 		PaidAt:        order.PaidAt,
 		ClosedAt:      order.ClosedAt,
+		Version:       order.Version,
 		CreatedAt:     order.CreatedAt,
 		UpdatedAt:     order.UpdatedAt,
 	}
@@ -168,15 +230,17 @@ func (r orderRow) toDomain() domain.OrderDeal {
 		ID:            r.ID,
 		AuctionID:     r.AuctionID,
 		LiveSessionID: cloneUint64Ptr(r.LiveSessionID),
+		LotSnapshot:   append([]byte(nil), r.LotSnapshot...),
 		WinnerID:      r.WinnerID,
 		SellerID:      r.SellerID,
 		DealPrice:     r.DealPrice,
 		DepositAmount: r.DepositAmount,
 		Status:        r.Status,
 		PayStatus:     r.PayStatus,
-		PayDeadline:   r.PayDeadline,
-		PaidAt:        r.PaidAt,
-		ClosedAt:      r.ClosedAt,
+		PayDeadline:   cloneTimePtrUTC(r.PayDeadline),
+		PaidAt:        cloneTimePtrUTC(r.PaidAt),
+		ClosedAt:      cloneTimePtrUTC(r.ClosedAt),
+		Version:       r.Version,
 		CreatedAt:     r.CreatedAt,
 		UpdatedAt:     r.UpdatedAt,
 	}
@@ -276,6 +340,33 @@ func (r *MemoryOrderRepository) List(ctx context.Context, filter domain.OrderFil
 	return orders[filter.Offset:end], nil
 }
 
+func (r *MemoryOrderRepository) ListPayTimeoutCandidates(ctx context.Context, now time.Time, limit int) ([]domain.OrderDeal, error) {
+	_ = ctx
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	now = now.UTC()
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	orders := make([]domain.OrderDeal, 0, len(r.orders))
+	for _, order := range r.orders {
+		if order.Status != domain.OrderStatusCreated || order.PayStatus != domain.PayStatusUnpaid || !order.PaymentExpired(now) {
+			continue
+		}
+		orders = append(orders, cloneOrder(order))
+	}
+	sort.Slice(orders, func(i, j int) bool {
+		if orders[i].PayDeadline != nil && orders[j].PayDeadline != nil && !orders[i].PayDeadline.Equal(*orders[j].PayDeadline) {
+			return orders[i].PayDeadline.Before(*orders[j].PayDeadline)
+		}
+		return orders[i].ID < orders[j].ID
+	})
+	if len(orders) > limit {
+		orders = orders[:limit]
+	}
+	return orders, nil
+}
+
 func (r *MemoryOrderRepository) Update(ctx context.Context, order *domain.OrderDeal) error {
 	_ = ctx
 	r.mu.Lock()
@@ -289,7 +380,53 @@ func (r *MemoryOrderRepository) Update(ctx context.Context, order *domain.OrderD
 	return nil
 }
 
+func (r *MemoryOrderRepository) UpdateStatusWithVersion(ctx context.Context, order *domain.OrderDeal, expectedVersion int64, allowedFromStatuses []domain.OrderStatus) error {
+	_ = ctx
+	if order == nil || order.ID == 0 {
+		return domain.ErrInvalidArgument
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	current, ok := r.orders[order.ID]
+	if !ok {
+		return domain.ErrNotFound
+	}
+	if current.Version != expectedVersion || !orderStatusInList(current.Status, allowedFromStatuses) {
+		if current.Status.Terminal() {
+			return domain.ErrInvalidState
+		}
+		return domain.ErrOptimisticConflict
+	}
+	now := time.Now().UTC()
+	current.Status = order.Status
+	current.PayStatus = order.PayStatus
+	current.PaidAt = cloneTimePtrUTC(order.PaidAt)
+	current.ClosedAt = cloneTimePtrUTC(order.ClosedAt)
+	current.Version = expectedVersion + 1
+	current.UpdatedAt = now
+	r.orders[order.ID] = cloneOrder(current)
+	order.Version = current.Version
+	order.UpdatedAt = now
+	return nil
+}
+
 func cloneOrder(order domain.OrderDeal) domain.OrderDeal {
 	order.LiveSessionID = cloneUint64Ptr(order.LiveSessionID)
+	order.LotSnapshot = append([]byte(nil), order.LotSnapshot...)
+	order.PayDeadline = cloneTimePtrUTC(order.PayDeadline)
+	order.PaidAt = cloneTimePtrUTC(order.PaidAt)
+	order.ClosedAt = cloneTimePtrUTC(order.ClosedAt)
 	return order
+}
+
+func orderStatusInList(s domain.OrderStatus, list []domain.OrderStatus) bool {
+	if len(list) == 0 {
+		return true
+	}
+	for _, v := range list {
+		if v == s {
+			return true
+		}
+	}
+	return false
 }

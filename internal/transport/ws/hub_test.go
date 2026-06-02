@@ -135,6 +135,56 @@ func TestHubOnlineCountUpdatesOnSubscribeUnsubscribeAndSlowConsumer(t *testing.T
 	}
 }
 
+func TestHubDebouncesPresenceForLargeRooms(t *testing.T) {
+	hub := NewHub()
+	hub.SetPresenceImmediateFanoutLimit(1)
+	hub.SetPresenceBroadcastDelay(time.Hour)
+	c1 := NewClient("c1", "u1", 34001, 4)
+	c2 := NewClient("c2", "u2", 34001, 4)
+	if err := hub.Subscribe(34001, c1); err != nil {
+		t.Fatalf("subscribe c1: %v", err)
+	}
+	drainPresence(t, c1)
+	if err := hub.Subscribe(34001, c2); err != nil {
+		t.Fatalf("subscribe c2: %v", err)
+	}
+	assertNoPresence(t, c1)
+	assertNoPresence(t, c2)
+
+	hub.flushPresence(34001)
+	if online := lastPresenceOnline(t, c1); online != 2 {
+		t.Fatalf("expected debounced c1 online 2, got %d", online)
+	}
+	if online := lastPresenceOnline(t, c2); online != 2 {
+		t.Fatalf("expected debounced c2 online 2, got %d", online)
+	}
+}
+
+func TestHubUnsubscribeClientDoesNotRemoveReplacementWithSameID(t *testing.T) {
+	hub := NewHub()
+	oldClient := NewClient("same", "u1", 35001, 4)
+	replacement := NewClient("same", "u2", 35001, 4)
+	if err := hub.Subscribe(35001, oldClient); err != nil {
+		t.Fatalf("subscribe old: %v", err)
+	}
+	drainPresence(t, oldClient)
+	if err := hub.Subscribe(35001, replacement); err != nil {
+		t.Fatalf("subscribe replacement: %v", err)
+	}
+	if !oldClient.Closed() || oldClient.CloseReason() != "closed" {
+		t.Fatalf("expected old client closed on replacement, closed=%v reason=%q", oldClient.Closed(), oldClient.CloseReason())
+	}
+
+	hub.UnsubscribeClient(oldClient)
+	room, ok := hub.Room(35001)
+	if !ok || room.ClientCount() != 1 {
+		t.Fatalf("expected replacement to remain subscribed, room=%+v ok=%v", room, ok)
+	}
+	if replacement.Closed() {
+		t.Fatalf("replacement should not be closed by old client teardown, reason=%q", replacement.CloseReason())
+	}
+}
+
 func TestHubSharedOnlineCounterAggregatesMultipleInstances(t *testing.T) {
 	counter := NewMemoryOnlineCounter()
 	hub1 := NewHubWithOnlineCounter(counter)
@@ -297,6 +347,38 @@ func TestHubBroadcastSessionEndDeliversAndCleansSessionIndex(t *testing.T) {
 	}
 }
 
+func TestHubBroadcastLiveSessionDeliversWithoutCleaningSessionIndex(t *testing.T) {
+	hub := NewHub()
+	const sessionID uint64 = 9002
+	c1 := NewClientWithSession("c1", "u1", 40011, sessionID, 8)
+	c2 := NewClientWithSession("c2", "u2", 40012, sessionID, 8)
+	if err := hub.Subscribe(40011, c1); err != nil {
+		t.Fatalf("subscribe c1: %v", err)
+	}
+	if err := hub.Subscribe(40012, c2); err != nil {
+		t.Fatalf("subscribe c2: %v", err)
+	}
+	drainPresence(t, c1, c2)
+
+	delivered := hub.BroadcastLiveSession(sessionID, Envelope{Type: TypeLiveVoiceBroadcast, RequestID: "voice-1", Payload: json.RawMessage(`{"audioBase64":"AQI="}`)})
+	if delivered != 2 {
+		t.Fatalf("expected 2 delivered, got %d", delivered)
+	}
+	if got := hub.SessionClientCount(sessionID); got != 2 {
+		t.Fatalf("expected session index retained, got %d", got)
+	}
+	for _, c := range []*Client{c1, c2} {
+		select {
+		case env := <-c.Outbound():
+			if env.Type != TypeLiveVoiceBroadcast || env.LiveSessionID != sessionID || env.RequestID != "voice-1" {
+				t.Fatalf("unexpected envelope on %s: %+v", c.ID, env)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("timed out waiting for live voice broadcast on %s", c.ID)
+		}
+	}
+}
+
 func TestHubBroadcastSessionEndZeroIDIsNoop(t *testing.T) {
 	hub := NewHub()
 	if got := hub.BroadcastSessionEnd(0, nil); got != 0 {
@@ -376,17 +458,26 @@ func lastPresenceOnline(t *testing.T, client *Client) int {
 	}
 }
 
+func assertNoPresence(t *testing.T, client *Client) {
+	t.Helper()
+	select {
+	case env := <-client.Outbound():
+		t.Fatalf("unexpected immediate presence for %s: %+v", client.ID, env)
+	default:
+	}
+}
+
 type failingOnlineCounter struct{}
 
-func (failingOnlineCounter) Join(ctx context.Context, auctionID uint64, connectionID string) (int, error) {
+func (failingOnlineCounter) Join(ctx context.Context, auctionID uint64, connectionID, userID string) (int, error) {
 	return 0, errors.New("shared counter unavailable")
 }
 
-func (failingOnlineCounter) Leave(ctx context.Context, auctionID uint64, connectionID string) (int, error) {
+func (failingOnlineCounter) Leave(ctx context.Context, auctionID uint64, connectionID, userID string) (int, error) {
 	return 0, errors.New("shared counter unavailable")
 }
 
-func (failingOnlineCounter) Touch(ctx context.Context, auctionID uint64, connectionID string) (int, error) {
+func (failingOnlineCounter) Touch(ctx context.Context, auctionID uint64, connectionID, userID string) (int, error) {
 	return 0, errors.New("shared counter unavailable")
 }
 

@@ -90,8 +90,6 @@ type adminBlacklistView struct {
 
 type adminAuctionView struct {
 	domain.AuctionLot
-	ItemName             string `json:"itemName"`
-	ItemTitle            string `json:"itemTitle"`
 	SellerNickname       string `json:"sellerNickname"`
 	LiveSessionName      string `json:"liveSessionName"`
 	LeaderBidderNickname string `json:"leaderBidderNickname"`
@@ -105,8 +103,6 @@ type adminOrderView struct {
 	LiveSessionName string `json:"liveSessionName"`
 	AuctionName     string `json:"auctionName"`
 	AuctionTitle    string `json:"auctionTitle"`
-	ItemName        string `json:"itemName"`
-	ItemTitle       string `json:"itemTitle"`
 }
 
 type adminAuditLogView struct {
@@ -512,7 +508,6 @@ type adminNameResolver struct {
 	ctx      context.Context
 	handler  *AdminHandler
 	users    map[string]domain.SafeUser
-	items    map[uint64]domain.Item
 	sessions map[uint64]domain.LiveSession
 	auctions map[uint64]domain.AuctionLot
 }
@@ -522,17 +517,12 @@ func newAdminNameResolver(ctx context.Context, h *AdminHandler) *adminNameResolv
 		ctx:      ctx,
 		handler:  h,
 		users:    make(map[string]domain.SafeUser),
-		items:    make(map[uint64]domain.Item),
 		sessions: make(map[uint64]domain.LiveSession),
 		auctions: make(map[uint64]domain.AuctionLot),
 	}
 }
 
 func (r *adminNameResolver) auctionView(auction domain.AuctionLot) (adminAuctionView, error) {
-	item, err := r.item(auction.ItemID)
-	if err != nil {
-		return adminAuctionView{}, err
-	}
 	seller, err := r.user(auction.SellerID)
 	if err != nil {
 		return adminAuctionView{}, err
@@ -557,8 +547,6 @@ func (r *adminNameResolver) auctionView(auction domain.AuctionLot) (adminAuction
 	}
 	return adminAuctionView{
 		AuctionLot:           auction,
-		ItemName:             item.Title,
-		ItemTitle:            item.Title,
 		SellerNickname:       seller.Nickname,
 		LiveSessionName:      session.Title,
 		LeaderBidderNickname: leader.Nickname,
@@ -586,22 +574,14 @@ func (r *adminNameResolver) orderView(order domain.OrderDeal) (adminOrderView, e
 	if err != nil {
 		return adminOrderView{}, err
 	}
-	var item domain.Item
-	if auction.ItemID != 0 {
-		item, err = r.item(auction.ItemID)
-		if err != nil {
-			return adminOrderView{}, err
-		}
-	}
+	title := auction.Title
 	return adminOrderView{
 		OrderDeal:       order,
 		WinnerNickname:  winner.Nickname,
 		SellerNickname:  seller.Nickname,
 		LiveSessionName: session.Title,
-		AuctionName:     item.Title,
-		AuctionTitle:    item.Title,
-		ItemName:        item.Title,
-		ItemTitle:       item.Title,
+		AuctionName:     title,
+		AuctionTitle:    title,
 	}, nil
 }
 
@@ -640,25 +620,6 @@ func (r *adminNameResolver) user(userID string) (domain.SafeUser, error) {
 	}
 	r.users[userID] = user
 	return user, nil
-}
-
-func (r *adminNameResolver) item(itemID uint64) (domain.Item, error) {
-	if itemID == 0 {
-		return domain.Item{}, nil
-	}
-	if item, ok := r.items[itemID]; ok {
-		return item, nil
-	}
-	item, err := r.handler.admin.ItemByID(r.ctx, itemID)
-	if err != nil {
-		if errors.Is(err, domain.ErrNotFound) || errors.Is(err, domain.ErrInvalidArgument) {
-			r.items[itemID] = domain.Item{}
-			return domain.Item{}, nil
-		}
-		return domain.Item{}, err
-	}
-	r.items[itemID] = item
-	return item, nil
 }
 
 func (r *adminNameResolver) session(sessionID uint64) (domain.LiveSession, error) {
@@ -705,7 +666,7 @@ func (r *adminNameResolver) targetName(log domain.AuditLog) (string, error) {
 	case "USER":
 		return r.userDisplayName(targetID)
 	case "ITEM":
-		return r.itemDisplayName(targetID)
+		return targetID, nil
 	case "AUCTION", "AUCTION_LOT":
 		return r.auctionDisplayName(targetID)
 	case "LIVE_SESSION":
@@ -731,10 +692,6 @@ func (r *adminNameResolver) httpTargetName(path string) (string, error) {
 		switch segment {
 		case "users", "blacklist":
 			return r.userDisplayName(next)
-		case "items":
-			if next != "description" && next != "audit" {
-				return r.itemDisplayName(next)
-			}
 		case "auctions":
 			return r.auctionDisplayName(next)
 		case "live-sessions":
@@ -762,21 +719,6 @@ func (r *adminNameResolver) userDisplayName(userID string) (string, error) {
 	return strings.TrimSpace(userID), nil
 }
 
-func (r *adminNameResolver) itemDisplayName(itemID string) (string, error) {
-	id, err := strconv.ParseUint(strings.TrimSpace(itemID), 10, 64)
-	if err != nil || id == 0 {
-		return strings.TrimSpace(itemID), nil
-	}
-	item, err := r.item(id)
-	if err != nil {
-		return "", err
-	}
-	if item.Title != "" {
-		return item.Title, nil
-	}
-	return strings.TrimSpace(itemID), nil
-}
-
 func (r *adminNameResolver) auctionDisplayName(auctionID string) (string, error) {
 	id, err := strconv.ParseUint(strings.TrimSpace(auctionID), 10, 64)
 	if err != nil || id == 0 {
@@ -786,14 +728,8 @@ func (r *adminNameResolver) auctionDisplayName(auctionID string) (string, error)
 	if err != nil {
 		return "", err
 	}
-	if auction.ItemID != 0 {
-		item, err := r.item(auction.ItemID)
-		if err != nil {
-			return "", err
-		}
-		if item.Title != "" {
-			return item.Title, nil
-		}
+	if auction.Title != "" {
+		return auction.Title, nil
 	}
 	return strings.TrimSpace(auctionID), nil
 }

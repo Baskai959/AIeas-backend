@@ -13,7 +13,7 @@
 //     过期时间散开，避免同一时刻雪崩回源。
 //
 //  3. 业务可拼装：暴露的是泛型 Cache[T any] 接口（通过 []byte 序列化层），上层
-//     业务（ItemService 等）持有自己的具体缓存包装（如 ItemCache），通过 GetOrLoad
+//     业务服务持有自己的具体缓存包装，通过 GetOrLoad
 //     的 loader 闭包定义如何回源 + 如何序列化。
 //
 //  4. 观测可插拔：通过 Observer 接口而不是直接依赖 *metrics.Registry，避免 cache

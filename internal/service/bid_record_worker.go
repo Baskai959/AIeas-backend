@@ -153,7 +153,7 @@ func (w *BidRecordWriter) handleEvent(parentCtx context.Context, event redisinfr
 	)
 	defer span.End()
 
-	if event.EventType != "bid.accepted" && event.EventType != "bid.rejected" {
+	if event.EventType != "bid.accepted" || !event.Accepted {
 		_ = w.log.AckBidRecord(ctx, event.AuctionID, event.StreamID)
 		span.SetAttributes(attribute.String("bid_record.result", "skip"))
 		w.observeConsume("skip")
@@ -171,6 +171,10 @@ func (w *BidRecordWriter) handleEvent(parentCtx context.Context, event redisinfr
 	result, err := WriteBidRecordIdempotent(ctx, w.repo, event)
 	w.observeWrite(time.Since(writeStart))
 	switch result {
+	case BidRecordWriteSkipped:
+		_ = w.log.AckBidRecord(ctx, event.AuctionID, event.StreamID)
+		span.SetAttributes(attribute.String("bid_record.result", "skip"))
+		w.observeConsume("skip")
 	case BidRecordWriteOK, BidRecordWriteDuplicateConsistent:
 		_ = w.log.AckBidRecord(ctx, event.AuctionID, event.StreamID)
 		if result == BidRecordWriteOK {
@@ -231,12 +235,30 @@ const (
 	BidRecordWriteDuplicateConsistent
 	BidRecordWriteDuplicateConflict
 	BidRecordWriteTemporaryFailure
+	BidRecordWriteSkipped
 )
 
+type bidRecordInsertIgnorer interface {
+	CreateIgnore(ctx context.Context, bid *domain.BidRecord) (bool, error)
+}
+
 func WriteBidRecordIdempotent(ctx context.Context, repo repository.BidRepository, event redisinfra.BidEvent) (BidRecordWriteResult, error) {
+	if event.EventType != "bid.accepted" || !event.Accepted {
+		return BidRecordWriteSkipped, nil
+	}
 	record := event.ToBidRecord()
 	if record.CreatedAt.IsZero() {
 		record.CreatedAt = time.Now().UTC()
+	}
+	if inserter, ok := repo.(bidRecordInsertIgnorer); ok {
+		inserted, err := inserter.CreateIgnore(ctx, &record)
+		if err != nil {
+			return BidRecordWriteTemporaryFailure, err
+		}
+		if inserted {
+			return BidRecordWriteOK, nil
+		}
+		return BidRecordWriteDuplicateConsistent, nil
 	}
 	existing, findErr := repo.FindByRequestID(ctx, event.RequestID)
 	if findErr == nil {
@@ -396,7 +418,10 @@ func (r *BidRecordReconciler) reconcileAuctions(ctx context.Context, auctions []
 			continue
 		}
 		for _, event := range events {
-			if event.EventType != "bid.accepted" && event.EventType != "bid.rejected" {
+			if event.EventType != "bid.accepted" || !event.Accepted {
+				if event.Seq > lastSeq {
+					lastSeq = event.Seq
+				}
 				continue
 			}
 			writeStart := time.Now()

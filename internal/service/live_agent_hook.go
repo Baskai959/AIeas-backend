@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -17,6 +18,7 @@ import (
 const (
 	liveAgentHookDefaultConfigKey = "live.agent_hook.default"
 	liveAgentHookDescription      = "商家直播拍卖 AI Agent hook 开关"
+	defaultHighestBidHookQuiet    = 5 * time.Second
 )
 
 type LiveAgentHookConfig struct {
@@ -24,14 +26,15 @@ type LiveAgentHookConfig struct {
 }
 
 type LiveAgentHookInvoker interface {
-	InvokeLiveAgentHook(ctx context.Context, message string) error
+	InvokeLiveAgentHook(ctx context.Context, sessionID, question string) error
 }
 
 type DisabledLiveAgentHookInvoker struct{}
 
-func (DisabledLiveAgentHookInvoker) InvokeLiveAgentHook(ctx context.Context, message string) error {
+func (DisabledLiveAgentHookInvoker) InvokeLiveAgentHook(ctx context.Context, sessionID, question string) error {
 	_ = ctx
-	_ = message
+	_ = sessionID
+	_ = question
 	return nil
 }
 
@@ -40,13 +43,23 @@ type LiveAgentHookService struct {
 	users   repository.UserRepository
 	invoker LiveAgentHookInvoker
 
-	mu    sync.RWMutex
-	cache map[string]liveAgentHookCacheEntry
+	mu                     sync.RWMutex
+	cache                  map[string]liveAgentHookCacheEntry
+	highestBidQuietPeriod  time.Duration
+	pendingHighestBidHooks map[string]*liveAgentHighestBidHook
 }
 
 type liveAgentHookCacheEntry struct {
 	enabled   bool
 	expiresAt time.Time
+}
+
+type liveAgentHighestBidHook struct {
+	merchantID string
+	sessionID  uint64
+	question   string
+	generation uint64
+	timer      *time.Timer
 }
 
 func NewLiveAgentHookService(configs repository.ConfigRepository, users repository.UserRepository, invoker LiveAgentHookInvoker) *LiveAgentHookService {
@@ -57,11 +70,22 @@ func NewLiveAgentHookService(configs repository.ConfigRepository, users reposito
 		invoker = DisabledLiveAgentHookInvoker{}
 	}
 	return &LiveAgentHookService{
-		configs: configs,
-		users:   users,
-		invoker: invoker,
-		cache:   make(map[string]liveAgentHookCacheEntry),
+		configs:                configs,
+		users:                  users,
+		invoker:                invoker,
+		cache:                  make(map[string]liveAgentHookCacheEntry),
+		highestBidQuietPeriod:  defaultHighestBidHookQuiet,
+		pendingHighestBidHooks: make(map[string]*liveAgentHighestBidHook),
 	}
+}
+
+func (s *LiveAgentHookService) SetHighestBidQuietPeriod(period time.Duration) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.highestBidQuietPeriod = period
 }
 
 func (s *LiveAgentHookService) GetConfig(ctx context.Context, merchantID string) (LiveAgentHookConfig, error) {
@@ -96,19 +120,56 @@ func (s *LiveAgentHookService) SetConfig(ctx context.Context, merchantID, update
 }
 
 func (s *LiveAgentHookService) EmitLiveStarted(ctx context.Context, merchantID string, sessionID uint64) {
-	s.Emit(ctx, merchantID, fmt.Sprintf("直播场次%d开播了", sessionID))
+	s.Emit(ctx, merchantID, sessionID, fmt.Sprintf("直播场次%d开播了", sessionID))
 }
 
-func (s *LiveAgentHookService) EmitItemListed(ctx context.Context, merchantID string, itemID uint64) {
-	s.Emit(ctx, merchantID, fmt.Sprintf("商品%d上架了", itemID))
+func (s *LiveAgentHookService) EmitLotMounted(ctx context.Context, merchantID string, sessionID, auctionID uint64) {
+	s.Emit(ctx, merchantID, sessionID, fmt.Sprintf("直播场次%d的拍品%d已上架", sessionID, auctionID))
 }
 
-func (s *LiveAgentHookService) EmitItemOffline(ctx context.Context, merchantID string, itemID uint64) {
-	s.Emit(ctx, merchantID, fmt.Sprintf("商品%d下架了", itemID))
+func (s *LiveAgentHookService) EmitLotUnmounted(ctx context.Context, merchantID string, sessionID, auctionID uint64) {
+	s.Emit(ctx, merchantID, sessionID, fmt.Sprintf("直播场次%d的拍品%d已下架", sessionID, auctionID))
+}
+
+func (s *LiveAgentHookService) EmitLotStarted(ctx context.Context, merchantID string, sessionID, auctionID uint64, durationSec int) {
+	if durationSec > 0 {
+		s.Emit(ctx, merchantID, sessionID, fmt.Sprintf("直播场次%d的拍品%d开始拍卖/讲解，拍卖时长%d秒", sessionID, auctionID, durationSec))
+		return
+	}
+	s.Emit(ctx, merchantID, sessionID, fmt.Sprintf("直播场次%d的拍品%d开始拍卖/讲解", sessionID, auctionID))
+}
+
+func (s *LiveAgentHookService) EmitLotCancelled(ctx context.Context, merchantID string, sessionID, auctionID uint64) {
+	s.Emit(ctx, merchantID, sessionID, fmt.Sprintf("直播场次%d的拍品%d已取消拍卖/讲解", sessionID, auctionID))
+}
+
+func (s *LiveAgentHookService) EmitAuctionCancelled(ctx context.Context, merchantID string, sessionID, auctionID uint64) {
+	s.Emit(ctx, merchantID, sessionID, fmt.Sprintf("直播场次%d的拍品%d已取消", sessionID, auctionID))
 }
 
 func (s *LiveAgentHookService) EmitHammerWon(ctx context.Context, merchantID string, sessionID, auctionID uint64, price int64) {
-	s.Emit(ctx, merchantID, fmt.Sprintf("直播场次%d的拍品%d落锤成交，成交价%d分", sessionID, auctionID, price))
+	s.EmitAuctionClosed(ctx, merchantID, sessionID, auctionID, domain.AuctionStatusClosedWon, price, false, "")
+}
+
+func (s *LiveAgentHookService) EmitAuctionClosed(ctx context.Context, merchantID string, sessionID, auctionID uint64, status domain.AuctionStatus, price int64, auto bool, reason string) {
+	switch status {
+	case domain.AuctionStatusClosedWon:
+		if auto {
+			s.Emit(ctx, merchantID, sessionID, fmt.Sprintf("直播场次%d的拍品%d自动落锤成交，成交价%d分", sessionID, auctionID, price))
+			return
+		}
+		s.Emit(ctx, merchantID, sessionID, fmt.Sprintf("直播场次%d的拍品%d落锤成交，成交价%d分", sessionID, auctionID, price))
+	case domain.AuctionStatusClosedFailed:
+		if auto {
+			s.Emit(ctx, merchantID, sessionID, fmt.Sprintf("直播场次%d的拍品%d自动落锤流拍", sessionID, auctionID))
+			return
+		}
+		if strings.TrimSpace(reason) != "" {
+			s.Emit(ctx, merchantID, sessionID, fmt.Sprintf("直播场次%d的拍品%d流拍，原因：%s", sessionID, auctionID, strings.TrimSpace(reason)))
+			return
+		}
+		s.Emit(ctx, merchantID, sessionID, fmt.Sprintf("直播场次%d的拍品%d流拍", sessionID, auctionID))
+	}
 }
 
 func (s *LiveAgentHookService) EmitHighestBid(ctx context.Context, merchantID string, sessionID uint64, bidderID string, price int64) {
@@ -118,18 +179,26 @@ func (s *LiveAgentHookService) EmitHighestBid(ctx context.Context, merchantID st
 			name = strings.TrimSpace(user.Nickname)
 		}
 	}
-	s.Emit(ctx, merchantID, fmt.Sprintf("直播场次%d用户%s目前最高价格%d分", sessionID, name, price))
+	s.EmitHighestBidWithBidderName(ctx, merchantID, sessionID, bidderID, name, price)
+}
+
+func (s *LiveAgentHookService) EmitHighestBidWithBidderName(ctx context.Context, merchantID string, sessionID uint64, bidderID string, bidderName string, price int64) {
+	name := strings.TrimSpace(bidderName)
+	if name == "" {
+		name = strings.TrimSpace(bidderID)
+	}
+	s.emitHighestBidDebounced(ctx, merchantID, sessionID, fmt.Sprintf("直播场次%d用户%s目前最高价格%d分", sessionID, name, price))
 }
 
 func (s *LiveAgentHookService) EmitConfigChanged(ctx context.Context, merchantID string, sessionID uint64, enabled bool) {
 	if !enabled {
 		return
 	}
-	s.emitDirect(ctx, merchantID, fmt.Sprintf("直播场次%dAI直播助手已开启", sessionID))
+	s.emitDirect(ctx, merchantID, sessionID, fmt.Sprintf("直播场次%dAI直播助手已开启", sessionID))
 }
 
-func (s *LiveAgentHookService) Emit(ctx context.Context, merchantID, message string) {
-	if s == nil || s.invoker == nil || strings.TrimSpace(merchantID) == "" || strings.TrimSpace(message) == "" {
+func (s *LiveAgentHookService) Emit(ctx context.Context, merchantID string, sessionID uint64, question string) {
+	if s == nil || s.invoker == nil || strings.TrimSpace(merchantID) == "" || sessionID == 0 || strings.TrimSpace(question) == "" {
 		return
 	}
 	enabled, err := s.enabled(ctx, merchantID)
@@ -140,20 +209,81 @@ func (s *LiveAgentHookService) Emit(ctx context.Context, merchantID, message str
 	if !enabled {
 		return
 	}
-	s.emitDirect(ctx, merchantID, message)
+	s.emitDirect(ctx, merchantID, sessionID, question)
 }
 
-func (s *LiveAgentHookService) emitDirect(ctx context.Context, merchantID, message string) {
-	if s == nil || s.invoker == nil || strings.TrimSpace(merchantID) == "" || strings.TrimSpace(message) == "" {
+func (s *LiveAgentHookService) emitHighestBidDebounced(ctx context.Context, merchantID string, sessionID uint64, question string) {
+	if s == nil || strings.TrimSpace(merchantID) == "" || sessionID == 0 || strings.TrimSpace(question) == "" {
 		return
 	}
-	msg := strings.TrimSpace(message)
+	period := s.highestBidPeriod()
+	if period <= 0 {
+		s.Emit(ctx, merchantID, sessionID, question)
+		return
+	}
+	key := fmt.Sprintf("%s:%d", strings.TrimSpace(merchantID), sessionID)
+	s.mu.Lock()
+	if s.pendingHighestBidHooks == nil {
+		s.pendingHighestBidHooks = make(map[string]*liveAgentHighestBidHook)
+	}
+	pending := s.pendingHighestBidHooks[key]
+	if pending == nil {
+		pending = &liveAgentHighestBidHook{}
+		s.pendingHighestBidHooks[key] = pending
+	}
+	pending.merchantID = strings.TrimSpace(merchantID)
+	pending.sessionID = sessionID
+	pending.question = strings.TrimSpace(question)
+	pending.generation++
+	generation := pending.generation
+	if pending.timer != nil {
+		pending.timer.Stop()
+	}
+	pending.timer = time.AfterFunc(period, func() {
+		s.fireHighestBidHook(key, generation)
+	})
+	s.mu.Unlock()
+}
+
+func (s *LiveAgentHookService) highestBidPeriod() time.Duration {
+	if s == nil {
+		return 0
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.highestBidQuietPeriod
+}
+
+func (s *LiveAgentHookService) fireHighestBidHook(key string, generation uint64) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	pending := s.pendingHighestBidHooks[key]
+	if pending == nil || pending.generation != generation {
+		s.mu.Unlock()
+		return
+	}
+	merchantID := pending.merchantID
+	sessionID := pending.sessionID
+	question := pending.question
+	delete(s.pendingHighestBidHooks, key)
+	s.mu.Unlock()
+	s.Emit(context.Background(), merchantID, sessionID, question)
+}
+
+func (s *LiveAgentHookService) emitDirect(ctx context.Context, merchantID string, sessionID uint64, question string) {
+	if s == nil || s.invoker == nil || strings.TrimSpace(merchantID) == "" || sessionID == 0 || strings.TrimSpace(question) == "" {
+		return
+	}
+	session := strconv.FormatUint(sessionID, 10)
+	q := strings.TrimSpace(question)
 	invoker := s.invoker
 	go func() {
 		defer func() { _ = recover() }()
 		hookCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
-		if err := invoker.InvokeLiveAgentHook(hookCtx, msg); err != nil {
+		if err := invoker.InvokeLiveAgentHook(hookCtx, session, q); err != nil {
 			slog.Default().Warn("live agent hook invoke failed", "merchant_id", merchantID, "error", err)
 		}
 	}()

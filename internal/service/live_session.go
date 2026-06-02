@@ -13,14 +13,19 @@ import (
 )
 
 var (
-	ErrLiveSessionBusy   = errors.New("live session is busy with another auction")
-	ErrLotAlreadyMounted = errors.New("auction already mounted to another live session")
+	ErrLiveSessionBusy            = errors.New("live session is busy with another auction")
+	ErrLotAlreadyMounted          = errors.New("auction already mounted to another live session")
+	ErrLiveSessionLotInvalidState = errors.New("auction lot state does not allow this operation")
 )
 
 // OnlineCounter 用于在 Stats 接口中读取某 auction 的在线人数。
 // 通过定义在 service 包中的最小 interface 解耦 transport 层的 Hub。
 type OnlineCounter interface {
 	OnlineCount(auctionID uint64) int
+}
+
+type AIAssistantSwitchNotifier interface {
+	NotifySwitch(ctx context.Context, liveSessionID uint64, merchantID string, enabled bool)
 }
 
 // LiveSessionService 编排直播场次（live_session）领域操作：开播/闭播、统计累加、跨域查询。
@@ -38,6 +43,7 @@ type LiveSessionService struct {
 	sessionRealtime repository.LiveSessionRealtimeStore
 	onEnded         func(ctx context.Context, session domain.LiveSession)
 	hook            *LiveAgentHookService
+	aiSwitch        AIAssistantSwitchNotifier
 
 	mu sync.Mutex // 保护场次开关与闭播计数 flush 的临界区
 }
@@ -102,6 +108,13 @@ func (s *LiveSessionService) SetLiveAgentHookService(hook *LiveAgentHookService)
 		return
 	}
 	s.hook = hook
+}
+
+func (s *LiveSessionService) SetAIAssistantSwitchNotifier(notifier AIAssistantSwitchNotifier) {
+	if s == nil {
+		return
+	}
+	s.aiSwitch = notifier
 }
 
 // SetOnEnded 注入场次闭播完成后的回调（典型用法是 Hub.BroadcastSessionEnd）。
@@ -501,6 +514,28 @@ func (s *LiveSessionService) ListByMerchant(ctx context.Context, merchantID stri
 	return s.sessions.List(ctx, filter)
 }
 
+// ListVisible 列出当前 actor 可见的直播场次。
+// buyer 只能看到 LIVE 场次；merchant 只能看到自己的场次；admin 可按条件查看全部。
+func (s *LiveSessionService) ListVisible(ctx context.Context, merchantID string, status domain.LiveSessionStatus, actorID string, actorRole domain.Role, limit, offset int) ([]domain.LiveSession, error) {
+	if s == nil || s.sessions == nil {
+		return nil, domain.ErrNotFound
+	}
+	merchantID = strings.TrimSpace(merchantID)
+	switch actorRole {
+	case domain.RoleBuyer:
+		if status.Valid() && status != domain.LiveSessionStatusLive {
+			return []domain.LiveSession{}, nil
+		}
+		return s.sessions.List(ctx, domain.LiveSessionFilter{MerchantID: merchantID, Status: domain.LiveSessionStatusLive, Limit: limit, Offset: offset})
+	case domain.RoleMerchant:
+		return s.ListByMerchant(ctx, merchantID, status, actorID, actorRole, limit, offset)
+	case domain.RoleAdmin:
+		return s.sessions.List(ctx, domain.LiveSessionFilter{MerchantID: merchantID, Status: status, Limit: limit, Offset: offset})
+	default:
+		return nil, domain.ErrForbidden
+	}
+}
+
 // ListLots 返回某场次内的拍品列表（live_session_id 反查）。
 func (s *LiveSessionService) ListLots(ctx context.Context, sessionID uint64, actorID string, actorRole domain.Role) ([]domain.AuctionLot, error) {
 	if s == nil || s.sessions == nil || s.auctions == nil {
@@ -510,7 +545,7 @@ func (s *LiveSessionService) ListLots(ctx context.Context, sessionID uint64, act
 	if err != nil {
 		return nil, err
 	}
-	if !canAccessSellerOwned(actorID, actorRole, session.MerchantID) {
+	if !canReadLiveSession(actorID, actorRole, session) {
 		return nil, domain.ErrForbidden
 	}
 	all, err := s.auctions.List(ctx, domain.AuctionFilter{LiveSessionID: sessionID, Limit: 100})
@@ -577,7 +612,8 @@ func (s *LiveSessionService) ListAuctionBids(ctx context.Context, sessionID, auc
 	if s.bids == nil {
 		return []domain.BidRecord{}, nil
 	}
-	records, err := s.bids.ListByAuction(ctx, auctionID, limit)
+	roundStartTSMS := auction.StartTime.UnixMilli()
+	records, err := listAuctionBidRecordsForRound(ctx, s.bids, auctionID, roundStartTSMS, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -605,7 +641,11 @@ func (s *LiveSessionService) ListOrders(ctx context.Context, sessionID uint64, l
 	if offset < 0 {
 		offset = 0
 	}
-	return s.orders.List(ctx, domain.OrderFilter{SellerID: session.MerchantID, LiveSessionID: sessionID, Limit: limit, Offset: offset})
+	orders, err := s.orders.List(ctx, domain.OrderFilter{SellerID: session.MerchantID, LiveSessionID: sessionID, Limit: limit, Offset: offset})
+	if err != nil {
+		return nil, err
+	}
+	return s.enrichOrderWinnerNicknames(ctx, orders), nil
 }
 
 func (s *LiveSessionService) MountAuction(ctx context.Context, sessionID, auctionID uint64, actorID string, actorRole domain.Role) (domain.AuctionLot, error) {
@@ -636,7 +676,7 @@ func (s *LiveSessionService) MountAuction(ctx context.Context, sessionID, auctio
 	case domain.AuctionStatusDraft, domain.AuctionStatusPendingAudit, domain.AuctionStatusReady:
 		// allowed
 	default:
-		return domain.AuctionLot{}, domain.ErrInvalidState
+		return domain.AuctionLot{}, fmt.Errorf("%w: %w", ErrLiveSessionLotInvalidState, domain.ErrInvalidState)
 	}
 	if auction.LiveSessionID != nil && *auction.LiveSessionID == sessionID {
 		return auction, nil
@@ -647,6 +687,9 @@ func (s *LiveSessionService) MountAuction(ctx context.Context, sessionID, auctio
 	}
 	session.LotsTotal++
 	_ = s.sessions.Update(ctx, &session)
+	if s.hook != nil {
+		s.hook.EmitLotMounted(ctx, session.MerchantID, sessionID, auction.AuctionID)
+	}
 	return auction, nil
 }
 
@@ -669,13 +712,19 @@ func (s *LiveSessionService) UnmountAuction(ctx context.Context, sessionID, auct
 		return domain.ErrNotFound
 	}
 	if session.ActiveAuctionID == auctionID || auction.Status == domain.AuctionStatusRunning || auction.Status == domain.AuctionStatusExtended || auction.Status == domain.AuctionStatusHammerPending {
-		return domain.ErrInvalidState
+		return fmt.Errorf("%w: %w", ErrLiveSessionLotInvalidState, domain.ErrInvalidState)
 	}
 	if auction.Status == domain.AuctionStatusClosedWon || auction.Status == domain.AuctionStatusSettled {
-		return domain.ErrInvalidState
+		return fmt.Errorf("%w: %w", ErrLiveSessionLotInvalidState, domain.ErrInvalidState)
 	}
 	auction.LiveSessionID = nil
-	return s.auctions.Update(ctx, &auction)
+	if err := s.auctions.Update(ctx, &auction); err != nil {
+		return err
+	}
+	if s.hook != nil {
+		s.hook.EmitLotUnmounted(ctx, session.MerchantID, sessionID, auction.AuctionID)
+	}
+	return nil
 }
 
 func (s *LiveSessionService) ActivateAuctionWithOptions(ctx context.Context, in ActivateLiveSessionAuctionInput) (domain.AuctionLot, error) {
@@ -705,8 +754,13 @@ func (s *LiveSessionService) ActivateAuctionWithOptions(ctx context.Context, in 
 	if auction.LiveSessionID == nil || *auction.LiveSessionID != in.SessionID {
 		return domain.AuctionLot{}, domain.ErrInvalidArgument
 	}
-	if auction.Status.Terminal() {
+	switch auction.Status {
+	case domain.AuctionStatusClosedWon, domain.AuctionStatusSettled:
 		return domain.AuctionLot{}, domain.ErrInvalidState
+	case domain.AuctionStatusClosedFailed:
+		if err := s.resetAuctionToReady(ctx, &auction); err != nil {
+			return domain.AuctionLot{}, err
+		}
 	}
 	now := time.Now().UTC()
 	var startTime, endTime time.Time
@@ -755,6 +809,13 @@ func (s *LiveSessionService) ActivateAuctionWithOptions(ctx context.Context, in 
 		}
 		auction = started
 	}
+	if s.hook != nil {
+		durationSec := in.DurationSec
+		if durationSec <= 0 && !auction.StartTime.IsZero() && !auction.EndTime.IsZero() && auction.EndTime.After(auction.StartTime) {
+			durationSec = int(auction.EndTime.Sub(auction.StartTime).Seconds())
+		}
+		s.hook.EmitLotStarted(ctx, session.MerchantID, in.SessionID, auction.AuctionID, durationSec)
+	}
 	return auction, nil
 }
 
@@ -766,6 +827,7 @@ func (s *LiveSessionService) DeactivateAuction(ctx context.Context, sessionID ui
 	if !canAccessSellerOwned(actorID, actorRole, session.MerchantID) {
 		return domain.LiveSession{}, domain.ErrForbidden
 	}
+	var cancelledAuctionID uint64
 	if session.ActiveAuctionID != 0 {
 		auction, err := s.auctions.FindByID(ctx, session.ActiveAuctionID)
 		if err != nil {
@@ -775,6 +837,7 @@ func (s *LiveSessionService) DeactivateAuction(ctx context.Context, sessionID ui
 			if err := s.resetAuctionToReady(ctx, &auction); err != nil {
 				return domain.LiveSession{}, err
 			}
+			cancelledAuctionID = auction.AuctionID
 		}
 		if s.lock != nil {
 			_ = s.lock.Release(ctx, sessionID, session.ActiveAuctionID)
@@ -783,6 +846,9 @@ func (s *LiveSessionService) DeactivateAuction(ctx context.Context, sessionID ui
 	}
 	if err := s.sessions.Update(ctx, &session); err != nil {
 		return domain.LiveSession{}, err
+	}
+	if cancelledAuctionID != 0 && s.hook != nil {
+		s.hook.EmitLotCancelled(ctx, session.MerchantID, sessionID, cancelledAuctionID)
 	}
 	return session, nil
 }
@@ -822,7 +888,7 @@ func (s *LiveSessionService) Stats(ctx context.Context, sessionID uint64, actorI
 	if err != nil {
 		return LiveSessionStats{}, err
 	}
-	if !canAccessSellerOwned(actorID, actorRole, session.MerchantID) {
+	if !canReadLiveSession(actorID, actorRole, session) {
 		return LiveSessionStats{}, domain.ErrForbidden
 	}
 	stats := LiveSessionStats{LiveSessionID: session.ID, LotsTotal: session.LotsTotal, LotsSold: session.LotsSold, LotsUnsold: session.LotsUnsold, BidCount: session.BidCount, GMVCent: session.GMVCent, ViewerPeak: session.ViewerPeak, ViewerTotal: session.ViewerTotal, ActiveAuctionID: session.ActiveAuctionID}
@@ -832,22 +898,42 @@ func (s *LiveSessionService) Stats(ctx context.Context, sessionID uint64, actorI
 			stats.LotsTotal = len(lots)
 		}
 	}
+	if s.sessionRealtime != nil {
+		if counters, peak, err := s.sessionRealtime.LoadCounters(ctx, sessionID); err == nil {
+			stats.LotsTotal += counters.LotsTotalDelta
+			stats.LotsSold += counters.LotsSoldDelta
+			stats.LotsUnsold += counters.LotsUnsoldDelta
+			stats.BidCount += counters.BidCountDelta
+			stats.GMVCent += counters.GMVCentDelta
+			stats.ViewerTotal += counters.ViewerTotalAdd
+			if peak > stats.ViewerPeak {
+				stats.ViewerPeak = peak
+			}
+		}
+	}
 	if session.ActiveAuctionID == 0 {
 		return stats, nil
 	}
 	if s.hub != nil {
 		stats.Online = s.hub.OnlineCount(session.ActiveAuctionID)
 	}
-	if s.bids != nil {
-		if count, err := s.bids.CountByAuction(ctx, session.ActiveAuctionID); err == nil {
-			stats.CurrentBidCount = count
-		}
-	}
 	var endTime time.Time
+	realtimeOK := false
 	if s.auctionRealtime != nil {
 		if state, ok, err := s.auctionRealtime.GetAuctionState(ctx, session.ActiveAuctionID); err == nil && ok {
+			realtimeOK = true
 			stats.CurrentPrice = state.CurrentPrice
+			stats.CurrentBidCount = state.BidCount
 			endTime = state.EndTime
+		}
+	}
+	if s.bids != nil && !realtimeOK {
+		if auction, err := s.auctions.FindByID(ctx, session.ActiveAuctionID); err == nil {
+			if count, err := countAuctionBidsForRound(ctx, s.bids, session.ActiveAuctionID, auction.StartTime.UnixMilli()); err == nil {
+				stats.CurrentBidCount = count
+			}
+		} else if count, err := s.bids.CountByAuction(ctx, session.ActiveAuctionID); err == nil {
+			stats.CurrentBidCount = count
 		}
 	}
 	if endTime.IsZero() {
@@ -895,12 +981,15 @@ func (s *LiveSessionService) UpdateAgentHookConfig(ctx context.Context, sessionI
 		return LiveAgentHookConfig{}, err
 	}
 	s.hook.EmitConfigChanged(ctx, session.MerchantID, session.ID, enabled)
+	if s.aiSwitch != nil {
+		s.aiSwitch.NotifySwitch(ctx, session.ID, session.MerchantID, enabled)
+	}
 	return cfg, nil
 }
 
 func (s *LiveSessionService) resetAuctionToReady(ctx context.Context, auction *domain.AuctionLot) error {
 	switch auction.Status {
-	case domain.AuctionStatusReady, domain.AuctionStatusWarmingUp, domain.AuctionStatusRunning, domain.AuctionStatusExtended, domain.AuctionStatusHammerPending:
+	case domain.AuctionStatusReady, domain.AuctionStatusWarmingUp, domain.AuctionStatusRunning, domain.AuctionStatusExtended, domain.AuctionStatusHammerPending, domain.AuctionStatusClosedFailed:
 		// allowed
 	default:
 		return domain.ErrInvalidState
@@ -946,6 +1035,47 @@ func normalizeBidSort(sortBy string) string {
 	}
 }
 
+func filterBidRecordsByRoundStart(records []domain.BidRecord, roundStartTSMS int64) []domain.BidRecord {
+	if roundStartTSMS <= 0 || len(records) == 0 {
+		return records
+	}
+	out := records[:0]
+	for _, record := range records {
+		if record.BidTSMS >= roundStartTSMS {
+			out = append(out, record)
+		}
+	}
+	return out
+}
+
+func listAuctionBidRecordsForRound(ctx context.Context, bids repository.BidRepository, auctionID uint64, roundStartTSMS int64, limit int) ([]domain.BidRecord, error) {
+	if bids == nil {
+		return []domain.BidRecord{}, nil
+	}
+	if roundBids, ok := bids.(repository.BidRoundRepository); ok {
+		return roundBids.ListByAuctionSince(ctx, auctionID, roundStartTSMS, limit)
+	}
+	records, err := bids.ListByAuction(ctx, auctionID, limit)
+	if err != nil {
+		return nil, err
+	}
+	return filterBidRecordsByRoundStart(records, roundStartTSMS), nil
+}
+
+func countAuctionBidsForRound(ctx context.Context, bids repository.BidRepository, auctionID uint64, roundStartTSMS int64) (int, error) {
+	if bids == nil {
+		return 0, nil
+	}
+	if roundBids, ok := bids.(repository.BidRoundRepository); ok {
+		return roundBids.CountByAuctionSince(ctx, auctionID, roundStartTSMS)
+	}
+	records, err := listAuctionBidRecordsForRound(ctx, bids, auctionID, roundStartTSMS, 100)
+	if err != nil {
+		return 0, err
+	}
+	return len(records), nil
+}
+
 func lockTTLForAuction(auction domain.AuctionLot) time.Duration {
 	if auction.EndTime.IsZero() {
 		return time.Hour
@@ -985,6 +1115,34 @@ func (s *LiveSessionService) enrichBidderNicknames(ctx context.Context, records 
 	return out
 }
 
+func (s *LiveSessionService) enrichOrderWinnerNicknames(ctx context.Context, orders []domain.OrderDeal) []domain.OrderDeal {
+	if len(orders) == 0 || s.users == nil {
+		return orders
+	}
+	out := make([]domain.OrderDeal, len(orders))
+	copy(out, orders)
+	cache := make(map[string]string, len(out))
+	for i := range out {
+		winnerID := strings.TrimSpace(out[i].WinnerID)
+		if winnerID == "" {
+			continue
+		}
+		if nickname, ok := cache[winnerID]; ok {
+			out[i].WinnerNickname = nickname
+			continue
+		}
+		user, err := s.users.FindByID(winnerID)
+		if err != nil {
+			cache[winnerID] = ""
+			continue
+		}
+		nickname := strings.TrimSpace(user.Nickname)
+		cache[winnerID] = nickname
+		out[i].WinnerNickname = nickname
+	}
+	return out
+}
+
 func (s *LiveSessionService) enrichLots(ctx context.Context, lots []domain.AuctionLot) []domain.AuctionLot {
 	if len(lots) == 0 || s.bids == nil {
 		return lots
@@ -992,10 +1150,11 @@ func (s *LiveSessionService) enrichLots(ctx context.Context, lots []domain.Aucti
 	out := make([]domain.AuctionLot, len(lots))
 	for i := range lots {
 		out[i] = lots[i]
-		if count, err := s.bids.CountByAuction(ctx, lots[i].AuctionID); err == nil {
+		roundStartTSMS := lots[i].StartTime.UnixMilli()
+		if count, err := countAuctionBidsForRound(ctx, s.bids, lots[i].AuctionID, roundStartTSMS); err == nil {
 			out[i].BidCount = count
 		}
-		if records, err := s.bids.ListByAuction(ctx, lots[i].AuctionID, 1); err == nil && len(records) > 0 {
+		if records, err := listAuctionBidRecordsForRound(ctx, s.bids, lots[i].AuctionID, roundStartTSMS, 1); err == nil && len(records) > 0 {
 			out[i].CurrentPrice = records[0].BidPrice
 			out[i].LeaderBidderID = records[0].BidderID
 		}

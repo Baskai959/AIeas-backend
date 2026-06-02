@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -81,12 +82,65 @@ func TestWSHandlerBidPlaceRequiresExpectedState(t *testing.T) {
 	}
 }
 
+func TestWSHandlerRejectedBidOnlyReturnsAck(t *testing.T) {
+	ctx := context.Background()
+	cfg := appconfig.Default().Auction
+	cfg.FreqLimitCount = 100
+	hub := corews.NewHub()
+	bidSvc, auctionID := newWSBidFixture(t, cfg, hub)
+	handler := NewWSHandler(hub, bidSvc, 8, 65536, time.Second, 2*time.Second)
+	client := corews.NewClient("c1", "u_1001", auctionID, 8)
+	if err := hub.Subscribe(auctionID, client); err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	for {
+		select {
+		case <-client.Outbound():
+		default:
+			goto drained
+		}
+	}
+
+drained:
+	payload, _ := json.Marshal(map[string]interface{}{"price": 1050, "expectedCurrentPrice": 1000})
+	responses := handler.handleInbound(ctx, client, corews.Envelope{Type: "bid.place", RequestID: "ws-bid-reject", Payload: payload})
+	if len(responses) != 1 || responses[0].Type != "bid.ack" {
+		t.Fatalf("expected bid.ack, got %+v", responses)
+	}
+	var ack domain.BidResult
+	if err := json.Unmarshal(responses[0].Payload, &ack); err != nil {
+		t.Fatalf("decode ack: %v", err)
+	}
+	if ack.Accepted || ack.Reason == "" {
+		t.Fatalf("expected rejected ack, got %+v", ack)
+	}
+	select {
+	case env := <-client.Outbound():
+		t.Fatalf("rejected bid should not be broadcast to room, got %+v", env)
+	default:
+	}
+}
+
 func TestWSHandlerParseLastSeq(t *testing.T) {
 	req := httptest.NewRequest("GET", "/ws/auctions/10001?lastSeq=42", nil)
 	c := app.NewContext(1)
 	c.Request.SetRequestURI(req.URL.RequestURI())
 	if got := parseLastSeq(c); got != 42 {
 		t.Fatalf("expected lastSeq 42, got %d", got)
+	}
+}
+
+func TestWSHandlerSafeWriteRecoversPanic(t *testing.T) {
+	err := writeJSONWithDeadline(panickingFrameWriter{}, corews.Envelope{Type: "room.online"})
+	if err == nil || !strings.Contains(err.Error(), "panic") {
+		t.Fatalf("expected recovered panic error, got %v", err)
+	}
+}
+
+func TestWSHandlerSafeReadRecoversPanic(t *testing.T) {
+	_, _, err := readMessage(panickingFrameReader{})
+	if err == nil || !strings.Contains(err.Error(), "panic") {
+		t.Fatalf("expected recovered read panic error, got %v", err)
 	}
 }
 
@@ -133,10 +187,14 @@ func TestWSHandlerDeliverRoomSnapshotFromRT(t *testing.T) {
 		if err := json.Unmarshal(env.Payload, &payload); err != nil {
 			t.Fatalf("decode snapshot payload: %v", err)
 		}
-		for _, key := range []string{"auctionId", "status", "currentPrice", "leaderBidderId", "endTime", "seq", "serverTime", "source", "degraded"} {
+		for _, key := range []string{"auctionId", "status", "startPrice", "capPrice", "incrementRule", "currentPrice", "leaderBidderId", "endTime", "seq", "serverTime", "source", "degraded"} {
 			if _, ok := payload[key]; !ok {
 				t.Fatalf("snapshot payload missing %q: %+v", key, payload)
 			}
+		}
+		rule, ok := payload["incrementRule"].(map[string]interface{})
+		if !ok || rule["type"] != "fixed" {
+			t.Fatalf("unexpected incrementRule in snapshot: %+v", payload["incrementRule"])
 		}
 		if degraded, _ := payload["degraded"].(bool); degraded {
 			t.Fatalf("expected degraded=false from RT-served snapshot, got payload=%+v", payload)
@@ -180,10 +238,29 @@ func newWSBidFixture(t *testing.T, cfg appconfig.AuctionConfig, hub *corews.Hub)
 	return bidSvc, auctionID
 }
 
+type panickingFrameWriter struct{}
+
+func (panickingFrameWriter) SetWriteDeadline(time.Time) error {
+	panic("nil hijack connection")
+}
+
+func (panickingFrameWriter) WriteJSON(v interface{}) error {
+	return nil
+}
+
+func (panickingFrameWriter) WriteMessage(messageType int, data []byte) error {
+	return nil
+}
+
+type panickingFrameReader struct{}
+
+func (panickingFrameReader) ReadMessage() (int, []byte, error) {
+	panic("nil hijack connection")
+}
+
 func newWSBidFixtureWithAuctionService(t *testing.T, cfg appconfig.AuctionConfig, hub *corews.Hub) (*service.BidService, *service.AuctionService, uint64) {
 	t.Helper()
 	ctx := context.Background()
-	itemRepo := repository.NewMemoryItemRepository()
 	auctionRepo := repository.NewMemoryAuctionRepository()
 	bidRepo := repository.NewMemoryBidRepository()
 	depositRepo := repository.NewMemoryDepositRepository()
@@ -191,21 +268,20 @@ func newWSBidFixtureWithAuctionService(t *testing.T, cfg appconfig.AuctionConfig
 	realtime := repository.NewMemoryRealtimeStore()
 	riskSvc := service.NewRiskService(riskRepo, realtime, hub)
 	depositSvc := service.NewDepositService(depositRepo, auctionRepo, realtime, riskSvc, repository.NoopTxManager{})
-	auctionSvc := service.NewAuctionService(auctionRepo, itemRepo, repository.NoopTxManager{})
+	auctionSvc := service.NewAuctionService(auctionRepo, repository.NoopTxManager{})
 	auctionSvc.SetRealtime(realtime)
 	auctionSvc.SetPublisher(hub)
 	auctionSvc.SetAuctionConfig(cfg)
 	bidSvc := service.NewBidService(bidRepo, auctionRepo, realtime, riskSvc, hub, cfg)
 
-	item := domain.Item{SellerID: "u_2001", Title: "Watch", Category: "luxury", ConditionGrade: domain.ConditionNew, Status: domain.ItemStatusReady}
-	if err := itemRepo.Create(ctx, &item); err != nil {
-		t.Fatalf("create item: %v", err)
-	}
 	rule, _ := json.Marshal(map[string]interface{}{"type": "fixed", "amount": 100, "maxBidSteps": 10})
 	auction, err := auctionSvc.Create(ctx, service.CreateAuctionInput{
 		ActorID:        "u_2001",
 		ActorRole:      domain.RoleMerchant,
-		ItemID:         item.ID,
+		Title:          "Watch",
+		Category:       "luxury",
+		ConditionGrade: domain.ConditionNew,
+		Description:    "rare watch",
 		AuctionType:    domain.AuctionTypeEnglish,
 		StartPrice:     1000,
 		ReservePrice:   1000,
@@ -214,7 +290,7 @@ func newWSBidFixtureWithAuctionService(t *testing.T, cfg appconfig.AuctionConfig
 		AntiSnipingSec: 60,
 		AntiExtendSec:  30,
 		DepositAmount:  100,
-		Status:         domain.AuctionStatusReady,
+		Status:         domain.AuctionStatusPendingAudit,
 		StartTime:      time.Now().UTC().Add(-time.Minute),
 		EndTime:        time.Now().UTC().Add(time.Hour),
 	})

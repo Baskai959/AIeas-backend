@@ -96,6 +96,9 @@ func (r *EventRelay) poll(ctx context.Context) {
 			}
 			r.lastSeq[auctionID] = event.Seq
 			r.mu.Unlock()
+			if event.EventType == "bid.rejected" {
+				continue
+			}
 			r.hub.Broadcast(auctionID, Envelope{Type: event.EventType, Seq: event.Seq, Payload: event.PayloadJSON()})
 		}
 	}

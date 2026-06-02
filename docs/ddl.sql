@@ -24,6 +24,7 @@ CREATE TABLE IF NOT EXISTS `user` (
   `avatar_url`    VARCHAR(512)    DEFAULT NULL            COMMENT '头像 URL',
   `role`          VARCHAR(16)     NOT NULL DEFAULT 'buyer' COMMENT '角色：buyer/merchant/admin',
   `status`        VARCHAR(16)     NOT NULL DEFAULT 'ACTIVE' COMMENT '账号状态：ACTIVE/DISABLED',
+  `ai_permission` VARCHAR(16)     NOT NULL DEFAULT 'ASK'   COMMENT '商家 AI 控制权限：ASK=执行前询问/ALLOW=自动允许/DENY=自动拒绝',
   `last_login_at` DATETIME(3)     DEFAULT NULL            COMMENT '最近登录时间',
   `created_at`    DATETIME(3)     NOT NULL DEFAULT CURRENT_TIMESTAMP(3) COMMENT '创建时间',
   `updated_at`    DATETIME(3)     NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3) COMMENT '更新时间',
@@ -34,35 +35,22 @@ CREATE TABLE IF NOT EXISTS `user` (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='用户表';
 
 -- ---------------------------------------------------------------------
--- 2. item 商品表
--- ---------------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS `item` (
-  `id`              BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '商品 ID',
-  `seller_id`       BIGINT UNSIGNED NOT NULL                COMMENT '卖家 ID（关联 user.id）',
-  `title`           VARCHAR(128)    NOT NULL                COMMENT '商品标题',
-  `category`        VARCHAR(64)     NOT NULL                COMMENT '分类',
-  `brand`           VARCHAR(64)     DEFAULT NULL            COMMENT '品牌',
-  `condition_grade` VARCHAR(16)     NOT NULL DEFAULT 'NEW'  COMMENT '成色：NEW/LIKE_NEW/GOOD/FAIR',
-  `images`          JSON            NOT NULL                COMMENT '图片 URL 数组（JSON）',
-  `description`     TEXT            DEFAULT NULL            COMMENT '商品描述',
-  `status`          VARCHAR(16)     NOT NULL DEFAULT 'PENDING_AUDIT' COMMENT '状态：DRAFT/PENDING_AUDIT/READY/REJECTED/LISTED/OFFLINE',
-  `created_at`      DATETIME(3)     NOT NULL DEFAULT CURRENT_TIMESTAMP(3) COMMENT '创建时间',
-  `updated_at`      DATETIME(3)     NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3) COMMENT '更新时间',
-  PRIMARY KEY (`id`),
-  KEY `idx_seller_status` (`seller_id`, `status`),
-  KEY `idx_category` (`category`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='商品表';
-
--- ---------------------------------------------------------------------
--- 3. auction_lot 拍品表
+-- 2. auction_lot 拍品表
+--    拍品直接承载商品展示信息和拍卖规则信息，不再依赖 item/item_id 主链路。
 --    与《直播竞拍系统技术设计方案.md》第 10.2 节对齐
 --    补充字段: winner_id / deal_price / closed_at / closed_by
 -- ---------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS `auction_lot` (
   `auction_id`       BIGINT          NOT NULL                  COMMENT '拍品 ID（后端雪花 ID，非自增）',
-  `item_id`          BIGINT          NOT NULL                  COMMENT '关联商品 ID（item.id）',
   `seller_id`        BIGINT          NOT NULL                  COMMENT '卖家 ID（user.id）',
   `live_session_id`  BIGINT UNSIGNED DEFAULT NULL              COMMENT '所属直播场次 ID（NULL=未关联场次）',
+  `title`            VARCHAR(128)    NOT NULL                  COMMENT '拍品标题',
+  `description`      TEXT            DEFAULT NULL              COMMENT '拍品描述',
+  `category`         VARCHAR(64)     NOT NULL                  COMMENT '拍品类目',
+  `brand`            VARCHAR(64)     DEFAULT NULL              COMMENT '品牌',
+  `condition_grade`  VARCHAR(16)     NOT NULL DEFAULT 'GOOD'   COMMENT '成色：NEW/LIKE_NEW/GOOD/FAIR',
+  `image_urls`       JSON            NOT NULL                  COMMENT '拍品图片 URL 数组',
+  `cover_url`        VARCHAR(1024)   DEFAULT NULL              COMMENT '拍品封面 URL，默认可取 image_urls 首图',
   `auction_type`     VARCHAR(16)     NOT NULL DEFAULT 'ENGLISH' COMMENT '拍卖类型，MVP 仅支持 ENGLISH',
   `start_price`      BIGINT          NOT NULL                  COMMENT '起拍价（分），允许为 0（0 元起拍）',
   `reserve_price`    BIGINT          NOT NULL DEFAULT 0        COMMENT '保留价（分），0 表示无保留价',
@@ -72,8 +60,9 @@ CREATE TABLE IF NOT EXISTS `auction_lot` (
   `anti_extend_sec`  INT             NOT NULL DEFAULT 30       COMMENT '反狙击延长时长（秒）',
   `anti_extend_mode` VARCHAR(16)     NOT NULL DEFAULT 'ADD'    COMMENT '反狙击延时模式：ADD=结束时间增加 anti_extend_sec；RESET=倒计时重置为 anti_extend_sec',
   `deposit_amount`   BIGINT          NOT NULL                  COMMENT '保证金金额（分）',
-  `status`           VARCHAR(32)     NOT NULL                  COMMENT '状态：DRAFT/PENDING_AUDIT/READY/WARMING_UP/RUNNING/EXTENDED/HAMMER_PENDING/CLOSED_WON/CLOSED_FAILED/SETTLED',
+  `status`           VARCHAR(32)     NOT NULL                  COMMENT '状态：DRAFT/PENDING_AUDIT/AUDIT_REJECTED/READY/WARMING_UP/RUNNING/EXTENDED/HAMMER_PENDING/CLOSED_WON/CLOSED_FAILED/SETTLED',
   `rule_snapshot`    JSON            NOT NULL                  COMMENT '规则快照（不可变）JSON',
+  `audit_task_id`    VARCHAR(96)     NOT NULL DEFAULT ''       COMMENT '当前拍品内容审核任务 ID，用于过滤过期 AI 审核回调',
   `start_time`       DATETIME(3)     DEFAULT NULL              COMMENT '开拍时间；NULL 表示未设置定时开拍',
   `end_time`         DATETIME(3)     DEFAULT NULL              COMMENT '计划结束时间（可被反狙击延长）；NULL 表示启动时按时长计算',
   `duration_sec`     INT             NOT NULL DEFAULT 0        COMMENT '拍卖时长（秒），0 表示未预设，可在上架/激活时指定',
@@ -85,15 +74,16 @@ CREATE TABLE IF NOT EXISTS `auction_lot` (
   `created_at`       DATETIME(3)     NOT NULL DEFAULT CURRENT_TIMESTAMP(3) COMMENT '创建时间',
   `updated_at`       DATETIME(3)     NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3) COMMENT '更新时间',
   PRIMARY KEY (`auction_id`),
-  KEY `idx_item_id` (`item_id`),
   KEY `idx_seller_id` (`seller_id`),
+  KEY `idx_lot_category` (`category`),
+  KEY `idx_lot_title` (`title`),
   KEY `idx_live_session` (`live_session_id`),
   KEY `idx_status_end_time` (`status`, `end_time`),
   KEY `idx_winner_id` (`winner_id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='拍品（拍卖实例）表';
 
 -- ---------------------------------------------------------------------
--- 4. bid_record 出价记录表
+-- 3. bid_record 出价记录表
 --    uk_request_id 提供出价幂等保障
 -- ---------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS `bid_record` (
@@ -111,18 +101,21 @@ CREATE TABLE IF NOT EXISTS `bid_record` (
   PRIMARY KEY (`id`),
   UNIQUE KEY `uk_request_id` (`request_id`),
   KEY `idx_auction_bid_ts` (`auction_id`, `bid_ts_ms`),
+  KEY `idx_bid_record_auction_allow_price_time` (`auction_id`, `risk_result`, `reject_reason`, `bid_price` DESC, `bid_ts_ms` ASC),
+  KEY `idx_bid_record_auction_allow_time` (`auction_id`, `risk_result`, `reject_reason`, `bid_ts_ms`),
   KEY `idx_live_session` (`live_session_id`),
   KEY `idx_bidder_id` (`bidder_id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='出价记录表';
 
 -- ---------------------------------------------------------------------
--- 5. order_deal 成交订单表
+-- 4. order_deal 成交订单表
 --    uk_auction_id 保证一拍一单，防止重复成交
 -- ---------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS `order_deal` (
   `id`             BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '订单 ID（成交订单由后端雪花 ID 写入，保留自增兜底）',
   `auction_id`     BIGINT          NOT NULL                COMMENT '拍品 ID（auction_lot.auction_id）',
   `live_session_id` BIGINT UNSIGNED DEFAULT NULL           COMMENT '所属直播场次 ID（NULL=非场次内成交）',
+  `lot_snapshot`   JSON            DEFAULT NULL            COMMENT '成交时拍品展示与拍卖规则快照',
   `winner_id`      BIGINT UNSIGNED NOT NULL                COMMENT '中拍人 ID（user.id）',
   `seller_id`      BIGINT UNSIGNED NOT NULL                COMMENT '卖家 ID（user.id）',
   `deal_price`     BIGINT          NOT NULL                COMMENT '成交价（分）',
@@ -132,6 +125,7 @@ CREATE TABLE IF NOT EXISTS `order_deal` (
   `pay_deadline`   DATETIME(3)     DEFAULT NULL            COMMENT '支付截止时间',
   `paid_at`        DATETIME(3)     DEFAULT NULL            COMMENT '支付完成时间',
   `closed_at`      DATETIME(3)     DEFAULT NULL            COMMENT '订单关闭时间',
+  `version`        BIGINT          NOT NULL DEFAULT 0      COMMENT '行级乐观锁版本号，支付/超时关单 CAS 路径递增',
   `created_at`     DATETIME(3)     NOT NULL DEFAULT CURRENT_TIMESTAMP(3) COMMENT '创建时间',
   `updated_at`     DATETIME(3)     NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3) COMMENT '更新时间',
   PRIMARY KEY (`id`),
@@ -143,7 +137,7 @@ CREATE TABLE IF NOT EXISTS `order_deal` (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='成交订单表';
 
 -- ---------------------------------------------------------------------
--- 6. deposit_ledger 保证金账本
+-- 5. deposit_ledger 保证金账本
 --    uk_auction_user 保证同用户在同拍场仅一条有效记录
 -- ---------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS `deposit_ledger` (
@@ -162,7 +156,7 @@ CREATE TABLE IF NOT EXISTS `deposit_ledger` (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='保证金账本';
 
 -- ---------------------------------------------------------------------
--- 7. audit_log 审计日志
+-- 6. audit_log 审计日志
 -- ---------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS `audit_log` (
   `id`            BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '审计日志 ID',
@@ -295,19 +289,17 @@ INSERT INTO `user` (`id`, `account`, `phone`, `nickname`, `password_hash`, `role
   (3, 'buyer001',    '13800000003', '买家小明',   'e027cbdb3f9674449886392eaefd930e17d60411538b6fd2b7612431134e7fca', 'buyer',    'ACTIVE'),
   (4, 'disabled001', '13800000004', '停用买家',   'e027cbdb3f9674449886392eaefd930e17d60411538b6fd2b7612431134e7fca', 'buyer',    'DISABLED');
 
--- 演示商品
-INSERT INTO `item` (`id`, `seller_id`, `title`, `category`, `brand`, `condition_grade`, `images`, `description`, `status`) VALUES
-  (1001, 2, '【演示】限量版机械键盘', '数码配件', 'DemoBrand', 'NEW',
-   JSON_ARRAY('https://example.com/demo1-1.jpg','https://example.com/demo1-2.jpg'),
-   '演示用商品，限量版机械键盘，全新未拆封。', 'LISTED');
-
 -- 演示拍品（0 元起拍 + 反狙击 15s/30s + 保证金 100 元）
 INSERT INTO `auction_lot`
-  (`auction_id`, `item_id`, `seller_id`, `auction_type`, `start_price`, `reserve_price`, `cap_price`,
-   `increment_rule`, `anti_sniping_sec`, `anti_extend_sec`, `deposit_amount`,
+  (`auction_id`, `seller_id`, `title`, `category`, `brand`, `condition_grade`, `image_urls`, `cover_url`, `description`,
+   `auction_type`, `start_price`, `reserve_price`, `cap_price`, `increment_rule`, `anti_sniping_sec`, `anti_extend_sec`, `deposit_amount`,
    `status`, `rule_snapshot`, `start_time`, `end_time`)
 VALUES
-  (90001, 1001, 2, 'ENGLISH', 0, 0, 50000,
+  (90001, 2, '【演示】限量版机械键盘', '数码配件', 'DemoBrand', 'NEW',
+   JSON_ARRAY('https://example.com/demo1-1.jpg','https://example.com/demo1-2.jpg'),
+   'https://example.com/demo1-1.jpg',
+   '演示用拍品，限量版机械键盘，全新未拆封。',
+   'ENGLISH', 0, 0, 50000,
    JSON_OBJECT('type', 'fixed', 'amount', 100, 'maxBidSteps', 10),
    15, 30, 10000,
    'READY',
@@ -327,5 +319,5 @@ VALUES
 INSERT INTO `config_item` (`config_key`, `config_value`, `description`) VALUES
   ('default.deposit_ratio',   JSON_OBJECT('ratio', 0.1, 'min', 1000, 'max', 100000), '默认保证金比例（按起拍价 10%，最小 10 元最大 1000 元）'),
   ('default.anti_sniping',    JSON_OBJECT('triggerSec', 15, 'extendSec', 30),         '默认反狙击参数'),
-  ('order.pay_timeout_sec',   JSON_OBJECT('value', 1800),                              '订单支付超时（秒）'),
+  ('order.pay_timeout_sec',   JSON_OBJECT('value', 1200),                              '订单支付超时（秒）'),
   ('live.agent_hook.default', JSON_OBJECT('enabled', false),                           '直播拍卖 AI Agent hook 默认开关');

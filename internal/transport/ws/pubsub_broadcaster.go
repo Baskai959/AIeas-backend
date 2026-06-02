@@ -77,6 +77,9 @@ func (b *PubSubBroadcaster) handleMessage(msg *redisgo.Message) {
 	if eventType == "" {
 		eventType = "bid.accepted"
 	}
+	if eventType == "bid.rejected" {
+		return
+	}
 	b.hub.Broadcast(auctionID, Envelope{Type: eventType, Seq: payload.Seq, Payload: json.RawMessage(msg.Payload)})
 }
 

@@ -25,6 +25,7 @@ func TestNewNoopAndDefaultAreDisabled(t *testing.T) {
 		t.Fatalf("nil registry must report disabled")
 	}
 	nilReg.ObserveHTTP("GET", "/x", 200, time.Millisecond, 0, 0) // must not panic
+	nilReg.ObserveBidStage("state", "ok", time.Millisecond)
 	nilReg.IncBidDuplicate()
 	nilReg.IncWSConnect()
 	nilReg.ObserveRedisLua("foo", time.Millisecond, "")
@@ -94,9 +95,13 @@ func TestHTTPInflightGaugeIncDec(t *testing.T) {
 func TestObserveBidAndDuplicate(t *testing.T) {
 	r := New(Options{Enabled: true})
 	r.ObserveBid("accepted", "ok", 2*time.Millisecond)
+	r.ObserveBidStage("lua_place_bid", "accepted", 2*time.Millisecond)
 	r.IncBidDuplicate()
 	if v := counterVecValue(t, r.bidTotal, "accepted", "ok"); v != 1 {
 		t.Fatalf("bidTotal accepted=ok expected 1, got %v", v)
+	}
+	if v := histogramVecCount(t, r.bidStageDuration, "lua_place_bid", "accepted"); v != 1 {
+		t.Fatalf("bidStageDuration expected 1, got %v", v)
 	}
 	if v := counterValue(t, r.bidDuplicateTotal); v != 1 {
 		t.Fatalf("bidDuplicateTotal expected 1, got %v", v)
@@ -159,6 +164,23 @@ func counterVecValue(t *testing.T, vec *prometheus.CounterVec, labels ...string)
 		t.Fatalf("GetMetricWithLabelValues: %v", err)
 	}
 	return counterValue(t, c)
+}
+
+func histogramVecCount(t *testing.T, vec *prometheus.HistogramVec, labels ...string) uint64 {
+	t.Helper()
+	h, err := vec.GetMetricWithLabelValues(labels...)
+	if err != nil {
+		t.Fatalf("GetMetricWithLabelValues: %v", err)
+	}
+	metric, ok := h.(prometheus.Metric)
+	if !ok {
+		t.Fatalf("histogram does not implement prometheus.Metric")
+	}
+	var m dto.Metric
+	if err := metric.Write(&m); err != nil {
+		t.Fatalf("histogram write: %v", err)
+	}
+	return m.GetHistogram().GetSampleCount()
 }
 
 func gaugeValue(t *testing.T, g prometheus.Gauge) float64 {

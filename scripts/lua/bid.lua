@@ -47,25 +47,7 @@ if extend_ms == nil then extend_ms = 0 end
 if max_extend_count == nil then max_extend_count = 0 end
 if freq_limit_count == nil then freq_limit_count = 0 end
 if freq_window_ms == nil then freq_window_ms = 0 end
-if idem_ttl_ms == nil or idem_ttl_ms <= 0 then idem_ttl_ms = 86400000 end
-
-local function assert_type(key, expected)
-  local key_type = redis.call("TYPE", key).ok
-  if key_type ~= "none" and key_type ~= expected then
-    error("WRONGTYPE " .. key .. " expected " .. expected .. " got " .. key_type)
-  end
-end
-
-assert_type(state_key, "hash")
-assert_type(ranking_key, "zset")
-assert_type(idem_key, "string")
-assert_type(enrolled_key, "set")
-assert_type(deposit_key, "set")
-assert_type(freq_key, "string")
-assert_type(user_bids_key, "hash")
-assert_type(stream_key, "stream")
-assert_type(seq_key, "string")
-assert_type(active_streams_key, "set")
+if idem_ttl_ms == nil or idem_ttl_ms <= 0 then idem_ttl_ms = 30000 end
 
 local function number_or_zero(value)
   if value == false or value == nil or value == "" then
@@ -116,11 +98,10 @@ local function build_result(accepted, reason, current_price, leader_id, end_ts, 
   return cjson.encode(result)
 end
 
-local function append_event(accepted, reason, current_price, leader_id, end_ts, extend_count, extended, version, auction_status, auto_closed)
+local function append_accepted_event(current_price, leader_id, end_ts, extend_count, extended, version, auction_status, auto_closed)
   local seq = redis.call("INCR", seq_key)
   local stream_id = tostring(seq) .. "-0"
-  local event_type = accepted and "bid.accepted" or "bid.rejected"
-  redis.call("XADD", stream_key, stream_id,
+  redis.call("XADD", stream_key, "MAXLEN", "~", "10000", stream_id,
     "request_id", request_id,
     "auction_id", tostring(auction_id),
     "live_session_id", tostring(live_session_id),
@@ -129,9 +110,9 @@ local function append_event(accepted, reason, current_price, leader_id, end_ts, 
     "bid_price", tostring(price),
     "bid_ts_ms", tostring(now_ms),
     "source", source,
-    "risk_result", accepted and "ALLOW" or "REJECT",
-    "reject_reason", reason,
-    "accepted", accepted and "1" or "0",
+    "risk_result", "ALLOW",
+    "reject_reason", "",
+    "accepted", "1",
     "current_price", tostring(current_price),
     "leader_bidder_id", leader_id,
     "end_ts_ms", tostring(end_ts),
@@ -142,11 +123,11 @@ local function append_event(accepted, reason, current_price, leader_id, end_ts, 
     "seq", tostring(seq),
     "stream_id", stream_id,
     "created_at_ms", tostring(now_ms),
-    "event_type", event_type,
+    "event_type", "bid.accepted",
     "traceparent", trace_parent,
     "tracestate", trace_state
   )
-  local payload = build_result(accepted, reason, current_price, leader_id, end_ts, extend_count, extended, version, seq, stream_id, false, auction_status, auto_closed)
+  local payload = build_result(true, "", current_price, leader_id, end_ts, extend_count, extended, version, seq, stream_id, false, auction_status, auto_closed)
   local channel = "auction:" .. tostring(auction_id) .. ":events"
   redis.call("PUBLISH", channel, payload)
   redis.call("SADD", active_streams_key, tostring(auction_id))
@@ -155,19 +136,35 @@ end
 
 local existing = redis.call("GET", idem_key)
 if existing then
+  local ok, decoded = pcall(cjson.decode, existing)
+  if ok and type(decoded) == "table" then
+    decoded["duplicate"] = true
+    return cjson.encode(decoded)
+  end
   return existing
 end
 
-local status = redis.call("HGET", state_key, "status")
-local current_price = number_or_zero(redis.call("HGET", state_key, "current_price"))
-local start_price_raw = redis.call("HGET", state_key, "start_price")
+local status_fields = redis.call("HMGET", state_key,
+  "status",
+  "current_price",
+  "start_price",
+  "cap_price",
+  "leader_bidder_id",
+  "end_ts_ms",
+  "extend_count",
+  "version",
+  "increment_rule"
+)
+local status = status_fields[1]
+local current_price = number_or_zero(status_fields[2])
+local start_price_raw = status_fields[3]
 local start_price = number_or_zero(start_price_raw)
-local cap_price = number_or_zero(redis.call("HGET", state_key, "cap_price"))
-local leader_id = string_or_empty(redis.call("HGET", state_key, "leader_bidder_id"))
-local end_ts = number_or_zero(redis.call("HGET", state_key, "end_ts_ms"))
-local extend_count = number_or_zero(redis.call("HGET", state_key, "extend_count"))
-local version = number_or_zero(redis.call("HGET", state_key, "version"))
-local increment_rule = string_or_empty(redis.call("HGET", state_key, "increment_rule"))
+local cap_price = number_or_zero(status_fields[4])
+local leader_id = string_or_empty(status_fields[5])
+local end_ts = number_or_zero(status_fields[6])
+local extend_count = number_or_zero(status_fields[7])
+local version = number_or_zero(status_fields[8])
+local increment_rule = string_or_empty(status_fields[9])
 
 local function positive_number(value)
   local parsed = tonumber(value)
@@ -181,33 +178,56 @@ if (start_price_raw == false or start_price_raw == nil or start_price_raw == "")
   start_price = current_price
 end
 
-local function increment_rule_for_price(rule_raw, fallback_amount, current_price_for_rule)
-  local amount = positive_number(redis.call("HGET", state_key, "increment_amount")) or positive_number(fallback_amount) or 1
-  local max_steps = tonumber(redis.call("HGET", state_key, "max_bid_steps")) or 1
+local rule_decoded_ok = false
+local rule_decoded = nil
+if increment_rule ~= "" then
+  local ok, parsed = pcall(cjson.decode, increment_rule)
+  if ok and type(parsed) == "table" then
+    rule_decoded_ok = true
+    rule_decoded = parsed
+  end
+end
+
+local rule_type = ""
+local rule_max_steps_override = nil
+local rule_fixed_amount = nil
+local rule_steps = nil
+if rule_decoded_ok then
+  local parsed_steps = tonumber(rule_decoded["maxBidSteps"])
+  if parsed_steps ~= nil and parsed_steps > 0 then
+    rule_max_steps_override = parsed_steps
+  end
+  rule_type = string.lower(tostring(rule_decoded["type"] or ""))
+  if rule_type == "fixed" then
+    rule_fixed_amount = positive_number(rule_decoded["amount"])
+  elseif rule_type == "ladder" and type(rule_decoded["steps"]) == "table" then
+    rule_steps = rule_decoded["steps"]
+  end
+end
+
+local fallback_increment_amount = positive_number(redis.call("HGET", state_key, "increment_amount"))
+local fallback_max_bid_steps = tonumber(redis.call("HGET", state_key, "max_bid_steps")) or 1
+if fallback_max_bid_steps <= 0 then
+  fallback_max_bid_steps = 1
+end
+
+local function increment_rule_for_price(current_price_for_rule)
+  local amount = fallback_increment_amount or positive_number(min_increment) or 1
+  local max_steps = rule_max_steps_override or fallback_max_bid_steps
   if max_steps <= 0 then
     max_steps = 1
   end
-  if rule_raw == "" then
+  if not rule_decoded_ok then
     return amount, max_steps
   end
-  local ok, rule = pcall(cjson.decode, rule_raw)
-  if not ok or type(rule) ~= "table" then
-    return amount, max_steps
-  end
-  local parsed_steps = tonumber(rule["maxBidSteps"])
-  if parsed_steps ~= nil and parsed_steps > 0 then
-    max_steps = parsed_steps
-  end
-  local rule_type = string.lower(tostring(rule["type"] or ""))
   if rule_type == "fixed" then
-    local parsed_amount = positive_number(rule["amount"])
-    if parsed_amount ~= nil then
-      amount = parsed_amount
+    if rule_fixed_amount ~= nil then
+      amount = rule_fixed_amount
     end
     return amount, max_steps
   end
-  if rule_type == "ladder" and type(rule["steps"]) == "table" then
-    for _, step in ipairs(rule["steps"]) do
+  if rule_type == "ladder" and rule_steps ~= nil then
+    for _, step in ipairs(rule_steps) do
       if type(step) == "table" then
         local step_min = tonumber(step["min"]) or 0
         local step_max = tonumber(step["max"])
@@ -222,8 +242,7 @@ local function increment_rule_for_price(rule_raw, fallback_amount, current_price
 end
 
 local function reject(reason)
-  local seq, stream_id = append_event(false, reason, current_price, leader_id, end_ts, extend_count, false, version, status, false)
-  local result = build_result(false, reason, current_price, leader_id, end_ts, extend_count, false, version, seq, stream_id, false, status, false)
+  local result = build_result(false, reason, current_price, leader_id, end_ts, extend_count, false, version, 0, "", false, status, false)
   if request_id ~= "" then
     redis.call("SET", idem_key, result, "PX", idem_ttl_ms)
   end
@@ -260,8 +279,8 @@ if freq_limit_count > 0 and freq_window_ms > 0 then
   end
 end
 
-local increment_amount, max_bid_steps = increment_rule_for_price(increment_rule, min_increment, current_price)
-local expected_increment_amount, expected_max_bid_steps = increment_rule_for_price(increment_rule, min_increment, expected_current_price)
+local increment_amount, max_bid_steps = increment_rule_for_price(current_price)
+local expected_increment_amount, expected_max_bid_steps = increment_rule_for_price(expected_current_price)
 if price <= start_price then
   return reject("BELOW_START_PRICE")
 end
@@ -313,9 +332,10 @@ elseif anti_snipe_ms > 0 and extend_ms > 0 and extend_count < max_extend_count t
 end
 
 version = version + 1
+redis.call("HINCRBY", state_key, "bid_count", 1)
 local next_price = price
 local next_leader = bidder_id
-local seq, stream_id = append_event(true, "", next_price, next_leader, end_ts, extend_count, extended, version, status, auto_closed)
+local seq, stream_id = append_accepted_event(next_price, next_leader, end_ts, extend_count, extended, version, status, auto_closed)
 redis.call("HSET", state_key,
   "status", status,
   "current_price", next_price,

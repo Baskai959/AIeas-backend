@@ -1,0 +1,115 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "拍品去商品维度 API",
+    "version": "1.0.2",
+    "description": "商家直接创建拍品，拍品承载展示信息与拍卖规则；发布后进入待审核并由后台异步调用 AI 审核，AI 通过后进入 READY。响应统一包装为 {code,message,data,trace_id}。"
+  },
+  "paths": {
+    "/api/v1/auctions": {
+      "post": {
+        "summary": "创建拍品",
+        "description": "不传 status 默认发布为 PENDING_AUDIT；暂存草稿传 DRAFT。READY 只能由后台审核或 AI 审核回调产生。",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/AuctionUpsertRequest" } } } },
+        "responses": { "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/AuctionLotResponse" } } } } }
+      },
+      "get": {
+        "summary": "拍品列表",
+        "parameters": [
+          { "name": "status", "in": "query", "schema": { "type": "string" } },
+          { "name": "category", "in": "query", "schema": { "type": "string" } },
+          { "name": "keyword", "in": "query", "schema": { "type": "string" } },
+          { "name": "liveSessionId", "in": "query", "schema": { "type": "integer", "format": "int64" } },
+          { "name": "limit", "in": "query", "schema": { "type": "integer", "default": 20 } },
+          { "name": "offset", "in": "query", "schema": { "type": "integer", "default": 0 } }
+        ],
+        "responses": { "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/AuctionListResponse" } } } } }
+      }
+    },
+    "/api/v1/auctions/images": {
+      "post": {
+        "summary": "上传拍品图片",
+        "description": "上传一张或多张拍品图片，返回可写入 AuctionLot.imageUrls/coverUrl 的代理 URL。",
+        "requestBody": {
+          "required": true,
+          "content": { "multipart/form-data": { "schema": { "type": "object", "properties": { "images": { "type": "array", "items": { "type": "string", "format": "binary" } }, "image": { "type": "string", "format": "binary" } } } } }
+        },
+        "responses": { "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/AuctionImageUploadResponse" } } } } }
+      }
+    },
+    "/api/v1/auctions/{id}": {
+      "get": {
+        "summary": "拍品详情",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "integer", "format": "int64" } }],
+        "responses": { "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/AuctionLotResponse" } } } } }
+      },
+      "patch": {
+        "summary": "编辑拍品",
+        "description": "status 如需传入，只允许 DRAFT 或 PENDING_AUDIT；READY 不能由商家编辑接口直接写入。",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "integer", "format": "int64" } }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/AuctionUpsertRequest" } } } },
+        "responses": { "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/AuctionLotResponse" } } } } }
+      }
+    },
+    "/api/v1/auctions/description/optimize": {
+      "post": {
+        "summary": "拍品描述优化",
+        "requestBody": { "required": true, "content": { "multipart/form-data": { "schema": { "type": "object", "properties": { "image": { "type": "string", "format": "binary" }, "imageUrl": { "type": "string" }, "title": { "type": "string" }, "category": { "type": "string" }, "condition": { "type": "string" } }, "required": ["title", "category", "condition"] } } } },
+        "responses": { "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/LotDescriptionOptimizeResponse" } } } } }
+      }
+    },
+    "/api/v1/auctions/audit/callback": {
+      "post": {
+        "summary": "拍品内容 AI 审核回调",
+        "description": "AI 审核服务对拍品内容审核完成后的旁路回调。仅记录/确认回调结果，不推进运行中或已成交拍品状态。",
+        "parameters": [{ "name": "X-Callback-Key", "in": "header", "required": true, "schema": { "type": "string" } }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/AuctionAuditCallbackRequest" } } } },
+        "responses": { "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/AuctionAuditCallbackWrappedResponse" } } } } }
+      }
+    },
+    "/api/v1/orders": {
+      "get": {
+        "summary": "订单列表（返回成交时 lotSnapshot）",
+        "responses": { "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/OrderListResponse" } } } } }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "BaseResponse": {
+        "type": "object",
+        "required": ["code", "message", "data"],
+        "properties": { "code": { "type": "integer", "example": 0 }, "message": { "type": "string", "example": "success" }, "trace_id": { "type": "string" } }
+      },
+      "AuctionUpsertRequest": {
+        "type": "object",
+        "required": ["title", "category", "condition", "startPrice", "reservePrice", "incrementRule", "depositAmount"],
+        "properties": {
+          "title": { "type": "string" }, "description": { "type": "string" }, "category": { "type": "string" }, "brand": { "type": "string" },
+          "condition": { "type": "string", "enum": ["NEW", "LIKE_NEW", "GOOD", "FAIR"] },
+          "imageUrls": { "type": "array", "items": { "type": "string" } }, "coverUrl": { "type": "string" }, "auctionType": { "type": "string", "default": "ENGLISH" },
+          "startPrice": { "type": "integer", "format": "int64", "description": "分" }, "reservePrice": { "type": "integer", "format": "int64" }, "capPrice": { "type": "integer", "format": "int64" },
+          "incrementRule": { "type": "object" }, "antiSnipingSec": { "type": "integer" }, "antiExtendSec": { "type": "integer" }, "antiExtendMode": { "type": "string", "enum": ["ADD", "RESET"] },
+          "depositAmount": { "type": "integer", "format": "int64" }, "durationSec": { "type": "integer" }, "startTime": { "type": "string", "format": "date-time" }, "endTime": { "type": "string", "format": "date-time" }, "status": { "type": "string", "enum": ["DRAFT", "PENDING_AUDIT"], "default": "PENDING_AUDIT", "description": "创建/编辑接口允许写入的状态。DRAFT 表示暂存，PENDING_AUDIT 表示发布待审核；READY 由审核回调产生。" }
+        }
+      },
+      "AuctionLot": {
+        "allOf": [{ "$ref": "#/components/schemas/AuctionUpsertRequest" }],
+        "properties": { "auctionId": { "type": "integer", "format": "int64" }, "sellerId": { "type": "string" }, "status": { "type": "string" }, "liveSessionId": { "type": "integer", "format": "int64", "nullable": true } }
+      },
+      "OrderDeal": {
+        "type": "object",
+        "properties": { "id": { "type": "integer", "format": "int64" }, "auctionId": { "type": "integer", "format": "int64" }, "lotSnapshot": { "$ref": "#/components/schemas/AuctionLot" }, "winnerId": { "type": "string" }, "sellerId": { "type": "string" }, "dealPrice": { "type": "integer", "format": "int64" }, "status": { "type": "string" }, "payStatus": { "type": "string" } }
+      },
+      "AuctionLotResponse": { "allOf": [{ "$ref": "#/components/schemas/BaseResponse" }], "properties": { "data": { "$ref": "#/components/schemas/AuctionLot" } } },
+      "AuctionListResponse": { "allOf": [{ "$ref": "#/components/schemas/BaseResponse" }], "properties": { "data": { "type": "object", "properties": { "auctions": { "type": "array", "items": { "$ref": "#/components/schemas/AuctionLot" } } } } } },
+      "AuctionImageUploadResponse": { "allOf": [{ "$ref": "#/components/schemas/BaseResponse" }], "properties": { "data": { "type": "object", "properties": { "imageUrls": { "type": "array", "items": { "type": "string" } }, "coverUrl": { "type": "string" } } } } },
+      "LotDescriptionOptimizeResponse": { "allOf": [{ "$ref": "#/components/schemas/BaseResponse" }], "properties": { "data": { "type": "object", "properties": { "title": { "type": "string" }, "category": { "type": "string" }, "description": { "type": "string" } } } } },
+      "OrderListResponse": { "allOf": [{ "$ref": "#/components/schemas/BaseResponse" }], "properties": { "data": { "type": "object", "properties": { "orders": { "type": "array", "items": { "$ref": "#/components/schemas/OrderDeal" } } } } } },
+      "AuctionAuditCallbackRequest": { "type": "object", "required": ["success", "is_approved", "callback_context"], "properties": { "requestId": { "type": "string" }, "request_id": { "type": "string" }, "status": { "type": "string" }, "success": { "type": "boolean", "description": "AI 审核任务是否成功返回结论；false 时后端只接收回调，不推进拍品状态。" }, "isApproved": { "type": "boolean" }, "is_approved": { "type": "boolean" }, "rejectReasons": { "type": "array", "items": { "type": "string" } }, "reject_reasons": { "type": "array", "items": { "type": "string" } }, "riskLabels": { "type": "array", "items": { "type": "string" } }, "risk_labels": { "type": "array", "items": { "type": "string" } }, "context": { "$ref": "#/components/schemas/AuctionAuditCallbackContext" }, "callback_context": { "$ref": "#/components/schemas/AuctionAuditCallbackContext" } } },
+      "AuctionAuditCallbackContext": { "type": "object", "required": ["auctionId"], "properties": { "taskId": { "type": "string", "example": "product-audit-53767059931648" }, "auctionId": { "type": "integer", "format": "int64" }, "sellerId": { "type": "string" }, "scope": { "type": "string", "example": "auction_lot_content" } }, "additionalProperties": true },
+      "AuctionAuditCallbackResponse": { "type": "object", "properties": { "accepted": { "type": "boolean" }, "requestId": { "type": "string" }, "auctionId": { "type": "integer", "format": "int64" }, "status": { "type": "string" }, "lotStatus": { "type": "string", "description": "本次回调推进后的拍品状态；success=false 时可能为空。" }, "success": { "type": "boolean" }, "isApproved": { "type": "boolean" }, "rejectReasons": { "type": "array", "items": { "type": "string" } }, "riskLabels": { "type": "array", "items": { "type": "string" } }, "scope": { "type": "string" } } },
+      "AuctionAuditCallbackWrappedResponse": { "allOf": [{ "$ref": "#/components/schemas/BaseResponse" }], "properties": { "data": { "$ref": "#/components/schemas/AuctionAuditCallbackResponse" } } }
+    }
+  }
+}

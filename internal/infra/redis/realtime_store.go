@@ -53,20 +53,24 @@ func (s *AuctionRealtimeStore) InitAuction(ctx context.Context, auction domain.A
 	if incrementAmount <= 0 {
 		incrementAmount = minIncrement
 	}
-	state := domain.AuctionState{
-		AuctionID:    auction.AuctionID,
-		Status:       auction.Status,
-		CurrentPrice: auction.StartPrice,
-		StartTime:    auction.StartTime,
-		EndTime:      auction.EndTime,
-		Version:      time.Now().UTC().UnixMilli(),
-		Source:       "redis",
-	}
-	client, _ := s.shardForAuction(auction.AuctionID)
 	var liveSessionID uint64
 	if auction.LiveSessionID != nil {
 		liveSessionID = *auction.LiveSessionID
 	}
+	state := domain.AuctionState{
+		AuctionID:     auction.AuctionID,
+		LiveSessionID: liveSessionID,
+		Status:        auction.Status,
+		StartPrice:    auction.StartPrice,
+		CapPrice:      auction.CapPrice,
+		IncrementRule: append([]byte(nil), auction.IncrementRule...),
+		CurrentPrice:  auction.StartPrice,
+		StartTime:     auction.StartTime,
+		EndTime:       auction.EndTime,
+		Version:       time.Now().UTC().UnixMilli(),
+		Source:        "redis",
+	}
+	client, _ := s.shardForAuction(auction.AuctionID)
 	pipe := client.Pipeline()
 	pipe.Del(ctx,
 		s.keys.AuctionBids(auction.AuctionID),
@@ -84,6 +88,7 @@ func (s *AuctionRealtimeStore) InitAuction(ctx context.Context, auction domain.A
 		"current_price", auction.StartPrice,
 		"cap_price", auction.CapPrice,
 		"leader_bidder_id", "",
+		"bid_count", 0,
 		"start_ts_ms", auction.StartTime.UnixMilli(),
 		"end_ts_ms", auction.EndTime.UnixMilli(),
 		"last_bid_ts_ms", 0,
@@ -110,9 +115,14 @@ func (s *AuctionRealtimeStore) GetAuctionState(ctx context.Context, auctionID ui
 	}
 	state := domain.AuctionState{
 		AuctionID:      parseUint(values["auction_id"], auctionID),
+		LiveSessionID:  parseUint(values["live_session_id"], 0),
 		Status:         domain.AuctionStatus(values["status"]),
+		StartPrice:     parseInt(values["start_price"], 0),
+		CapPrice:       parseInt(values["cap_price"], 0),
+		IncrementRule:  parseRawJSON(values["increment_rule"]),
 		CurrentPrice:   parseInt(values["current_price"], 0),
 		LeaderBidderID: values["leader_bidder_id"],
+		BidCount:       int(parseInt(values["bid_count"], 0)),
 		StartTime:      time.UnixMilli(parseInt(values["start_ts_ms"], 0)).UTC(),
 		EndTime:        time.UnixMilli(parseInt(values["end_ts_ms"], 0)).UTC(),
 		LastBidTSMS:    parseInt(values["last_bid_ts_ms"], 0),
@@ -170,7 +180,7 @@ func (s *AuctionRealtimeStore) PlaceBid(ctx context.Context, input domain.BidInp
 		now = time.Now().UTC()
 	}
 	if input.IdempotencyTTL <= 0 {
-		input.IdempotencyTTL = 24 * time.Hour
+		input.IdempotencyTTL = 30 * time.Second
 	}
 	expectedCurrentPrice := ""
 	if input.ExpectedCurrentPrice != nil {
@@ -394,4 +404,11 @@ func parseUint(raw string, fallback uint64) uint64 {
 		return fallback
 	}
 	return value
+}
+
+func parseRawJSON(raw string) json.RawMessage {
+	if strings.TrimSpace(raw) == "" || !json.Valid([]byte(raw)) {
+		return nil
+	}
+	return append([]byte(nil), raw...)
 }

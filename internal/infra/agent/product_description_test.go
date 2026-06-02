@@ -69,16 +69,15 @@ func TestLiveAnalysisClientReturnsAsyncAgentErrorMessage(t *testing.T) {
 	}
 }
 
-func TestLiveAuctionHookClientPostsMessage(t *testing.T) {
-	var gotMessage string
+func TestLiveAuctionHookClientPostsQuestion(t *testing.T) {
+	var gotReq struct {
+		SessionID string `json:"session_id"`
+		Question  string `json:"question"`
+	}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var req struct {
-			Message string `json:"message"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if err := json.NewDecoder(r.Body).Decode(&gotReq); err != nil {
 			t.Fatalf("decode hook request: %v", err)
 		}
-		gotMessage = req.Message
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"success":true}`))
 	}))
@@ -88,10 +87,10 @@ func TestLiveAuctionHookClientPostsMessage(t *testing.T) {
 		LiveAuctionHookURL: server.URL,
 		Timeout:            appconfig.Duration(time.Second),
 	})
-	if err := client.InvokeLiveAgentHook(t.Context(), "直播间70001开播了"); err != nil {
+	if err := client.InvokeLiveAgentHook(t.Context(), "70001", "直播间70001开播了"); err != nil {
 		t.Fatalf("invoke live auction hook: %v", err)
 	}
-	if gotMessage != "直播间70001开播了" {
-		t.Fatalf("unexpected hook request message=%q", gotMessage)
+	if gotReq.SessionID != "70001" || gotReq.Question != "直播间70001开播了" {
+		t.Fatalf("unexpected hook request: %+v", gotReq)
 	}
 }

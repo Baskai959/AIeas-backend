@@ -33,6 +33,16 @@ func TestAuctionRealtimeStorePlaceBidWritesStreamAndIsIdempotent(t *testing.T) {
 	if !result.Accepted || result.Seq != 1 || result.StreamID != "1-0" || result.Event != "bid.accepted" {
 		t.Fatalf("unexpected accepted result: %+v", result)
 	}
+	state, ok, err := store.GetAuctionState(ctx, auctionID)
+	if err != nil || !ok {
+		t.Fatalf("read state: ok=%v err=%v", ok, err)
+	}
+	if state.BidCount != 1 || state.CurrentPrice != 1100 {
+		t.Fatalf("unexpected realtime state after bid: %+v", state)
+	}
+	if state.StartPrice != 1000 || state.CapPrice != 2000 || string(state.IncrementRule) != `{"type":"fixed","amount":100,"maxBidSteps":10}` {
+		t.Fatalf("realtime state should include pricing rule, got %+v", state)
+	}
 	entries, err := client.XRange(ctx, keys.AuctionStream(auctionID), "-", "+").Result()
 	if err != nil {
 		t.Fatalf("read stream: %v", err)
@@ -45,7 +55,7 @@ func TestAuctionRealtimeStorePlaceBidWritesStreamAndIsIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("duplicate bid: %v", err)
 	}
-	if duplicate.Seq != result.Seq || duplicate.StreamID != result.StreamID || duplicate.Price != result.Price {
+	if !duplicate.Duplicate || duplicate.Seq != result.Seq || duplicate.StreamID != result.StreamID || duplicate.Price != result.Price {
 		t.Fatalf("expected duplicate original seq/stream/price, first=%+v duplicate=%+v", result, duplicate)
 	}
 	entries, _ = client.XRange(ctx, keys.AuctionStream(auctionID), "-", "+").Result()
@@ -54,7 +64,7 @@ func TestAuctionRealtimeStorePlaceBidWritesStreamAndIsIdempotent(t *testing.T) {
 	}
 }
 
-func TestAuctionRealtimeStoreRejectedBidWritesStreamAndReplayGap(t *testing.T) {
+func TestAuctionRealtimeStoreRejectedBidDoesNotWriteStreamAndReplayGap(t *testing.T) {
 	ctx := context.Background()
 	store, client, keys := newMiniredisStore(t)
 	auctionID := uint64(10002)
@@ -65,13 +75,13 @@ func TestAuctionRealtimeStoreRejectedBidWritesStreamAndReplayGap(t *testing.T) {
 	if err != nil {
 		t.Fatalf("place rejected bid: %v", err)
 	}
-	if rejected.Accepted || rejected.Reason != "NOT_ENROLLED" || rejected.Seq != 1 || rejected.StreamID != "1-0" || rejected.Event != "bid.rejected" {
+	if rejected.Accepted || rejected.Reason != "NOT_ENROLLED" || rejected.Seq != 0 || rejected.StreamID != "" || rejected.Event != "bid.rejected" {
 		t.Fatalf("unexpected rejected result: %+v", rejected)
 	}
 
 	log := NewEventLog(NewShardedRTClientFromShards([]*RedisRTClient{{Client: client}}), keys)
 	events, complete, err := log.ReplayBidEvents(ctx, auctionID, 0, 10)
-	if err != nil || !complete || len(events) != 1 || events[0].Seq != 1 || events[0].EventType != "bid.rejected" || events[0].RejectReason != "NOT_ENROLLED" {
+	if err != nil || !complete || len(events) != 0 {
 		t.Fatalf("unexpected replay events=%+v complete=%v err=%v", events, complete, err)
 	}
 	gapAuctionID := uint64(10003)

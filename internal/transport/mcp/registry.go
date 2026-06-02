@@ -6,11 +6,9 @@ func resourceTemplates() []resourceTemplate {
 		{URITemplate: "aieas://users?role={role}&status={status}&keyword={keyword}&limit={limit}&offset={offset}", Name: "users-list", Description: "用户列表", MIMEType: "application/json"},
 		{URITemplate: "aieas://merchants/{merchantId}", Name: "merchant", Description: "商家安全资料和经营概览", MIMEType: "application/json"},
 		{URITemplate: "aieas://merchants/{merchantId}/live-sessions?status={status}&limit={limit}&offset={offset}", Name: "merchant-live-sessions", Description: "商家直播场次列表", MIMEType: "application/json"},
-		{URITemplate: "aieas://items/{itemId}", Name: "item", Description: "商品详情", MIMEType: "application/json"},
-		{URITemplate: "aieas://items?sellerId={sellerId}&status={status}&category={category}&limit={limit}&offset={offset}", Name: "items-list", Description: "商品列表", MIMEType: "application/json"},
 		{URITemplate: "aieas://auction-lots/{auctionId}", Name: "auction-lot", Description: "拍品详情", MIMEType: "application/json"},
 		{URITemplate: "aieas://auction-lots/{auctionId}/state", Name: "auction-state", Description: "拍品实时状态", MIMEType: "application/json"},
-		{URITemplate: "aieas://auction-lots?sellerId={sellerId}&status={status}&itemId={itemId}&liveSessionId={liveSessionId}&limit={limit}&offset={offset}", Name: "auction-lots-list", Description: "拍品列表", MIMEType: "application/json"},
+		{URITemplate: "aieas://auction-lots?sellerId={sellerId}&status={status}&liveSessionId={liveSessionId}&limit={limit}&offset={offset}", Name: "auction-lots-list", Description: "拍品列表", MIMEType: "application/json"},
 		{URITemplate: "aieas://live-sessions/{sessionId}", Name: "live-session", Description: "直播场次详情", MIMEType: "application/json"},
 		{URITemplate: "aieas://live-sessions/{sessionId}/lots", Name: "live-session-lots", Description: "场次内拍品", MIMEType: "application/json"},
 		{URITemplate: "aieas://live-sessions/{sessionId}/bids?limit={limit}&offset={offset}&sort={sort}", Name: "live-session-bids", Description: "场次出价记录", MIMEType: "application/json"},
@@ -43,9 +41,7 @@ func readToolDefinitions() []toolDefinition {
 		tool("read_user", "读取用户安全信息。只读，无副作用。", objectSchema(map[string]interface{}{"userId": stringProp("用户 ID；缺省时读取当前登录用户")}, nil)),
 		tool("read_users", "查询用户列表。admin only。只读，无副作用。", pagedSchema(map[string]interface{}{"role": enumProp([]string{"buyer", "merchant", "admin"}), "status": enumProp([]string{"ACTIVE", "DISABLED"}), "keyword": stringProp("用户 ID、账号或昵称关键词")}, nil)),
 		tool("read_merchant", "读取商家资料和经营概览。只读，无副作用。", objectSchema(map[string]interface{}{"merchantId": stringProp("商家用户 ID")}, nil)),
-		tool("read_items", "查询商品列表。只读，无副作用。", pagedSchema(map[string]interface{}{"sellerId": stringProp("商家用户 ID"), "status": stringProp("商品状态"), "category": stringProp("类目")}, nil)),
-		tool("read_item", "读取商品详情。只读，无副作用。", objectSchema(map[string]interface{}{"itemId": integerProp("商品 ID")}, []string{"itemId"})),
-		tool("read_auction_lots", "查询拍品列表。只读，无副作用。", pagedSchema(map[string]interface{}{"sellerId": stringProp("商家用户 ID"), "status": stringProp("拍品状态"), "itemId": integerProp("商品 ID"), "liveSessionId": integerProp("直播场次 ID")}, nil)),
+		tool("read_auction_lots", "查询拍品列表。只读，无副作用。", pagedSchema(map[string]interface{}{"sellerId": stringProp("商家用户 ID"), "status": stringProp("拍品状态"), "liveSessionId": integerProp("直播场次 ID")}, nil)),
 		tool("read_auction_lot", "读取拍品详情。只读，无副作用。", objectSchema(map[string]interface{}{"auctionId": integerProp("拍品 ID")}, []string{"auctionId"})),
 		tool("read_auction_state", "读取拍品实时状态。只读，无副作用。", objectSchema(map[string]interface{}{"auctionId": integerProp("拍品 ID")}, []string{"auctionId"})),
 		tool("read_live_sessions", "查询直播场次。只读，无副作用。", pagedSchema(map[string]interface{}{"merchantId": stringProp("商家用户 ID"), "status": stringProp("场次状态")}, nil)),
@@ -64,8 +60,29 @@ func readToolDefinitions() []toolDefinition {
 func controlToolDefinitions() []toolDefinition {
 	return []toolDefinition{
 		tool("get_merchant_live_control_context", "获取商家当前直播场次控制台上下文。参数只需要 merchantId，返回当前场次、讲解中拍品、成交/流拍/待讲解/可上架拍品。", objectSchema(map[string]interface{}{"merchantId": stringProp("商家用户 ID")}, []string{"merchantId"})),
-		tool("operate_live_session_lot", "模拟商家直播中的拍品操作。支持 onShelf 上架、offShelf 下架、startExplain 开始讲解、hammer 落槌、endLive 下播。", objectSchema(map[string]interface{}{"liveSessionId": integerProp("直播场次 ID"), "auctionId": integerProp("拍品 ID"), "action": enumProp([]string{"onShelf", "offShelf", "startExplain", "hammer", "endLive"}), "durationSec": optionalIntegerProp("开始讲解时可指定讲解/拍卖时长，单位秒"), "force": booleanProp("hammer/endLive 时是否强制结束；hammer 默认 true"), "requestId": stringProp("可选幂等请求 ID，建议 hammer 时传入")}, []string{"liveSessionId", "auctionId", "action"})),
+		tool("operate_live_session_lot", "模拟商家直播中的拍品操作。支持 onShelf 上架、offShelf 下架、startExplain 开始拍卖/讲解、hammer 落槌、endLive 下播；startExplain 必须传 auctionDurationSec。", operateLiveSessionLotSchema()),
+		tool("live_voice_broadcast", "直播语音播报。传入直播场次 ID 和播报文本，服务端调用豆包 TTS 合成语音，并通过 live.voice_broadcast WebSocket 事件推送给订阅该场次的用户端。", objectSchema(map[string]interface{}{"liveSessionId": integerProp("直播场次 ID"), "text": stringProp("播报文本，1-1000 字"), "requestId": stringProp("可选请求 ID，用于关联 MCP 调用和 WebSocket 播报事件")}, []string{"liveSessionId", "text"})),
 	}
+}
+
+func operateLiveSessionLotSchema() map[string]interface{} {
+	schema := objectSchema(map[string]interface{}{
+		"liveSessionId":      integerProp("直播场次 ID"),
+		"auctionId":          integerProp("拍品 ID"),
+		"action":             enumProp([]string{"onShelf", "offShelf", "startExplain", "hammer", "endLive"}),
+		"auctionDurationSec": optionalIntegerProp("拍卖/讲解时长，单位秒；action=startExplain 时必填且必须大于 0"),
+		"force":              booleanProp("hammer/endLive 时是否强制结束；hammer 默认 true"),
+		"requestId":          stringProp("可选幂等请求 ID，建议 hammer 时传入"),
+	}, []string{"liveSessionId", "auctionId", "action"})
+	schema["allOf"] = []interface{}{
+		map[string]interface{}{
+			"if": map[string]interface{}{
+				"properties": map[string]interface{}{"action": map[string]interface{}{"const": "startExplain"}},
+			},
+			"then": map[string]interface{}{"required": []string{"auctionDurationSec"}},
+		},
+	}
+	return schema
 }
 
 func tool(name, description string, inputSchema map[string]interface{}) toolDefinition {

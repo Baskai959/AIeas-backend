@@ -79,7 +79,7 @@ func (h *LiveSessionHandler) List(ctx context.Context, c *app.RequestContext) {
 	if !status.Valid() {
 		status = ""
 	}
-	sessions, err := h.sessions.ListByMerchant(ctx, strings.TrimSpace(c.Query("merchantId")), status, AuthUserID(c), AuthRole(c), parseQueryInt(c, "limit", 20), parseQueryInt(c, "offset", 0))
+	sessions, err := h.sessions.ListVisible(ctx, strings.TrimSpace(c.Query("merchantId")), status, AuthUserID(c), AuthRole(c), parseQueryInt(c, "limit", 20), parseQueryInt(c, "offset", 0))
 	if err != nil {
 		writeLiveSessionError(c, err)
 		return
@@ -390,6 +390,8 @@ func writeLiveSessionError(c *app.RequestContext, err error) {
 		WriteError(c, 404, 32001, "直播场次不存在", nil)
 	case errors.Is(err, domain.ErrForbidden):
 		WriteError(c, 403, 32002, "无直播场次操作权限", nil)
+	case errors.Is(err, service.ErrLiveSessionLotInvalidState):
+		WriteError(c, 409, 32005, "拍品状态不允许此操作", nil)
 	case errors.Is(err, domain.ErrInvalidState):
 		WriteError(c, 409, 32003, "直播场次状态不允许此操作", nil)
 	case errors.Is(err, domain.ErrInvalidArgument):

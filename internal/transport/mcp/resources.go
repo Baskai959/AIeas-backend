@@ -100,25 +100,6 @@ func (h *Handler) resourceData(ctx context.Context, rawURI string, actor service
 			items, err := h.read.ListLiveSessions(ctx, filter, actor)
 			return pagePayload(items, filter.Limit, filter.Offset, len(items)), err
 		}
-	case "items":
-		if len(parts) == 0 {
-			filter := domain.ItemFilter{
-				SellerID: strings.TrimSpace(q.Get("sellerId")),
-				Status:   itemStatus(q.Get("status")),
-				Category: strings.TrimSpace(q.Get("category")),
-				Limit:    queryInt(q, "limit", 20),
-				Offset:   queryInt(q, "offset", 0),
-			}
-			items, err := h.read.ListItems(ctx, filter, actor)
-			return pagePayload(items, filter.Limit, filter.Offset, len(items)), err
-		}
-		if len(parts) == 1 {
-			id, err := parseUintID(parts[0])
-			if err != nil {
-				return nil, domain.ErrInvalidArgument
-			}
-			return h.read.ReadItem(ctx, id, actor)
-		}
 	case "auction-lots":
 		if len(parts) == 0 {
 			filter := auctionFilterFromQuery(q)
@@ -250,7 +231,6 @@ func auctionFilterFromQuery(q url.Values) domain.AuctionFilter {
 	return domain.AuctionFilter{
 		SellerID:      strings.TrimSpace(q.Get("sellerId")),
 		Status:        auctionStatus(q.Get("status")),
-		ItemID:        queryUint(q, "itemId"),
 		LiveSessionID: queryUint(q, "liveSessionId"),
 		Limit:         queryInt(q, "limit", 20),
 		Offset:        queryInt(q, "offset", 0),
@@ -286,14 +266,6 @@ func auditFilterFromQuery(q url.Values) domain.AuditFilter {
 		Limit:      queryInt(q, "limit", 20),
 		Offset:     queryInt(q, "offset", 0),
 	}
-}
-
-func itemStatus(raw string) domain.ItemStatus {
-	status := domain.ItemStatus(strings.TrimSpace(raw))
-	if status.Valid() {
-		return status
-	}
-	return ""
 }
 
 func auctionStatus(raw string) domain.AuctionStatus {

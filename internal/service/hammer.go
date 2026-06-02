@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"strconv"
@@ -18,18 +19,19 @@ import (
 )
 
 type HammerService struct {
-	auctions  repository.AuctionRepository
-	orders    repository.OrderRepository
-	deposits  repository.DepositRepository
-	realtime  repository.AuctionRealtimeStore
-	tx        repository.TxManager
-	publisher EventPublisher
-	orderID   OrderIDGenerator
-	sessions  *LiveSessionService
-	onClose   func(ctx context.Context, auctionID uint64)
-	metrics   *metrics.Registry
-	hook      *LiveAgentHookService
-	events    SettlementEventPublisher
+	auctions   repository.AuctionRepository
+	orders     repository.OrderRepository
+	deposits   repository.DepositRepository
+	realtime   repository.AuctionRealtimeStore
+	tx         repository.TxManager
+	publisher  EventPublisher
+	orderID    OrderIDGenerator
+	sessions   *LiveSessionService
+	onClose    func(ctx context.Context, auctionID uint64)
+	metrics    *metrics.Registry
+	hook       *LiveAgentHookService
+	events     SettlementEventPublisher
+	payTimeout time.Duration
 }
 
 type OrderIDGenerator interface {
@@ -43,7 +45,7 @@ func NewHammerService(auctions repository.AuctionRepository, orders repository.O
 	if tx == nil {
 		tx = repository.NoopTxManager{}
 	}
-	return &HammerService{auctions: auctions, orders: orders, deposits: deposits, realtime: realtime, tx: tx, publisher: publisher}
+	return &HammerService{auctions: auctions, orders: orders, deposits: deposits, realtime: realtime, tx: tx, publisher: publisher, payTimeout: DefaultOrderPayTimeout}
 }
 
 // SetOnClose 注册拍卖终态回调（如直播间锁释放），不影响主流程错误。
@@ -53,6 +55,12 @@ func (s *HammerService) SetOnClose(fn func(ctx context.Context, auctionID uint64
 
 func (s *HammerService) SetOrderIDGenerator(idGen OrderIDGenerator) {
 	s.orderID = idGen
+}
+
+func (s *HammerService) SetOrderPayTimeout(timeout time.Duration) {
+	if timeout > 0 {
+		s.payTimeout = timeout
+	}
 }
 
 // SetLiveSessionService 注入直播场次服务，用于在 Hammer 时回填 order.live_session_id 与累加场次成交计数。
@@ -209,13 +217,14 @@ func (s *HammerService) hammerInternal(ctx context.Context, in domain.HammerInpu
 			ID:            orderID,
 			AuctionID:     current.AuctionID,
 			LiveSessionID: cloneLiveSessionID(current.LiveSessionID),
+			LotSnapshot:   buildLotDealSnapshot(current, result.Price, result.WinnerID, closedAt),
 			WinnerID:      result.WinnerID,
 			SellerID:      current.SellerID,
 			DealPrice:     result.Price,
 			DepositAmount: depositAmount,
 			Status:        domain.OrderStatusCreated,
 			PayStatus:     domain.PayStatusUnpaid,
-			PayDeadline:   ptrTime(in.Now.Add(24 * time.Hour)),
+			PayDeadline:   ptrTime(in.Now.Add(s.payTimeout)),
 			CreatedAt:     in.Now,
 			UpdatedAt:     in.Now,
 		}
@@ -287,13 +296,51 @@ func (s *HammerService) hammerInternal(ctx context.Context, in domain.HammerInpu
 		payload["orderId"] = order.ID
 	}
 	broadcastJSON(s.publisher, result.AuctionID, "auction.closed", payload)
-	if s.hook != nil && result.Status == domain.AuctionStatusClosedWon && auction.LiveSessionID != nil {
-		s.hook.EmitHammerWon(ctx, auction.SellerID, *auction.LiveSessionID, auction.AuctionID, result.Price)
+	if s.hook != nil && auction.LiveSessionID != nil {
+		reason := ""
+		if result.Status == domain.AuctionStatusClosedFailed {
+			reason = "未达到保留价或无人有效出价"
+		}
+		s.hook.EmitAuctionClosed(ctx, auction.SellerID, *auction.LiveSessionID, auction.AuctionID, result.Status, result.Price, isAutoHammerInput(in), reason)
 	}
 	if s.onClose != nil {
 		s.onClose(ctx, result.AuctionID)
 	}
 	return result, order, nil
+}
+
+func isAutoHammerInput(in domain.HammerInput) bool {
+	closedBy := strings.ToUpper(strings.TrimSpace(in.ClosedBy))
+	if closedBy == "SYSTEM" || closedBy == "CAP_PRICE" {
+		return true
+	}
+	requestID := strings.ToLower(strings.TrimSpace(in.RequestID))
+	return strings.HasPrefix(requestID, "auto-") || strings.HasPrefix(requestID, "cap-")
+}
+
+func buildLotDealSnapshot(lot domain.AuctionLot, dealPrice int64, winnerID string, closedAt time.Time) json.RawMessage {
+	payload := map[string]interface{}{
+		"auctionId":     lot.AuctionID,
+		"sellerId":      lot.SellerID,
+		"liveSessionId": lot.LiveSessionID,
+		"title":         lot.Title,
+		"description":   lot.Description,
+		"category":      lot.Category,
+		"brand":         lot.Brand,
+		"condition":     lot.ConditionGrade,
+		"imageUrls":     lot.ImageURLs,
+		"coverUrl":      lot.CoverURL,
+		"startPrice":    lot.StartPrice,
+		"reservePrice":  lot.ReservePrice,
+		"capPrice":      lot.CapPrice,
+		"incrementRule": json.RawMessage(lot.IncrementRule),
+		"depositAmount": lot.DepositAmount,
+		"dealPrice":     dealPrice,
+		"winnerId":      winnerID,
+		"closedAt":      closedAt,
+	}
+	data, _ := json.Marshal(payload)
+	return data
 }
 
 func (s *HammerService) publishSettlementEvents(ctx context.Context, auction domain.AuctionLot, result domain.HammerResult, order *domain.OrderDeal, in domain.HammerInput) {
