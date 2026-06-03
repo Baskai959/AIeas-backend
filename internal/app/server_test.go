@@ -84,6 +84,49 @@ func TestAuthLoginAndMeSuccess(t *testing.T) {
 	}
 }
 
+func TestAuthProfileAndAvatarUpdate(t *testing.T) {
+	h := newTestServer()
+	token := loginForToken(t, h.Engine, "buyer001", "Passw0rd!", "buyer")
+
+	patch := doJSONWithHeaders(t, h.Engine, consts.MethodPatch, "/api/v1/auth/me", `{"nickname":"  新昵称001  "}`, ut.Header{Key: "Authorization", Value: "Bearer " + token}, ut.Header{Key: "Idempotency-Key", Value: "profile-update-1"})
+	if patch.status != 200 || patch.body.Code != 0 {
+		t.Fatalf("expected profile update success, got status=%d raw=%s", patch.status, patch.raw)
+	}
+	var profile struct {
+		ID        string `json:"id"`
+		Nickname  string `json:"nickname"`
+		AvatarURL string `json:"avatarUrl"`
+	}
+	mustDecodeData(t, patch.body.Data, &profile)
+	if profile.ID != "u_1001" || profile.Nickname != "新昵称001" || profile.AvatarURL != "" {
+		t.Fatalf("unexpected profile update payload: %+v", profile)
+	}
+
+	upload := doMultipartWithHeaders(t, h.Engine, consts.MethodPost, "/api/v1/auth/me/avatar", nil, []multipartTestFile{
+		{FieldName: "avatar", Filename: "avatar.jpg", Body: "buyer avatar bytes"},
+	}, ut.Header{Key: "Authorization", Value: "Bearer " + token}, ut.Header{Key: "Idempotency-Key", Value: "avatar-upload-1"})
+	if upload.status != 200 || upload.body.Code != 0 {
+		t.Fatalf("expected avatar upload success, got status=%d raw=%s", upload.status, upload.raw)
+	}
+	mustDecodeData(t, upload.body.Data, &profile)
+	if profile.Nickname != "新昵称001" || !strings.HasPrefix(profile.AvatarURL, "/api/v1/images/") {
+		t.Fatalf("unexpected avatar update payload: %+v", profile)
+	}
+	imageResp := ut.PerformRequest(h.Engine, consts.MethodGet, profile.AvatarURL, nil)
+	if imageResp.Code != 200 || imageResp.Body.String() != "buyer avatar bytes" {
+		t.Fatalf("expected avatar image proxy success, got status=%d body=%q", imageResp.Code, imageResp.Body.String())
+	}
+
+	me := doJSONWithHeaders(t, h.Engine, consts.MethodGet, "/api/v1/auth/me", "", ut.Header{Key: "Authorization", Value: "Bearer " + token})
+	if me.status != 200 || me.body.Code != 0 {
+		t.Fatalf("expected me after avatar success, got status=%d raw=%s", me.status, me.raw)
+	}
+	mustDecodeData(t, me.body.Data, &profile)
+	if profile.Nickname != "新昵称001" || !strings.HasPrefix(profile.AvatarURL, "/api/v1/images/") {
+		t.Fatalf("expected me to include updated profile, got %+v", profile)
+	}
+}
+
 func TestNewServerWithConfigUsesJWTTTL(t *testing.T) {
 	cfg := appconfig.Default()
 	cfg.JWT.AccessTokenTTL = appconfig.Duration(45 * time.Minute)

@@ -236,7 +236,7 @@
       "post": {
         "tags": ["Auction"],
         "summary": "创建拍品",
-        "description": "商家或管理员可调用。可通过 auctionId 传入外部生成 ID；不传时由服务生成。",
+        "description": "商家或管理员可调用。可通过 auctionId 传入外部生成 ID；不传时由服务生成。请求体支持 startPrice、reservePrice、capPrice、incrementRule、反狙击延时等拍卖规则字段；incrementRule 不传时默认 fixed/100 分/maxBidSteps=10。",
         "requestBody": { "$ref": "#/components/requestBodies/AuctionCreateRequest" },
         "responses": {
           "200": { "$ref": "#/components/responses/ApiSuccess" },
@@ -257,6 +257,7 @@
       "patch": {
         "tags": ["Auction"],
         "summary": "更新拍品",
+        "description": "更新拍品展示信息或拍卖规则。规则字段包括 startPrice、reservePrice、capPrice、incrementRule、antiSnipingSec、antiExtendSec、antiExtendMode、durationSec；传 incrementRule 时必须传完整规则对象。",
         "parameters": [{ "$ref": "#/components/parameters/Id" }],
         "requestBody": { "$ref": "#/components/requestBodies/AuctionPatchRequest" },
         "responses": {
@@ -278,9 +279,10 @@
       "get": {
         "tags": ["Auction"],
         "summary": "拍品实时状态",
+        "description": "返回 AuctionState；data 内包含 startPrice、capPrice、incrementRule、currentPrice、leaderBidderId、endTime、version、source 等实时状态字段。",
         "parameters": [{ "$ref": "#/components/parameters/Id" }],
         "responses": {
-          "200": { "$ref": "#/components/responses/ApiSuccess" },
+          "200": { "$ref": "#/components/responses/AuctionStateSuccess" },
           "default": { "$ref": "#/components/responses/ApiError" }
         }
       }
@@ -364,6 +366,7 @@
       "post": {
         "tags": ["Auction"],
         "summary": "拍品 AI 审核回调",
+        "description": "审核系统回调。兼容 requestId/request_id；审核结论可通过 auditResult、audit_result、decision、conclusion、isApproved、is_approved 或 success 表达。",
         "security": [{ "callbackKey": [] }],
         "requestBody": { "$ref": "#/components/requestBodies/AuctionAuditCallbackRequest" },
         "responses": {
@@ -1026,7 +1029,7 @@
       "get": {
         "tags": ["WebSocket"],
         "summary": "订阅拍品实时事件",
-        "description": "HTTP/1.1 Upgrade 到 WebSocket。连接后自动订阅 auction_id 对应房间，并下发 room.snapshot。业务文本帧使用 WebSocketEnvelope。",
+        "description": "HTTP/1.1 Upgrade 到 WebSocket。连接后自动订阅 auction_id 对应房间，并下发 room.snapshot；snapshot.payload 包含 startPrice、capPrice、incrementRule 等拍卖规则。业务文本帧使用 WebSocketEnvelope。",
         "security": [
           { "bearerAuth": [] },
           { "wsQueryToken": [] }
@@ -1046,7 +1049,7 @@
       "get": {
         "tags": ["WebSocket"],
         "summary": "订阅直播场次实时事件",
-        "description": "HTTP/1.1 Upgrade 到 WebSocket。连接会绑定 liveSessionId；若场次当前有 activeAuctionId，同时订阅对应拍品房间；若没有活跃拍品，仍可接收场次维度事件。",
+        "description": "HTTP/1.1 Upgrade 到 WebSocket。连接会绑定 liveSessionId；若场次当前有 activeAuctionId，同时订阅对应拍品房间并下发带拍卖规则的 room.snapshot；若没有活跃拍品，仍可接收场次维度事件。",
         "security": [
           { "bearerAuth": [] },
           { "wsQueryToken": [] }
@@ -1170,6 +1173,23 @@
           }
         }
       },
+      "AuctionStateSuccess": {
+        "description": "拍品实时状态响应",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "required": ["code", "message", "data", "trace_id"],
+              "properties": {
+                "code": { "type": "integer", "description": "业务码，0 表示成功" },
+                "message": { "type": "string" },
+                "data": { "$ref": "#/components/schemas/AuctionState" },
+                "trace_id": { "type": "string" }
+              }
+            }
+          }
+        }
+      },
       "ApiError": {
         "description": "业务错误",
         "content": {
@@ -1228,6 +1248,118 @@
       "OrderStatus": { "type": "string", "enum": ["CREATED", "PAID", "TIMEOUT", "CANCELLED"] },
       "PayStatus": { "type": "string", "enum": ["UNPAID", "PAID", "REFUNDED"] },
       "RiskEventStatus": { "type": "string", "enum": ["PENDING", "REVIEWED", "IGNORED"] },
+      "IncrementRule": {
+        "oneOf": [
+          { "$ref": "#/components/schemas/FixedIncrementRule" },
+          { "$ref": "#/components/schemas/LadderIncrementRule" }
+        ],
+        "description": "拍品加价规则。创建拍品时不传则默认 {\"type\":\"fixed\",\"amount\":100,\"maxBidSteps\":10}。maxBidSteps 表示单次出价最多跨越的加价步数。"
+      },
+      "FixedIncrementRule": {
+        "type": "object",
+        "required": ["type", "amount", "maxBidSteps"],
+        "additionalProperties": false,
+        "properties": {
+          "type": { "type": "string", "enum": ["fixed"], "description": "固定加价规则" },
+          "amount": { "type": "integer", "format": "int64", "minimum": 1, "description": "固定加价金额，单位为分" },
+          "maxBidSteps": { "type": "integer", "minimum": 1, "description": "单次出价最多跨越的固定加价步数" }
+        }
+      },
+      "LadderIncrementRule": {
+        "type": "object",
+        "required": ["type", "maxBidSteps", "steps"],
+        "additionalProperties": false,
+        "properties": {
+          "type": { "type": "string", "enum": ["ladder"], "description": "阶梯加价规则" },
+          "maxBidSteps": { "type": "integer", "minimum": 1, "description": "单次出价最多跨越的当前阶梯步数" },
+          "steps": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 50,
+            "items": { "$ref": "#/components/schemas/IncrementStep" },
+            "description": "阶梯必须从 min=0 开始，区间连续无间隙；max 为不包含上界，最后一段必须省略 max。"
+          }
+        }
+      },
+      "IncrementStep": {
+        "type": "object",
+        "required": ["min", "amount"],
+        "additionalProperties": false,
+        "properties": {
+          "min": { "type": "integer", "format": "int64", "minimum": 0, "description": "阶梯下界，单位为分，包含该值" },
+          "max": { "type": "integer", "format": "int64", "minimum": 0, "nullable": true, "description": "阶梯上界，单位为分，不包含该值；最后一段省略或为 null" },
+          "amount": { "type": "integer", "format": "int64", "minimum": 1, "description": "当前阶梯加价金额，单位为分" }
+        }
+      },
+      "AuctionRuleSnapshot": {
+        "type": "object",
+        "description": "拍品规则快照，用于审核和追溯；由服务在创建或更新拍品时根据展示字段和拍卖规则固化。",
+        "properties": {
+          "title": { "type": "string" },
+          "category": { "type": "string" },
+          "brand": { "type": "string" },
+          "condition": { "$ref": "#/components/schemas/ConditionGrade" },
+          "coverUrl": { "type": "string" },
+          "imageUrls": { "type": "array", "items": { "type": "string" } },
+          "auctionType": { "$ref": "#/components/schemas/AuctionType" },
+          "startPrice": { "type": "integer", "format": "int64", "description": "起拍价，分" },
+          "reservePrice": { "type": "integer", "format": "int64", "description": "保留价，分" },
+          "capPrice": { "type": "integer", "format": "int64", "description": "封顶价，分；0 表示不设置封顶价" },
+          "incrementRule": { "$ref": "#/components/schemas/IncrementRule" },
+          "antiSnipingSec": { "type": "integer", "description": "反狙击触发窗口，秒" },
+          "antiExtendSec": { "type": "integer", "description": "单次延时时长，秒" },
+          "antiExtendMode": { "$ref": "#/components/schemas/AuctionExtendMode" },
+          "durationSec": { "type": "integer", "description": "拍卖持续秒数" },
+          "depositPolicy": {
+            "type": "object",
+            "properties": {
+              "amount": { "type": "integer", "format": "int64", "description": "保证金，分" }
+            }
+          }
+        }
+      },
+      "AuctionState": {
+        "type": "object",
+        "description": "拍品实时状态。REST /api/v1/auctions/{id}/state 的 data 和 auction.started.payload.state 使用该结构。",
+        "properties": {
+          "auctionId": { "type": "integer", "format": "uint64" },
+          "liveSessionId": { "type": "integer", "format": "uint64" },
+          "status": { "$ref": "#/components/schemas/AuctionStatus" },
+          "startPrice": { "type": "integer", "format": "int64", "description": "起拍价，分" },
+          "capPrice": { "type": "integer", "format": "int64", "description": "封顶价，分；0 表示不设置封顶价" },
+          "incrementRule": { "$ref": "#/components/schemas/IncrementRule" },
+          "currentPrice": { "type": "integer", "format": "int64", "description": "当前价，分" },
+          "leaderBidderId": { "type": "string", "description": "当前领先用户 ID" },
+          "bidCount": { "type": "integer" },
+          "startTime": { "type": "string", "format": "date-time" },
+          "endTime": { "type": "string", "format": "date-time" },
+          "lastBidTsMs": { "type": "integer", "format": "int64", "description": "最近出价时间，Unix 毫秒" },
+          "extendCount": { "type": "integer" },
+          "version": { "type": "integer", "format": "int64" },
+          "source": { "type": "string", "description": "状态来源，常见为 redis 或 db" }
+        }
+      },
+      "BidRejectReason": {
+        "type": "string",
+        "enum": [
+          "BID_SERVICE_UNAVAILABLE",
+          "INVALID_PAYLOAD",
+          "MISSING_EXPECTED_STATE",
+          "STALE_AUCTION_STATE",
+          "BELOW_START_PRICE",
+          "PRICE_STEP_MISMATCH",
+          "BELOW_MIN_INCREMENT",
+          "ABOVE_MAX_BID_STEPS",
+          "ABOVE_EXPECTED_MAX_BID_STEPS",
+          "ABOVE_CAP_PRICE",
+          "INVALID_STATE",
+          "NOT_ENROLLED",
+          "DEPOSIT_NOT_READY",
+          "BLACKLIST",
+          "FREQ_LIMIT"
+        ],
+        "description": "WebSocket bid.ack / bid.rejected 常见拒绝原因；服务错误映射也可能返回中文文案。"
+      },
       "LoginRequest": {
         "type": "object",
         "required": ["account", "password", "role"],
@@ -1274,10 +1406,13 @@
           "auctionType": { "$ref": "#/components/schemas/AuctionType" },
           "startPrice": { "type": "integer", "format": "int64", "description": "起拍价，分" },
           "reservePrice": { "type": "integer", "format": "int64", "description": "保留价，分" },
-          "capPrice": { "type": "integer", "format": "int64", "description": "封顶价，分" },
-          "incrementRule": { "type": "object", "additionalProperties": true },
-          "antiSnipingSec": { "type": "integer" },
-          "antiExtendSec": { "type": "integer" },
+          "capPrice": { "type": "integer", "format": "int64", "description": "封顶价，分；0 表示不设置封顶价；大于 0 时必须大于 startPrice" },
+          "incrementRule": {
+            "allOf": [{ "$ref": "#/components/schemas/IncrementRule" }],
+            "description": "加价规则。可传 fixed 或 ladder；创建时省略则默认 fixed/100 分/maxBidSteps=10，PATCH 时若传入必须是完整规则对象。"
+          },
+          "antiSnipingSec": { "type": "integer", "description": "反狙击触发窗口，秒；不传或小于等于 0 时默认 15" },
+          "antiExtendSec": { "type": "integer", "description": "单次延时时长，秒；不传或小于等于 0 时默认 30" },
           "antiExtendMode": { "$ref": "#/components/schemas/AuctionExtendMode" },
           "depositAmount": { "type": "integer", "format": "int64", "description": "保证金，分" },
           "status": { "$ref": "#/components/schemas/AuctionStatus" },
@@ -1296,6 +1431,10 @@
           "requestId": { "type": "string" },
           "request_id": { "type": "string" },
           "status": { "type": "string" },
+          "auditResult": { "type": "string", "description": "审核结论兼容字段；APPROVED/PASS/ALLOW/OK 表示通过，REJECTED/DENY/BLOCK 表示拒绝" },
+          "audit_result": { "type": "string", "description": "auditResult 的 snake_case 兼容字段" },
+          "decision": { "type": "string", "description": "审核结论兼容字段" },
+          "conclusion": { "type": "string", "description": "审核结论兼容字段" },
           "success": { "type": "boolean" },
           "isApproved": { "type": "boolean" },
           "is_approved": { "type": "boolean" },
@@ -1499,18 +1638,84 @@
           "seq": { "type": "integer", "format": "int64" },
           "ack": { "type": "boolean" },
           "liveSessionId": { "type": "integer", "format": "uint64" },
-          "payload": { "type": "object", "additionalProperties": true }
+          "payload": {
+            "anyOf": [
+              { "$ref": "#/components/schemas/WSBidPlacePayload" },
+              { "$ref": "#/components/schemas/WebSocketRoomSnapshotPayload" },
+              { "$ref": "#/components/schemas/WSBidAckPayload" },
+              { "$ref": "#/components/schemas/AuctionState" },
+              { "type": "object", "additionalProperties": true }
+            ],
+            "description": "业务载荷，结构随 type 变化。room.snapshot 使用 WebSocketRoomSnapshotPayload；bid.place 使用 WSBidPlacePayload；bid.ack 可参考 WSBidAckPayload。"
+          }
         },
         "description": "WebSocket 业务文本帧统一信封。详见 docs/WebSocket用户端交互协议.md。"
+      },
+      "WebSocketRoomSnapshotPayload": {
+        "type": "object",
+        "description": "连接建立后主动下发的 room.snapshot.payload。时间字段为 Unix 毫秒。",
+        "properties": {
+          "auctionId": { "type": "integer", "format": "uint64" },
+          "status": { "$ref": "#/components/schemas/AuctionStatus" },
+          "startPrice": { "type": "integer", "format": "int64", "description": "起拍价，分" },
+          "capPrice": { "type": "integer", "format": "int64", "description": "封顶价，分；0 表示不设置封顶价" },
+          "incrementRule": { "$ref": "#/components/schemas/IncrementRule" },
+          "currentPrice": { "type": "integer", "format": "int64", "description": "当前价，分" },
+          "leaderBidderId": { "type": "string" },
+          "startTime": { "type": "integer", "format": "int64", "description": "开始时间，Unix 毫秒" },
+          "endTime": { "type": "integer", "format": "int64", "description": "结束时间，Unix 毫秒" },
+          "extendCount": { "type": "integer" },
+          "version": { "type": "integer", "format": "int64" },
+          "seq": { "type": "integer", "format": "int64", "description": "快照对应的房间水位" },
+          "serverTime": { "type": "integer", "format": "int64", "description": "服务端当前 Unix 毫秒时间" },
+          "source": { "type": "string", "description": "快照来源，常见为 redis 或 db" },
+          "degraded": { "type": "boolean", "description": "是否从 DB 降级读取" }
+        }
+      },
+      "WSBidAckPayload": {
+        "type": "object",
+        "description": "bid.place 后当前连接收到的 bid.ack.payload。成功时字段与 BidResult 基本一致，失败时至少包含 accepted=false 与 reason。",
+        "properties": {
+          "requestId": { "type": "string" },
+          "auctionId": { "type": "integer", "format": "uint64" },
+          "liveSessionId": { "type": "integer", "format": "uint64" },
+          "bidderId": { "type": "string" },
+          "bidderNickname": { "type": "string" },
+          "price": { "type": "integer", "format": "int64", "description": "本次出价金额，分" },
+          "accepted": { "type": "boolean" },
+          "duplicate": { "type": "boolean", "description": "是否命中幂等重复结果" },
+          "reason": {
+            "anyOf": [
+              { "$ref": "#/components/schemas/BidRejectReason" },
+              { "type": "string" }
+            ],
+            "description": "拒绝原因或服务错误文案"
+          },
+          "code": { "type": "integer", "description": "服务层错误码，仅部分错误响应出现" },
+          "currentPrice": { "type": "integer", "format": "int64", "description": "服务端裁决后的当前价，分" },
+          "leaderBidderId": { "type": "string" },
+          "endTime": { "type": "string", "format": "date-time" },
+          "endTsMs": { "type": "integer", "format": "int64", "description": "结束时间，Unix 毫秒，Redis 路径常见" },
+          "extended": { "type": "boolean" },
+          "extendCount": { "type": "integer" },
+          "version": { "type": "integer", "format": "int64" },
+          "seq": { "type": "integer", "format": "int64" },
+          "streamId": { "type": "string" },
+          "event": { "type": "string", "enum": ["bid.accepted", "bid.rejected"] },
+          "riskResult": { "type": "string", "enum": ["ALLOW", "REJECT", "REVIEW"] },
+          "auctionStatus": { "$ref": "#/components/schemas/AuctionStatus" },
+          "autoClosed": { "type": "boolean", "description": "是否因达到封顶价自动关闭" }
+        }
       },
       "WSBidPlacePayload": {
         "type": "object",
         "required": ["price", "expectedCurrentPrice"],
         "properties": {
           "auctionId": { "type": "integer", "format": "uint64" },
-          "price": { "type": "integer", "format": "int64", "description": "出价金额，分" },
-          "expectedCurrentPrice": { "type": "integer", "format": "int64", "description": "客户端看到的当前价，分" }
-        }
+          "price": { "type": "integer", "format": "int64", "description": "出价金额，分；必须满足 startPrice、capPrice、incrementRule 和 maxBidSteps 限制" },
+          "expectedCurrentPrice": { "type": "integer", "format": "int64", "description": "客户端看到的当前价，分；服务端用于并发校验以及基于客户端视角限制单次最大步数" }
+        },
+        "description": "客户端提交出价的 payload。auctionId 省略时使用连接绑定的拍品 ID。"
       }
     }
   }

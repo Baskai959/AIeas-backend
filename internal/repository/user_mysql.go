@@ -1,6 +1,7 @@
 package repository
 
 import (
+	"database/sql"
 	"errors"
 	"strings"
 
@@ -20,7 +21,7 @@ func NewMySQLUserRepository(db *gorm.DB) *MySQLUserRepository {
 func (r *MySQLUserRepository) FindByAccountAndRole(account string, role domain.Role) (domain.User, error) {
 	var row userRow
 	err := r.db.Table("user").
-		Select("id, account, nickname, role, status, ai_permission, password_hash").
+		Select("id, account, nickname, avatar_url, role, status, ai_permission, password_hash").
 		Where("account = ? AND role IN ?", account, roleAliases(role)).
 		First(&row).Error
 	if err != nil {
@@ -35,7 +36,7 @@ func (r *MySQLUserRepository) FindByAccountAndRole(account string, role domain.R
 func (r *MySQLUserRepository) FindByID(id string) (domain.User, error) {
 	var row userRow
 	err := r.db.Table("user").
-		Select("id, account, nickname, role, status, ai_permission, password_hash").
+		Select("id, account, nickname, avatar_url, role, status, ai_permission, password_hash").
 		Where("id = ?", normalizeUserIDForDB(id)).
 		First(&row).Error
 	if err != nil {
@@ -48,7 +49,7 @@ func (r *MySQLUserRepository) FindByID(id string) (domain.User, error) {
 }
 
 func (r *MySQLUserRepository) List(filter domain.UserFilter) ([]domain.User, error) {
-	query := r.db.Table("user").Select("id, account, nickname, role, status, ai_permission, password_hash").Order("id DESC")
+	query := r.db.Table("user").Select("id, account, nickname, avatar_url, role, status, ai_permission, password_hash").Order("id DESC")
 	if filter.Role.Valid() {
 		query = query.Where("role IN ?", roleAliases(filter.Role))
 	}
@@ -78,6 +79,8 @@ func (r *MySQLUserRepository) List(filter domain.UserFilter) ([]domain.User, err
 
 func (r *MySQLUserRepository) Update(user *domain.User) error {
 	res := r.db.Table("user").Where("id = ?", normalizeUserIDForDB(user.ID)).Updates(map[string]interface{}{
+		"nickname":      user.Nickname,
+		"avatar_url":    user.AvatarURL,
 		"status":        user.Status,
 		"ai_permission": domain.NormalizeMerchantAIPermission(user.AIPermission),
 	})
@@ -99,6 +102,7 @@ type userRow struct {
 	ID           string                      `gorm:"column:id"`
 	Account      string                      `gorm:"column:account"`
 	Nickname     string                      `gorm:"column:nickname"`
+	AvatarURL    sql.NullString              `gorm:"column:avatar_url"`
 	Role         string                      `gorm:"column:role"`
 	Status       string                      `gorm:"column:status"`
 	AIPermission domain.MerchantAIPermission `gorm:"column:ai_permission"`
@@ -110,11 +114,19 @@ func (u userRow) toDomain() domain.User {
 		ID:           u.ID,
 		Account:      u.Account,
 		Nickname:     u.Nickname,
+		AvatarURL:    nullableStringValue(u.AvatarURL),
 		Role:         normalizeRole(u.Role),
 		Status:       normalizeStatus(u.Status),
 		AIPermission: domain.NormalizeMerchantAIPermission(u.AIPermission),
 		PasswordHash: u.PasswordHash,
 	}
+}
+
+func nullableStringValue(value sql.NullString) string {
+	if !value.Valid {
+		return ""
+	}
+	return value.String
 }
 
 func normalizeRole(role string) domain.Role {

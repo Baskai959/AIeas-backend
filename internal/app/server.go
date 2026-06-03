@@ -678,7 +678,7 @@ func newServerWithServices(
 	h.POST("/mcp/control", mcpControlHandler.Post)
 	h.GET("/mcp/control", mcpControlHandler.Get)
 
-	authHandler := httptransport.NewAuthHandler(authService)
+	authHandler := httptransport.NewAuthHandler(authService, objectUploader)
 	auctionHandler := httptransport.NewAuctionHandler(auctionService, depositService, hammerService, objectUploader, descriptionGen, cfg.Agent.LiveAnalysisCallbackAPIKey)
 	orderHandler := httptransport.NewOrderHandler(orderService)
 	adminHandler := httptransport.NewAdminHandler(adminService)
@@ -705,6 +705,8 @@ func newServerWithServices(
 
 		protected := v1.Group("/auth", authHandler.AuthMiddleware())
 		protected.GET("/me", authHandler.Me)
+		protected.PATCH("/me", httptransport.WithIdempotency(idempotencyStore, idempotencyTTL, authHandler.UpdateProfile))
+		protected.POST("/me/avatar", httptransport.WithIdempotency(idempotencyStore, idempotencyTTL, authHandler.UploadAvatar))
 		protected.POST("/logout", authHandler.Logout)
 
 		v1.GET("/audit-logs", authHandler.AuthMiddleware(), httptransport.RoleAuth(domain.RoleMerchant, domain.RoleAdmin), adminHandler.ListOwnAuditLogs)

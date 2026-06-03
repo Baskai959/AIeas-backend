@@ -5,8 +5,10 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"aieas_backend/internal/domain"
 	"aieas_backend/internal/repository"
@@ -36,6 +38,11 @@ type LoginResult struct {
 type RefreshResult struct {
 	AccessToken string `json:"accessToken"`
 	ExpiresIn   int64  `json:"expiresIn"`
+}
+
+type UpdateProfileInput struct {
+	UserID   string
+	Nickname *string
 }
 
 func NewAuthService(users repository.UserRepository, jwt *jwtpkg.Manager) *AuthService {
@@ -109,6 +116,49 @@ func (s *AuthService) Me(userID string) (domain.SafeUser, error) {
 	}
 	if user.Status == domain.UserStatusDisabled {
 		return domain.SafeUser{}, domain.ErrAccountDisabled
+	}
+	return user.Safe(), nil
+}
+
+func (s *AuthService) UpdateProfile(in UpdateProfileInput) (domain.SafeUser, error) {
+	userID := strings.TrimSpace(in.UserID)
+	if userID == "" || in.Nickname == nil {
+		return domain.SafeUser{}, domain.ErrInvalidArgument
+	}
+	user, err := s.users.FindByID(userID)
+	if err != nil {
+		return domain.SafeUser{}, err
+	}
+	if user.Status == domain.UserStatusDisabled {
+		return domain.SafeUser{}, domain.ErrAccountDisabled
+	}
+	nickname := strings.TrimSpace(*in.Nickname)
+	if nickname == "" || utf8.RuneCountInString(nickname) > 64 {
+		return domain.SafeUser{}, domain.ErrInvalidArgument
+	}
+	user.Nickname = nickname
+	if err := s.users.Update(&user); err != nil {
+		return domain.SafeUser{}, err
+	}
+	return user.Safe(), nil
+}
+
+func (s *AuthService) UpdateAvatar(userID, avatarURL string) (domain.SafeUser, error) {
+	userID = strings.TrimSpace(userID)
+	avatarURL = strings.TrimSpace(avatarURL)
+	if userID == "" || avatarURL == "" || len(avatarURL) > 512 {
+		return domain.SafeUser{}, domain.ErrInvalidArgument
+	}
+	user, err := s.users.FindByID(userID)
+	if err != nil {
+		return domain.SafeUser{}, err
+	}
+	if user.Status == domain.UserStatusDisabled {
+		return domain.SafeUser{}, domain.ErrAccountDisabled
+	}
+	user.AvatarURL = avatarURL
+	if err := s.users.Update(&user); err != nil {
+		return domain.SafeUser{}, err
 	}
 	return user.Safe(), nil
 }

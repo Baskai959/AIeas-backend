@@ -1,4 +1,3 @@
-、
 # WebSocket 用户端交互协议
 
 本文面向用户端前端接入，说明当前后端实际支持的 WebSocket 连接方式、上行消息、下行消息和字段含义。
@@ -9,6 +8,7 @@
 - `internal/transport/http/ws_handler.go`
 - `internal/transport/ws/envelope.go`
 - `internal/transport/ws/hub.go`
+- `internal/domain/{auction,increment_rule}.go`
 - `internal/service/{auction,bid,hammer,timer,risk,ai_assistant,mcp_control}.go`
 - `internal/infra/redis/event_log.go`
 - `scripts/lua/bid.lua`
@@ -92,8 +92,8 @@ wss://example.com/ws/live-sessions/20001?token=<accessToken>&lastSeq=128
 | --- | --- | --- | --- |
 | `requestId` | string | 建议必填 | 出价请求 ID。用于响应关联和幂等 |
 | `payload.auctionId` | uint64 | 否 | 拍品 ID。省略时使用连接路径中的 `auction_id` 或场次当前活跃拍品 |
-| `payload.price` | int64 | 是 | 出价金额，单位为分 |
-| `payload.expectedCurrentPrice` | int64 | 是 | 客户端看到的当前价，服务端用于并发校验。缺失时返回 `MISSING_EXPECTED_STATE` |
+| `payload.price` | int64 | 是 | 出价金额，单位为分。必须满足拍品的 `incrementRule`、`capPrice` 和单次最大步数限制 |
+| `payload.expectedCurrentPrice` | int64 | 是 | 客户端看到的当前价，服务端用于并发校验和单次最大步数校验。缺失时返回 `MISSING_EXPECTED_STATE` |
 
 响应：
 
@@ -201,6 +201,13 @@ wss://example.com/ws/live-sessions/20001?token=<accessToken>&lastSeq=128
   "payload": {
     "auctionId": 10001,
     "status": "RUNNING",
+    "startPrice": 100000,
+    "capPrice": 300000,
+    "incrementRule": {
+      "type": "fixed",
+      "amount": 1000,
+      "maxBidSteps": 10
+    },
     "currentPrice": 110000,
     "leaderBidderId": "u_1001",
     "startTime": 1730000000000,
@@ -219,6 +226,9 @@ wss://example.com/ws/live-sessions/20001?token=<accessToken>&lastSeq=128
 | --- | --- | --- |
 | `payload.auctionId` | uint64 | 拍品 ID |
 | `payload.status` | string | 拍品状态，例如 `RUNNING`、`EXTENDED`、`CLOSED_WON` |
+| `payload.startPrice` | int64 | 起拍价，单位为分 |
+| `payload.capPrice` | int64 | 封顶价，单位为分；`0` 表示不设置封顶价 |
+| `payload.incrementRule` | object | 拍品加价规则。Redis 状态缺失且 DB 降级也会尽量补齐；可能在历史状态缺失时省略 |
 | `payload.currentPrice` | int64 | 当前价，单位为分 |
 | `payload.leaderBidderId` | string | 当前领先用户 ID，可能为空 |
 | `payload.startTime` | int64 | 开始时间，Unix 毫秒 |
@@ -229,6 +239,42 @@ wss://example.com/ws/live-sessions/20001?token=<accessToken>&lastSeq=128
 | `payload.serverTime` | int64 | 服务端当前 Unix 毫秒时间，用于计算时钟偏移 |
 | `payload.source` | string | 快照来源，常见为 `redis` 或 `db` |
 | `payload.degraded` | bool | 是否从 DB 降级读取。`true` 表示实时态可能不是最新 |
+
+`incrementRule` 当前支持两种格式：
+
+固定加价：
+
+```json
+{
+  "type": "fixed",
+  "amount": 100,
+  "maxBidSteps": 10
+}
+```
+
+阶梯加价：
+
+```json
+{
+  "type": "ladder",
+  "maxBidSteps": 5,
+  "steps": [
+    { "min": 0, "max": 10000, "amount": 100 },
+    { "min": 10000, "amount": 500 }
+  ]
+}
+```
+
+| 字段 | 类型 | 含义 |
+| --- | --- | --- |
+| `type` | string | `fixed` 固定加价，`ladder` 阶梯加价 |
+| `amount` | int64 | 固定加价金额，单位为分；仅 `fixed` 使用，必须大于 0 |
+| `maxBidSteps` | int | 单次出价最多跨越的加价步数，必须大于 0 |
+| `steps[].min` | int64 | 阶梯下界，单位为分，包含该值 |
+| `steps[].max` | int64 | 阶梯上界，单位为分，不包含该值；最后一个阶梯必须省略 |
+| `steps[].amount` | int64 | 当前阶梯的加价金额，单位为分，必须大于 0 |
+
+创建拍品时如果未传 `incrementRule`，后端默认写入 `{"type":"fixed","amount":100,"maxBidSteps":10}`。用户端可用快照里的 `incrementRule` 约束出价按钮和输入框，但最终裁决以后端为准。
 
 ### 4.2 `room.online`
 
@@ -350,6 +396,16 @@ wss://example.com/ws/live-sessions/20001?token=<accessToken>&lastSeq=128
 | `BID_SERVICE_UNAVAILABLE` | WebSocket Handler 未注入出价服务 |
 | `INVALID_PAYLOAD` | `payload` JSON 解析失败或存在未知字段 |
 | `MISSING_EXPECTED_STATE` | 缺少 `expectedCurrentPrice` |
+| `STALE_AUCTION_STATE` | 客户端 `expectedCurrentPrice` 与服务端当前价不一致，或客户端状态已经过期 |
+| `BELOW_START_PRICE` | 出价小于或等于起拍价 |
+| `PRICE_STEP_MISMATCH` | 出价不符合当前加价步长 |
+| `BELOW_MIN_INCREMENT` | 出价未达到当前价加一个最小加价步长 |
+| `ABOVE_MAX_BID_STEPS` | 出价超过基于服务端当前价计算出的单次最大允许价 |
+| `ABOVE_EXPECTED_MAX_BID_STEPS` | 客户端状态落后时，出价超过基于 `expectedCurrentPrice` 计算出的单次最大允许价 |
+| `ABOVE_CAP_PRICE` | 出价超过封顶价 |
+| `INVALID_STATE` | 拍品不处于 `RUNNING` 或 `EXTENDED` |
+| `NOT_ENROLLED` | 买家未报名该拍品 |
+| `DEPOSIT_NOT_READY` | 保证金未冻结或未就绪 |
 | `BLACKLIST` | 用户命中黑名单 |
 | `FREQ_LIMIT` | 出价频率过高 |
 | 其他中文文案 | 服务层错误经 HTTP 错误映射后的提示 |
@@ -557,6 +613,13 @@ Redis Stream / PubSub 路径下，payload 字段名略有差异：
     "state": {
       "auctionId": 10001,
       "status": "RUNNING",
+      "startPrice": 100000,
+      "capPrice": 300000,
+      "incrementRule": {
+        "type": "fixed",
+        "amount": 1000,
+        "maxBidSteps": 10
+      },
       "currentPrice": 100000,
       "leaderBidderId": "",
       "bidCount": 0,
@@ -575,6 +638,9 @@ Redis Stream / PubSub 路径下，payload 字段名略有差异：
 | --- | --- | --- |
 | `payload.auctionId` | uint64 | 拍品 ID |
 | `payload.state` | object | 开拍后的拍品实时状态 |
+| `payload.state.startPrice` | int64 | 起拍价，单位为分 |
+| `payload.state.capPrice` | int64 | 封顶价，单位为分；`0` 表示不设置封顶价 |
+| `payload.state.incrementRule` | object | 拍品加价规则，格式同 `room.snapshot.payload.incrementRule` |
 | `payload.state.currentPrice` | int64 | 当前价，单位为分 |
 | `payload.state.startTime` | string | 开始时间，Go `time.Time` JSON 格式 |
 | `payload.state.endTime` | string | 结束时间，Go `time.Time` JSON 格式 |
@@ -901,7 +967,7 @@ Hub 默认通用 ACK。`bid.place`、`room.subscribe`、`room.unsubscribe`、`he
 ## 5. 用户端推荐处理流程
 
 1. 进入拍品或直播场次页面后建立 WebSocket 连接。
-2. 收到 `room.snapshot` 后初始化 UI：当前价、领先者、状态、倒计时、`lastSeq=payload.seq`。
+2. 收到 `room.snapshot` 后初始化 UI：当前价、起拍价、封顶价、加价规则、领先者、状态、倒计时、`lastSeq=payload.seq`。
 3. 对所有带外层 `seq` 的消息做去重：只处理 `seq > lastSeq`，处理后更新 `lastSeq`。
 4. 收到 `bid.accepted` 后更新当前价、领先者、倒计时、延时次数。
 5. 收到 `ranking.updated` 后刷新排行榜。

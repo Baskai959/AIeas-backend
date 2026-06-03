@@ -153,7 +153,10 @@ local status_fields = redis.call("HMGET", state_key,
   "end_ts_ms",
   "extend_count",
   "version",
-  "increment_rule"
+  "increment_rule",
+  "increment_amount",
+  "max_bid_steps",
+  "bid_count"
 )
 local status = status_fields[1]
 local current_price = number_or_zero(status_fields[2])
@@ -165,6 +168,9 @@ local end_ts = number_or_zero(status_fields[6])
 local extend_count = number_or_zero(status_fields[7])
 local version = number_or_zero(status_fields[8])
 local increment_rule = string_or_empty(status_fields[9])
+local increment_amount_raw = status_fields[10]
+local max_bid_steps_raw = status_fields[11]
+local bid_count = number_or_zero(status_fields[12])
 
 local function positive_number(value)
   local parsed = tonumber(value)
@@ -205,8 +211,8 @@ if rule_decoded_ok then
   end
 end
 
-local fallback_increment_amount = positive_number(redis.call("HGET", state_key, "increment_amount"))
-local fallback_max_bid_steps = tonumber(redis.call("HGET", state_key, "max_bid_steps")) or 1
+local fallback_increment_amount = positive_number(increment_amount_raw)
+local fallback_max_bid_steps = tonumber(max_bid_steps_raw) or 1
 if fallback_max_bid_steps <= 0 then
   fallback_max_bid_steps = 1
 end
@@ -332,20 +338,34 @@ elseif anti_snipe_ms > 0 and extend_ms > 0 and extend_count < max_extend_count t
 end
 
 version = version + 1
-redis.call("HINCRBY", state_key, "bid_count", 1)
+bid_count = bid_count + 1
 local next_price = price
 local next_leader = bidder_id
 local seq, stream_id = append_accepted_event(next_price, next_leader, end_ts, extend_count, extended, version, status, auto_closed)
-redis.call("HSET", state_key,
-  "status", status,
-  "current_price", next_price,
-  "leader_bidder_id", next_leader,
-  "last_bid_ts_ms", now_ms,
-  "end_ts_ms", end_ts,
-  "extend_count", extend_count,
-  "version", version,
-  "closed_at_ms", auto_closed and now_ms or string_or_empty(redis.call("HGET", state_key, "closed_at_ms"))
-)
+if auto_closed then
+  redis.call("HSET", state_key,
+    "status", status,
+    "current_price", next_price,
+    "leader_bidder_id", next_leader,
+    "last_bid_ts_ms", now_ms,
+    "end_ts_ms", end_ts,
+    "extend_count", extend_count,
+    "version", version,
+    "bid_count", bid_count,
+    "closed_at_ms", now_ms
+  )
+else
+  redis.call("HSET", state_key,
+    "status", status,
+    "current_price", next_price,
+    "leader_bidder_id", next_leader,
+    "last_bid_ts_ms", now_ms,
+    "end_ts_ms", end_ts,
+    "extend_count", extend_count,
+    "version", version,
+    "bid_count", bid_count
+  )
+end
 local old_member = redis.call("HGET", user_bids_key, bidder_id)
 if old_member and old_member ~= false then
   redis.call("ZREM", ranking_key, old_member)

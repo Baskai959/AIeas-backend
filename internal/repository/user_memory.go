@@ -101,6 +101,9 @@ func (r *MemoryUserRepository) Update(user *domain.User) error {
 	if user.Nickname == "" {
 		user.Nickname = existing.Nickname
 	}
+	if user.AvatarURL == "" {
+		user.AvatarURL = existing.AvatarURL
+	}
 	if user.Role == "" {
 		user.Role = existing.Role
 	}

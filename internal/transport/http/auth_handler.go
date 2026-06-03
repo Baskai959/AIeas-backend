@@ -2,9 +2,11 @@ package http
 
 import (
 	"context"
+	"mime/multipart"
 	"strings"
 
 	"aieas_backend/internal/domain"
+	"aieas_backend/internal/infra/objectstorage"
 	"aieas_backend/internal/service"
 
 	"github.com/cloudwego/hertz/pkg/app"
@@ -18,11 +20,16 @@ const (
 )
 
 type AuthHandler struct {
-	auth *service.AuthService
+	auth     *service.AuthService
+	uploader objectstorage.Uploader
 }
 
-func NewAuthHandler(auth *service.AuthService) *AuthHandler {
-	return &AuthHandler{auth: auth}
+func NewAuthHandler(auth *service.AuthService, uploaders ...objectstorage.Uploader) *AuthHandler {
+	uploader := objectstorage.Uploader(objectstorage.DisabledUploader{})
+	if len(uploaders) > 0 && uploaders[0] != nil {
+		uploader = uploaders[0]
+	}
+	return &AuthHandler{auth: auth, uploader: uploader}
 }
 
 type loginRequest struct {
@@ -37,6 +44,10 @@ type refreshRequest struct {
 
 type logoutRequest struct {
 	RefreshToken string `json:"refreshToken"`
+}
+
+type updateProfileRequest struct {
+	Nickname *string `json:"nickname"`
 }
 
 func (h *AuthHandler) Login(ctx context.Context, c *app.RequestContext) {
@@ -72,6 +83,49 @@ func (h *AuthHandler) AdminLogin(ctx context.Context, c *app.RequestContext) {
 func (h *AuthHandler) Me(ctx context.Context, c *app.RequestContext) {
 	userID := c.GetString(contextUserID)
 	user, err := h.auth.Me(userID)
+	if err != nil {
+		status, code, msg := service.HTTPStatusAndCode(err)
+		WriteError(c, status, code, msg, nil)
+		return
+	}
+	WriteSuccess(c, user)
+}
+
+func (h *AuthHandler) UpdateProfile(ctx context.Context, c *app.RequestContext) {
+	_ = ctx
+	var req updateProfileRequest
+	if err := c.BindJSON(&req); err != nil || req.Nickname == nil {
+		WriteError(c, 400, 20001, "参数不合法", nil)
+		return
+	}
+	user, err := h.auth.UpdateProfile(service.UpdateProfileInput{
+		UserID:   AuthUserID(c),
+		Nickname: req.Nickname,
+	})
+	if err != nil {
+		status, code, msg := service.HTTPStatusAndCode(err)
+		WriteError(c, status, code, msg, nil)
+		return
+	}
+	WriteSuccess(c, user)
+}
+
+func (h *AuthHandler) UploadAvatar(ctx context.Context, c *app.RequestContext) {
+	if !isMultipartRequest(c) {
+		WriteError(c, 400, 20001, "参数不合法", nil)
+		return
+	}
+	fileHeader, err := avatarFile(c)
+	if err != nil {
+		WriteError(c, 400, 20001, "参数不合法", nil)
+		return
+	}
+	avatarURL, err := h.uploadAvatar(ctx, fileHeader)
+	if err != nil {
+		writeServiceError(c, err)
+		return
+	}
+	user, err := h.auth.UpdateAvatar(AuthUserID(c), avatarURL)
 	if err != nil {
 		status, code, msg := service.HTTPStatusAndCode(err)
 		WriteError(c, status, code, msg, nil)
@@ -135,6 +189,32 @@ func (h *AuthHandler) AuthMiddleware() app.HandlerFunc {
 		c.Set(contextExp, claims.ExpiresAt)
 		c.Next(ctx)
 	}
+}
+
+func (h *AuthHandler) uploadAvatar(ctx context.Context, fileHeader *multipart.FileHeader) (string, error) {
+	if fileHeader == nil || fileHeader.Size <= 0 || fileHeader.Size > maxImageUploadSizeBytes {
+		return "", domain.ErrInvalidArgument
+	}
+	file, err := fileHeader.Open()
+	if err != nil {
+		return "", err
+	}
+	avatarURL, uploadErr := h.uploader.Upload(ctx, objectstorage.UploadInput{Filename: fileHeader.Filename, ContentType: imageContentType(fileHeader), Size: fileHeader.Size, Body: file})
+	closeErr := file.Close()
+	if uploadErr != nil {
+		return "", uploadErr
+	}
+	if closeErr != nil {
+		return "", closeErr
+	}
+	return avatarURL, nil
+}
+
+func avatarFile(c *app.RequestContext) (*multipart.FileHeader, error) {
+	if fileHeader, err := c.FormFile("avatar"); err == nil && fileHeader != nil {
+		return fileHeader, nil
+	}
+	return c.FormFile("image")
 }
 
 func TraceMiddleware() app.HandlerFunc {

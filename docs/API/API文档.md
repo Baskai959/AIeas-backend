@@ -12,6 +12,7 @@
 - 当前没有 `/api/v1/items` 商品 REST 路由；拍品已承载标题、图片、描述、价格等展示字段。
 - 当前直播入口使用 `live-sessions`，不是旧版 `live-rooms`。
 - 当前 WebSocket 实际路由是 `/ws/auctions/:auction_id` 与 `/ws/live-sessions/:session_id`。
+- 拍品创建、更新、实时状态和 WebSocket 首帧快照均支持传递拍卖规则：`startPrice`、`capPrice`、`incrementRule`。
 
 ## 1. 基础约定
 
@@ -110,6 +111,49 @@ Idempotency-Key: <stable-request-id>
 | `liveSessionId` | 所属直播场次 |
 | `limit` / `offset` | 分页 |
 
+拍品拍卖规则字段：
+
+| 字段 | 出现位置 | 类型 | 含义 |
+| --- | --- | --- | --- |
+| `startPrice` | 创建、更新、详情、列表、实时状态、WebSocket 快照 | int64 | 起拍价，单位为分 |
+| `reservePrice` | 创建、更新、详情、列表、规则快照 | int64 | 保留价，单位为分 |
+| `capPrice` | 创建、更新、详情、列表、实时状态、WebSocket 快照 | int64 | 封顶价，单位为分；`0` 表示不设置封顶价 |
+| `incrementRule` | 创建、更新、详情、列表、实时状态、WebSocket 快照 | object | 加价规则；创建时不传则默认固定加价 `100` 分，单次最多 `10` 步 |
+| `antiSnipingSec` | 创建、更新、详情、列表、规则快照 | int | 反狙击触发窗口，单位秒；不传或小于等于 0 时默认 `15` |
+| `antiExtendSec` | 创建、更新、详情、列表、规则快照 | int | 单次延时时长，单位秒；不传或小于等于 0 时默认 `30` |
+| `antiExtendMode` | 创建、更新、详情、列表、规则快照 | string | 延时模式：`ADD` 表示在原结束时间上累加，`RESET` 表示重置为当前时间加延时 |
+| `durationSec` | 创建、更新、详情、列表、规则快照 | int | 拍卖持续秒数 |
+| `ruleSnapshot` | 详情、列表 | object | 创建或更新时固化的展示与拍卖规则快照，用于审核和追溯 |
+
+`incrementRule` 支持固定加价：
+
+```json
+{
+  "type": "fixed",
+  "amount": 100,
+  "maxBidSteps": 10
+}
+```
+
+也支持阶梯加价：
+
+```json
+{
+  "type": "ladder",
+  "maxBidSteps": 5,
+  "steps": [
+    { "min": 0, "max": 10000, "amount": 100 },
+    { "min": 10000, "amount": 500 }
+  ]
+}
+```
+
+校验规则：金额均为分；`amount` 和 `maxBidSteps` 必须大于 0；阶梯最多 50 段，第一段 `min` 必须为 0，相邻阶梯必须连续，`max` 为不包含上界，最后一段必须省略 `max`。`capPrice > 0` 时必须大于 `startPrice`，且 `reservePrice` 不能大于 `capPrice`。
+
+`GET /api/v1/auctions/:id/state` 返回的实时状态会带 `startPrice`、`capPrice`、`incrementRule`，前端应与 WebSocket `room.snapshot` 使用同一套字段初始化出价控件。
+
+拍品 AI 审核回调兼容多种字段名：请求 ID 可用 `requestId` 或 `request_id`；审核结论可用 `auditResult`、`audit_result`、`decision`、`conclusion`、`isApproved`、`is_approved` 或 `success` 表达；拒绝原因和风险标签同时兼容 camelCase 与 snake_case。
+
 ### 3.3 LiveSession
 
 | Method | Path | 说明 | 鉴权 |
@@ -207,6 +251,8 @@ Idempotency-Key: <stable-request-id>
 | `lastSeq` | 断线重连补偿游标 |
 
 消息格式和字段含义见：[../WebSocket用户端交互协议.md](../WebSocket用户端交互协议.md)。
+
+连接建立后的 `room.snapshot` 会下发当前拍品的 `startPrice`、`capPrice`、`incrementRule`；开拍广播 `auction.started.payload.state` 也包含同一套规则字段。出价失败时，`bid.ack.payload.reason` 可能返回 `PRICE_STEP_MISMATCH`、`ABOVE_MAX_BID_STEPS`、`ABOVE_CAP_PRICE` 等规则校验原因。
 
 当前用户端常用下行事件包括：
 
