@@ -240,7 +240,7 @@ func (s *MCPReadService) ListLiveSessions(ctx context.Context, filter domain.Liv
 		return nil, domain.ErrNotFound
 	}
 	if actor.Role == domain.RoleMerchant || filter.MerchantID != "" {
-		return s.sessionSvc.ListByMerchant(ctx, filter.MerchantID, filter.Status, actor.ID, actor.Role, filter.Limit, filter.Offset)
+		return s.sessionSvc.ListByMerchantFiltered(ctx, filter, actor.ID, actor.Role)
 	}
 	if s.sessions == nil {
 		return nil, domain.ErrNotFound

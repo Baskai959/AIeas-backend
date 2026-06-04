@@ -58,14 +58,37 @@ func (p *Producer) PublishBidEvent(ctx context.Context, event redisinfra.BidEven
 	if p == nil {
 		return nil
 	}
+	msg, err := p.bidEventMessage(ctx, event)
+	if err != nil {
+		return err
+	}
+	return p.publishMessages(ctx, p.bidEventsTopic, msg)
+}
+
+func (p *Producer) PublishBidEvents(ctx context.Context, events []redisinfra.BidEvent) error {
+	if p == nil || len(events) == 0 {
+		return nil
+	}
+	messages := make([]kafkago.Message, 0, len(events))
+	for _, event := range events {
+		msg, err := p.bidEventMessage(ctx, event)
+		if err != nil {
+			return err
+		}
+		messages = append(messages, msg)
+	}
+	return p.publishMessages(ctx, p.bidEventsTopic, messages...)
+}
+
+func (p *Producer) bidEventMessage(ctx context.Context, event redisinfra.BidEvent) (kafkago.Message, error) {
 	payload := map[string]interface{}{}
 	if err := json.Unmarshal(event.PayloadJSON(), &payload); err != nil {
-		return fmt.Errorf("marshal bid kafka event: %w", err)
+		return kafkago.Message{}, fmt.Errorf("marshal bid kafka event: %w", err)
 	}
 	payload["eventType"] = event.EventType
 	value, err := json.Marshal(payload)
 	if err != nil {
-		return fmt.Errorf("marshal bid kafka event: %w", err)
+		return kafkago.Message{}, fmt.Errorf("marshal bid kafka event: %w", err)
 	}
 	headers := map[string]string{"event_type": event.EventType}
 	for k, v := range event.TraceCarrier() {
@@ -74,7 +97,12 @@ func (p *Producer) PublishBidEvent(ctx context.Context, event redisinfra.BidEven
 	if headers["traceparent"] == "" {
 		tracing.InjectMap(ctx, headers)
 	}
-	return p.publish(ctx, p.bidEventsTopic, strconv.FormatUint(event.AuctionID, 10), value, headers)
+	return kafkago.Message{
+		Key:     []byte(strconv.FormatUint(event.AuctionID, 10)),
+		Value:   value,
+		Time:    time.Now().UTC(),
+		Headers: kafkaHeaders(headers),
+	}, nil
 }
 
 func (p *Producer) PublishAuctionClosed(ctx context.Context, auction domain.AuctionLot, result domain.HammerResult, order *domain.OrderDeal) error {
@@ -178,14 +206,20 @@ func (p *Producer) Close() error {
 }
 
 func (p *Producer) publish(ctx context.Context, topic, key string, value []byte, headers map[string]string) error {
-	writer := p.writer(topic)
-	msg := kafkago.Message{
+	return p.publishMessages(ctx, topic, kafkago.Message{
 		Key:     []byte(key),
 		Value:   value,
 		Time:    time.Now().UTC(),
 		Headers: kafkaHeaders(headers),
+	})
+}
+
+func (p *Producer) publishMessages(ctx context.Context, topic string, messages ...kafkago.Message) error {
+	if len(messages) == 0 {
+		return nil
 	}
-	if err := writer.WriteMessages(ctx, msg); err != nil {
+	writer := p.writer(topic)
+	if err := writer.WriteMessages(ctx, messages...); err != nil {
 		return fmt.Errorf("write kafka topic %s: %w", topic, err)
 	}
 	return nil

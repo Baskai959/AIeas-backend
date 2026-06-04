@@ -307,6 +307,12 @@ func (r *countingFindByRequestIDRepo) Create(ctx context.Context, bid *domain.Bi
 	return nil
 }
 
+func (r *countingFindByRequestIDRepo) CreateIgnoreBatch(ctx context.Context, records []domain.BidRecord) error {
+	_ = ctx
+	_ = records
+	return nil
+}
+
 func (r *countingFindByRequestIDRepo) FindByRequestID(ctx context.Context, requestID string) (domain.BidRecord, error) {
 	_ = ctx
 	_ = requestID

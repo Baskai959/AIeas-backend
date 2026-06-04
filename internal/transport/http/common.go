@@ -65,6 +65,18 @@ func parseQueryInt(c *app.RequestContext, name string, fallback int) int {
 	return n
 }
 
+func parseQueryUint(c *app.RequestContext, name string) uint64 {
+	value := strings.TrimSpace(c.Query(name))
+	if value == "" {
+		return 0
+	}
+	n, err := strconv.ParseUint(value, 10, 64)
+	if err != nil {
+		return 0
+	}
+	return n
+}
+
 func isMultipartRequest(c *app.RequestContext) bool {
 	return strings.Contains(strings.ToLower(string(c.GetHeader("Content-Type"))), "multipart/form-data")
 }

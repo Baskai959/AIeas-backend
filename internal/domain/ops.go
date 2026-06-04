@@ -52,24 +52,51 @@ const (
 	PayStatusRefunded PayStatus = "REFUNDED"
 )
 
+type FulfillmentStatus string
+
+const (
+	FulfillmentStatusUnshipped FulfillmentStatus = "UNSHIPPED"
+	FulfillmentStatusShipped   FulfillmentStatus = "SHIPPED"
+	FulfillmentStatusReceived  FulfillmentStatus = "RECEIVED"
+)
+
+func (s FulfillmentStatus) Valid() bool {
+	switch s {
+	case FulfillmentStatusUnshipped, FulfillmentStatusShipped, FulfillmentStatusReceived:
+		return true
+	default:
+		return false
+	}
+}
+
+func NormalizeFulfillmentStatus(status FulfillmentStatus) FulfillmentStatus {
+	if status.Valid() {
+		return status
+	}
+	return FulfillmentStatusUnshipped
+}
+
 type OrderDeal struct {
-	ID             uint64          `json:"id"`
-	AuctionID      uint64          `json:"auctionId"`
-	LiveSessionID  *uint64         `json:"liveSessionId,omitempty"`
-	LotSnapshot    json.RawMessage `json:"lotSnapshot,omitempty"`
-	WinnerID       string          `json:"winnerId"`
-	WinnerNickname string          `json:"winnerNickname,omitempty"`
-	SellerID       string          `json:"sellerId"`
-	DealPrice      int64           `json:"dealPrice"`
-	DepositAmount  int64           `json:"depositAmount"`
-	Status         OrderStatus     `json:"status"`
-	PayStatus      PayStatus       `json:"payStatus"`
-	PayDeadline    *time.Time      `json:"payDeadline,omitempty"`
-	PaidAt         *time.Time      `json:"paidAt,omitempty"`
-	ClosedAt       *time.Time      `json:"closedAt,omitempty"`
-	Version        int64           `json:"version,omitempty"`
-	CreatedAt      time.Time       `json:"createdAt"`
-	UpdatedAt      time.Time       `json:"updatedAt"`
+	ID                uint64            `json:"id"`
+	AuctionID         uint64            `json:"auctionId"`
+	LiveSessionID     *uint64           `json:"liveSessionId,omitempty"`
+	LotSnapshot       json.RawMessage   `json:"lotSnapshot,omitempty"`
+	WinnerID          string            `json:"winnerId"`
+	WinnerNickname    string            `json:"winnerNickname,omitempty"`
+	SellerID          string            `json:"sellerId"`
+	DealPrice         int64             `json:"dealPrice"`
+	DepositAmount     int64             `json:"depositAmount"`
+	Status            OrderStatus       `json:"status"`
+	PayStatus         PayStatus         `json:"payStatus"`
+	FulfillmentStatus FulfillmentStatus `json:"fulfillmentStatus"`
+	PayDeadline       *time.Time        `json:"payDeadline,omitempty"`
+	PaidAt            *time.Time        `json:"paidAt,omitempty"`
+	ShippedAt         *time.Time        `json:"shippedAt,omitempty"`
+	ReceivedAt        *time.Time        `json:"receivedAt,omitempty"`
+	ClosedAt          *time.Time        `json:"closedAt,omitempty"`
+	Version           int64             `json:"version,omitempty"`
+	CreatedAt         time.Time         `json:"createdAt"`
+	UpdatedAt         time.Time         `json:"updatedAt"`
 }
 
 func (o OrderDeal) PaymentExpired(now time.Time) bool {
@@ -112,6 +139,7 @@ func (o *OrderDeal) MarkTimeout(now time.Time) error {
 type OrderFilter struct {
 	WinnerID      string
 	SellerID      string
+	AuctionID     uint64
 	LiveSessionID uint64
 	Status        OrderStatus
 	PayStatus     PayStatus

@@ -17,8 +17,9 @@ import (
 
 // LiveSessionHandler 暴露直播场次（live_session）相关读接口。
 type LiveSessionHandler struct {
-	sessions *service.LiveSessionService
-	uploader objectstorage.Uploader
+	sessions    *service.LiveSessionService
+	marketplace *service.MarketplaceService
+	uploader    objectstorage.Uploader
 }
 
 func NewLiveSessionHandler(sessions *service.LiveSessionService, uploader objectstorage.Uploader) *LiveSessionHandler {
@@ -26,6 +27,13 @@ func NewLiveSessionHandler(sessions *service.LiveSessionService, uploader object
 		uploader = objectstorage.DisabledUploader{}
 	}
 	return &LiveSessionHandler{sessions: sessions, uploader: uploader}
+}
+
+func (h *LiveSessionHandler) SetMarketplaceService(marketplace *service.MarketplaceService) {
+	if h == nil {
+		return
+	}
+	h.marketplace = marketplace
 }
 
 type liveSessionCreateRequest struct {
@@ -79,12 +87,19 @@ func (h *LiveSessionHandler) List(ctx context.Context, c *app.RequestContext) {
 	if !status.Valid() {
 		status = ""
 	}
-	sessions, err := h.sessions.ListVisible(ctx, strings.TrimSpace(c.Query("merchantId")), status, AuthUserID(c), AuthRole(c), parseQueryInt(c, "limit", 20), parseQueryInt(c, "offset", 0))
+	sessions, err := h.sessions.ListVisibleFiltered(ctx, domain.LiveSessionFilter{
+		MerchantID: strings.TrimSpace(c.Query("merchantId")),
+		Status:     status,
+		Keyword:    strings.TrimSpace(c.Query("keyword")),
+		Sort:       strings.TrimSpace(c.Query("sort")),
+		Limit:      parseQueryInt(c, "limit", 20),
+		Offset:     parseQueryInt(c, "offset", 0),
+	}, AuthUserID(c), AuthRole(c))
 	if err != nil {
 		writeLiveSessionError(c, err)
 		return
 	}
-	WriteSuccess(c, map[string]interface{}{"sessions": sessions})
+	WriteSuccess(c, map[string]interface{}{"sessions": h.liveSessionViews(ctx, sessions)})
 }
 
 func (h *LiveSessionHandler) Update(ctx context.Context, c *app.RequestContext) {
@@ -132,7 +147,7 @@ func (h *LiveSessionHandler) End(ctx context.Context, c *app.RequestContext) {
 }
 
 // ListByMerchant 列出某商家的所有场次：GET /merchants/:merchantId/live-sessions
-// 商家角色强制以 actorID 为 merchantID；admin 可指定任意 merchant。
+// buyer 只能看到 LIVE；商家角色强制以 actorID 为 merchantID；admin 可指定任意 merchant。
 func (h *LiveSessionHandler) ListByMerchant(ctx context.Context, c *app.RequestContext) {
 	merchantID := strings.TrimSpace(c.Param("merchantId"))
 	status := domain.LiveSessionStatus(strings.TrimSpace(c.Query("status")))
@@ -141,12 +156,19 @@ func (h *LiveSessionHandler) ListByMerchant(ctx context.Context, c *app.RequestC
 	}
 	limit := parseQueryInt(c, "limit", 20)
 	offset := parseQueryInt(c, "offset", 0)
-	sessions, err := h.sessions.ListByMerchant(ctx, merchantID, status, AuthUserID(c), AuthRole(c), limit, offset)
+	sessions, err := h.sessions.ListByMerchantFiltered(ctx, domain.LiveSessionFilter{
+		MerchantID: merchantID,
+		Status:     status,
+		Keyword:    strings.TrimSpace(c.Query("keyword")),
+		Sort:       strings.TrimSpace(c.Query("sort")),
+		Limit:      limit,
+		Offset:     offset,
+	}, AuthUserID(c), AuthRole(c))
 	if err != nil {
 		writeLiveSessionError(c, err)
 		return
 	}
-	WriteSuccess(c, map[string]interface{}{"sessions": sessions})
+	WriteSuccess(c, map[string]interface{}{"sessions": h.liveSessionViews(ctx, sessions)})
 }
 
 // Get 返回单个场次详情：GET /live-sessions/:sessionId
@@ -160,7 +182,7 @@ func (h *LiveSessionHandler) Get(ctx context.Context, c *app.RequestContext) {
 		writeLiveSessionError(c, err)
 		return
 	}
-	WriteSuccess(c, session)
+	WriteSuccess(c, h.liveSessionView(ctx, session))
 }
 
 // Lots 返回某场次内的拍品列表：GET /live-sessions/:sessionId/lots
@@ -382,6 +404,24 @@ func liveSessionIDParam(c *app.RequestContext) (uint64, bool) {
 		return id, true
 	}
 	return parseUintParam(c, "sessionId")
+}
+
+func (h *LiveSessionHandler) liveSessionView(ctx context.Context, session domain.LiveSession) interface{} {
+	if h == nil || h.marketplace == nil {
+		return session
+	}
+	return h.marketplace.LiveSessionView(ctx, session)
+}
+
+func (h *LiveSessionHandler) liveSessionViews(ctx context.Context, sessions []domain.LiveSession) interface{} {
+	if h == nil || h.marketplace == nil {
+		return sessions
+	}
+	views := make([]domain.LiveSessionView, 0, len(sessions))
+	for _, session := range sessions {
+		views = append(views, h.marketplace.LiveSessionView(ctx, session))
+	}
+	return views
 }
 
 func writeLiveSessionError(c *app.RequestContext, err error) {

@@ -22,6 +22,7 @@ const (
 	BidRejectAboveCapPrice            = "ABOVE_CAP_PRICE"
 	BidRejectMissingExpectedState     = "MISSING_EXPECTED_STATE"
 	BidRejectStaleAuctionState        = "STALE_AUCTION_STATE"
+	BidRejectAuctionBusy              = "AUCTION_BUSY"
 )
 
 // IncrementRule supports fixed increment and ladder increment.

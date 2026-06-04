@@ -88,6 +88,52 @@ func (r *MemoryAuctionRepository) List(ctx context.Context, filter domain.Auctio
 	return paginateAuctions(auctions, filter.Limit, filter.Offset), nil
 }
 
+func (r *MemoryAuctionRepository) Search(ctx context.Context, filter domain.AuctionSearchFilter) ([]domain.AuctionLot, int64, error) {
+	_ = ctx
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	statusSet := make(map[domain.AuctionStatus]struct{}, len(filter.VisibleStatuses))
+	for _, status := range filter.VisibleStatuses {
+		if status.Valid() {
+			statusSet[status] = struct{}{}
+		}
+	}
+	categorySet := make(map[string]struct{})
+	for _, category := range normalizedCategoryValues(filter.CategoryID, filter.CategoryValues) {
+		categorySet[category] = struct{}{}
+	}
+	keyword := strings.ToLower(strings.TrimSpace(filter.Keyword))
+	auctions := make([]domain.AuctionLot, 0, len(r.auctions))
+	for _, auction := range r.auctions {
+		if len(statusSet) > 0 {
+			if _, ok := statusSet[auction.Status]; !ok {
+				continue
+			}
+		}
+		if filter.Status.Valid() && auction.Status != filter.Status {
+			continue
+		}
+		if filter.MerchantID != "" && auction.SellerID != filter.MerchantID {
+			continue
+		}
+		if len(categorySet) > 0 {
+			if _, ok := categorySet[auction.Category]; !ok {
+				continue
+			}
+		}
+		if keyword != "" {
+			haystack := strings.ToLower(auction.Title + " " + auction.Description + " " + auction.Brand)
+			if !strings.Contains(haystack, keyword) {
+				continue
+			}
+		}
+		auctions = append(auctions, cloneAuction(auction))
+	}
+	sortAuctionsForSearch(auctions, filter.Sort)
+	total := int64(len(auctions))
+	return paginateAuctions(auctions, filter.Limit, filter.Offset), total, nil
+}
+
 func (r *MemoryAuctionRepository) Update(ctx context.Context, auction *domain.AuctionLot) error {
 	_ = ctx
 	r.mu.Lock()
@@ -180,4 +226,58 @@ func paginateAuctions(auctions []domain.AuctionLot, limit, offset int) []domain.
 		end = len(auctions)
 	}
 	return auctions[offset:end]
+}
+
+func sortAuctionsForSearch(auctions []domain.AuctionLot, sortBy string) {
+	switch strings.TrimSpace(sortBy) {
+	case "priceAsc":
+		sort.Slice(auctions, func(i, j int) bool {
+			if auctions[i].StartPrice == auctions[j].StartPrice {
+				return auctions[i].AuctionID > auctions[j].AuctionID
+			}
+			return auctions[i].StartPrice < auctions[j].StartPrice
+		})
+	case "priceDesc":
+		sort.Slice(auctions, func(i, j int) bool {
+			if auctions[i].StartPrice == auctions[j].StartPrice {
+				return auctions[i].AuctionID > auctions[j].AuctionID
+			}
+			return auctions[i].StartPrice > auctions[j].StartPrice
+		})
+	case "endingSoon":
+		sort.Slice(auctions, func(i, j int) bool {
+			if auctions[i].EndTime.Equal(auctions[j].EndTime) {
+				return auctions[i].AuctionID > auctions[j].AuctionID
+			}
+			if auctions[i].EndTime.IsZero() {
+				return false
+			}
+			if auctions[j].EndTime.IsZero() {
+				return true
+			}
+			return auctions[i].EndTime.Before(auctions[j].EndTime)
+		})
+	case "startTimeAsc":
+		sort.Slice(auctions, func(i, j int) bool {
+			if auctions[i].StartTime.Equal(auctions[j].StartTime) {
+				return auctions[i].AuctionID < auctions[j].AuctionID
+			}
+			if auctions[i].StartTime.IsZero() {
+				return false
+			}
+			if auctions[j].StartTime.IsZero() {
+				return true
+			}
+			return auctions[i].StartTime.Before(auctions[j].StartTime)
+		})
+	case "startTimeDesc", "latest", "newest":
+		sort.Slice(auctions, func(i, j int) bool {
+			if auctions[i].StartTime.Equal(auctions[j].StartTime) {
+				return auctions[i].AuctionID > auctions[j].AuctionID
+			}
+			return auctions[i].StartTime.After(auctions[j].StartTime)
+		})
+	default:
+		sort.Slice(auctions, func(i, j int) bool { return auctions[i].AuctionID > auctions[j].AuctionID })
+	}
 }

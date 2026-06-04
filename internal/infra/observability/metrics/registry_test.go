@@ -26,6 +26,7 @@ func TestNewNoopAndDefaultAreDisabled(t *testing.T) {
 	}
 	nilReg.ObserveHTTP("GET", "/x", 200, time.Millisecond, 0, 0) // must not panic
 	nilReg.ObserveBidStage("state", "ok", time.Millisecond)
+	nilReg.IncBidRoute("lua_enter", "attempt")
 	nilReg.IncBidDuplicate()
 	nilReg.IncWSConnect()
 	nilReg.ObserveRedisLua("foo", time.Millisecond, "")
@@ -96,12 +97,16 @@ func TestObserveBidAndDuplicate(t *testing.T) {
 	r := New(Options{Enabled: true})
 	r.ObserveBid("accepted", "ok", 2*time.Millisecond)
 	r.ObserveBidStage("lua_place_bid", "accepted", 2*time.Millisecond)
+	r.IncBidRoute("lua_enter", "attempt")
 	r.IncBidDuplicate()
 	if v := counterVecValue(t, r.bidTotal, "accepted", "ok"); v != 1 {
 		t.Fatalf("bidTotal accepted=ok expected 1, got %v", v)
 	}
 	if v := histogramVecCount(t, r.bidStageDuration, "lua_place_bid", "accepted"); v != 1 {
 		t.Fatalf("bidStageDuration expected 1, got %v", v)
+	}
+	if v := counterVecValue(t, r.bidRouteTotal, "lua_enter", "attempt"); v != 1 {
+		t.Fatalf("bidRouteTotal expected 1, got %v", v)
 	}
 	if v := counterValue(t, r.bidDuplicateTotal); v != 1 {
 		t.Fatalf("bidDuplicateTotal expected 1, got %v", v)

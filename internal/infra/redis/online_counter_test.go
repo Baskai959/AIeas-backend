@@ -84,6 +84,29 @@ func TestOnlineCounterCountsDistinctUsers(t *testing.T) {
 	}
 }
 
+func TestOnlineCounterCanUseRedisCache(t *testing.T) {
+	ctx := context.Background()
+	rtMR := miniredis.RunT(t)
+	rtClient := redisgo.NewClient(&redisgo.Options{Addr: rtMR.Addr()})
+	t.Cleanup(func() { _ = rtClient.Close() })
+	cacheMR := miniredis.RunT(t)
+	cacheClient := redisgo.NewClient(&redisgo.Options{Addr: cacheMR.Addr()})
+	t.Cleanup(func() { _ = cacheClient.Close() })
+	keys := NewKeyBuilder("test")
+	counter := NewOnlineCounterOnCache(&RedisCacheClient{Client: cacheClient}, keys, time.Minute)
+
+	count, err := counter.Join(ctx, 10001, "conn-cache-1", "u_1001")
+	if err != nil || count != 1 {
+		t.Fatalf("join count=%d err=%v", count, err)
+	}
+	if exists, err := cacheClient.Exists(ctx, keys.OnlineAuctionUsers(10001)).Result(); err != nil || exists != 1 {
+		t.Fatalf("expected online auction users in cache, exists=%d err=%v", exists, err)
+	}
+	if exists, err := rtClient.Exists(ctx, keys.OnlineAuctionUsers(10001)).Result(); err != nil || exists != 0 {
+		t.Fatalf("online counter must not write RT in cache mode, exists=%d err=%v", exists, err)
+	}
+}
+
 func TestOnlineCounterDefaultTTLIsShort(t *testing.T) {
 	ctx := context.Background()
 	mr := miniredis.RunT(t)

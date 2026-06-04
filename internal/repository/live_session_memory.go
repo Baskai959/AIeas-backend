@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -89,18 +90,16 @@ func (r *MemoryLiveSessionRepository) List(ctx context.Context, filter domain.Li
 	_ = ctx
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	ids := make([]uint64, 0, len(r.sessions))
-	for id := range r.sessions {
-		ids = append(ids, id)
-	}
-	sort.Slice(ids, func(i, j int) bool { return ids[i] > ids[j] })
-	sessions := make([]domain.LiveSession, 0, len(ids))
-	for _, id := range ids {
-		session := r.sessions[id]
+	sessions := make([]domain.LiveSession, 0, len(r.sessions))
+	keyword := strings.ToLower(strings.TrimSpace(filter.Keyword))
+	for _, session := range r.sessions {
 		if filter.MerchantID != "" && session.MerchantID != filter.MerchantID {
 			continue
 		}
 		if filter.Status.Valid() && session.Status != filter.Status {
+			continue
+		}
+		if keyword != "" && !liveSessionMatchesKeyword(session, keyword) {
 			continue
 		}
 		if filter.OpenedFrom != nil && (session.OpenedAt == nil || session.OpenedAt.Before(*filter.OpenedFrom)) {
@@ -111,6 +110,7 @@ func (r *MemoryLiveSessionRepository) List(ctx context.Context, filter domain.Li
 		}
 		sessions = append(sessions, session)
 	}
+	sortLiveSessions(sessions, filter.Sort)
 	if filter.Offset < 0 {
 		filter.Offset = 0
 	}
@@ -125,4 +125,74 @@ func (r *MemoryLiveSessionRepository) List(ctx context.Context, filter domain.Li
 		end = len(sessions)
 	}
 	return sessions[filter.Offset:end], nil
+}
+
+func liveSessionMatchesKeyword(session domain.LiveSession, keyword string) bool {
+	return strings.Contains(strings.ToLower(session.Title), keyword) ||
+		strings.Contains(strings.ToLower(session.Description), keyword) ||
+		strings.Contains(strings.ToLower(session.MerchantID), keyword)
+}
+
+func sortLiveSessions(sessions []domain.LiveSession, sortBy string) {
+	sort.SliceStable(sessions, func(i, j int) bool {
+		left, right := sessions[i], sessions[j]
+		switch strings.TrimSpace(sortBy) {
+		case "oldest", "createdAtAsc":
+			return left.ID < right.ID
+		case "startTimeAsc", "scheduledStartAsc":
+			return timeBeforePtr(left.ScheduledStartTime, right.ScheduledStartTime, true, left.ID, right.ID)
+		case "startTimeDesc", "scheduledStartDesc":
+			return timeAfterPtr(left.ScheduledStartTime, right.ScheduledStartTime, true, left.ID, right.ID)
+		case "openedAtAsc":
+			return timeBeforePtr(left.OpenedAt, right.OpenedAt, true, left.ID, right.ID)
+		case "openedAtDesc":
+			return timeAfterPtr(left.OpenedAt, right.OpenedAt, true, left.ID, right.ID)
+		case "gmvDesc":
+			if left.GMVCent != right.GMVCent {
+				return left.GMVCent > right.GMVCent
+			}
+			return left.ID > right.ID
+		case "viewerDesc", "viewerPeakDesc":
+			if left.ViewerPeak != right.ViewerPeak {
+				return left.ViewerPeak > right.ViewerPeak
+			}
+			return left.ID > right.ID
+		case "latest", "newest", "createdAtDesc":
+			fallthrough
+		default:
+			return left.ID > right.ID
+		}
+	})
+}
+
+func timeBeforePtr(left, right *time.Time, nullLast bool, leftID, rightID uint64) bool {
+	if left == nil || right == nil {
+		if left == nil && right == nil {
+			return leftID < rightID
+		}
+		if nullLast {
+			return left != nil
+		}
+		return left == nil
+	}
+	if !left.Equal(*right) {
+		return left.Before(*right)
+	}
+	return leftID < rightID
+}
+
+func timeAfterPtr(left, right *time.Time, nullLast bool, leftID, rightID uint64) bool {
+	if left == nil || right == nil {
+		if left == nil && right == nil {
+			return leftID > rightID
+		}
+		if nullLast {
+			return right == nil
+		}
+		return left != nil
+	}
+	if !left.Equal(*right) {
+		return left.After(*right)
+	}
+	return leftID > rightID
 }

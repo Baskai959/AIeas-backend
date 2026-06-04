@@ -35,6 +35,7 @@ type Registry struct {
 	bidTotal          *prometheus.CounterVec
 	bidDuration       prometheus.Histogram
 	bidStageDuration  *prometheus.HistogramVec
+	bidRouteTotal     *prometheus.CounterVec
 	bidRejectTotal    *prometheus.CounterVec
 	bidDuplicateTotal prometheus.Counter
 	bidFreqLimitTotal prometheus.Counter
@@ -75,6 +76,7 @@ type Registry struct {
 	workerBidRecordConsumeTotal  *prometheus.CounterVec
 	workerBidRecordWriteDuration prometheus.Histogram
 	workerBidRecordDLQTotal      *prometheus.CounterVec
+	workerBidRankingConsumeTotal *prometheus.CounterVec
 	workerTaskTotal              *prometheus.CounterVec
 
 	// WebSocket
@@ -192,6 +194,9 @@ func (r *Registry) register() {
 		Namespace: ns, Name: "auction_bid_stage_duration_seconds", Help: "Bid handler stage duration",
 		Buckets: durBucketsFast,
 	}, []string{"stage", "result"})
+	r.bidRouteTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: ns, Name: "auction_bid_route_total", Help: "Bid route decisions before and after Redis Lua",
+	}, []string{"decision", "reason"})
 	r.bidRejectTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: ns, Name: "auction_bid_reject_total", Help: "Bid rejection by reason",
 	}, []string{"reason"})
@@ -299,6 +304,9 @@ func (r *Registry) register() {
 	r.workerBidRecordDLQTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: ns, Name: "worker_bid_record_dlq_total", Help: "Bid record dead-letter queue writes",
 	}, []string{"reason"})
+	r.workerBidRankingConsumeTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: ns, Name: "worker_bid_ranking_consume_total", Help: "Bid ranking worker consume outcome",
+	}, []string{"result"})
 	r.workerTaskTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: ns, Name: "worker_task_total", Help: "Background worker task outcome",
 	}, []string{"worker", "result"})
@@ -333,7 +341,7 @@ func (r *Registry) register() {
 	collectors := []prometheus.Collector{
 		r.httpRequestsTotal, r.httpRequestDuration, r.httpInflight,
 		r.httpRequestBodyBytes, r.httpResponseBytes,
-		r.bidTotal, r.bidDuration, r.bidStageDuration, r.bidRejectTotal,
+		r.bidTotal, r.bidDuration, r.bidStageDuration, r.bidRouteTotal, r.bidRejectTotal,
 		r.bidDuplicateTotal, r.bidFreqLimitTotal,
 		r.hammerTotal, r.hammerDuration,
 		r.hammerMySQLTxDuration, r.hammerDuplicateTotal,
@@ -348,6 +356,7 @@ func (r *Registry) register() {
 		r.redisPoolHits, r.redisPoolMisses,
 		r.workerBidRecordConsumeTotal, r.workerBidRecordWriteDuration,
 		r.workerBidRecordDLQTotal,
+		r.workerBidRankingConsumeTotal,
 		r.workerTaskTotal,
 		r.wsConnections, r.wsConnectionTotal, r.wsBroadcastDuration,
 		r.wsBroadcastFanoutTotal, r.wsSlowClientDisconnect,

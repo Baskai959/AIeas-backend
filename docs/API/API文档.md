@@ -5,6 +5,8 @@
 机器可导入版本：
 
 - OpenAPI 3.0 JSON：[当前项目接口.openapi.json](./当前项目接口.openapi.json)
+- 用户端发现与参与接口 OpenAPI：[用户端发现与参与接口.openapi.json](./用户端发现与参与接口.openapi.json)
+- 直播场次列表搜索排序 OpenAPI：[直播场次列表搜索排序.openapi.json](./直播场次列表搜索排序.openapi.json)
 - WebSocket 用户端交互协议：[../WebSocket用户端交互协议.md](../WebSocket用户端交互协议.md)
 
 重要变更：
@@ -13,6 +15,7 @@
 - 当前直播入口使用 `live-sessions`，不是旧版 `live-rooms`。
 - 当前 WebSocket 实际路由是 `/ws/auctions/:auction_id` 与 `/ws/live-sessions/:session_id`。
 - 拍品创建、更新、实时状态和 WebSocket 首帧快照均支持传递拍卖规则：`startPrice`、`capPrice`、`incrementRule`。
+- 用户端发现、详情、分类、商家搜索和我的竞拍接口见 `/api/v1/search/lots`、`/api/v1/lots/:id`、`/api/v1/auction-participations/mine` 等，不复用 merchant/admin 权限的 `/api/v1/auctions/:id`。
 
 ## 1. 基础约定
 
@@ -152,6 +155,14 @@ Idempotency-Key: <stable-request-id>
 
 `GET /api/v1/auctions/:id/state` 返回的实时状态会带 `startPrice`、`capPrice`、`incrementRule`，前端应与 WebSocket `room.snapshot` 使用同一套字段初始化出价控件。
 
+用户端拍品展示字段补充：
+
+| 字段 | 类型 | 含义 |
+| --- | --- | --- |
+| `categoryId` | string | 前端筛选用类目 ID，由后端根据 `category` 映射补充 |
+| `imageUrl` | string | 用户端主图，优先取 `coverUrl`，其次取 `imageUrls[0]` |
+| `participantCount` | int | 报名/缴纳保证金的参与人数 |
+
 拍品 AI 审核回调兼容多种字段名：请求 ID 可用 `requestId` 或 `request_id`；审核结论可用 `auditResult`、`audit_result`、`decision`、`conclusion`、`isApproved`、`is_approved` 或 `success` 表达；拒绝原因和风险标签同时兼容 camelCase 与 snake_case。
 
 ### 3.3 LiveSession
@@ -164,7 +175,7 @@ Idempotency-Key: <stable-request-id>
 | `GET` | `/api/v1/live-sessions/:id/bids` | 场次出价记录 | JWT |
 | `GET` | `/api/v1/live-sessions/:id/orders` | 场次订单列表 | JWT |
 | `GET` | `/api/v1/live-sessions/:id/stats` | 场次统计 | JWT |
-| `GET` | `/api/v1/merchants/:merchantId/live-sessions` | 指定商家的场次列表 | JWT + merchant/admin |
+| `GET` | `/api/v1/merchants/:merchantId/live-sessions` | 指定商家的场次列表；买家仅可见 LIVE 场次 | JWT |
 | `POST` | `/api/v1/live-sessions` | 创建场次 | JWT + merchant/admin |
 | `PATCH` | `/api/v1/live-sessions/:id` | 更新场次 | JWT + merchant/admin + 幂等 |
 | `POST` | `/api/v1/live-sessions/:id/start` | 开播 | JWT + merchant/admin + 幂等 |
@@ -177,7 +188,81 @@ Idempotency-Key: <stable-request-id>
 | `GET` | `/api/v1/live-sessions/:id/agent-hook` | 读取 Agent Hook 开关 | JWT + merchant/admin |
 | `PATCH` | `/api/v1/live-sessions/:id/agent-hook` | 更新 Agent Hook 开关 | JWT + merchant/admin + 幂等 |
 
-### 3.4 LiveAnalysis
+`GET /api/v1/live-sessions` 查询参数：
+
+| 参数 | 说明 |
+| --- | --- |
+| `merchantId` | 商家用户 ID |
+| `status` | 场次状态；买家传非 `LIVE` 状态会返回空列表 |
+| `keyword` | 关键词，匹配 `title`、`description`、`merchantId` |
+| `sort` | `latest`/`newest`/`createdAtDesc`、`oldest`/`createdAtAsc`、`startTimeAsc`/`scheduledStartAsc`、`startTimeDesc`/`scheduledStartDesc`、`openedAtAsc`、`openedAtDesc`、`gmvDesc`、`viewerDesc`/`viewerPeakDesc` |
+| `limit` / `offset` | 分页 |
+
+`GET /api/v1/merchants/:merchantId/live-sessions` 同样支持 `status`、`keyword`、`sort`、`limit`、`offset`。买家只能看到该商家的 `LIVE` 场次；商家角色会强制使用当前登录商家 ID；管理员可指定任意商家。
+
+用户端直播场次展示字段补充：
+
+| 字段 | 类型 | 含义 |
+| --- | --- | --- |
+| `merchantName` | string | 商家展示名 |
+| `videoSource` | string | 视频源类型，当前实现预留为空字符串 |
+| `videoUrl` | string | 视频播放地址，当前实现预留为空字符串 |
+| `digitalHuman` | object | 数字人配置，当前实现返回空对象 |
+| `onlineCount` | int | 当前在线人数，基于 activeAuctionId 的 WebSocket Hub 在线数 |
+
+### 3.4 Marketplace
+
+| Method | Path | 说明 | 鉴权 |
+| --- | --- | --- | --- |
+| `GET` | `/api/v1/search/lots` | 用户端搜索拍品，用于发现页、分类页、商品搜索、商家商品列表 | JWT |
+| `GET` | `/api/v1/lots/:id` | 用户端拍品详情 | JWT |
+| `GET` | `/api/v1/auction-participations/mine` | 我的竞拍参与记录，聚合押金、拍品、直播场次、订单 | JWT + buyer |
+| `GET` | `/api/v1/categories` | 用户端分类列表 | JWT |
+| `GET` | `/api/v1/search/merchants` | 搜索商家 | JWT |
+| `GET` | `/api/v1/merchants/:id` | 商家主页信息，带当前或最近直播场次 | JWT |
+
+`GET /api/v1/search/lots` 查询参数：
+
+| 参数 | 说明 |
+| --- | --- |
+| `keyword` | 关键词，匹配拍品标题、描述、类目、品牌等 |
+| `sort` | `priceAsc`、`priceDesc`、`endingSoon`、`startTimeAsc`、`startTimeDesc`、`latest`、`newest` |
+| `status` | 拍品状态；非用户端可见状态会返回空列表 |
+| `categoryId` | 类目 ID，例如 `jewelry`、`collectible`、`luxury`、`digital`、`camera` |
+| `merchantId` | 商家用户 ID |
+| `limit` / `offset` | 分页 |
+
+用户端可见拍品状态：`READY`、`WARMING_UP`、`RUNNING`、`EXTENDED`、`HAMMER_PENDING`、`CLOSED_WON`、`CLOSED_FAILED`、`SETTLED`。返回格式：
+
+```json
+{
+  "lots": [],
+  "total": 0
+}
+```
+
+`GET /api/v1/auction-participations/mine` 返回 `data.records`：
+
+```json
+{
+  "records": [
+    {
+      "id": "1",
+      "userId": "u_1001",
+      "lot": {},
+      "room": {},
+      "order": {},
+      "depositAmount": 5000,
+      "depositStatus": "READY",
+      "enrolledAt": "2026-06-04T00:00:00Z"
+    }
+  ]
+}
+```
+
+`GET /api/v1/categories` 当前返回固定类目：`jewelry`、`collectible`、`luxury`、`digital`、`camera`、`uncategorized`。`GET /api/v1/search/merchants` 返回 `data.merchants`，字段包括 `id`、`name`、`avatarUrl`、`followerCount`、`liveRoomId`、`liveSessionId`、`currentLiveSession`。
+
+### 3.5 LiveAnalysis
 
 | Method | Path | 说明 | 鉴权 |
 | --- | --- | --- | --- |
@@ -185,7 +270,7 @@ Idempotency-Key: <stable-request-id>
 | `GET` | `/api/v1/live-analysis/reports/:liveSessionId` | 查询直播总结报告 | JWT + merchant/admin |
 | `POST` | `/api/v1/live-analysis/callback` | 直播总结报告回调 | Callback Key |
 
-### 3.5 AIAssistant
+### 3.6 AIAssistant
 
 | Method | Path | 说明 | 鉴权 |
 | --- | --- | --- | --- |
@@ -201,7 +286,7 @@ Idempotency-Key: <stable-request-id>
 | `ALLOW` | 自动允许 |
 | `DENY` | 自动拒绝 |
 
-### 3.6 Order
+### 3.7 Order
 
 | Method | Path | 说明 | 鉴权 |
 | --- | --- | --- | --- |
@@ -210,9 +295,17 @@ Idempotency-Key: <stable-request-id>
 | `GET` | `/api/v1/orders/:id` | 订单详情 | JWT |
 | `POST` | `/api/v1/orders/:id/pay` | 支付订单 | JWT + 幂等 |
 
-常用查询参数：`winnerId`、`sellerId`、`status`、`payStatus`、`limit`、`offset`。
+常用查询参数：`winnerId`、`sellerId`、`auctionId`、`status`、`payStatus`、`limit`、`offset`。其中 `GET /api/v1/orders/mine?auctionId=123` 可直接按拍品过滤我的订单。
 
-### 3.7 Admin
+订单履约字段：
+
+| 字段 | 类型 | 含义 |
+| --- | --- | --- |
+| `fulfillmentStatus` | string | `UNSHIPPED` 未发货、`SHIPPED` 已发货、`RECEIVED` 已收货 |
+| `shippedAt` | date-time | 发货时间 |
+| `receivedAt` | date-time | 收货时间 |
+
+### 3.8 Admin
 
 | Method | Path | 说明 | 鉴权 |
 | --- | --- | --- | --- |

@@ -41,6 +41,13 @@ func (b KeyBuilder) AuctionUserBids(auctionID uint64) string {
 	return b.key("auction:%d:user_bids", auctionID)
 }
 
+// AuctionUserLatestSeq 是 per-auction 的 hash：bidderID -> 该用户最新写入 ranking
+// 时使用的 BidEvent.Seq；用于排行榜防乱序比较，不影响 ranking_member 编码（保持
+// hammer.lua 兼容）。
+func (b KeyBuilder) AuctionUserLatestSeq(auctionID uint64) string {
+	return b.key("auction:%d:user_latest_seq", auctionID)
+}
+
 func (b KeyBuilder) AuctionIdempotency(auctionID uint64, requestID string) string {
 	return b.key("auction:%d:idem:%s", auctionID, requestID)
 }

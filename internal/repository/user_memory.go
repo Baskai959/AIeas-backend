@@ -3,6 +3,7 @@ package repository
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"strings"
 	"sync"
 
 	"aieas_backend/internal/domain"
@@ -60,6 +61,7 @@ func (r *MemoryUserRepository) List(filter domain.UserFilter) ([]domain.User, er
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	users := make([]domain.User, 0, len(r.byID))
+	keyword := strings.ToLower(strings.TrimSpace(filter.Keyword))
 	for _, user := range r.byID {
 		if filter.Role.Valid() && user.Role != filter.Role {
 			continue
@@ -67,8 +69,11 @@ func (r *MemoryUserRepository) List(filter domain.UserFilter) ([]domain.User, er
 		if filter.Status != "" && user.Status != filter.Status {
 			continue
 		}
-		if filter.Keyword != "" && user.ID != filter.Keyword && user.Account != filter.Keyword && user.Nickname != filter.Keyword {
-			continue
+		if keyword != "" {
+			haystack := strings.ToLower(user.ID + " " + user.Account + " " + user.Nickname)
+			if !strings.Contains(haystack, keyword) {
+				continue
+			}
 		}
 		users = append(users, user)
 	}

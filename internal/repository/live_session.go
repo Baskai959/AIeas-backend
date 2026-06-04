@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 	"errors"
+	"strings"
 	"time"
 
 	"aieas_backend/internal/domain"
@@ -109,12 +110,16 @@ func (r *MySQLLiveSessionRepository) Update(ctx context.Context, session *domain
 }
 
 func (r *MySQLLiveSessionRepository) List(ctx context.Context, filter domain.LiveSessionFilter) ([]domain.LiveSession, error) {
-	query := r.dbFor(ctx).Table("live_session").Order("id DESC")
+	query := r.dbFor(ctx).Table("live_session")
 	if filter.MerchantID != "" {
 		query = query.Where("merchant_id = ?", normalizeUserIDForDB(filter.MerchantID))
 	}
 	if filter.Status.Valid() {
 		query = query.Where("status = ?", filter.Status)
+	}
+	if keyword := strings.TrimSpace(filter.Keyword); keyword != "" {
+		like := "%" + keyword + "%"
+		query = query.Where("title LIKE ? OR description LIKE ? OR merchant_id LIKE ?", like, like, like)
 	}
 	if filter.OpenedFrom != nil {
 		query = query.Where("opened_at >= ?", *filter.OpenedFrom)
@@ -129,7 +134,7 @@ func (r *MySQLLiveSessionRepository) List(ctx context.Context, filter domain.Liv
 		filter.Offset = 0
 	}
 	var rows []liveSessionRow
-	if err := query.Limit(filter.Limit).Offset(filter.Offset).Find(&rows).Error; err != nil {
+	if err := query.Order(liveSessionListOrder(filter.Sort)).Limit(filter.Limit).Offset(filter.Offset).Find(&rows).Error; err != nil {
 		return nil, err
 	}
 	sessions := make([]domain.LiveSession, 0, len(rows))
@@ -137,6 +142,29 @@ func (r *MySQLLiveSessionRepository) List(ctx context.Context, filter domain.Liv
 		sessions = append(sessions, row.toDomain())
 	}
 	return sessions, nil
+}
+
+func liveSessionListOrder(sortBy string) string {
+	switch strings.TrimSpace(sortBy) {
+	case "oldest", "createdAtAsc":
+		return "id ASC"
+	case "startTimeAsc", "scheduledStartAsc":
+		return "scheduled_start_time IS NULL ASC, scheduled_start_time ASC, id ASC"
+	case "startTimeDesc", "scheduledStartDesc":
+		return "scheduled_start_time IS NULL ASC, scheduled_start_time DESC, id DESC"
+	case "openedAtAsc":
+		return "opened_at IS NULL ASC, opened_at ASC, id ASC"
+	case "openedAtDesc":
+		return "opened_at IS NULL ASC, opened_at DESC, id DESC"
+	case "gmvDesc":
+		return "gmv_cent DESC, id DESC"
+	case "viewerDesc", "viewerPeakDesc":
+		return "viewer_peak DESC, id DESC"
+	case "latest", "newest", "createdAtDesc":
+		fallthrough
+	default:
+		return "id DESC"
+	}
 }
 
 type liveSessionRow struct {

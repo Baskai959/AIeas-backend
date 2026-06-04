@@ -66,10 +66,11 @@ func (h *OrderHandler) Pay(ctx context.Context, c *app.RequestContext) {
 
 func orderFilterFromRequest(c *app.RequestContext) domain.OrderFilter {
 	filter := domain.OrderFilter{
-		WinnerID: strings.TrimSpace(c.Query("winnerId")),
-		SellerID: strings.TrimSpace(c.Query("sellerId")),
-		Limit:    parseQueryInt(c, "limit", 20),
-		Offset:   parseQueryInt(c, "offset", 0),
+		WinnerID:  strings.TrimSpace(c.Query("winnerId")),
+		SellerID:  strings.TrimSpace(c.Query("sellerId")),
+		AuctionID: parseQueryUint(c, "auctionId"),
+		Limit:     parseQueryInt(c, "limit", 20),
+		Offset:    parseQueryInt(c, "offset", 0),
 	}
 	if status := domain.OrderStatus(strings.TrimSpace(c.Query("status"))); status != "" {
 		filter.Status = status

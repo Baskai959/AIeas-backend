@@ -744,6 +744,60 @@ func TestLiveSessionCoverUploadRoute(t *testing.T) {
 	}
 }
 
+func TestBuyerCanListMerchantLiveSessionsRoute(t *testing.T) {
+	h := newTestServer()
+	merchantToken := loginForToken(t, h.Engine, "merchant001", "Passw0rd!", "merchant")
+	buyerToken := loginForToken(t, h.Engine, "buyer001", "Passw0rd!", "buyer")
+
+	createLive := doJSONWithHeaders(t, h.Engine, consts.MethodPost, "/api/v1/live-sessions", `{"title":"买家可见珠宝直播"}`, ut.Header{Key: "Authorization", Value: "Bearer " + merchantToken})
+	if createLive.status != 200 || createLive.body.Code != 0 {
+		t.Fatalf("expected live session create success, got status=%d raw=%s", createLive.status, createLive.raw)
+	}
+	var liveSession struct {
+		ID uint64 `json:"id"`
+	}
+	mustDecodeData(t, createLive.body.Data, &liveSession)
+
+	startLive := doJSONWithHeaders(t, h.Engine, consts.MethodPost, "/api/v1/live-sessions/"+strconv.FormatUint(liveSession.ID, 10)+"/start", "", ut.Header{Key: "Authorization", Value: "Bearer " + merchantToken}, ut.Header{Key: "Idempotency-Key", Value: "buyer-list-merchant-live-start"})
+	if startLive.status != 200 || startLive.body.Code != 0 {
+		t.Fatalf("expected live session start success, got status=%d raw=%s", startLive.status, startLive.raw)
+	}
+
+	createDraft := doJSONWithHeaders(t, h.Engine, consts.MethodPost, "/api/v1/live-sessions", `{"title":"买家不可见草稿直播"}`, ut.Header{Key: "Authorization", Value: "Bearer " + merchantToken})
+	if createDraft.status != 200 || createDraft.body.Code != 0 {
+		t.Fatalf("expected draft session create success, got status=%d raw=%s", createDraft.status, createDraft.raw)
+	}
+
+	listLive := doJSONWithHeaders(t, h.Engine, consts.MethodGet, "/api/v1/merchants/u_2001/live-sessions?keyword="+url.QueryEscape("珠宝"), "", ut.Header{Key: "Authorization", Value: "Bearer " + buyerToken})
+	if listLive.status != 200 || listLive.body.Code != 0 {
+		t.Fatalf("expected buyer merchant live sessions success, got status=%d raw=%s", listLive.status, listLive.raw)
+	}
+	var liveData struct {
+		Sessions []struct {
+			ID     uint64                   `json:"id"`
+			Status domain.LiveSessionStatus `json:"status"`
+		} `json:"sessions"`
+	}
+	mustDecodeData(t, listLive.body.Data, &liveData)
+	if len(liveData.Sessions) != 1 || liveData.Sessions[0].ID != liveSession.ID || liveData.Sessions[0].Status != domain.LiveSessionStatusLive {
+		t.Fatalf("expected buyer to see only live merchant session, got %+v", liveData)
+	}
+
+	listDraft := doJSONWithHeaders(t, h.Engine, consts.MethodGet, "/api/v1/merchants/u_2001/live-sessions?keyword="+url.QueryEscape("草稿"), "", ut.Header{Key: "Authorization", Value: "Bearer " + buyerToken})
+	if listDraft.status != 200 || listDraft.body.Code != 0 {
+		t.Fatalf("expected buyer draft keyword query success, got status=%d raw=%s", listDraft.status, listDraft.raw)
+	}
+	var draftData struct {
+		Sessions []struct {
+			ID uint64 `json:"id"`
+		} `json:"sessions"`
+	}
+	mustDecodeData(t, listDraft.body.Data, &draftData)
+	if len(draftData.Sessions) != 0 {
+		t.Fatalf("buyer should not see draft merchant sessions, got %+v", draftData)
+	}
+}
+
 func TestAuctionCreateTriggersLotContentAudit(t *testing.T) {
 	auditor := &captureProductAuditor{result: service.ProductAuditResult{Success: true, RequestID: "agent-lot-audit-1", Status: "ACCEPTED"}, called: make(chan struct{}, 1)}
 	uploader := objectstorage.NewMemoryUploader("")

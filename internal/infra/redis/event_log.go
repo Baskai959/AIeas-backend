@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"aieas_backend/internal/domain"
@@ -15,6 +16,51 @@ import (
 
 const BidRecordConsumerGroup = "bid-record-writers"
 const BidKafkaBridgeConsumerGroup = "bid-kafka-bridge"
+const BidRankingConsumerGroup = "bid-ranking-updaters"
+
+var updateAcceptedRankingScript = redisgo.NewScript(`
+local ranking_key = KEYS[1]
+local user_bids_key = KEYS[2]
+local user_seq_key = KEYS[3]
+
+local bidder_id = ARGV[1]
+local price = tonumber(ARGV[2])
+local bid_ts_ms = tonumber(ARGV[3])
+local seq = tonumber(ARGV[4])
+local new_member = ARGV[5]
+
+if bidder_id == nil or bidder_id == '' or price == nil or price <= 0 then
+	return redis.error_reply('invalid ranking input')
+end
+
+local old_member = redis.call('HGET', user_bids_key, bidder_id)
+if old_member ~= false and old_member ~= nil and old_member ~= '' then
+	local old_seq = tonumber(redis.call('HGET', user_seq_key, bidder_id)) or 0
+	local old_price_raw, old_inverted_raw = string.match(old_member, '^(%d+):(%d+):')
+	local old_price = tonumber(old_price_raw) or 0
+	local old_inverted = tonumber(old_inverted_raw) or 9999999999999
+	local old_bid_ts_ms = 9999999999999 - old_inverted
+
+	local newer = false
+	if price ~= old_price then
+		newer = price > old_price
+	elseif bid_ts_ms ~= old_bid_ts_ms then
+		newer = bid_ts_ms > old_bid_ts_ms
+	else
+		newer = seq > old_seq
+	end
+
+	if not newer then
+		return 0
+	end
+	redis.call('ZREM', ranking_key, old_member)
+end
+
+redis.call('ZADD', ranking_key, 0, new_member)
+redis.call('HSET', user_bids_key, bidder_id, new_member)
+redis.call('HSET', user_seq_key, bidder_id, seq)
+return 1
+`)
 
 type BidEvent struct {
 	AuctionID      uint64
@@ -66,12 +112,29 @@ func (e BidEvent) TraceCarrier() map[string]string {
 // 把所有 shard 的 active_streams 合并返回。DLQ (`bid_record:dlq`) 是全局 key，
 // 固定在 ForGlobal()（shard 0）。
 type EventLog struct {
-	sharded *ShardedRTClient
-	keys    KeyBuilder
+	sharded        *ShardedRTClient
+	rankingSharded *ShardedRTClient
+	keys           KeyBuilder
+
+	ensuredGroups sync.Map
+}
+
+type ensureGroupKey struct {
+	shardIdx  int
+	auctionID uint64
+	group     string
 }
 
 func NewEventLog(sharded *ShardedRTClient, keys KeyBuilder) *EventLog {
-	return &EventLog{sharded: sharded, keys: keys}
+	return &EventLog{sharded: sharded, rankingSharded: sharded, keys: keys}
+}
+
+// SetRankingShardedRT 注入专用于异步排行榜更新的 Redis client/pool。
+// Stream 消费和 ACK 仍然使用 EventLog 的 worker RT pool。
+func (l *EventLog) SetRankingShardedRT(sharded *ShardedRTClient) {
+	if l != nil && sharded != nil {
+		l.rankingSharded = sharded
+	}
 }
 
 func (l *EventLog) Enabled() bool { return l != nil && l.sharded != nil && l.sharded.Len() > 0 }
@@ -81,6 +144,19 @@ func (l *EventLog) shardForAuction(auctionID uint64) *RedisRTClient {
 		return nil
 	}
 	return l.sharded.ForAuction(auctionID)
+}
+
+func (l *EventLog) rankingShardForAuction(auctionID uint64) *RedisRTClient {
+	if l == nil {
+		return nil
+	}
+	if l.rankingSharded != nil {
+		return l.rankingSharded.ForAuction(auctionID)
+	}
+	if l.sharded != nil {
+		return l.sharded.ForAuction(auctionID)
+	}
+	return nil
 }
 
 func (l *EventLog) globalShard() *RedisRTClient {
@@ -193,12 +269,40 @@ func (l *EventLog) EnsureConsumerGroup(ctx context.Context, auctionID uint64, gr
 	if group == "" {
 		return fmt.Errorf("redis event log consumer group is required")
 	}
-	client := l.shardForAuction(auctionID)
-	err := client.XGroupCreateMkStream(ctx, l.keys.AuctionStream(auctionID), group, "0-0").Err()
-	if err != nil && !strings.Contains(strings.ToUpper(err.Error()), "BUSYGROUP") {
-		return err
+	shardIdx := l.sharded.IndexAuction(auctionID)
+	cacheKey := ensureGroupKey{shardIdx: shardIdx, auctionID: auctionID, group: group}
+	if _, ok := l.ensuredGroups.Load(cacheKey); ok {
+		return nil
 	}
-	return nil
+	client := l.sharded.ForIndex(shardIdx)
+	err := client.XGroupCreateMkStream(ctx, l.keys.AuctionStream(auctionID), group, "0-0").Err()
+	if err == nil || isBusyGroupErr(err) {
+		l.ensuredGroups.Store(cacheKey, struct{}{})
+		return nil
+	}
+	return err
+}
+
+func isBusyGroupErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(strings.ToUpper(err.Error()), "BUSYGROUP")
+}
+
+func isNoGroupErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(strings.ToUpper(err.Error()), "NOGROUP")
+}
+
+func (l *EventLog) invalidateEnsuredGroup(auctionID uint64, group string) {
+	if !l.Enabled() {
+		return
+	}
+	shardIdx := l.sharded.IndexAuction(auctionID)
+	l.ensuredGroups.Delete(ensureGroupKey{shardIdx: shardIdx, auctionID: auctionID, group: group})
 }
 
 func (l *EventLog) ReadBidRecordGroup(ctx context.Context, auctionID uint64, consumer string, count int64, block time.Duration) ([]BidEvent, error) {
@@ -220,6 +324,26 @@ func (l *EventLog) ReadConsumerGroup(ctx context.Context, auctionID uint64, grou
 	if err != nil {
 		if err == redisgo.Nil {
 			return nil, nil
+		}
+		if isNoGroupErr(err) {
+			l.invalidateEnsuredGroup(auctionID, group)
+			if err := l.EnsureConsumerGroup(ctx, auctionID, group); err != nil {
+				return nil, err
+			}
+			streams, err = client.XReadGroup(ctx, &redisgo.XReadGroupArgs{
+				Group:    group,
+				Consumer: consumer,
+				Streams:  []string{l.keys.AuctionStream(auctionID), ">"},
+				Count:    count,
+				Block:    block,
+			}).Result()
+			if err != nil {
+				if err == redisgo.Nil {
+					return nil, nil
+				}
+				return nil, err
+			}
+			return bidEventsFromStreams(streams, 0), nil
 		}
 		return nil, err
 	}
@@ -280,7 +404,82 @@ func (l *EventLog) AckConsumerGroup(ctx context.Context, auctionID uint64, group
 	return client.XAck(ctx, l.keys.AuctionStream(auctionID), group, ids...).Err()
 }
 
-// WriteBidRecordDLQ 把死信写到全局 shard 上的 DLQ，便于运维统一巡检。
+// TrimAuctionStream 对单个拍卖的 bid stream 做近似长度裁剪。
+// 裁剪从 bid.lua 主原子段移到后台 worker，避免每次 accepted bid 都在热 Lua 里执行 MAXLEN。
+func (l *EventLog) TrimAuctionStream(ctx context.Context, auctionID uint64, maxLen int64) error {
+	if !l.Enabled() {
+		return fmt.Errorf("redis event log is not configured")
+	}
+	if maxLen <= 0 {
+		return nil
+	}
+	client := l.shardForAuction(auctionID)
+	return client.XTrimMaxLenApprox(ctx, l.keys.AuctionStream(auctionID), maxLen, 0).Err()
+}
+
+// UpdateAcceptedRanking 更新拍卖的 ranking ZSet 与 user_bids HASH。
+// 使用 Lua 原子脚本 + (price, bidTSMS, seq) 三元组比较防乱序：仅当新事件比旧事件
+// 严格"靠后"时才替换（旧 / 同 / 更早事件 → no-op，返回 nil），避免 WATCH 在
+// 热点拍卖 user_bids / user_latest_seq 整个 hash key 上产生事务冲突。
+// seq 单独存于 user_latest_seq hash，不入 ranking_member 编码，hammer.lua 零改动。
+// 失败由调用方决定是否致命；本方法不会自己写日志/指标。
+func (l *EventLog) UpdateAcceptedRanking(ctx context.Context, auctionID uint64, bidderID string, price, bidTSMS, seq int64) error {
+	if !l.Enabled() {
+		return fmt.Errorf("redis event log is not configured")
+	}
+	if bidderID == "" || price <= 0 {
+		return fmt.Errorf("redis event log: invalid ranking input")
+	}
+	client := l.rankingShardForAuction(auctionID)
+	if client == nil {
+		return fmt.Errorf("redis event log: ranking store is not configured")
+	}
+	rankingKey := l.keys.AuctionBids(auctionID)
+	userBidsKey := l.keys.AuctionUserBids(auctionID)
+	userSeqKey := l.keys.AuctionUserLatestSeq(auctionID)
+	newMember := FormatRankingMember(price, bidTSMS, bidderID)
+	return updateAcceptedRankingScript.Run(ctx, client, []string{rankingKey, userBidsKey, userSeqKey},
+		bidderID, price, bidTSMS, seq, newMember,
+	).Err()
+}
+
+// rankingNewerThan 在三元组 (price, bidTSMS, seq) 上比较：新事件比旧事件严格"靠后"
+// 才返回 true。次序：price 大者优先；相同则 bidTSMS 晚者优先；都相同则 seq 大者优先。
+func rankingNewerThan(newPrice, newTS, newSeq, oldPrice, oldTS, oldSeq int64) bool {
+	if newPrice != oldPrice {
+		return newPrice > oldPrice
+	}
+	if newTS != oldTS {
+		return newTS > oldTS
+	}
+	return newSeq > oldSeq
+}
+
+// parseRankingMember 解析 FormatRankingMember 编码：%019d:%013d:%s。
+// 第二段是 9999999999999-bidTSMS（用于 ZSet 排序），还原回 bidTSMS。
+func parseRankingMember(member string) (price, bidTSMS int64) {
+	if member == "" {
+		return 0, 0
+	}
+	parts := strings.SplitN(member, ":", 3)
+	if len(parts) < 2 {
+		return 0, 0
+	}
+	price = parseInt64(parts[0], 0)
+	inverted := parseInt64(parts[1], 0)
+	bidTSMS = int64(9999999999999) - inverted
+	return price, bidTSMS
+}
+
+// FormatRankingMember 与 bid.lua 历史实现保持字节一致：
+//
+//	%019d:%013d:%s   (price, 9999999999999-bidTSMS, bidderID)
+//
+// 这是 ZSet 排序的 source of truth；hammer.lua 也按这一格式解析。
+func FormatRankingMember(price, bidTSMS int64, bidderID string) string {
+	return fmt.Sprintf("%019d:%013d:%s", price, int64(9999999999999)-bidTSMS, bidderID)
+}
+
 func (l *EventLog) WriteBidRecordDLQ(ctx context.Context, event BidEvent, reason string) error {
 	if !l.Enabled() {
 		return fmt.Errorf("redis event log is not configured")

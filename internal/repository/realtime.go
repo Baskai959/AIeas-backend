@@ -16,6 +16,7 @@ type AuctionRealtimeStore interface {
 	InitAuction(ctx context.Context, auction domain.AuctionLot, minIncrement int64) (domain.AuctionState, error)
 	GetAuctionState(ctx context.Context, auctionID uint64) (domain.AuctionState, bool, error)
 	MarkEnrollment(ctx context.Context, auctionID uint64, userID string) error
+	BidPrerequisites(ctx context.Context, auctionID uint64, userID string) (bool, bool, error)
 	PlaceBid(ctx context.Context, input domain.BidInput) (domain.BidResult, error)
 	Hammer(ctx context.Context, input domain.HammerInput) (domain.HammerResult, error)
 	TopN(ctx context.Context, auctionID uint64, limit int) ([]domain.RankingEntry, error)
@@ -54,6 +55,13 @@ func (NoopRealtimeStore) MarkEnrollment(ctx context.Context, auctionID uint64, u
 	_ = auctionID
 	_ = userID
 	return nil
+}
+
+func (NoopRealtimeStore) BidPrerequisites(ctx context.Context, auctionID uint64, userID string) (bool, bool, error) {
+	_ = ctx
+	_ = auctionID
+	_ = userID
+	return false, false, nil
 }
 
 func (NoopRealtimeStore) PlaceBid(ctx context.Context, input domain.BidInput) (domain.BidResult, error) {

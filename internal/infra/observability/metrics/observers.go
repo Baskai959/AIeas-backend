@@ -83,6 +83,19 @@ func (r *Registry) ObserveBidStage(stage, result string, elapsed time.Duration) 
 	r.bidStageDuration.WithLabelValues(stage, result).Observe(elapsed.Seconds())
 }
 
+func (r *Registry) IncBidRoute(decision, reason string) {
+	if !r.Enabled() {
+		return
+	}
+	if decision == "" {
+		decision = "unknown"
+	}
+	if reason == "" {
+		reason = "none"
+	}
+	r.bidRouteTotal.WithLabelValues(decision, reason).Inc()
+}
+
 func (r *Registry) IncBidReject(reason string) {
 	if !r.Enabled() {
 		return
@@ -248,6 +261,13 @@ func (r *Registry) IncWorkerBidRecordDLQ(reason string) {
 		return
 	}
 	r.workerBidRecordDLQTotal.WithLabelValues(reason).Inc()
+}
+
+func (r *Registry) IncWorkerBidRankingConsume(result string) {
+	if !r.Enabled() {
+		return
+	}
+	r.workerBidRankingConsumeTotal.WithLabelValues(result).Inc()
 }
 
 func (r *Registry) IncWorkerTask(worker, result string) {

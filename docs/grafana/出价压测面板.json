@@ -357,15 +357,452 @@
       ]
     },
     {
-      "id": 5,
-      "type": "row",
-      "title": "行2 · 出价延迟（ACK 延迟来源）",
       "collapsed": false,
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
         "y": 17
+      },
+      "id": 50,
+      "panels": [],
+      "title": "行2 · Go 预拒与 Lua 进入（P0/P1/P3 效果）",
+      "type": "row"
+    },
+    {
+      "id": 51,
+      "type": "timeseries",
+      "title": "Go预拒 vs Lua进入 QPS",
+      "description": "判断 P0/P1/P3 是否把请求挡在 Lua 前：go_blocked 越高、lua_enter 越低，Redis Lua 排队压力越小。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 18
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "ops/s",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(aieas_auction_bid_route_total{decision=~\"go_blacklist_reject|go_prerequisite_reject|go_local_reject|same_price_gate_reject\"}[1m]))",
+          "legendFormat": "go_blocked",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(aieas_auction_bid_route_total{decision=\"lua_enter\"}[1m]))",
+          "legendFormat": "lua_enter",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(aieas_auction_bid_route_total{decision=\"same_price_gate_reject\"}[1m]))",
+          "legendFormat": "same_price_gate_reject",
+          "range": true,
+          "refId": "C"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(aieas_auction_bid_route_total{decision=\"same_price_gate_acquire\"}[1m]))",
+          "legendFormat": "same_price_gate_acquire",
+          "range": true,
+          "refId": "D"
+        }
+      ]
+    },
+    {
+      "id": 52,
+      "type": "timeseries",
+      "title": "Lua进入比例 / Go拦截比例",
+      "description": "用总出价请求做分母，观察请求是继续进入 Lua，还是已在 Go 层被预拒/闸门拦住。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 18
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(aieas_auction_bid_route_total{decision=\"lua_enter\"}[1m])) / clamp_min(sum(rate(aieas_auction_bid_total[1m])), 0.001)",
+          "legendFormat": "lua_enter_ratio",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(aieas_auction_bid_route_total{decision=~\"go_blacklist_reject|go_prerequisite_reject|go_local_reject|same_price_gate_reject\"}[1m])) / clamp_min(sum(rate(aieas_auction_bid_total[1m])), 0.001)",
+          "legendFormat": "go_block_ratio",
+          "range": true,
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "id": 53,
+      "type": "timeseries",
+      "title": "Go本地价格预拒原因",
+      "description": "重点看 BELOW_MIN_INCREMENT 是否已经在 Go 层返回；如果这里高，说明低价请求没有打进 Lua。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 26
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "ops/s",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(aieas_auction_bid_route_total{decision=\"go_local_reject\"}[1m])) by (reason)",
+          "legendFormat": "{{reason}}",
+          "range": true,
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 54,
+      "type": "timeseries",
+      "title": "Lua拒绝原因（确认低价是否仍进Lua）",
+      "description": "重点看 BELOW_MIN_INCREMENT 是否仍在 Lua 里大量出现；如果这里高，说明本地缓存/安全门没有命中或请求形态不满足预拒条件。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 26
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "ops/s",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(aieas_auction_bid_route_total{decision=\"lua_reject\"}[1m])) by (reason)",
+          "legendFormat": "{{reason}}",
+          "range": true,
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "row",
+      "title": "行3 · 出价延迟（ACK 延迟来源）",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 34
       },
       "panels": []
     },
@@ -382,7 +819,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 18
+        "y": 35
       },
       "fieldConfig": {
         "defaults": {
@@ -477,7 +914,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 18
+        "y": 35
       },
       "fieldConfig": {
         "defaults": {
@@ -562,21 +999,21 @@
     {
       "id": 8,
       "type": "row",
-      "title": "行3 · Redis 连接池（证实“连接池排队等待”根因）",
+      "title": "行4 · Redis 连接池（证实“连接池排队等待”根因）",
       "collapsed": false,
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 26
+        "y": 43
       },
       "panels": []
     },
     {
       "id": 9,
       "type": "timeseries",
-      "title": "连接池排队速率",
-      "description": "每秒新增的连接池等待次数。>0 且随时间上涨 = 连接池在排队等连接（请求数超过池可用连接）。",
+      "title": "连接池排队速率（按 Redis pool）",
+      "description": "按 exported_instance 区分主出价 rt-*、后台 rt-worker-*、PubSub pubsub-*、排行榜 ranking-*、cache。主链路排队应重点看 rt-*。",
       "datasource": {
         "type": "prometheus",
         "uid": "${DS_PROMETHEUS}"
@@ -585,7 +1022,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 27
+        "y": 44
       },
       "fieldConfig": {
         "defaults": {
@@ -660,8 +1097,8 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "sum(rate(aieas_redis_pool_wait_count_total[1m])) by (instance)",
-          "legendFormat": "{{instance}}",
+          "expr": "sum(rate(aieas_redis_pool_wait_count_total[1m])) by (exported_instance)",
+          "legendFormat": "{{exported_instance}}",
           "range": true,
           "refId": "A"
         }
@@ -670,8 +1107,8 @@
     {
       "id": 10,
       "type": "timeseries",
-      "title": "连接池平均每次等待时长",
-      "description": "等待总时长增量 / 等待次数增量 = 平均每次等待时长，这是“连接池等待”占 ACK 延迟比例的直接量化。分母用 clamp_min 防除零。",
+      "title": "连接池平均每次等待时长（按 Redis pool）",
+      "description": "pool wait 的客户端视角平均耗时。若 rt-* 升高，会直接拉高主出价 ACK；pubsub/ranking/rt-worker/cache 升高说明异步链路或在线人数独立承压。",
       "datasource": {
         "type": "prometheus",
         "uid": "${DS_PROMETHEUS}"
@@ -680,7 +1117,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 27
+        "y": 44
       },
       "fieldConfig": {
         "defaults": {
@@ -755,8 +1192,8 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "(sum(rate(aieas_redis_pool_wait_duration_seconds_total[1m])) by (instance) / clamp_min(sum(rate(aieas_redis_pool_wait_count_total[1m])) by (instance), 1)) * 1000",
-          "legendFormat": "{{instance}}",
+          "expr": "(sum(rate(aieas_redis_pool_wait_duration_seconds_total[1m])) by (exported_instance) / clamp_min(sum(rate(aieas_redis_pool_wait_count_total[1m])) by (exported_instance), 1)) * 1000",
+          "legendFormat": "{{exported_instance}}",
           "range": true,
           "refId": "A"
         }
@@ -765,7 +1202,7 @@
     {
       "id": 11,
       "type": "timeseries",
-      "title": "连接池超时速率",
+      "title": "连接池超时速率（按 Redis pool）",
       "description": "每秒连接池超时次数。出现非 0 = 连接池耗尽（PoolTimeout 触发），是连接池容量不足的强信号。",
       "datasource": {
         "type": "prometheus",
@@ -775,7 +1212,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 35
+        "y": 52
       },
       "fieldConfig": {
         "defaults": {
@@ -850,8 +1287,8 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "sum(rate(aieas_redis_pool_timeouts_total[1m])) by (instance)",
-          "legendFormat": "{{instance}}",
+          "expr": "sum(rate(aieas_redis_pool_timeouts_total[1m])) by (exported_instance)",
+          "legendFormat": "{{exported_instance}}",
           "range": true,
           "refId": "A"
         }
@@ -860,7 +1297,7 @@
     {
       "id": 12,
       "type": "timeseries",
-      "title": "连接池连接数（总/空闲）",
+      "title": "连接池连接数（总/空闲，按 Redis pool）",
       "description": "对比总连接数与空闲连接数：空闲连接趋零 = 池被占满，后续请求只能排队或超时。",
       "datasource": {
         "type": "prometheus",
@@ -870,7 +1307,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 35
+        "y": 52
       },
       "fieldConfig": {
         "defaults": {
@@ -945,8 +1382,8 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "sum(aieas_redis_pool_total_conns) by (instance)",
-          "legendFormat": "{{instance}} 总连接",
+          "expr": "sum(aieas_redis_pool_total_conns) by (exported_instance)",
+          "legendFormat": "{{exported_instance}} 总连接",
           "range": true,
           "refId": "A"
         },
@@ -956,8 +1393,8 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "sum(aieas_redis_pool_idle_conns) by (instance)",
-          "legendFormat": "{{instance}} 空闲连接",
+          "expr": "sum(aieas_redis_pool_idle_conns) by (exported_instance)",
+          "legendFormat": "{{exported_instance}} 空闲连接",
           "range": true,
           "refId": "B"
         }
@@ -966,7 +1403,7 @@
     {
       "id": 13,
       "type": "timeseries",
-      "title": "连接复用命中率",
+      "title": "连接复用命中率（按 Redis pool）",
       "description": "命中数 /（命中数 + 未命中数）= 连接复用命中率。命中率下降说明频繁新建连接，间接反映池压力。分母用 clamp_min 防除零。",
       "datasource": {
         "type": "prometheus",
@@ -976,7 +1413,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 43
+        "y": 60
       },
       "fieldConfig": {
         "defaults": {
@@ -1051,31 +1488,31 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "sum(rate(aieas_redis_pool_hits_total[1m])) by (instance) / clamp_min(sum(rate(aieas_redis_pool_hits_total[1m]) + rate(aieas_redis_pool_misses_total[1m])) by (instance), 1)",
-          "legendFormat": "{{instance}}",
+          "expr": "sum(rate(aieas_redis_pool_hits_total[1m])) by (exported_instance) / clamp_min(sum(rate(aieas_redis_pool_hits_total[1m]) + rate(aieas_redis_pool_misses_total[1m])) by (exported_instance), 1)",
+          "legendFormat": "{{exported_instance}}",
           "range": true,
           "refId": "A"
         }
       ]
     },
     {
-      "id": 14,
+      "id": 55,
       "type": "row",
-      "title": "行4 · Redis 命令与运行时",
+      "title": "行5 · Redis Pool 分离验证（主链路 / PubSub / Ranking / Worker / Cache）",
       "collapsed": false,
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 51
+        "y": 68
       },
       "panels": []
     },
     {
-      "id": 15,
+      "id": 56,
       "type": "timeseries",
-      "title": "Redis 命令延迟 P95",
-      "description": "Redis 命令本身执行的 P95 延迟。与“连接池平均每次等待时长”对比——若客户端总延迟上涨而命令本身平稳，说明延迟来自排队等待而非命令执行。",
+      "title": "主出价 RT pool 等待速率（只看 rt-*）",
+      "description": "主出价 Lua / 状态读写使用 rt-*。这里应尽量接近 0；若它升高，ACK p95 通常会被直接拉高。",
       "datasource": {
         "type": "prometheus",
         "uid": "${DS_PROMETHEUS}"
@@ -1084,102 +1521,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 52
-      },
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "axisBorderShow": false,
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "ms",
-            "axisPlacement": "auto",
-            "barAlignment": 0,
-            "drawStyle": "line",
-            "fillOpacity": 10,
-            "gradientMode": "none",
-            "hideFrom": {
-              "legend": false,
-              "tooltip": false,
-              "viz": false
-            },
-            "insertNulls": false,
-            "lineInterpolation": "linear",
-            "lineWidth": 1,
-            "pointSize": 5,
-            "scaleDistribution": {
-              "type": "linear"
-            },
-            "showPoints": "auto",
-            "spanNulls": false,
-            "stacking": {
-              "group": "A",
-              "mode": "none"
-            },
-            "thresholdsStyle": {
-              "mode": "off"
-            }
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              }
-            ]
-          },
-          "unit": "ms"
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "calcs": [
-            "lastNotNull",
-            "max"
-          ],
-          "displayMode": "table",
-          "placement": "bottom",
-          "showLegend": true
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
-          },
-          "editorMode": "code",
-          "expr": "(histogram_quantile(0.95, sum(rate(aieas_redis_command_duration_seconds_bucket[1m])) by (le, instance))) * 1000",
-          "legendFormat": "{{instance}}",
-          "range": true,
-          "refId": "A"
-        }
-      ]
-    },
-    {
-      "id": 16,
-      "type": "timeseries",
-      "title": "Redis 命令错误速率",
-      "description": "每秒 Redis 命令错误数，用于排查命令层失败（连接断开、超时、执行错误等）。",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${DS_PROMETHEUS}"
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 52
+        "y": 69
       },
       "fieldConfig": {
         "defaults": {
@@ -1254,8 +1596,496 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "sum(rate(aieas_redis_command_errors_total[1m])) by (instance)",
-          "legendFormat": "{{instance}}",
+          "expr": "sum(rate(aieas_redis_pool_wait_count_total{exported_instance=~\"rt-[0-9]+\"}[1m])) by (exported_instance)",
+          "legendFormat": "{{exported_instance}} wait/s",
+          "range": true,
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 57,
+      "type": "timeseries",
+      "title": "异步/在线 pool 等待速率（pubsub/ranking/rt-worker/cache）",
+      "description": "PUBLISH、Stream、ranking、在线人数已拆到独立 pool。这里升高不应直接占用主出价 rt-* pool。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 69
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "ops/s",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(aieas_redis_pool_wait_count_total{exported_instance=~\"pubsub-.*|ranking-.*|rt-worker-.*|cache\"}[1m])) by (exported_instance)",
+          "legendFormat": "{{exported_instance}} wait/s",
+          "range": true,
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 58,
+      "type": "timeseries",
+      "title": "主出价 RT 命令 P95（rt-* / EVALSHA 等）",
+      "description": "主链路命令耗时。EVALSHA=bid.place 客户端耗时；若 PUBLISH 出现在这里，说明 publish pool 没有生效。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 77
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "ms",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "(histogram_quantile(0.95, sum(rate(aieas_redis_command_duration_seconds_bucket{exported_instance=~\"rt-[0-9]+\",op=~\"EVALSHA|PIPELINE|HGETALL|GET|PUBLISH\"}[1m])) by (le, exported_instance, op))) * 1000",
+          "legendFormat": "{{exported_instance}} {{op}}",
+          "range": true,
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 59,
+      "type": "timeseries",
+      "title": "非主链路 Redis 命令 P95（pubsub/ranking/worker/cache）",
+      "description": "用于确认 PUBLISH 落在 pubsub-*，ranking EVALSHA 落在 ranking-*，XREADGROUP/XACK/XTRIM 落在 rt-worker-*，在线人数 pipeline 落在 cache。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 77
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "ms",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "(histogram_quantile(0.95, sum(rate(aieas_redis_command_duration_seconds_bucket{exported_instance=~\"pubsub-.*|ranking-.*|rt-worker-.*|cache\"}[1m])) by (le, exported_instance, op))) * 1000",
+          "legendFormat": "{{exported_instance}} {{op}}",
+          "range": true,
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 14,
+      "type": "row",
+      "title": "行6 · Redis 命令与运行时",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 85
+      },
+      "panels": []
+    },
+    {
+      "id": 15,
+      "type": "timeseries",
+      "title": "Redis 命令延迟 P95（按 Redis pool）",
+      "description": "Redis 客户端命令耗时 P95，包含排队、网络与服务端执行。按 exported_instance 区分主出价、worker、publish 与 cache。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 86
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "ms",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "(histogram_quantile(0.95, sum(rate(aieas_redis_command_duration_seconds_bucket[1m])) by (le, exported_instance))) * 1000",
+          "legendFormat": "{{exported_instance}}",
+          "range": true,
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 16,
+      "type": "timeseries",
+      "title": "Redis 命令错误速率（按 pool/op）",
+      "description": "每秒 Redis 命令错误数，用于排查命令层失败（连接断开、超时、执行错误等）。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 86
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "ops/s",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(aieas_redis_command_errors_total[1m])) by (exported_instance, op)",
+          "legendFormat": "{{exported_instance}} {{op}}",
           "range": true,
           "refId": "A"
         }
@@ -1274,7 +2104,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 60
+        "y": 94
       },
       "fieldConfig": {
         "defaults": {
@@ -1359,13 +2189,13 @@
     {
       "id": 18,
       "type": "row",
-      "title": "行5 · 出价链路阶段补充（ACK 是被哪个阶段拉高）",
+      "title": "行7 · 出价链路阶段补充（ACK 是被哪个阶段拉高）",
       "collapsed": false,
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 68
+        "y": 102
       },
       "panels": []
     },
@@ -1382,7 +2212,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 69
+        "y": 103
       },
       "fieldConfig": {
         "defaults": {
@@ -1499,7 +2329,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 69
+        "y": 103
       },
       "fieldConfig": {
         "defaults": {
@@ -1594,7 +2424,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 77
+        "y": 111
       },
       "fieldConfig": {
         "defaults": {
@@ -1689,7 +2519,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 77
+        "y": 111
       },
       "fieldConfig": {
         "defaults": {
@@ -1774,13 +2604,13 @@
     {
       "id": 23,
       "type": "row",
-      "title": "行6 · Redis / Lua 热点（Redis 是否是 ACK 延迟主因）",
+      "title": "行8 · Redis / Lua 热点（Redis 是否是 ACK 延迟主因）",
       "collapsed": false,
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 85
+        "y": 119
       },
       "panels": []
     },
@@ -1797,7 +2627,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 86
+        "y": 120
       },
       "fieldConfig": {
         "defaults": {
@@ -1903,7 +2733,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 86
+        "y": 120
       },
       "fieldConfig": {
         "defaults": {
@@ -1988,8 +2818,8 @@
     {
       "id": 26,
       "type": "timeseries",
-      "title": "Redis 命令 QPS Top10",
-      "description": "按 Redis 命令统计调用量，判断热点命令是否来自 EVALSHA、XREADGROUP、XACK、XRANGE、HGETALL、SMEMBERS 等。",
+      "title": "Redis 命令 QPS Top20（按 pool/op）",
+      "description": "按 Redis pool + 命令统计调用量，确认出价 EVALSHA 是否只在 rt-*、PUBLISH 是否在 pubsub-*、ranking EVALSHA 是否在 ranking-*、XREADGROUP/XACK/XTRIM 是否在 rt-worker-*。",
       "datasource": {
         "type": "prometheus",
         "uid": "${DS_PROMETHEUS}"
@@ -1998,7 +2828,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 94
+        "y": 128
       },
       "fieldConfig": {
         "defaults": {
@@ -2073,8 +2903,8 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "topk(10, sum(rate(aieas_redis_command_duration_seconds_count[1m])) by (op))",
-          "legendFormat": "{{op}}",
+          "expr": "topk(20, sum(rate(aieas_redis_command_duration_seconds_count[1m])) by (exported_instance, op))",
+          "legendFormat": "{{exported_instance}} {{op}}",
           "range": true,
           "refId": "A"
         }
@@ -2083,8 +2913,8 @@
     {
       "id": 27,
       "type": "timeseries",
-      "title": "Redis 命令 P95（按 op）",
-      "description": "按命令类型看 Redis 命令尾延迟。EVALSHA 高通常对应出价 Lua；XREADGROUP/XACK 高通常对应异步事件消费。",
+      "title": "Redis 命令 P95（按 pool/op）",
+      "description": "按命令类型看 Redis 命令尾延迟。EVALSHA 高通常对应出价 Lua；XREADGROUP/XACK/XTRIM 高通常对应异步事件消费或 Stream 裁剪。",
       "datasource": {
         "type": "prometheus",
         "uid": "${DS_PROMETHEUS}"
@@ -2093,7 +2923,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 94
+        "y": 128
       },
       "fieldConfig": {
         "defaults": {
@@ -2168,8 +2998,8 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "(histogram_quantile(0.95, sum(rate(aieas_redis_command_duration_seconds_bucket[1m])) by (le, op))) * 1000",
-          "legendFormat": "{{op}}",
+          "expr": "(histogram_quantile(0.95, sum(rate(aieas_redis_command_duration_seconds_bucket[1m])) by (le, exported_instance, op))) * 1000",
+          "legendFormat": "{{exported_instance}} {{op}}",
           "range": true,
           "refId": "A"
         }
@@ -2178,13 +3008,13 @@
     {
       "id": 28,
       "type": "row",
-      "title": "行7 · 异步事件与 MySQL 落库（是否形成后台 backlog）",
+      "title": "行9 · 异步事件与 MySQL 落库（是否形成后台 backlog）",
       "collapsed": false,
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 102
+        "y": 136
       },
       "panels": []
     },
@@ -2201,7 +3031,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 103
+        "y": 137
       },
       "fieldConfig": {
         "defaults": {
@@ -2329,7 +3159,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 103
+        "y": 137
       },
       "fieldConfig": {
         "defaults": {
@@ -2424,7 +3254,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 111
+        "y": 145
       },
       "fieldConfig": {
         "defaults": {
@@ -2519,7 +3349,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 111
+        "y": 145
       },
       "fieldConfig": {
         "defaults": {
@@ -2614,7 +3444,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 119
+        "y": 153
       },
       "fieldConfig": {
         "defaults": {
@@ -2731,7 +3561,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 119
+        "y": 153
       },
       "fieldConfig": {
         "defaults": {
@@ -2816,13 +3646,13 @@
     {
       "id": 35,
       "type": "row",
-      "title": "行8 · WebSocket 广播与连接（在线人数是否放大延迟）",
+      "title": "行10 · WebSocket 广播与连接（在线人数是否放大延迟）",
       "collapsed": false,
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 127
+        "y": 161
       },
       "panels": []
     },
@@ -2839,7 +3669,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 128
+        "y": 162
       },
       "fieldConfig": {
         "defaults": {
@@ -2934,7 +3764,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 128
+        "y": 162
       },
       "fieldConfig": {
         "defaults": {
@@ -3029,7 +3859,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 128
+        "y": 162
       },
       "fieldConfig": {
         "defaults": {
@@ -3124,7 +3954,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 136
+        "y": 170
       },
       "fieldConfig": {
         "defaults": {
@@ -3230,7 +4060,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 136
+        "y": 170
       },
       "fieldConfig": {
         "defaults": {
@@ -3315,13 +4145,13 @@
     {
       "id": 41,
       "type": "row",
-      "title": "行9 · 进程资源、GC 与 HTTP 辅助指标",
+      "title": "行11 · 进程资源、GC 与 HTTP 辅助指标",
       "collapsed": false,
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 144
+        "y": 178
       },
       "panels": []
     },
@@ -3338,7 +4168,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 145
+        "y": 179
       },
       "fieldConfig": {
         "defaults": {
@@ -3433,7 +4263,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 145
+        "y": 179
       },
       "fieldConfig": {
         "defaults": {
@@ -3528,7 +4358,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 145
+        "y": 179
       },
       "fieldConfig": {
         "defaults": {
@@ -3623,7 +4453,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 153
+        "y": 187
       },
       "fieldConfig": {
         "defaults": {
@@ -3729,7 +4559,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 153
+        "y": 187
       },
       "fieldConfig": {
         "defaults": {
@@ -3824,7 +4654,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 153
+        "y": 187
       },
       "fieldConfig": {
         "defaults": {
@@ -3919,7 +4749,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 161
+        "y": 195
       },
       "fieldConfig": {
         "defaults": {
@@ -4014,7 +4844,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 161
+        "y": 195
       },
       "fieldConfig": {
         "defaults": {
@@ -4132,6 +4962,6 @@
   "timezone": "browser",
   "title": "出价链路压测监控面板",
   "uid": "aieas-bid-loadtest",
-  "version": 4,
+  "version": 6,
   "weekStart": ""
 }

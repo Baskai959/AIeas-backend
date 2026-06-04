@@ -67,6 +67,8 @@ type LiveSession struct {
 type LiveSessionFilter struct {
 	MerchantID string
 	Status     LiveSessionStatus
+	Keyword    string
+	Sort       string
 	OpenedFrom *time.Time
 	OpenedTo   *time.Time
 	Limit      int

@@ -1,0 +1,392 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "AI电商拍卖系统 - 直播场次列表搜索排序",
+    "version": "2026-06-04",
+    "description": "为当前直播场次列表接口补充 keyword 与 sort 查询能力。REST 响应统一包裹为 {code,message,data,trace_id}。"
+  },
+  "servers": [
+    {
+      "url": "http://127.0.0.1:8080",
+      "description": "本地默认服务地址"
+    }
+  ],
+  "security": [
+    {
+      "bearerAuth": []
+    }
+  ],
+  "tags": [
+    {
+      "name": "LiveSession",
+      "description": "直播场次列表、搜索与排序"
+    }
+  ],
+  "paths": {
+    "/api/v1/live-sessions": {
+      "get": {
+        "tags": [
+          "LiveSession"
+        ],
+        "summary": "直播场次列表",
+        "description": "用户端直播间列表入口。买家只会看到 LIVE 场次；商家只能看到自己的场次；管理员可按条件查看全部。",
+        "parameters": [
+          {
+            "name": "merchantId",
+            "in": "query",
+            "description": "商家用户 ID。",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "status",
+            "in": "query",
+            "description": "场次状态。买家传非 LIVE 状态会返回空列表。",
+            "schema": {
+              "$ref": "#/components/schemas/LiveSessionStatus"
+            }
+          },
+          {
+            "name": "keyword",
+            "in": "query",
+            "description": "关键词，匹配 title、description、merchantId。",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "sort",
+            "in": "query",
+            "description": "排序方式；不传默认 latest。",
+            "schema": {
+              "$ref": "#/components/schemas/LiveSessionSort"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "分页大小，默认 20，最大 100。",
+            "schema": {
+              "type": "integer",
+              "default": 20,
+              "minimum": 1,
+              "maximum": 100
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "description": "分页偏移，默认 0。",
+            "schema": {
+              "type": "integer",
+              "default": 0,
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/LiveSessionListResponse"
+          },
+          "401": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "403": {
+            "$ref": "#/components/responses/ErrorResponse"
+          }
+        }
+      }
+    },
+    "/api/v1/merchants/{merchantId}/live-sessions": {
+      "get": {
+        "tags": [
+          "LiveSession"
+        ],
+        "summary": "指定商家的直播场次列表",
+        "description": "用于商家主页直播场次列表。买家可访问但只返回 LIVE 场次；商家角色会强制使用当前登录商家 ID；管理员可指定任意 merchantId。支持 keyword 与 sort。",
+        "parameters": [
+          {
+            "name": "merchantId",
+            "in": "path",
+            "required": true,
+            "description": "商家用户 ID。",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "status",
+            "in": "query",
+            "description": "场次状态。",
+            "schema": {
+              "$ref": "#/components/schemas/LiveSessionStatus"
+            }
+          },
+          {
+            "name": "keyword",
+            "in": "query",
+            "description": "关键词，匹配 title、description、merchantId。",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "sort",
+            "in": "query",
+            "description": "排序方式；不传默认 latest。",
+            "schema": {
+              "$ref": "#/components/schemas/LiveSessionSort"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "分页大小，默认 20，最大 100。",
+            "schema": {
+              "type": "integer",
+              "default": 20,
+              "minimum": 1,
+              "maximum": 100
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "description": "分页偏移，默认 0。",
+            "schema": {
+              "type": "integer",
+              "default": 0,
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/LiveSessionListResponse"
+          },
+          "401": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "403": {
+            "$ref": "#/components/responses/ErrorResponse"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT"
+      }
+    },
+    "responses": {
+      "LiveSessionListResponse": {
+        "description": "直播场次列表",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/LiveSessionListResponse"
+            }
+          }
+        }
+      },
+      "ErrorResponse": {
+        "description": "统一错误响应",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            }
+          }
+        }
+      }
+    },
+    "schemas": {
+      "LiveSessionListResponse": {
+        "type": "object",
+        "required": [
+          "code",
+          "message",
+          "data",
+          "trace_id"
+        ],
+        "properties": {
+          "code": {
+            "type": "integer",
+            "example": 0
+          },
+          "message": {
+            "type": "string",
+            "example": "success"
+          },
+          "data": {
+            "type": "object",
+            "required": [
+              "sessions"
+            ],
+            "properties": {
+              "sessions": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/LiveSessionView"
+                }
+              }
+            }
+          },
+          "trace_id": {
+            "type": "string"
+          }
+        }
+      },
+      "ErrorResponse": {
+        "type": "object",
+        "required": [
+          "code",
+          "message",
+          "trace_id"
+        ],
+        "properties": {
+          "code": {
+            "type": "integer"
+          },
+          "message": {
+            "type": "string"
+          },
+          "data": {
+            "type": "object",
+            "nullable": true,
+            "additionalProperties": true
+          },
+          "trace_id": {
+            "type": "string"
+          }
+        }
+      },
+      "LiveSessionView": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "merchantId": {
+            "type": "string"
+          },
+          "merchantName": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "coverUrl": {
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/LiveSessionStatus"
+          },
+          "activeAuctionId": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "videoSource": {
+            "type": "string"
+          },
+          "videoUrl": {
+            "type": "string"
+          },
+          "digitalHuman": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "onlineCount": {
+            "type": "integer"
+          },
+          "openedAt": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "closedAt": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "scheduledStartTime": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "plannedDurationSec": {
+            "type": "integer"
+          },
+          "lotsTotal": {
+            "type": "integer"
+          },
+          "lotsSold": {
+            "type": "integer"
+          },
+          "lotsUnsold": {
+            "type": "integer"
+          },
+          "bidCount": {
+            "type": "integer"
+          },
+          "gmvCent": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "viewerPeak": {
+            "type": "integer"
+          },
+          "viewerTotal": {
+            "type": "integer"
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "updatedAt": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "LiveSessionStatus": {
+        "type": "string",
+        "enum": [
+          "DRAFT",
+          "SCHEDULED",
+          "LIVE",
+          "ENDED",
+          "CANCELLED"
+        ]
+      },
+      "LiveSessionSort": {
+        "type": "string",
+        "enum": [
+          "latest",
+          "newest",
+          "createdAtDesc",
+          "oldest",
+          "createdAtAsc",
+          "startTimeAsc",
+          "scheduledStartAsc",
+          "startTimeDesc",
+          "scheduledStartDesc",
+          "openedAtAsc",
+          "openedAtDesc",
+          "gmvDesc",
+          "viewerDesc",
+          "viewerPeakDesc"
+        ]
+      }
+    }
+  }
+}

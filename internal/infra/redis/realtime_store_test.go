@@ -70,12 +70,15 @@ func TestAuctionRealtimeStoreRejectedBidDoesNotWriteStreamAndReplayGap(t *testin
 	auctionID := uint64(10002)
 	now := time.UnixMilli(1700000000000).UTC()
 	mustInitRunningAuction(t, ctx, client, keys, auctionID, now)
+	if err := store.MarkEnrollment(ctx, auctionID, "u_1001"); err != nil {
+		t.Fatalf("mark enrollment: %v", err)
+	}
 
-	rejected, err := store.PlaceBid(ctx, domain.BidInput{RequestID: "req-reject", AuctionID: auctionID, BidderID: "u_missing", Price: 1100, ExpectedCurrentPrice: expectedCurrentPrice(1000), Now: now, Source: "live_ws", MinIncrement: 100, IdempotencyTTL: time.Hour})
+	rejected, err := store.PlaceBid(ctx, domain.BidInput{RequestID: "req-reject", AuctionID: auctionID, BidderID: "u_1001", Price: 1150, ExpectedCurrentPrice: expectedCurrentPrice(1000), Now: now, Source: "live_ws", MinIncrement: 100, IdempotencyTTL: time.Hour})
 	if err != nil {
 		t.Fatalf("place rejected bid: %v", err)
 	}
-	if rejected.Accepted || rejected.Reason != "NOT_ENROLLED" || rejected.Seq != 0 || rejected.StreamID != "" || rejected.Event != "bid.rejected" {
+	if rejected.Accepted || rejected.Reason != domain.BidRejectStepMismatch || rejected.Seq != 0 || rejected.StreamID != "" || rejected.Event != "bid.rejected" {
 		t.Fatalf("unexpected rejected result: %+v", rejected)
 	}
 
@@ -90,6 +93,50 @@ func TestAuctionRealtimeStoreRejectedBidDoesNotWriteStreamAndReplayGap(t *testin
 	}
 	if events, complete, err = log.ReplayBidEvents(ctx, gapAuctionID, 2, 10); err != nil || complete || len(events) != 0 {
 		t.Fatalf("expected incomplete replay gap, events=%+v complete=%v err=%v", events, complete, err)
+	}
+}
+
+func TestAuctionRealtimeStoreHammerUsesStateLeaderWhenRankingIsAsync(t *testing.T) {
+	ctx := context.Background()
+	store, client, keys := newMiniredisStore(t)
+	auctionID := uint64(10003)
+	now := time.UnixMilli(1700000000000).UTC()
+	mustInitRunningAuction(t, ctx, client, keys, auctionID, now)
+
+	result, err := store.PlaceBid(ctx, domain.BidInput{
+		RequestID:            "hammer-state-bid",
+		AuctionID:            auctionID,
+		BidderID:             "u_1001",
+		Price:                1100,
+		ExpectedCurrentPrice: expectedCurrentPrice(1000),
+		Now:                  now,
+		Source:               "live_ws",
+		MinIncrement:         100,
+		IdempotencyTTL:       time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("place bid: %v", err)
+	}
+	if !result.Accepted {
+		t.Fatalf("expected accepted bid, got %+v", result)
+	}
+	if zcard, err := client.ZCard(ctx, keys.AuctionBids(auctionID)).Result(); err != nil || zcard != 0 {
+		t.Fatalf("ranking should be async and empty before worker update, zcard=%d err=%v", zcard, err)
+	}
+
+	closed, err := store.Hammer(ctx, domain.HammerInput{
+		RequestID:      "hammer-state-close",
+		AuctionID:      auctionID,
+		Now:            now.Add(time.Second),
+		IdempotencyTTL: time.Hour,
+		ReservePrice:   1000,
+		Force:          true,
+	})
+	if err != nil {
+		t.Fatalf("hammer: %v", err)
+	}
+	if closed.Status != domain.AuctionStatusClosedWon || closed.WinnerID != "u_1001" || closed.Price != 1100 {
+		t.Fatalf("hammer should close from state leader/current price, got %+v", closed)
 	}
 }
 
@@ -313,6 +360,230 @@ func TestAuctionRealtimeStoreAntiExtendResetMode(t *testing.T) {
 	}
 	if !result.Accepted || !result.Extended || !result.EndTime.Equal(now.Add(30*time.Second)) {
 		t.Fatalf("expected reset-mode extension to now+30s, got %+v", result)
+	}
+}
+
+func TestAuctionRealtimeStoreInitAuctionRegistersActiveStream(t *testing.T) {
+	ctx := context.Background()
+	store, client, keys := newMiniredisStore(t)
+	auctionID := uint64(10100)
+	now := time.UnixMilli(1700000000000).UTC()
+	auction := domain.AuctionLot{
+		AuctionID:     auctionID,
+		Status:        domain.AuctionStatusRunning,
+		StartPrice:    1000,
+		ReservePrice:  1000,
+		CapPrice:      2000,
+		StartTime:     now.Add(-time.Minute),
+		EndTime:       now.Add(time.Hour),
+		IncrementRule: json.RawMessage(`{"type":"fixed","amount":100,"maxBidSteps":10}`),
+	}
+	if _, err := store.InitAuction(ctx, auction, 100); err != nil {
+		t.Fatalf("init auction: %v", err)
+	}
+	members, err := client.SMembers(ctx, keys.ActiveStreams()).Result()
+	if err != nil {
+		t.Fatalf("smembers active streams: %v", err)
+	}
+	want := strconv.FormatUint(auctionID, 10)
+	found := false
+	for _, m := range members {
+		if m == want {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected active_streams to contain %s after InitAuction, got %v", want, members)
+	}
+	stateValues, err := client.HGetAll(ctx, keys.AuctionState(auctionID)).Result()
+	if err != nil {
+		t.Fatalf("hgetall state: %v", err)
+	}
+	if stateValues["increment_rule_type"] != "fixed" {
+		t.Fatalf("expected increment_rule_type=fixed, got %q", stateValues["increment_rule_type"])
+	}
+	if stateValues["increment_fixed_amount"] != "100" {
+		t.Fatalf("expected increment_fixed_amount=100, got %q", stateValues["increment_fixed_amount"])
+	}
+}
+
+func TestAuctionRealtimeStorePlaceBidPublishesRawPayload(t *testing.T) {
+	ctx := context.Background()
+	store, client, _ := newMiniredisStore(t)
+	auctionID := uint64(10101)
+	now := time.UnixMilli(1700000000000).UTC()
+	auction := domain.AuctionLot{
+		AuctionID:     auctionID,
+		Status:        domain.AuctionStatusRunning,
+		StartPrice:    1000,
+		ReservePrice:  1000,
+		CapPrice:      2000,
+		StartTime:     now.Add(-time.Minute),
+		EndTime:       now.Add(time.Hour),
+		IncrementRule: json.RawMessage(`{"type":"fixed","amount":100,"maxBidSteps":10}`),
+	}
+	if _, err := store.InitAuction(ctx, auction, 100); err != nil {
+		t.Fatalf("init auction: %v", err)
+	}
+	if err := store.MarkEnrollment(ctx, auctionID, "u_1001"); err != nil {
+		t.Fatalf("mark enrollment: %v", err)
+	}
+	channel := "auction:" + strconv.FormatUint(auctionID, 10) + ":events"
+	pubsub := client.Subscribe(ctx, channel)
+	defer pubsub.Close()
+	if _, err := pubsub.Receive(ctx); err != nil {
+		t.Fatalf("subscribe receive: %v", err)
+	}
+	ch := pubsub.Channel()
+
+	result, err := store.PlaceBid(ctx, domain.BidInput{RequestID: "pubsub-req", AuctionID: auctionID, BidderID: "u_1001", Price: 1100, ExpectedCurrentPrice: expectedCurrentPrice(1000), Now: now, Source: "live_ws", MinIncrement: 100, IdempotencyTTL: time.Hour})
+	if err != nil || !result.Accepted {
+		t.Fatalf("place bid: result=%+v err=%v", result, err)
+	}
+	select {
+	case msg := <-ch:
+		if msg == nil {
+			t.Fatalf("nil message from pubsub")
+		}
+		var payload struct {
+			Event     string `json:"event"`
+			Seq       int64  `json:"seq"`
+			AuctionID uint64 `json:"auctionId"`
+			EndTSMS   int64  `json:"endTsMs"`
+		}
+		if err := json.Unmarshal([]byte(msg.Payload), &payload); err != nil {
+			t.Fatalf("unmarshal published payload: %v (%s)", err, msg.Payload)
+		}
+		if payload.Event != "bid.accepted" || payload.Seq != result.Seq || payload.AuctionID != auctionID {
+			t.Fatalf("unexpected published payload: %+v raw=%s", payload, msg.Payload)
+		}
+		if payload.EndTSMS == 0 {
+			t.Fatalf("published payload must keep endTsMs field, raw=%s", msg.Payload)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("expected published event on %s within timeout", channel)
+	}
+}
+
+func TestAuctionRealtimeStorePlaceBidUsesDedicatedPublishClient(t *testing.T) {
+	ctx := context.Background()
+	store, _, _ := newMiniredisStore(t)
+	pubMR := miniredis.RunT(t)
+	pubClient := redisgo.NewClient(&redisgo.Options{Addr: pubMR.Addr()})
+	t.Cleanup(func() { _ = pubClient.Close() })
+	store.SetPublishShardedRT(NewShardedRTClientFromShards([]*RedisRTClient{{Client: pubClient}}))
+
+	auctionID := uint64(10103)
+	now := time.UnixMilli(1700000000000).UTC()
+	auction := domain.AuctionLot{
+		AuctionID:     auctionID,
+		Status:        domain.AuctionStatusRunning,
+		StartPrice:    1000,
+		ReservePrice:  1000,
+		CapPrice:      2000,
+		StartTime:     now.Add(-time.Minute),
+		EndTime:       now.Add(time.Hour),
+		IncrementRule: json.RawMessage(`{"type":"fixed","amount":100,"maxBidSteps":10}`),
+	}
+	if _, err := store.InitAuction(ctx, auction, 100); err != nil {
+		t.Fatalf("init auction: %v", err)
+	}
+	if err := store.MarkEnrollment(ctx, auctionID, "u_1001"); err != nil {
+		t.Fatalf("mark enrollment: %v", err)
+	}
+
+	channel := "auction:" + strconv.FormatUint(auctionID, 10) + ":events"
+	pubsub := pubClient.Subscribe(ctx, channel)
+	defer pubsub.Close()
+	if _, err := pubsub.Receive(ctx); err != nil {
+		t.Fatalf("subscribe receive: %v", err)
+	}
+	ch := pubsub.Channel()
+
+	result, err := store.PlaceBid(ctx, domain.BidInput{RequestID: "pub-dedicated-req", AuctionID: auctionID, BidderID: "u_1001", Price: 1100, ExpectedCurrentPrice: expectedCurrentPrice(1000), Now: now, Source: "live_ws", MinIncrement: 100, IdempotencyTTL: time.Hour})
+	if err != nil || !result.Accepted {
+		t.Fatalf("place bid: result=%+v err=%v", result, err)
+	}
+	select {
+	case msg := <-ch:
+		if msg == nil || msg.Channel != channel {
+			t.Fatalf("unexpected dedicated publish message: %+v", msg)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("expected published event on dedicated publish client")
+	}
+}
+
+func TestAuctionRealtimeStoreTopNUsesDedicatedRankingClient(t *testing.T) {
+	ctx := context.Background()
+	store, mainClient, keys := newMiniredisStore(t)
+	rankingMR := miniredis.RunT(t)
+	rankingClient := redisgo.NewClient(&redisgo.Options{Addr: rankingMR.Addr()})
+	t.Cleanup(func() { _ = rankingClient.Close() })
+	store.SetRankingShardedRT(NewShardedRTClientFromShards([]*RedisRTClient{{Client: rankingClient}}))
+
+	auctionID := uint64(10104)
+	if err := mainClient.ZAdd(ctx, keys.AuctionBids(auctionID), redisgo.Z{Score: 0, Member: FormatRankingMember(9999, 1700000009000, "u_rt")}).Err(); err != nil {
+		t.Fatalf("seed main ranking: %v", err)
+	}
+	wantMember := FormatRankingMember(1500, 1700000001000, "u_cache")
+	if err := rankingClient.ZAdd(ctx, keys.AuctionBids(auctionID), redisgo.Z{Score: 0, Member: wantMember}).Err(); err != nil {
+		t.Fatalf("seed dedicated ranking: %v", err)
+	}
+
+	top, err := store.TopN(ctx, auctionID, 10)
+	if err != nil {
+		t.Fatalf("topn: %v", err)
+	}
+	if len(top) != 1 || top[0].BidderID != "u_cache" || top[0].Price != 1500 {
+		t.Fatalf("TopN should read dedicated ranking client, got %+v want member %s", top, wantMember)
+	}
+}
+
+func TestAuctionRealtimeStorePlaceBidDuplicateDoesNotPublish(t *testing.T) {
+	ctx := context.Background()
+	store, client, _ := newMiniredisStore(t)
+	auctionID := uint64(10102)
+	now := time.UnixMilli(1700000000000).UTC()
+	auction := domain.AuctionLot{
+		AuctionID:     auctionID,
+		Status:        domain.AuctionStatusRunning,
+		StartPrice:    1000,
+		ReservePrice:  1000,
+		CapPrice:      2000,
+		StartTime:     now.Add(-time.Minute),
+		EndTime:       now.Add(time.Hour),
+		IncrementRule: json.RawMessage(`{"type":"fixed","amount":100,"maxBidSteps":10}`),
+	}
+	if _, err := store.InitAuction(ctx, auction, 100); err != nil {
+		t.Fatalf("init auction: %v", err)
+	}
+	if err := store.MarkEnrollment(ctx, auctionID, "u_1001"); err != nil {
+		t.Fatalf("mark enrollment: %v", err)
+	}
+	if _, err := store.PlaceBid(ctx, domain.BidInput{RequestID: "dedup-req", AuctionID: auctionID, BidderID: "u_1001", Price: 1100, ExpectedCurrentPrice: expectedCurrentPrice(1000), Now: now, Source: "live_ws", MinIncrement: 100, IdempotencyTTL: time.Hour}); err != nil {
+		t.Fatalf("first bid: %v", err)
+	}
+	channel := "auction:" + strconv.FormatUint(auctionID, 10) + ":events"
+	pubsub := client.Subscribe(ctx, channel)
+	defer pubsub.Close()
+	if _, err := pubsub.Receive(ctx); err != nil {
+		t.Fatalf("subscribe receive: %v", err)
+	}
+	ch := pubsub.Channel()
+
+	dup, err := store.PlaceBid(ctx, domain.BidInput{RequestID: "dedup-req", AuctionID: auctionID, BidderID: "u_1001", Price: 1500, ExpectedCurrentPrice: expectedCurrentPrice(1100), Now: now.Add(time.Second), Source: "live_ws", MinIncrement: 100, IdempotencyTTL: time.Hour})
+	if err != nil {
+		t.Fatalf("dup bid: %v", err)
+	}
+	if !dup.Duplicate || !dup.Accepted {
+		t.Fatalf("expected duplicate accepted, got %+v", dup)
+	}
+	select {
+	case msg := <-ch:
+		t.Fatalf("duplicate request must not publish, got %+v", msg)
+	case <-time.After(150 * time.Millisecond):
 	}
 }
 

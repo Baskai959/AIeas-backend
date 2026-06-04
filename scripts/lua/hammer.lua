@@ -1,11 +1,12 @@
 local state_key = KEYS[1]
-local ranking_key = KEYS[2]
-local close_lock_key = KEYS[3]
+local close_lock_key = KEYS[2]
 
 local request_id = ARGV[1]
 local auction_id = tonumber(ARGV[2])
 local now_ms = tonumber(ARGV[3])
 local idem_ttl_ms = tonumber(ARGV[4])
+local reserve_price = tonumber(ARGV[5]) or 0
+local force = ARGV[6] == "1" or ARGV[6] == "true"
 
 local function number_or_zero(value)
   if value == false or value == nil or value == "" then
@@ -30,6 +31,7 @@ local status = redis.call("HGET", state_key, "status")
 local version = number_or_zero(redis.call("HGET", state_key, "version"))
 local winner_id = string_or_empty(redis.call("HGET", state_key, "leader_bidder_id"))
 local price = number_or_zero(redis.call("HGET", state_key, "current_price"))
+local end_ts = number_or_zero(redis.call("HGET", state_key, "end_ts_ms"))
 
 if status == false or status == nil then
   local missing = cjson.encode({
@@ -58,11 +60,20 @@ if status == "CLOSED_WON" or status == "CLOSED_FAILED" or status == "SETTLED" th
   return closed
 end
 
-local top = redis.call("ZREVRANGE", ranking_key, 0, 0, "WITHSCORES")
-if #top >= 2 then
-  local parsed_price, parsed_winner = string.match(top[1], "^(%d+):%d+:(.+)$")
-  winner_id = parsed_winner or top[1]
-  price = tonumber(parsed_price) or tonumber(top[2])
+if not force and now_ms < end_ts then
+  local not_ended = cjson.encode({
+    requestId = request_id,
+    auctionId = auction_id,
+    status = "NOT_ENDED",
+    winnerId = "",
+    price = 0,
+    closedAtMs = now_ms,
+    version = version
+  })
+  return not_ended
+end
+
+if winner_id ~= "" and price > 0 and price >= reserve_price then
   status = "CLOSED_WON"
 else
   winner_id = ""

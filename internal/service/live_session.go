@@ -494,43 +494,64 @@ func (s *LiveSessionService) Get(ctx context.Context, id uint64) (domain.LiveSes
 	return s.sessions.Get(ctx, id)
 }
 
-// ListByMerchant 列出某商家的所有直播场次。
-// 当 actor 为商家时强制 merchantID = actorID；admin 可指定任意 merchantID。
+// ListByMerchant 列出某商家的直播场次。
+// buyer 只能看到指定商家的 LIVE 场次；merchant 强制 merchantID = actorID；admin 可指定任意 merchantID。
 func (s *LiveSessionService) ListByMerchant(ctx context.Context, merchantID string, status domain.LiveSessionStatus, actorID string, actorRole domain.Role, limit, offset int) ([]domain.LiveSession, error) {
+	return s.ListByMerchantFiltered(ctx, domain.LiveSessionFilter{MerchantID: merchantID, Status: status, Limit: limit, Offset: offset}, actorID, actorRole)
+}
+
+func (s *LiveSessionService) ListByMerchantFiltered(ctx context.Context, filter domain.LiveSessionFilter, actorID string, actorRole domain.Role) ([]domain.LiveSession, error) {
 	if s == nil || s.sessions == nil {
 		return nil, domain.ErrNotFound
 	}
-	merchantID = strings.TrimSpace(merchantID)
+	merchantID := strings.TrimSpace(filter.MerchantID)
 	if actorRole == domain.RoleMerchant {
 		merchantID = actorID
 	}
 	if merchantID == "" {
 		return nil, domain.ErrInvalidArgument
 	}
+	switch actorRole {
+	case domain.RoleBuyer:
+		if filter.Status.Valid() && filter.Status != domain.LiveSessionStatusLive {
+			return []domain.LiveSession{}, nil
+		}
+		filter.MerchantID = merchantID
+		filter.Status = domain.LiveSessionStatusLive
+		return s.sessions.List(ctx, filter)
+	case domain.RoleMerchant, domain.RoleAdmin:
+	default:
+		return nil, domain.ErrForbidden
+	}
 	if !canAccessSellerOwned(actorID, actorRole, merchantID) {
 		return nil, domain.ErrForbidden
 	}
-	filter := domain.LiveSessionFilter{MerchantID: merchantID, Status: status, Limit: limit, Offset: offset}
+	filter.MerchantID = merchantID
 	return s.sessions.List(ctx, filter)
 }
 
 // ListVisible 列出当前 actor 可见的直播场次。
 // buyer 只能看到 LIVE 场次；merchant 只能看到自己的场次；admin 可按条件查看全部。
 func (s *LiveSessionService) ListVisible(ctx context.Context, merchantID string, status domain.LiveSessionStatus, actorID string, actorRole domain.Role, limit, offset int) ([]domain.LiveSession, error) {
+	return s.ListVisibleFiltered(ctx, domain.LiveSessionFilter{MerchantID: merchantID, Status: status, Limit: limit, Offset: offset}, actorID, actorRole)
+}
+
+func (s *LiveSessionService) ListVisibleFiltered(ctx context.Context, filter domain.LiveSessionFilter, actorID string, actorRole domain.Role) ([]domain.LiveSession, error) {
 	if s == nil || s.sessions == nil {
 		return nil, domain.ErrNotFound
 	}
-	merchantID = strings.TrimSpace(merchantID)
+	filter.MerchantID = strings.TrimSpace(filter.MerchantID)
 	switch actorRole {
 	case domain.RoleBuyer:
-		if status.Valid() && status != domain.LiveSessionStatusLive {
+		if filter.Status.Valid() && filter.Status != domain.LiveSessionStatusLive {
 			return []domain.LiveSession{}, nil
 		}
-		return s.sessions.List(ctx, domain.LiveSessionFilter{MerchantID: merchantID, Status: domain.LiveSessionStatusLive, Limit: limit, Offset: offset})
+		filter.Status = domain.LiveSessionStatusLive
+		return s.sessions.List(ctx, filter)
 	case domain.RoleMerchant:
-		return s.ListByMerchant(ctx, merchantID, status, actorID, actorRole, limit, offset)
+		return s.ListByMerchantFiltered(ctx, filter, actorID, actorRole)
 	case domain.RoleAdmin:
-		return s.sessions.List(ctx, domain.LiveSessionFilter{MerchantID: merchantID, Status: status, Limit: limit, Offset: offset})
+		return s.sessions.List(ctx, filter)
 	default:
 		return nil, domain.ErrForbidden
 	}

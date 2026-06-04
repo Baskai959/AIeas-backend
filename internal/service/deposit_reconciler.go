@@ -16,10 +16,6 @@ import (
 
 // depositReconcilePrerequisiteReader 是 RT store 上读取 (enrolled, depositReady)
 // 状态的最小接口；MemoryRealtimeStore 与 redis.AuctionRealtimeStore 都实现了它。
-type depositReconcilePrerequisiteReader interface {
-	BidPrerequisites(ctx context.Context, auctionID uint64, userID string) (bool, bool, error)
-}
-
 // DepositReconciler 周期性巡检"押金账本(MySQL)"与"RT enrolled/deposits 集合"
 // 的最终一致性：当账本里某 user 是 READY/CAPTURED 但 RT 集合缺失时，调
 // MarkEnrollment 回填；其他状态（RELEASED/PENDING/FAILED）不回填，由原链路
@@ -174,20 +170,17 @@ func (r *DepositReconciler) reconcileAuction(ctx context.Context, auctionID uint
 	if err != nil {
 		return 0, err
 	}
-	reader, _ := r.realtime.(depositReconcilePrerequisiteReader)
 	fixed := 0
 	for _, ledger := range ledgers {
 		if ledger.Status != domain.DepositStatusReady && ledger.Status != domain.DepositStatusCaptured {
 			continue
 		}
-		if reader != nil {
-			enrolled, depositReady, err := reader.BidPrerequisites(ctx, auctionID, ledger.UserID)
-			if err != nil {
-				return fixed, err
-			}
-			if enrolled && depositReady {
-				continue
-			}
+		enrolled, depositReady, err := r.realtime.BidPrerequisites(ctx, auctionID, ledger.UserID)
+		if err != nil {
+			return fixed, err
+		}
+		if enrolled && depositReady {
+			continue
 		}
 		if err := r.realtime.MarkEnrollment(ctx, auctionID, ledger.UserID); err != nil {
 			return fixed, err

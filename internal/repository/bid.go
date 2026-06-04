@@ -16,6 +16,7 @@ import (
 
 type BidRepository interface {
 	Create(ctx context.Context, bid *domain.BidRecord) error
+	CreateIgnoreBatch(ctx context.Context, records []domain.BidRecord) error
 	FindByRequestID(ctx context.Context, requestID string) (domain.BidRecord, error)
 	ListByAuction(ctx context.Context, auctionID uint64, limit int) ([]domain.BidRecord, error)
 	CountByAuction(ctx context.Context, auctionID uint64) (int, error)
@@ -66,6 +67,21 @@ func (r *MySQLBidRepository) CreateIgnore(ctx context.Context, bid *domain.BidRe
 	*bid = row.toDomain()
 	return true, nil
 }
+
+func (r *MySQLBidRepository) CreateIgnoreBatch(ctx context.Context, records []domain.BidRecord) error {
+	if len(records) == 0 {
+		return nil
+	}
+	rows := make([]bidRecordRow, 0, len(records))
+	for _, rec := range records {
+		rows = append(rows, bidRecordRowFromDomain(rec))
+	}
+	return r.dbFor(ctx).Table("bid_record").
+		Clauses(clause.Insert{Modifier: "IGNORE"}).
+		CreateInBatches(&rows, bidRecordBatchInsertSize).Error
+}
+
+const bidRecordBatchInsertSize = 256
 
 func (r *MySQLBidRepository) FindByRequestID(ctx context.Context, requestID string) (domain.BidRecord, error) {
 	var row bidRecordRow
@@ -282,6 +298,40 @@ func (r *MemoryBidRepository) CreateIgnore(ctx context.Context, bid *domain.BidR
 		r.byRequest[bid.RequestID] = bid.ID
 	}
 	return true, nil
+}
+
+func (r *MemoryBidRepository) CreateIgnoreBatch(ctx context.Context, records []domain.BidRecord) error {
+	_ = ctx
+	if len(records) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(records))
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, rec := range records {
+		if rec.RequestID != "" {
+			if _, dup := seen[rec.RequestID]; dup {
+				continue
+			}
+			seen[rec.RequestID] = struct{}{}
+			if _, ok := r.byRequest[rec.RequestID]; ok {
+				continue
+			}
+		}
+		stored := rec
+		if stored.ID == 0 {
+			stored.ID = r.nextID
+			r.nextID++
+		}
+		if stored.CreatedAt.IsZero() {
+			stored.CreatedAt = time.Now().UTC()
+		}
+		r.byID[stored.ID] = cloneBidRecord(stored)
+		if stored.RequestID != "" {
+			r.byRequest[stored.RequestID] = stored.ID
+		}
+	}
+	return nil
 }
 
 func (r *MemoryBidRepository) FindByRequestID(ctx context.Context, requestID string) (domain.BidRecord, error) {

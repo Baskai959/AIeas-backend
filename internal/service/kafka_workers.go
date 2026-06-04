@@ -20,6 +20,10 @@ type BidEventKafkaProducer interface {
 	PublishBidEvent(ctx context.Context, event redisinfra.BidEvent) error
 }
 
+type BidEventKafkaBatchProducer interface {
+	PublishBidEvents(ctx context.Context, events []redisinfra.BidEvent) error
+}
+
 type BidEventKafkaConsumer interface {
 	FetchBidEvent(ctx context.Context) (redisinfra.BidEvent, func(context.Context) error, error)
 }
@@ -30,14 +34,15 @@ type SettlementEventPublisher interface {
 }
 
 type RedisBidEventKafkaBridge struct {
-	log        bidKafkaBridgeLog
-	producer   BidEventKafkaProducer
-	group      string
-	consumer   string
-	maxRetries int64
-	claimIdle  time.Duration
-	interval   time.Duration
-	metrics    *metrics.Registry
+	log           bidKafkaBridgeLog
+	producer      BidEventKafkaProducer
+	group         string
+	consumer      string
+	maxRetries    int64
+	claimIdle     time.Duration
+	interval      time.Duration
+	claimInterval time.Duration
+	metrics       *metrics.Registry
 }
 
 type bidKafkaBridgeLog interface {
@@ -59,13 +64,14 @@ func NewRedisBidEventKafkaBridge(log *redisinfra.EventLog, producer BidEventKafk
 		consumer = fmt.Sprintf("bid-kafka-%d", time.Now().UTC().UnixNano())
 	}
 	return &RedisBidEventKafkaBridge{
-		log:        log,
-		producer:   producer,
-		group:      group,
-		consumer:   consumer,
-		maxRetries: 5,
-		claimIdle:  30 * time.Second,
-		interval:   time.Second,
+		log:           log,
+		producer:      producer,
+		group:         group,
+		consumer:      consumer,
+		maxRetries:    5,
+		claimIdle:     30 * time.Second,
+		interval:      bidRecordBatchMaxLatency,
+		claimInterval: defaultClaimInterval,
 	}
 }
 
@@ -95,12 +101,13 @@ func (b *RedisBidEventKafkaBridge) Start(ctx context.Context) {
 func (b *RedisBidEventKafkaBridge) loopAllShards(ctx context.Context) {
 	ticker := time.NewTicker(b.interval)
 	defer ticker.Stop()
+	state := newClaimState()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			b.runOnceAll(ctx)
+			b.runOnceAll(ctx, state)
 		}
 	}
 }
@@ -108,12 +115,13 @@ func (b *RedisBidEventKafkaBridge) loopAllShards(ctx context.Context) {
 func (b *RedisBidEventKafkaBridge) loopShard(ctx context.Context, shardIdx int) {
 	ticker := time.NewTicker(b.interval)
 	defer ticker.Stop()
+	state := newClaimState()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			b.runOnceShard(ctx, shardIdx)
+			b.runOnceShard(ctx, shardIdx, state)
 		}
 	}
 }
@@ -122,44 +130,134 @@ func (b *RedisBidEventKafkaBridge) consumerForShard(shardIdx int) string {
 	return fmt.Sprintf("%s-s%d", b.consumer, shardIdx)
 }
 
-func (b *RedisBidEventKafkaBridge) runOnceAll(ctx context.Context) {
+func (b *RedisBidEventKafkaBridge) runOnceAll(ctx context.Context, state *claimState) {
 	auctions, err := b.log.ActiveAuctions(ctx)
 	if err != nil {
 		b.observeWorker("poll_error")
 		return
 	}
-	b.processAuctions(ctx, auctions, b.consumer)
+	b.processAuctions(ctx, auctions, b.consumer, state)
 }
 
-func (b *RedisBidEventKafkaBridge) runOnceShard(ctx context.Context, shardIdx int) {
+func (b *RedisBidEventKafkaBridge) runOnceShard(ctx context.Context, shardIdx int, state *claimState) {
 	auctions, err := b.log.ActiveAuctionsOnShard(ctx, shardIdx)
 	if err != nil {
 		b.observeWorker("poll_error")
 		return
 	}
-	b.processAuctions(ctx, auctions, b.consumerForShard(shardIdx))
+	b.processAuctions(ctx, auctions, b.consumerForShard(shardIdx), state)
 }
 
-func (b *RedisBidEventKafkaBridge) processAuctions(ctx context.Context, auctions []uint64, consumer string) {
+func (b *RedisBidEventKafkaBridge) processAuctions(ctx context.Context, auctions []uint64, consumer string, state *claimState) {
+	doClaim := state.shouldClaim(time.Now(), b.claimInterval)
 	for _, auctionID := range auctions {
-		claimed, err := b.log.ClaimStaleConsumerEvents(ctx, auctionID, b.group, consumer, b.claimIdle, 32)
-		if err == nil {
-			b.handleEvents(ctx, claimed)
-		} else {
-			b.observeWorker("poll_error")
+		if doClaim {
+			claimed, err := b.log.ClaimStaleConsumerEvents(ctx, auctionID, b.group, consumer, b.claimIdle, bidRecordBatchMaxN)
+			if err == nil {
+				b.handleEvents(ctx, claimed)
+			} else {
+				b.observeWorker("poll_error")
+			}
 		}
-		events, err := b.log.ReadConsumerGroup(ctx, auctionID, b.group, consumer, 64, 10*time.Millisecond)
+		events, err := b.log.ReadConsumerGroup(ctx, auctionID, b.group, consumer, bidRecordBatchMaxN, 10*time.Millisecond)
 		if err == nil {
 			b.handleEvents(ctx, events)
 		} else {
 			b.observeWorker("poll_error")
 		}
 	}
+	if doClaim {
+		state.markClaimed(time.Now())
+	}
 }
 
 func (b *RedisBidEventKafkaBridge) handleEvents(ctx context.Context, events []redisinfra.BidEvent) {
+	if len(events) == 0 {
+		return
+	}
+	batch := make([]kafkaBridgePending, 0, len(events))
 	for _, event := range events {
-		b.handleEvent(ctx, event)
+		if pending, ok := b.preFilter(ctx, event); ok {
+			batch = append(batch, pending)
+		}
+	}
+	if len(batch) > 0 {
+		b.publishBatch(ctx, batch)
+	}
+}
+
+type kafkaBridgePending struct {
+	event redisinfra.BidEvent
+	ctx   context.Context
+}
+
+func (b *RedisBidEventKafkaBridge) preFilter(parentCtx context.Context, event redisinfra.BidEvent) (kafkaBridgePending, bool) {
+	ctx := tracing.ExtractMap(parentCtx, event.TraceCarrier())
+	if event.EventType != "bid.accepted" || !event.Accepted {
+		_ = b.log.AckConsumerGroup(ctx, event.AuctionID, b.group, event.StreamID)
+		b.observeWorker("skip")
+		return kafkaBridgePending{}, false
+	}
+	if event.Deliveries >= b.maxRetries {
+		_ = b.log.WriteBidRecordDLQ(ctx, event, "KAFKA_PUBLISH_MAX_RETRIES")
+		_ = b.log.AckConsumerGroup(ctx, event.AuctionID, b.group, event.StreamID)
+		b.observeDLQ("KAFKA_PUBLISH_MAX_RETRIES")
+		b.observeWorker("dlq")
+		return kafkaBridgePending{}, false
+	}
+	return kafkaBridgePending{event: event, ctx: ctx}, true
+}
+
+func (b *RedisBidEventKafkaBridge) publishBatch(parentCtx context.Context, batch []kafkaBridgePending) {
+	if len(batch) == 0 {
+		return
+	}
+	events := make([]redisinfra.BidEvent, 0, len(batch))
+	for _, p := range batch {
+		events = append(events, p.event)
+	}
+	ctx, span := tracing.StartSpan(parentCtx, "bid_event.kafka_publish_batch",
+		attribute.Int("events.count", len(events)),
+	)
+	err := b.publishBidEvents(ctx, events)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		span.SetAttributes(attribute.String("kafka_publish.result", "batch_temporary_failure"))
+		span.End()
+		for _, p := range batch {
+			b.handleEvent(p.ctx, p.event)
+		}
+		return
+	}
+	b.ackPublishedBatch(ctx, batch)
+	span.SetAttributes(attribute.String("kafka_publish.result", "ok"))
+	span.End()
+}
+
+func (b *RedisBidEventKafkaBridge) publishBidEvents(ctx context.Context, events []redisinfra.BidEvent) error {
+	if len(events) == 0 {
+		return nil
+	}
+	if batchProducer, ok := b.producer.(BidEventKafkaBatchProducer); ok {
+		return batchProducer.PublishBidEvents(ctx, events)
+	}
+	for _, event := range events {
+		if err := b.producer.PublishBidEvent(ctx, event); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (b *RedisBidEventKafkaBridge) ackPublishedBatch(ctx context.Context, batch []kafkaBridgePending) {
+	groups := make(map[uint64][]string)
+	for _, p := range batch {
+		groups[p.event.AuctionID] = append(groups[p.event.AuctionID], p.event.StreamID)
+		b.observeWorker("ok")
+	}
+	for auctionID, ids := range groups {
+		_ = b.log.AckConsumerGroup(ctx, auctionID, b.group, ids...)
 	}
 }
 
@@ -239,7 +337,36 @@ func (w *KafkaBidRecordWriter) Start(ctx context.Context) {
 
 func (w *KafkaBidRecordWriter) loop(ctx context.Context) {
 	for {
-		event, ack, err := w.consumer.FetchBidEvent(ctx)
+		batch, ok := w.fetchBatch(ctx)
+		if !ok {
+			return
+		}
+		w.flushBatch(ctx, batch)
+	}
+}
+
+type kafkaBidRecordPending struct {
+	event redisinfra.BidEvent
+	ack   func(context.Context) error
+	ctx   context.Context
+}
+
+func (w *KafkaBidRecordWriter) fetchBatch(ctx context.Context) ([]kafkaBidRecordPending, bool) {
+	batch := make([]kafkaBidRecordPending, 0, bidRecordBatchMaxN)
+	var deadline time.Time
+	for len(batch) < bidRecordBatchMaxN {
+		fetchCtx := ctx
+		cancel := func() {}
+		if len(batch) > 0 {
+			remaining := time.Until(deadline)
+			if remaining <= 0 {
+				break
+			}
+			fetchCtx, cancel = context.WithTimeout(ctx, remaining)
+		}
+		event, ack, err := w.consumer.FetchBidEvent(fetchCtx)
+		fetchCtxErr := fetchCtx.Err()
+		cancel()
 		if err != nil {
 			if ack != nil {
 				_ = ack(ctx)
@@ -248,14 +375,69 @@ func (w *KafkaBidRecordWriter) loop(ctx context.Context) {
 				continue
 			}
 			if ctx.Err() != nil {
-				return
+				return nil, false
+			}
+			if len(batch) > 0 && fetchCtxErr != nil {
+				break
 			}
 			slog.Default().Warn("fetch kafka bid event failed", "error", err)
 			w.observeConsume("fetch_error")
-			sleepContext(ctx, w.retryBackoff)
+			if len(batch) == 0 {
+				sleepContext(ctx, w.retryBackoff)
+				continue
+			}
+			break
+		}
+		pending, ok := w.preFilter(ctx, event, ack)
+		if !ok {
 			continue
 		}
-		w.handleEvent(ctx, event, ack)
+		if len(batch) == 0 {
+			deadline = time.Now().Add(bidRecordBatchMaxLatency)
+		}
+		batch = append(batch, pending)
+	}
+	return batch, true
+}
+
+func (w *KafkaBidRecordWriter) preFilter(parentCtx context.Context, event redisinfra.BidEvent, ack func(context.Context) error) (kafkaBidRecordPending, bool) {
+	ctx := tracing.ExtractMap(parentCtx, event.TraceCarrier())
+	if event.EventType != "bid.accepted" || !event.Accepted {
+		if ack != nil {
+			_ = ack(ctx)
+		}
+		w.observeConsume("skip")
+		return kafkaBidRecordPending{}, false
+	}
+	return kafkaBidRecordPending{event: event, ack: ack, ctx: ctx}, true
+}
+
+func (w *KafkaBidRecordWriter) flushBatch(ctx context.Context, batch []kafkaBidRecordPending) {
+	if len(batch) == 0 {
+		return
+	}
+	records := make([]domain.BidRecord, 0, len(batch))
+	for _, p := range batch {
+		rec := p.event.ToBidRecord()
+		if rec.CreatedAt.IsZero() {
+			rec.CreatedAt = time.Now().UTC()
+		}
+		records = append(records, rec)
+	}
+	writeStart := time.Now()
+	err := w.repo.CreateIgnoreBatch(ctx, records)
+	w.observeWrite(time.Since(writeStart))
+	if err == nil {
+		for _, p := range batch {
+			if p.ack != nil {
+				_ = p.ack(p.ctx)
+			}
+			w.observeConsume("ok")
+		}
+		return
+	}
+	for _, p := range batch {
+		w.handleEvent(p.ctx, p.event, p.ack)
 	}
 }
 

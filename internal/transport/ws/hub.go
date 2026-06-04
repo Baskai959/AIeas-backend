@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -13,6 +14,7 @@ const defaultEventWindow = 256
 const defaultOnlineCounterTimeout = 200 * time.Millisecond
 const defaultPresenceBroadcastDelay = 200 * time.Millisecond
 const defaultPresenceImmediateFanoutLimit = 16
+const defaultOnlineTouchInterval = 30 * time.Second
 
 var nextHubInstanceID atomic.Uint64
 
@@ -50,6 +52,9 @@ type Hub struct {
 	presenceDelay  time.Duration
 	presenceLimit  int
 	presenceTimers map[uint64]*presenceUpdate
+	onlineTouchMu  sync.Mutex
+	onlineTouchTTL time.Duration
+	onlineTouched  map[string]time.Time
 }
 
 type presenceUpdate struct {
@@ -128,6 +133,8 @@ func NewHubWithEventWindowAndOnlineCounter(eventWindow int, counter OnlineCounte
 		presenceDelay:  defaultPresenceBroadcastDelay,
 		presenceLimit:  defaultPresenceImmediateFanoutLimit,
 		presenceTimers: make(map[uint64]*presenceUpdate),
+		onlineTouchTTL: defaultOnlineTouchInterval,
+		onlineTouched:  make(map[string]time.Time),
 	}
 }
 
@@ -147,6 +154,17 @@ func (h *Hub) SetPresenceImmediateFanoutLimit(limit int) {
 	h.presenceMu.Lock()
 	defer h.presenceMu.Unlock()
 	h.presenceLimit = limit
+}
+
+// SetOnlineTouchInterval 设置在线人数续期间隔。interval<=0 表示不节流。
+func (h *Hub) SetOnlineTouchInterval(interval time.Duration) {
+	if h == nil {
+		return
+	}
+	h.onlineTouchMu.Lock()
+	defer h.onlineTouchMu.Unlock()
+	h.onlineTouchTTL = interval
+	h.onlineTouched = make(map[string]time.Time)
 }
 
 func NewClient(id, userID string, auctionID uint64, bufferSize int) *Client {
@@ -204,6 +222,7 @@ func (h *Hub) Subscribe(auctionID uint64, client *Client) error {
 	online := h.onlineCount(auctionID, fallback)
 	if client.CountOnline {
 		online = h.joinOnline(auctionID, client.ID, client.UserID, fallback)
+		h.markOnlineTouched(auctionID, client.ID)
 	}
 	h.emitPresence(room, online)
 	if reg := h.metricsSnapshot(); reg != nil {
@@ -501,6 +520,9 @@ func (h *Hub) Touch(auctionID uint64, clientID string) int {
 		}
 		userID = foundUserID
 	}
+	if h.shouldSkipOnlineTouch(auctionID, clientID) {
+		return fallback
+	}
 	return h.touchOnline(auctionID, clientID, userID, fallback)
 }
 
@@ -526,6 +548,7 @@ func (h *Hub) joinOnline(auctionID uint64, clientID, userID string, fallback int
 }
 
 func (h *Hub) leaveOnline(auctionID uint64, clientID, userID string, fallback int) int {
+	h.clearOnlineTouched(auctionID, clientID)
 	if h.onlineCounter == nil {
 		return fallback
 	}
@@ -574,6 +597,52 @@ func (h *Hub) onlineCounterContext() (context.Context, context.CancelFunc) {
 
 func (h *Hub) onlineMemberID(clientID string) string {
 	return h.instancePrefix + ":" + clientID
+}
+
+func (h *Hub) markOnlineTouched(auctionID uint64, clientID string) {
+	if h == nil || auctionID == 0 || clientID == "" {
+		return
+	}
+	h.onlineTouchMu.Lock()
+	defer h.onlineTouchMu.Unlock()
+	if h.onlineTouched == nil {
+		h.onlineTouched = make(map[string]time.Time)
+	}
+	h.onlineTouched[h.onlineTouchKey(auctionID, clientID)] = time.Now()
+}
+
+func (h *Hub) clearOnlineTouched(auctionID uint64, clientID string) {
+	if h == nil || auctionID == 0 || clientID == "" {
+		return
+	}
+	h.onlineTouchMu.Lock()
+	defer h.onlineTouchMu.Unlock()
+	delete(h.onlineTouched, h.onlineTouchKey(auctionID, clientID))
+}
+
+func (h *Hub) shouldSkipOnlineTouch(auctionID uint64, clientID string) bool {
+	if h == nil || auctionID == 0 || clientID == "" {
+		return false
+	}
+	now := time.Now()
+	h.onlineTouchMu.Lock()
+	defer h.onlineTouchMu.Unlock()
+	if h.onlineTouchTTL <= 0 {
+		return false
+	}
+	if h.onlineTouched == nil {
+		h.onlineTouched = make(map[string]time.Time)
+	}
+	key := h.onlineTouchKey(auctionID, clientID)
+	if last, ok := h.onlineTouched[key]; ok && now.Sub(last) < h.onlineTouchTTL {
+		return true
+	}
+	h.onlineTouched[key] = now
+	return false
+}
+
+func (h *Hub) onlineTouchKey(auctionID uint64, clientID string) string {
+	return strconv.FormatUint(auctionID, 10) + ":" + clientID
 }
 
 func (h *Hub) broadcastPresence(room *Room, online int) {

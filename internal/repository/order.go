@@ -85,6 +85,9 @@ func (r *MySQLOrderRepository) List(ctx context.Context, filter domain.OrderFilt
 	if filter.SellerID != "" {
 		query = query.Where("seller_id = ?", normalizeUserIDForDB(filter.SellerID))
 	}
+	if filter.AuctionID != 0 {
+		query = query.Where("auction_id = ?", filter.AuctionID)
+	}
 	if filter.LiveSessionID != 0 {
 		query = query.Where("live_session_id = ?", filter.LiveSessionID)
 	}
@@ -186,63 +189,72 @@ func (r *MySQLOrderRepository) UpdateStatusWithVersion(ctx context.Context, orde
 }
 
 type orderRow struct {
-	ID            uint64             `gorm:"column:id;primaryKey"`
-	AuctionID     uint64             `gorm:"column:auction_id"`
-	LiveSessionID *uint64            `gorm:"column:live_session_id"`
-	LotSnapshot   []byte             `gorm:"column:lot_snapshot"`
-	WinnerID      string             `gorm:"column:winner_id"`
-	SellerID      string             `gorm:"column:seller_id"`
-	DealPrice     int64              `gorm:"column:deal_price"`
-	DepositAmount int64              `gorm:"column:deposit_amount"`
-	Status        domain.OrderStatus `gorm:"column:status"`
-	PayStatus     domain.PayStatus   `gorm:"column:pay_status"`
-	PayDeadline   *time.Time         `gorm:"column:pay_deadline"`
-	PaidAt        *time.Time         `gorm:"column:paid_at"`
-	ClosedAt      *time.Time         `gorm:"column:closed_at"`
-	Version       int64              `gorm:"column:version;not null;default:0"`
-	CreatedAt     time.Time          `gorm:"column:created_at"`
-	UpdatedAt     time.Time          `gorm:"column:updated_at"`
+	ID                uint64                   `gorm:"column:id;primaryKey"`
+	AuctionID         uint64                   `gorm:"column:auction_id"`
+	LiveSessionID     *uint64                  `gorm:"column:live_session_id"`
+	LotSnapshot       []byte                   `gorm:"column:lot_snapshot"`
+	WinnerID          string                   `gorm:"column:winner_id"`
+	SellerID          string                   `gorm:"column:seller_id"`
+	DealPrice         int64                    `gorm:"column:deal_price"`
+	DepositAmount     int64                    `gorm:"column:deposit_amount"`
+	Status            domain.OrderStatus       `gorm:"column:status"`
+	PayStatus         domain.PayStatus         `gorm:"column:pay_status"`
+	FulfillmentStatus domain.FulfillmentStatus `gorm:"column:fulfillment_status"`
+	PayDeadline       *time.Time               `gorm:"column:pay_deadline"`
+	PaidAt            *time.Time               `gorm:"column:paid_at"`
+	ShippedAt         *time.Time               `gorm:"column:shipped_at"`
+	ReceivedAt        *time.Time               `gorm:"column:received_at"`
+	ClosedAt          *time.Time               `gorm:"column:closed_at"`
+	Version           int64                    `gorm:"column:version;not null;default:0"`
+	CreatedAt         time.Time                `gorm:"column:created_at"`
+	UpdatedAt         time.Time                `gorm:"column:updated_at"`
 }
 
 func orderRowFromDomain(order domain.OrderDeal) orderRow {
 	return orderRow{
-		ID:            order.ID,
-		AuctionID:     order.AuctionID,
-		LiveSessionID: cloneUint64Ptr(order.LiveSessionID),
-		LotSnapshot:   []byte(order.LotSnapshot),
-		WinnerID:      normalizeUserIDForDB(order.WinnerID),
-		SellerID:      normalizeUserIDForDB(order.SellerID),
-		DealPrice:     order.DealPrice,
-		DepositAmount: order.DepositAmount,
-		Status:        order.Status,
-		PayStatus:     order.PayStatus,
-		PayDeadline:   order.PayDeadline,
-		PaidAt:        order.PaidAt,
-		ClosedAt:      order.ClosedAt,
-		Version:       order.Version,
-		CreatedAt:     order.CreatedAt,
-		UpdatedAt:     order.UpdatedAt,
+		ID:                order.ID,
+		AuctionID:         order.AuctionID,
+		LiveSessionID:     cloneUint64Ptr(order.LiveSessionID),
+		LotSnapshot:       []byte(order.LotSnapshot),
+		WinnerID:          normalizeUserIDForDB(order.WinnerID),
+		SellerID:          normalizeUserIDForDB(order.SellerID),
+		DealPrice:         order.DealPrice,
+		DepositAmount:     order.DepositAmount,
+		Status:            order.Status,
+		PayStatus:         order.PayStatus,
+		FulfillmentStatus: domain.NormalizeFulfillmentStatus(order.FulfillmentStatus),
+		PayDeadline:       order.PayDeadline,
+		PaidAt:            order.PaidAt,
+		ShippedAt:         order.ShippedAt,
+		ReceivedAt:        order.ReceivedAt,
+		ClosedAt:          order.ClosedAt,
+		Version:           order.Version,
+		CreatedAt:         order.CreatedAt,
+		UpdatedAt:         order.UpdatedAt,
 	}
 }
 
 func (r orderRow) toDomain() domain.OrderDeal {
 	return domain.OrderDeal{
-		ID:            r.ID,
-		AuctionID:     r.AuctionID,
-		LiveSessionID: cloneUint64Ptr(r.LiveSessionID),
-		LotSnapshot:   append([]byte(nil), r.LotSnapshot...),
-		WinnerID:      r.WinnerID,
-		SellerID:      r.SellerID,
-		DealPrice:     r.DealPrice,
-		DepositAmount: r.DepositAmount,
-		Status:        r.Status,
-		PayStatus:     r.PayStatus,
-		PayDeadline:   cloneTimePtrUTC(r.PayDeadline),
-		PaidAt:        cloneTimePtrUTC(r.PaidAt),
-		ClosedAt:      cloneTimePtrUTC(r.ClosedAt),
-		Version:       r.Version,
-		CreatedAt:     r.CreatedAt,
-		UpdatedAt:     r.UpdatedAt,
+		ID:                r.ID,
+		AuctionID:         r.AuctionID,
+		LiveSessionID:     cloneUint64Ptr(r.LiveSessionID),
+		LotSnapshot:       append([]byte(nil), r.LotSnapshot...),
+		WinnerID:          r.WinnerID,
+		SellerID:          r.SellerID,
+		DealPrice:         r.DealPrice,
+		DepositAmount:     r.DepositAmount,
+		Status:            r.Status,
+		PayStatus:         r.PayStatus,
+		FulfillmentStatus: domain.NormalizeFulfillmentStatus(r.FulfillmentStatus),
+		PayDeadline:       cloneTimePtrUTC(r.PayDeadline),
+		PaidAt:            cloneTimePtrUTC(r.PaidAt),
+		ShippedAt:         cloneTimePtrUTC(r.ShippedAt),
+		ReceivedAt:        cloneTimePtrUTC(r.ReceivedAt),
+		ClosedAt:          cloneTimePtrUTC(r.ClosedAt),
+		Version:           r.Version,
+		CreatedAt:         r.CreatedAt,
+		UpdatedAt:         r.UpdatedAt,
 	}
 }
 
@@ -316,6 +328,9 @@ func (r *MemoryOrderRepository) List(ctx context.Context, filter domain.OrderFil
 			continue
 		}
 		if filter.SellerID != "" && order.SellerID != filter.SellerID {
+			continue
+		}
+		if filter.AuctionID != 0 && order.AuctionID != filter.AuctionID {
 			continue
 		}
 		if filter.LiveSessionID != 0 && (order.LiveSessionID == nil || *order.LiveSessionID != filter.LiveSessionID) {
@@ -413,8 +428,11 @@ func (r *MemoryOrderRepository) UpdateStatusWithVersion(ctx context.Context, ord
 func cloneOrder(order domain.OrderDeal) domain.OrderDeal {
 	order.LiveSessionID = cloneUint64Ptr(order.LiveSessionID)
 	order.LotSnapshot = append([]byte(nil), order.LotSnapshot...)
+	order.FulfillmentStatus = domain.NormalizeFulfillmentStatus(order.FulfillmentStatus)
 	order.PayDeadline = cloneTimePtrUTC(order.PayDeadline)
 	order.PaidAt = cloneTimePtrUTC(order.PaidAt)
+	order.ShippedAt = cloneTimePtrUTC(order.ShippedAt)
+	order.ReceivedAt = cloneTimePtrUTC(order.ReceivedAt)
 	order.ClosedAt = cloneTimePtrUTC(order.ClosedAt)
 	return order
 }

@@ -16,6 +16,7 @@ type AuctionRepository interface {
 	Create(ctx context.Context, auction *domain.AuctionLot) error
 	FindByID(ctx context.Context, id uint64) (domain.AuctionLot, error)
 	List(ctx context.Context, filter domain.AuctionFilter) ([]domain.AuctionLot, error)
+	Search(ctx context.Context, filter domain.AuctionSearchFilter) ([]domain.AuctionLot, int64, error)
 	Update(ctx context.Context, auction *domain.AuctionLot) error
 	Delete(ctx context.Context, id uint64) error
 	// CloseWithVersion 使用乐观锁 CAS 完成落槌：仅当 version=expectedVersion 且
@@ -95,6 +96,83 @@ func (r *MySQLAuctionRepository) List(ctx context.Context, filter domain.Auction
 		auctions = append(auctions, row.toDomain())
 	}
 	return auctions, nil
+}
+
+func (r *MySQLAuctionRepository) Search(ctx context.Context, filter domain.AuctionSearchFilter) ([]domain.AuctionLot, int64, error) {
+	query := r.dbFor(ctx).Table("auction_lot")
+	if len(filter.VisibleStatuses) > 0 {
+		query = query.Where("status IN ?", filter.VisibleStatuses)
+	}
+	if filter.Status.Valid() {
+		query = query.Where("status = ?", filter.Status)
+	}
+	if filter.MerchantID != "" {
+		query = query.Where("seller_id = ?", normalizeUserIDForDB(filter.MerchantID))
+	}
+	if values := normalizedCategoryValues(filter.CategoryID, filter.CategoryValues); len(values) > 0 {
+		query = query.Where("category IN ?", values)
+	}
+	if filter.Keyword != "" {
+		keyword := "%" + strings.TrimSpace(filter.Keyword) + "%"
+		query = query.Where("title LIKE ? OR description LIKE ? OR brand LIKE ?", keyword, keyword, keyword)
+	}
+	var total int64
+	if err := query.Count(&total).Error; err != nil {
+		return nil, 0, err
+	}
+	if filter.Limit <= 0 || filter.Limit > 100 {
+		filter.Limit = 20
+	}
+	if filter.Offset < 0 {
+		filter.Offset = 0
+	}
+	var rows []auctionRow
+	if err := query.Order(auctionSearchOrder(filter.Sort)).Limit(filter.Limit).Offset(filter.Offset).Find(&rows).Error; err != nil {
+		return nil, 0, err
+	}
+	auctions := make([]domain.AuctionLot, 0, len(rows))
+	for _, row := range rows {
+		auctions = append(auctions, row.toDomain())
+	}
+	return auctions, total, nil
+}
+
+func auctionSearchOrder(sortBy string) string {
+	switch strings.TrimSpace(sortBy) {
+	case "priceAsc":
+		return "start_price ASC, auction_id DESC"
+	case "priceDesc":
+		return "start_price DESC, auction_id DESC"
+	case "endingSoon":
+		return "end_time ASC, auction_id DESC"
+	case "startTimeAsc":
+		return "start_time ASC, auction_id ASC"
+	case "startTimeDesc", "latest", "newest":
+		return "start_time DESC, auction_id DESC"
+	default:
+		return "auction_id DESC"
+	}
+}
+
+func normalizedCategoryValues(categoryID string, values []string) []string {
+	seen := make(map[string]struct{}, len(values)+1)
+	out := make([]string, 0, len(values)+1)
+	add := func(value string) {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			return
+		}
+		if _, ok := seen[value]; ok {
+			return
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+	}
+	add(categoryID)
+	for _, value := range values {
+		add(value)
+	}
+	return out
 }
 
 func (r *MySQLAuctionRepository) Update(ctx context.Context, auction *domain.AuctionLot) error {

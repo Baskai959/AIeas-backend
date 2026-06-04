@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 	"errors"
+	"sort"
 	"strconv"
 	"sync"
 	"time"
@@ -16,6 +17,7 @@ type DepositRepository interface {
 	Create(ctx context.Context, deposit *domain.DepositLedger) error
 	FindByAuctionUser(ctx context.Context, auctionID uint64, userID string) (domain.DepositLedger, error)
 	ListByAuction(ctx context.Context, auctionID uint64) ([]domain.DepositLedger, error)
+	ListByUser(ctx context.Context, userID string, limit, offset int) ([]domain.DepositLedger, error)
 	Update(ctx context.Context, deposit *domain.DepositLedger) error
 }
 
@@ -58,6 +60,29 @@ func (r *MySQLDepositRepository) FindByAuctionUser(ctx context.Context, auctionI
 func (r *MySQLDepositRepository) ListByAuction(ctx context.Context, auctionID uint64) ([]domain.DepositLedger, error) {
 	var rows []depositRow
 	if err := r.dbFor(ctx).Table("deposit_ledger").Where("auction_id = ?", auctionID).Find(&rows).Error; err != nil {
+		return nil, err
+	}
+	items := make([]domain.DepositLedger, 0, len(rows))
+	for _, row := range rows {
+		items = append(items, row.toDomain())
+	}
+	return items, nil
+}
+
+func (r *MySQLDepositRepository) ListByUser(ctx context.Context, userID string, limit, offset int) ([]domain.DepositLedger, error) {
+	if limit <= 0 || limit > 100 {
+		limit = 20
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	var rows []depositRow
+	if err := r.dbFor(ctx).Table("deposit_ledger").
+		Where("user_id = ?", normalizeUserIDForDB(userID)).
+		Order("created_at DESC, id DESC").
+		Limit(limit).
+		Offset(offset).
+		Find(&rows).Error; err != nil {
 		return nil, err
 	}
 	items := make([]domain.DepositLedger, 0, len(rows))
@@ -181,6 +206,38 @@ func (r *MemoryDepositRepository) ListByAuction(ctx context.Context, auctionID u
 		}
 	}
 	return items, nil
+}
+
+func (r *MemoryDepositRepository) ListByUser(ctx context.Context, userID string, limit, offset int) ([]domain.DepositLedger, error) {
+	_ = ctx
+	if limit <= 0 || limit > 100 {
+		limit = 20
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	items := make([]domain.DepositLedger, 0)
+	for _, deposit := range r.items {
+		if deposit.UserID == userID {
+			items = append(items, cloneDeposit(deposit))
+		}
+	}
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].CreatedAt.Equal(items[j].CreatedAt) {
+			return items[i].ID > items[j].ID
+		}
+		return items[i].CreatedAt.After(items[j].CreatedAt)
+	})
+	if offset >= len(items) {
+		return []domain.DepositLedger{}, nil
+	}
+	end := offset + limit
+	if end > len(items) {
+		end = len(items)
+	}
+	return items[offset:end], nil
 }
 
 func (r *MemoryDepositRepository) Update(ctx context.Context, deposit *domain.DepositLedger) error {

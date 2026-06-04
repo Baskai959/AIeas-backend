@@ -24,9 +24,15 @@ import (
 
 const bidAuctionCacheTTL = 2 * time.Second
 const bidRealtimeStateCacheTTL = 200 * time.Millisecond
+const bidPrerequisiteCacheTTL = 30 * time.Second
 const bidNicknameCacheTTL = 5 * time.Minute
 const defaultBidIdempotencyTTL = 30 * time.Second
 const bidRankingBroadcastDelay = 200 * time.Millisecond
+const (
+	samePriceInflightLimit     int32 = 2
+	samePriceGateIdleTTL             = 30 * time.Second
+	samePriceGateSweepInterval       = 10 * time.Second
+)
 
 type BidService struct {
 	bids      repository.BidRepository
@@ -49,12 +55,17 @@ type BidService struct {
 	auctionGroup    singleflight.Group
 
 	realtimeStateCache sync.Map // map[uint64]*bidRealtimeStateCell
+	prerequisiteCache  sync.Map // map[string]bidPrerequisiteCacheEntry
 
 	nicknameCacheMu sync.RWMutex
 	nicknameCache   map[string]cachedBidderNickname
 
 	rankingBroadcastMu     sync.Mutex
 	rankingBroadcastTimers map[uint64]*time.Timer
+
+	samePriceGateMu        sync.Mutex
+	samePriceInflight      map[string]*samePriceGateEntry
+	samePriceGateNextSweep time.Time
 
 	blacklistStrategyMu        sync.RWMutex
 	blacklistStrategyCached    bool
@@ -214,12 +225,6 @@ func (s *BidService) place(ctx context.Context, in PlaceBidInput) (domain.BidRes
 		}
 		s.observeBidStage("mysql_idempotency", "miss", stageStart)
 	}
-	if result, ok := s.preRedisLocalStateReject(in); ok {
-		return result, nil
-	}
-	if result, ok := s.preRedisLocalFloorReject(ctx, in); ok {
-		return result, nil
-	}
 	stageStart = time.Now()
 	auction, err := s.bidAuctionSnapshot(ctx, in.AuctionID)
 	if err != nil {
@@ -262,6 +267,7 @@ func (s *BidService) place(ctx context.Context, in PlaceBidInput) (domain.BidRes
 		}
 		if isBlacklisted {
 			s.observeBidStage("blacklist_lookup", "hit", stageStart)
+			s.observeBidRoute("go_blacklist_reject", "BLACKLIST")
 			result := domain.BidResult{
 				RequestID:     in.RequestID,
 				AuctionID:     in.AuctionID,
@@ -280,13 +286,36 @@ func (s *BidService) place(ctx context.Context, in PlaceBidInput) (domain.BidRes
 		}
 		s.observeBidStage("blacklist_lookup", "miss", stageStart)
 	}
-	stageStart = time.Now()
-	rule, err := domain.ParseIncrementRule(auction.IncrementRule)
-	if err != nil {
-		s.observeBidStage("increment_rule", "error", stageStart)
-		return domain.BidResult{}, domain.ErrInvalidArgument
+	if result, ok := s.preRedisLocalReject(ctx, in); ok {
+		return result, nil
 	}
-	s.observeBidStage("increment_rule", "ok", stageStart)
+	if !riskControlEnabled {
+		s.observeBidStage("bid_prerequisites", "disabled", time.Now())
+	} else if result, ok, err := s.preRedisPrerequisiteReject(ctx, in, auction); err != nil {
+		return domain.BidResult{}, err
+	} else if ok {
+		s.enrichBidResult(ctx, &result, auction.liveSessionPtr())
+		if riskControlEnabled && blacklistStrategy.Enabled && blacklistStrategy.MissingDepositEnabled && s.risk != nil {
+			stageStart = time.Now()
+			s.scheduleAutoBlacklist(ctx, blacklistStrategy, in.BidderID, in.AuctionID, "AUTO_BLACKLIST_"+result.Reason, result)
+			s.observeBidStage("schedule_auto_blacklist", "missing_deposit", stageStart)
+		}
+		return result, nil
+	}
+	stageStart = time.Now()
+	var rule domain.IncrementRule
+	if auction.ParsedRuleOK {
+		rule = auction.ParsedRule
+		s.observeBidStage("increment_rule", "cache_hit", stageStart)
+	} else {
+		parsed, err := domain.ParseIncrementRule(auction.IncrementRule)
+		if err != nil {
+			s.observeBidStage("increment_rule", "error", stageStart)
+			return domain.BidResult{}, domain.ErrInvalidArgument
+		}
+		rule = parsed
+		s.observeBidStage("increment_rule", "ok", stageStart)
+	}
 	minIncrement := rule.AmountForPrice(auction.StartPrice)
 	if minIncrement <= 0 {
 		minIncrement = s.cfg.MinIncrementCent
@@ -310,7 +339,19 @@ func (s *BidService) place(ctx context.Context, in PlaceBidInput) (domain.BidRes
 	} else {
 		s.observeBidStage("bidder_nickname", "ok", stageStart)
 	}
+	gateRelease, gateRejected, gateResult := s.acquireSamePriceGate(ctx, in, auction)
+	if gateRejected {
+		return gateResult, nil
+	}
+	if gateRelease != nil {
+		defer func() {
+			if gateRelease != nil {
+				gateRelease()
+			}
+		}()
+	}
 	stageStart = time.Now()
+	s.observeBidRoute("lua_enter", "attempt")
 	result, err := s.realtime.PlaceBid(ctx, domain.BidInput{
 		RequestID:            in.RequestID,
 		AuctionID:            in.AuctionID,
@@ -333,11 +374,28 @@ func (s *BidService) place(ctx context.Context, in PlaceBidInput) (domain.BidRes
 		CapPrice:             auction.CapPrice,
 		IncrementRule:        rule,
 	})
+	if gateRelease != nil {
+		gateRelease()
+		gateRelease = nil
+	}
 	if err != nil {
 		s.observeBidStage("realtime_place_bid", "error", stageStart)
+		s.observeBidRoute("lua_error", "internal")
 		return domain.BidResult{}, err
 	}
 	s.observeBidStage("realtime_place_bid", bidStageResult(result), stageStart)
+	switch {
+	case result.Duplicate:
+		s.observeBidRoute("lua_duplicate", "duplicate")
+	case result.Accepted:
+		s.observeBidRoute("lua_accept", "ok")
+	default:
+		reason := strings.TrimSpace(result.Reason)
+		if reason == "" {
+			reason = "unknown"
+		}
+		s.observeBidRoute("lua_reject", reason)
+	}
 	s.storeBidRealtimeStateFromResult(in.AuctionID, result, time.Now().Add(bidRealtimeStateCacheTTL))
 	if result.RiskResult == "" {
 		if result.Accepted {
@@ -431,47 +489,153 @@ func (s *BidService) bidIdempotencyTTL() time.Duration {
 	return s.cfg.BidIdempotencyTTL.Std()
 }
 
-func (s *BidService) preRedisLocalStateReject(in PlaceBidInput) (domain.BidResult, bool) {
+// localBidState 是 Go 进程内基于 cachedBidRealtimeState + cachedBidAuction 合成的
+// "保守状态"，用于 EVALSHA 之前的本地预拒。仅在两个 cache 都命中且字段可信时才生成；
+// 任一字段缺失即视为不可用，调用方必须放行进 Lua。
+type localBidState struct {
+	auctionID      uint64
+	liveSessionID  uint64
+	status         domain.AuctionStatus
+	currentPrice   int64
+	leaderBidderID string
+	endTime        time.Time
+	extendCount    int
+	version        int64
+	startPrice     int64
+	capPrice       int64
+	rule           domain.IncrementRule
+	auction        bidAuctionSnapshot
+	state          domain.AuctionState
+}
+
+type samePriceGateEntry struct {
+	priceCounts  map[int64]*samePriceGatePriceEntry
+	highestPrice int64
+	lastUsed     time.Time
+}
+
+type samePriceGatePriceEntry struct {
+	count atomic.Int32
+}
+
+// buildLocalBidState 组合实时缓存与拍品快照成本地视图。返回 ok=false 表示安全门未通过，
+// 调用方必须放行进 Lua。auction snapshot 命中时使用其预解析的 IncrementRule（避免热路径
+// 重复 JSON 解析）；snapshot 未命中但 state 自带 IncrementRule 时退化为单源解析。
+func (s *BidService) buildLocalBidState(auctionID uint64, now time.Time) (localBidState, bool) {
+	if s == nil || auctionID == 0 {
+		return localBidState{}, false
+	}
+	state, ok := s.cachedBidRealtimeState(auctionID, now)
+	if !ok || state.AuctionID != auctionID {
+		return localBidState{}, false
+	}
+	auction, auctionOK := s.cachedBidAuction(auctionID, now)
+	var (
+		rule          domain.IncrementRule
+		ruleOK        bool
+		startPrice    int64
+		capPrice      int64
+		liveSessionID uint64
+	)
+	if auctionOK {
+		startPrice = auction.StartPrice
+		capPrice = auction.CapPrice
+		liveSessionID = auction.LiveSessionID
+		if auction.ParsedRuleOK {
+			rule = auction.ParsedRule
+			ruleOK = true
+		}
+	}
+	if startPrice <= 0 && state.StartPrice > 0 {
+		startPrice = state.StartPrice
+	}
+	if capPrice == 0 && state.CapPrice > 0 {
+		capPrice = state.CapPrice
+	}
+	if !ruleOK && len(state.IncrementRule) > 0 {
+		if parsed, err := domain.ParseIncrementRule(state.IncrementRule); err == nil {
+			rule = parsed
+			ruleOK = true
+		}
+	}
+	if state.LiveSessionID != 0 {
+		liveSessionID = state.LiveSessionID
+	}
+	if !ruleOK || startPrice <= 0 {
+		return localBidState{}, false
+	}
+	return localBidState{
+		auctionID:      auctionID,
+		liveSessionID:  liveSessionID,
+		status:         state.Status,
+		currentPrice:   state.CurrentPrice,
+		leaderBidderID: state.LeaderBidderID,
+		endTime:        state.EndTime,
+		extendCount:    state.ExtendCount,
+		version:        state.Version,
+		startPrice:     startPrice,
+		capPrice:       capPrice,
+		rule:           rule,
+		auction:        auction,
+		state:          state,
+	}, true
+}
+
+// preRedisLocalReject 是 Lua 之前唯一的本地预拒入口。基于 localBidState 做"必然拒"判断，
+// 任一安全条件不满足则放行进 Lua（绝不在 Go 层做"接受"判断）。
+//
+// 仅在 fixed rule + auction RUNNING/EXTENDED + 两个 cache 都命中 + 字段非零 时启用，
+// 覆盖以下拒因（基于单调性不变量：真实 current_price ≥ cached.currentPrice）：
+//   - BELOW_START_PRICE：必然拒
+//   - ABOVE_CAP_PRICE：必然拒
+//   - ABOVE_EXPECTED_MAX_BID_STEPS：基于客户端传入 expected 计算，与真实 state 无关，必然拒
+//   - PRICE_STEP_MISMATCH：基于 cached current 做模 amount 检查；真实 current 与 cached
+//     差值必然是 amount 整数倍，模值不变，必然拒
+//   - BELOW_MIN_INCREMENT：price < cached.currentPrice + step，真实 floor 只会更高，必然拒
+//
+// 不本地拦截 STALE_AUCTION_STATE（cached 可能落后）和 ABOVE_MAX_BID_STEPS（基于 cached
+// 不安全）。
+func (s *BidService) preRedisLocalReject(ctx context.Context, in PlaceBidInput) (domain.BidResult, bool) {
 	stageStart := time.Now()
-	state, ok := s.cachedBidRealtimeState(in.AuctionID, stageStart)
+	if state, ok := s.cachedBidRealtimeState(in.AuctionID, stageStart); ok {
+		if reason := conservativeLocalStateRejectReason(in, state); reason != "" {
+			result := rejectBidFromState(in, state, reason)
+			if auction, ok := s.cachedBidAuction(in.AuctionID, stageStart); ok {
+				s.enrichBidResult(ctx, &result, auction.liveSessionPtr())
+			}
+			s.observeBidStage("local_state_precheck", reason, stageStart)
+			s.observeBidRoute("go_local_reject", reason)
+			return result, true
+		}
+	}
+	local, ok := s.buildLocalBidState(in.AuctionID, stageStart)
 	if !ok {
 		return domain.BidResult{}, false
 	}
-	reason := conservativeLocalStateRejectReason(in, state)
+	if local.status != domain.AuctionStatusRunning && local.status != domain.AuctionStatusExtended {
+		return domain.BidResult{}, false
+	}
+	if local.rule.Type != domain.IncrementRuleTypeFixed || local.rule.Amount <= 0 || local.rule.MaxBidSteps <= 0 {
+		return domain.BidResult{}, false
+	}
+	if local.currentPrice <= 0 {
+		return domain.BidResult{}, false
+	}
+	if in.ExpectedCurrentPrice == nil {
+		return domain.BidResult{}, false
+	}
+	expectedCurrentPrice := *in.ExpectedCurrentPrice
+	if expectedCurrentPrice < 0 {
+		return domain.BidResult{}, false
+	}
+	reason := localRejectReason(in.Price, expectedCurrentPrice, local)
 	if reason == "" {
 		return domain.BidResult{}, false
 	}
-	s.observeBidStage("local_state_precheck", reason, stageStart)
-	return rejectBidFromState(in, state, reason), true
-}
-
-func (s *BidService) preRedisLocalFloorReject(ctx context.Context, in PlaceBidInput) (domain.BidResult, bool) {
-	stageStart := time.Now()
-	state, ok := s.cachedBidRealtimeState(in.AuctionID, stageStart)
-	if !ok || state.AuctionID != in.AuctionID {
-		return domain.BidResult{}, false
-	}
-	if state.CurrentPrice <= 0 {
-		return domain.BidResult{}, false
-	}
-	if state.Status != domain.AuctionStatusRunning && state.Status != domain.AuctionStatusExtended {
-		return domain.BidResult{}, false
-	}
-	auction, ok := s.cachedBidAuction(in.AuctionID, stageStart)
-	if !ok {
-		return domain.BidResult{}, false
-	}
-	rule, err := domain.ParseIncrementRule(auction.IncrementRule)
-	if err != nil {
-		return domain.BidResult{}, false
-	}
-	reason, hit := snapshotFloorPreRejectReason(in, state, true, auction, rule)
-	if !hit {
-		return domain.BidResult{}, false
-	}
-	result := rejectBidFromState(in, state, reason)
-	s.enrichBidResult(ctx, &result, auction.liveSessionPtr())
+	result := rejectBidFromState(in, local.state, reason)
+	s.enrichBidResult(ctx, &result, local.auction.liveSessionPtr())
 	s.observeBidStage("pre_reject_local", reason, stageStart)
+	s.observeBidRoute("go_local_reject", reason)
 	return result, true
 }
 
@@ -530,6 +694,319 @@ func conservativeLocalStateRejectReason(in PlaceBidInput, state domain.AuctionSt
 	return ""
 }
 
+// localRejectReason 返回本地必然拒的拒因字符串；返回 "" 表示放行进 Lua。
+func localRejectReason(price, expectedCurrentPrice int64, local localBidState) string {
+	if price <= local.startPrice {
+		return domain.BidRejectBelowStartPrice
+	}
+	if local.capPrice > 0 && price > local.capPrice {
+		return domain.BidRejectAboveCapPrice
+	}
+	amount := local.rule.Amount
+	isCapBid := local.capPrice > 0 && price == local.capPrice
+	// expected 必须 <= cached（>cached 视为客户端拿了未来 state，交给 Lua 兜底；
+	// 基于 expected 的 max bid steps 检查只有当 expected < cached 时才与真实 state
+	// 等价拒）。
+	if expectedCurrentPrice <= local.currentPrice {
+		expectedAmount := local.rule.AmountForPrice(expectedCurrentPrice)
+		if expectedAmount > 0 {
+			expectedMaxAllowed := expectedCurrentPrice + expectedAmount*int64(local.rule.MaxBidSteps)
+			if local.capPrice > 0 && expectedMaxAllowed > local.capPrice {
+				expectedMaxAllowed = local.capPrice
+			}
+			if expectedCurrentPrice < local.currentPrice && price > expectedMaxAllowed {
+				return domain.BidRejectAboveExpectedMaxBidSteps
+			}
+		}
+	}
+	if !isCapBid && (price-local.currentPrice)%amount != 0 {
+		return domain.BidRejectStepMismatch
+	}
+	if isCapBid {
+		if price <= local.currentPrice {
+			return domain.BidRejectBelowMinIncrement
+		}
+		return ""
+	}
+	if price < local.currentPrice+amount {
+		return domain.BidRejectBelowMinIncrement
+	}
+	return ""
+}
+
+// snapshotFloorPreRejectReason 兼容现有行级单测：基于显式传入的 (state, auction, rule)
+// 做与 preRedisLocalReject 等价的"必然拒"判断。生产路径不再调用本函数。
+func snapshotFloorPreRejectReason(in PlaceBidInput, state domain.AuctionState, stateOK bool, auction bidAuctionSnapshot, rule domain.IncrementRule) (string, bool) {
+	if !stateOK || state.AuctionID == 0 {
+		return "", false
+	}
+	if state.Status != domain.AuctionStatusRunning && state.Status != domain.AuctionStatusExtended {
+		return "", false
+	}
+	if rule.Type != domain.IncrementRuleTypeFixed || rule.Amount <= 0 || rule.MaxBidSteps <= 0 {
+		return "", false
+	}
+	if auction.StartPrice <= 0 {
+		return "", false
+	}
+	if state.CurrentPrice <= 0 {
+		return "", false
+	}
+	if in.ExpectedCurrentPrice == nil {
+		return "", false
+	}
+	expectedCurrentPrice := *in.ExpectedCurrentPrice
+	if expectedCurrentPrice < 0 {
+		return "", false
+	}
+	local := localBidState{
+		auctionID:    state.AuctionID,
+		status:       state.Status,
+		currentPrice: state.CurrentPrice,
+		startPrice:   auction.StartPrice,
+		capPrice:     auction.CapPrice,
+		rule:         rule,
+	}
+	if reason := localRejectReason(in.Price, expectedCurrentPrice, local); reason != "" {
+		return reason, true
+	}
+	return "", false
+}
+
+// acquireSamePriceGate 是 P3 最高价 in-flight 闸门：同一拍品内记录当前已进入 Lua
+// 的最高报价，低于该最高价的请求直接返回 AUCTION_BUSY；高于或等于当前最高价的请求
+// 按价格维度最多放行 samePriceInflightLimit 个并发进入 Lua。
+//
+// 触发条件（任一不满足则放行，不消耗 slot）：
+//   - fixed rule + auction RUNNING/EXTENDED + 两个 cache 命中（与本地预拒共用安全门）
+//   - currentPrice > 0
+//
+// 返回：release 用于在 Lua 调用之后递减 slot；rejected=true 表示已超 limit 必须直接返回
+// rejectedResult。超 limit 的拒绝不写 Redis 幂等、不触发自动黑名单（由调用方保证）。
+func (s *BidService) acquireSamePriceGate(ctx context.Context, in PlaceBidInput, auction bidAuctionSnapshot) (release func(), rejected bool, rejectedResult domain.BidResult) {
+	if s == nil || in.ExpectedCurrentPrice == nil {
+		return nil, false, domain.BidResult{}
+	}
+	now := time.Now()
+	local, ok := s.buildLocalBidState(in.AuctionID, now)
+	if !ok {
+		return nil, false, domain.BidResult{}
+	}
+	if local.status != domain.AuctionStatusRunning && local.status != domain.AuctionStatusExtended {
+		return nil, false, domain.BidResult{}
+	}
+	if local.rule.Type != domain.IncrementRuleTypeFixed || local.rule.Amount <= 0 {
+		return nil, false, domain.BidResult{}
+	}
+	if local.currentPrice <= 0 {
+		return nil, false, domain.BidResult{}
+	}
+	key := samePriceGateAuctionKey(in.AuctionID)
+	release, acquired := s.tryAcquireSamePriceGateSlot(key, in.Price, now)
+	if !acquired {
+		s.observeBidStage("same_price_gate", "rejected", now)
+		s.observeBidRoute("same_price_gate_reject", domain.BidRejectAuctionBusy)
+		result := rejectBidFromState(in, local.state, domain.BidRejectAuctionBusy)
+		s.enrichBidResult(ctx, &result, auction.liveSessionPtr())
+		return nil, true, result
+	}
+	s.observeBidStage("same_price_gate", "acquired", now)
+	s.observeBidRoute("same_price_gate_acquire", "ok")
+	return release, false, domain.BidResult{}
+}
+
+func samePriceGateKey(auctionID uint64, expectedCurrentPrice, price int64) string {
+	return strconv.FormatUint(auctionID, 10) + ":" +
+		strconv.FormatInt(expectedCurrentPrice, 10) + ":" +
+		strconv.FormatInt(price, 10)
+}
+
+func samePriceGateAuctionKey(auctionID uint64) string {
+	return strconv.FormatUint(auctionID, 10)
+}
+
+func parseSamePriceGateKey(key string) (string, int64, bool) {
+	parts := strings.Split(key, ":")
+	if len(parts) == 0 || parts[0] == "" {
+		return "", 0, false
+	}
+	if len(parts) == 1 {
+		return parts[0], 0, true
+	}
+	price, err := strconv.ParseInt(parts[len(parts)-1], 10, 64)
+	if err != nil {
+		return "", 0, false
+	}
+	return parts[0], price, true
+}
+
+func (s *BidService) tryAcquireSamePriceGateSlot(key string, price int64, now time.Time) (func(), bool) {
+	if s == nil || key == "" || price <= 0 {
+		return nil, true
+	}
+	s.samePriceGateMu.Lock()
+	defer s.samePriceGateMu.Unlock()
+	s.sweepSamePriceGateLocked(now)
+	if s.samePriceInflight == nil {
+		s.samePriceInflight = make(map[string]*samePriceGateEntry)
+	}
+	entry := s.samePriceInflight[key]
+	if entry == nil {
+		entry = &samePriceGateEntry{lastUsed: now, priceCounts: make(map[int64]*samePriceGatePriceEntry)}
+		s.samePriceInflight[key] = entry
+	}
+	entry.lastUsed = now
+	if entry.highestPrice > 0 && price < entry.highestPrice {
+		return nil, false
+	}
+	if entry.priceCounts == nil {
+		entry.priceCounts = make(map[int64]*samePriceGatePriceEntry)
+	}
+	priceEntry := entry.priceCounts[price]
+	if priceEntry == nil {
+		priceEntry = &samePriceGatePriceEntry{}
+		entry.priceCounts[price] = priceEntry
+	}
+	if next := priceEntry.count.Add(1); next > samePriceInflightLimit {
+		priceEntry.count.Add(-1)
+		entry.lastUsed = now
+		return nil, false
+	}
+	if price > entry.highestPrice {
+		entry.highestPrice = price
+	}
+	return func() {
+		s.releaseSamePriceGateSlot(key, price, priceEntry)
+	}, true
+}
+
+func (s *BidService) releaseSamePriceGateSlot(key string, price int64, priceEntry *samePriceGatePriceEntry) {
+	if s == nil || key == "" || price <= 0 || priceEntry == nil {
+		return
+	}
+	s.samePriceGateMu.Lock()
+	defer s.samePriceGateMu.Unlock()
+	entry := s.samePriceInflight[key]
+	if entry == nil {
+		return
+	}
+	next := priceEntry.count.Add(-1)
+	if next < 0 {
+		priceEntry.count.Store(0)
+		next = 0
+	}
+	if next == 0 {
+		delete(entry.priceCounts, price)
+		if price == entry.highestPrice {
+			entry.highestPrice = samePriceGateHighestPrice(entry)
+		}
+	}
+	entry.lastUsed = time.Now()
+}
+
+func (s *BidService) sweepSamePriceGateLocked(now time.Time) {
+	if s == nil || len(s.samePriceInflight) == 0 {
+		if s != nil && s.samePriceGateNextSweep.IsZero() {
+			s.samePriceGateNextSweep = now.Add(samePriceGateSweepInterval)
+		}
+		return
+	}
+	if !s.samePriceGateNextSweep.IsZero() && now.Before(s.samePriceGateNextSweep) {
+		return
+	}
+	for key, entry := range s.samePriceInflight {
+		if entry == nil || (!samePriceGateHasActive(entry) && now.Sub(entry.lastUsed) >= samePriceGateIdleTTL) {
+			delete(s.samePriceInflight, key)
+		}
+	}
+	s.samePriceGateNextSweep = now.Add(samePriceGateSweepInterval)
+}
+
+func samePriceGateHasActive(entry *samePriceGateEntry) bool {
+	if entry == nil {
+		return false
+	}
+	for price, priceEntry := range entry.priceCounts {
+		if priceEntry == nil || priceEntry.count.Load() <= 0 {
+			delete(entry.priceCounts, price)
+			continue
+		}
+		return true
+	}
+	entry.highestPrice = 0
+	return false
+}
+
+func samePriceGateHighestPrice(entry *samePriceGateEntry) int64 {
+	var highest int64
+	if entry == nil {
+		return 0
+	}
+	for price, priceEntry := range entry.priceCounts {
+		if priceEntry == nil || priceEntry.count.Load() <= 0 {
+			delete(entry.priceCounts, price)
+			continue
+		}
+		if price > highest {
+			highest = price
+		}
+	}
+	return highest
+}
+
+func (s *BidService) samePriceGateCounter(key string) *atomic.Int32 {
+	if s == nil || key == "" {
+		return nil
+	}
+	auctionKey, price, ok := parseSamePriceGateKey(key)
+	if !ok || price <= 0 {
+		return nil
+	}
+	s.samePriceGateMu.Lock()
+	defer s.samePriceGateMu.Unlock()
+	if s.samePriceInflight == nil {
+		s.samePriceInflight = make(map[string]*samePriceGateEntry)
+	}
+	entry := s.samePriceInflight[auctionKey]
+	if entry == nil {
+		entry = &samePriceGateEntry{lastUsed: time.Now(), priceCounts: make(map[int64]*samePriceGatePriceEntry)}
+		s.samePriceInflight[auctionKey] = entry
+	}
+	if entry.priceCounts == nil {
+		entry.priceCounts = make(map[int64]*samePriceGatePriceEntry)
+	}
+	priceEntry := entry.priceCounts[price]
+	if priceEntry == nil {
+		priceEntry = &samePriceGatePriceEntry{}
+		entry.priceCounts[price] = priceEntry
+	}
+	if price > entry.highestPrice {
+		entry.highestPrice = price
+	}
+	return &priceEntry.count
+}
+
+func (s *BidService) samePriceGateExists(key string) bool {
+	if s == nil || key == "" {
+		return false
+	}
+	auctionKey, price, ok := parseSamePriceGateKey(key)
+	if !ok {
+		return false
+	}
+	s.samePriceGateMu.Lock()
+	defer s.samePriceGateMu.Unlock()
+	entry, ok := s.samePriceInflight[auctionKey]
+	if !ok || entry == nil {
+		return false
+	}
+	if price <= 0 {
+		return true
+	}
+	priceEntry, ok := entry.priceCounts[price]
+	return ok && priceEntry != nil
+}
+
 type bidAuctionSnapshot struct {
 	AuctionID      uint64
 	SellerID       string
@@ -537,6 +1014,8 @@ type bidAuctionSnapshot struct {
 	StartPrice     int64
 	CapPrice       int64
 	IncrementRule  json.RawMessage
+	ParsedRule     domain.IncrementRule
+	ParsedRuleOK   bool
 	AntiSnipingSec int
 	AntiExtendSec  int
 	AntiExtendMode domain.AuctionExtendMode
@@ -553,6 +1032,12 @@ type cachedBidAuction struct {
 type cachedBidRealtimeState struct {
 	value     domain.AuctionState
 	expiresAt time.Time
+}
+
+type bidPrerequisiteCacheEntry struct {
+	enrolled     bool
+	depositReady bool
+	expiresAt    time.Time
 }
 
 type bidRealtimeStateCell struct {
@@ -744,6 +1229,37 @@ func (s *BidService) storeBidRealtimeStateFromResult(auctionID uint64, result do
 	s.storeBidRealtimeState(state, expiresAt)
 }
 
+func (s *BidService) cachedBidPrerequisites(auctionID uint64, bidderID string, now time.Time) (bool, bool, bool) {
+	if s == nil || auctionID == 0 || bidderID == "" {
+		return false, false, false
+	}
+	raw, ok := s.prerequisiteCache.Load(bidPrerequisiteCacheKey(auctionID, bidderID))
+	if !ok {
+		return false, false, false
+	}
+	entry, ok := raw.(bidPrerequisiteCacheEntry)
+	if !ok || now.After(entry.expiresAt) {
+		s.prerequisiteCache.Delete(bidPrerequisiteCacheKey(auctionID, bidderID))
+		return false, false, false
+	}
+	return entry.enrolled, entry.depositReady, true
+}
+
+func (s *BidService) storeBidPrerequisites(auctionID uint64, bidderID string, enrolled, depositReady bool, expiresAt time.Time) {
+	if s == nil || auctionID == 0 || bidderID == "" || !enrolled || !depositReady {
+		return
+	}
+	s.prerequisiteCache.Store(bidPrerequisiteCacheKey(auctionID, bidderID), bidPrerequisiteCacheEntry{
+		enrolled:     enrolled,
+		depositReady: depositReady,
+		expiresAt:    expiresAt,
+	})
+}
+
+func bidPrerequisiteCacheKey(auctionID uint64, bidderID string) string {
+	return strconv.FormatUint(auctionID, 10) + ":" + bidderID
+}
+
 func bidAuctionSnapshotFromLot(auction domain.AuctionLot) bidAuctionSnapshot {
 	snapshot := bidAuctionSnapshot{
 		AuctionID:      auction.AuctionID,
@@ -760,6 +1276,10 @@ func bidAuctionSnapshotFromLot(auction domain.AuctionLot) bidAuctionSnapshot {
 	}
 	if auction.LiveSessionID != nil {
 		snapshot.LiveSessionID = *auction.LiveSessionID
+	}
+	if rule, err := domain.ParseIncrementRule(snapshot.IncrementRule); err == nil {
+		snapshot.ParsedRule = rule
+		snapshot.ParsedRuleOK = true
 	}
 	return snapshot
 }
@@ -783,6 +1303,13 @@ func (s *BidService) observeBidStage(stage, result string, start time.Time) {
 		return
 	}
 	s.metrics.ObserveBidStage(stage, result, time.Since(start))
+}
+
+func (s *BidService) observeBidRoute(decision, reason string) {
+	if s == nil || s.metrics == nil {
+		return
+	}
+	s.metrics.IncBidRoute(decision, reason)
 }
 
 func bidStageResult(result domain.BidResult) string {
@@ -911,55 +1438,60 @@ func rejectBidFromState(in PlaceBidInput, state domain.AuctionState, reason stri
 	}
 }
 
-// snapshotFloorPreRejectReason 在 EVALSHA 之前，基于"快照 current_price 对应的最小合法价"
-// 做保守预拒。利用真实 current_price 单调上涨的不变量：若 price 连快照价对应的 floor 都不满足，
-// Lua 必然也会拒。仅在以下"安全条件全部满足"时启用，任一不满足都返回 (,false) 放行进 Lua：
-//   - 快照命中 (stateOK) 且 state.AuctionID 非零；
-//   - 拍卖处于 RUNNING / EXTENDED；
-//   - 加价规则为 fixed（ladder 第一版不预拒）；
-//   - StartPrice / 加价 amount 字段可信（>0）。
-//
-// 仅返回 BELOW_MIN_INCREMENT / BELOW_START_PRICE 这一类"价格不够"的拒因，绝不替代
-// NOT_ENROLLED / DEPOSIT_NOT_READY / FREQ_LIMIT 等需要权威 RT 状态的判定。
-func snapshotFloorPreRejectReason(in PlaceBidInput, state domain.AuctionState, stateOK bool, auction bidAuctionSnapshot, rule domain.IncrementRule) (string, bool) {
-	if !stateOK || state.AuctionID == 0 {
-		return "", false
+func (s *BidService) preRedisPrerequisiteReject(ctx context.Context, in PlaceBidInput, auction bidAuctionSnapshot) (domain.BidResult, bool, error) {
+	stageStart := time.Now()
+	if enrolled, depositReady, ok := s.cachedBidPrerequisites(in.AuctionID, in.BidderID, stageStart); ok {
+		s.observeBidStage("bid_prerequisites", "cache_hit", stageStart)
+		if enrolled && depositReady {
+			return domain.BidResult{}, false, nil
+		}
 	}
-	if state.Status != domain.AuctionStatusRunning && state.Status != domain.AuctionStatusExtended {
-		return "", false
+	enrolled, depositReady, err := s.realtime.BidPrerequisites(ctx, in.AuctionID, in.BidderID)
+	if err != nil {
+		s.observeBidStage("bid_prerequisites", "error", stageStart)
+		return domain.BidResult{}, false, err
 	}
-	if rule.Type != domain.IncrementRuleTypeFixed || rule.Amount <= 0 {
-		return "", false
+	if enrolled && depositReady {
+		s.storeBidPrerequisites(in.AuctionID, in.BidderID, enrolled, depositReady, time.Now().Add(bidPrerequisiteCacheTTL))
+		s.observeBidStage("bid_prerequisites", "ok", stageStart)
+		return domain.BidResult{}, false, nil
 	}
-	startPrice := auction.StartPrice
-	if startPrice <= 0 {
-		return "", false
+	reason := "DEPOSIT_NOT_READY"
+	resultLabel := "missing_deposit"
+	if !enrolled {
+		reason = "NOT_ENROLLED"
+		resultLabel = "not_enrolled"
 	}
-	currentPrice := state.CurrentPrice
-	if currentPrice <= 0 {
-		return "", false
+	s.observeBidStage("bid_prerequisites", resultLabel, stageStart)
+	s.observeBidRoute("go_prerequisite_reject", reason)
+	state := domain.AuctionState{
+		AuctionID:     in.AuctionID,
+		LiveSessionID: auction.LiveSessionID,
+		Status:        auction.Status,
+		StartPrice:    auction.StartPrice,
+		CapPrice:      auction.CapPrice,
+		CurrentPrice:  auction.StartPrice,
+		EndTime:       auction.EndTime,
+		Source:        "go_prerequisite",
 	}
-	if in.Price <= startPrice {
-		return domain.BidRejectBelowStartPrice, true
+	if cached, ok := s.cachedBidRealtimeState(in.AuctionID, time.Now()); ok {
+		state.CurrentPrice = cached.CurrentPrice
+		state.LeaderBidderID = cached.LeaderBidderID
+		state.EndTime = cached.EndTime
+		state.ExtendCount = cached.ExtendCount
+		state.Version = cached.Version
+		state.Status = cached.Status
+		if state.LiveSessionID == 0 {
+			state.LiveSessionID = cached.LiveSessionID
+		}
+		if state.StartPrice == 0 {
+			state.StartPrice = cached.StartPrice
+		}
+		if state.CapPrice == 0 {
+			state.CapPrice = cached.CapPrice
+		}
 	}
-	capPrice := auction.CapPrice
-	if capPrice > 0 && in.Price == capPrice && in.Price > currentPrice {
-		return "", false
-	}
-	// 仅在 price 与 amount 步长对齐时预拒，否则交给 Lua 区分 STEP_MISMATCH。
-	if (in.Price-currentPrice)%rule.Amount != 0 {
-		return "", false
-	}
-	var floor int64
-	if currentPrice <= startPrice {
-		floor = startPrice + rule.Amount
-	} else {
-		floor = currentPrice + rule.Amount
-	}
-	if in.Price < floor {
-		return domain.BidRejectBelowMinIncrement, true
-	}
-	return "", false
+	return rejectBidFromState(in, state, reason), true, nil
 }
 
 func (s *BidService) persistBid(ctx context.Context, in PlaceBidInput, result domain.BidResult, now time.Time) {

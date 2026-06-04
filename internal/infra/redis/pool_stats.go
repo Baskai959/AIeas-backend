@@ -10,20 +10,32 @@ import (
 
 const redisPoolStatsInterval = 5 * time.Second
 
-// StartPoolStatsCollector 启动一个后台 goroutine，周期性把每个 RT shard 与 Cache
-// 实例的连接池快照写入 metrics。instance 命名与 metrics hook 保持一致：RT 为
-// "rt-<idx>"，Cache 为 "cache"。goroutine 随 ctx 取消而退出。
-func StartPoolStatsCollector(ctx context.Context, registry *metrics.Registry, shardedRT *ShardedRTClient, cache *RedisCacheClient) {
+type RedisPoolStatsGroup struct {
+	Prefix  string
+	Sharded *ShardedRTClient
+}
+
+// StartPoolStatsCollector 启动一个后台 goroutine，周期性把每组 Redis pool 快照写入
+// metrics。instance 命名与 metrics hook 保持一致：如 "rt-<idx>",
+// "rt-worker-<idx>", "pubsub-<idx>", "ranking-<idx>", Cache 为 "cache"。
+func StartPoolStatsCollector(ctx context.Context, registry *metrics.Registry, cache *RedisCacheClient, groups ...RedisPoolStatsGroup) {
 	if registry == nil || !registry.Enabled() {
 		return
 	}
 	collect := func() {
-		if shardedRT != nil {
-			for i, shard := range shardedRT.Shards() {
+		for _, group := range groups {
+			if group.Sharded == nil {
+				continue
+			}
+			prefix := group.Prefix
+			if prefix == "" {
+				prefix = "rt"
+			}
+			for i, shard := range group.Sharded.Shards() {
 				if shard == nil || shard.Client == nil {
 					continue
 				}
-				registry.ObserveRedisPoolStats(fmt.Sprintf("rt-%d", i), shard.PoolStats())
+				registry.ObserveRedisPoolStats(fmt.Sprintf("%s-%d", prefix, i), shard.PoolStats())
 			}
 		}
 		if cache != nil && cache.Client != nil {

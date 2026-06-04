@@ -74,7 +74,7 @@ func NewServerWithConfig(cfg appconfig.Config) *server.Hertz {
 		// 启用 trace 但 exporter 初始化失败：降级到 noop，但保留日志告警。
 		logger.Warn("tracing setup failed, falling back to noop", "error", err)
 	}
-	db, shardedRT, rdbCache, err := openClients(context.Background(), cfg, logger, metricsRegistry, tracingProvider)
+	db, shardedRT, workerShardedRT, publishShardedRT, rankingShardedRT, rdbCache, err := openClients(context.Background(), cfg, logger, metricsRegistry, tracingProvider)
 	if err != nil {
 		panic(err)
 	}
@@ -82,18 +82,30 @@ func NewServerWithConfig(cfg appconfig.Config) *server.Hertz {
 	scripts.SetMetrics(metricsRegistry)
 	if err := scripts.LoadAll(context.Background()); err != nil {
 		_ = shardedRT.Close()
+		_ = workerShardedRT.Close()
+		_ = publishShardedRT.Close()
+		_ = rankingShardedRT.Close()
 		_ = rdbCache.Close()
 		_ = mysqlinfra.Close(db)
 		panic(fmt.Errorf("load redis scripts: %w", err))
 	}
 	keys := redisinfra.NewKeyBuilder("")
 	realtimeStore := redisinfra.NewAuctionRealtimeStore(shardedRT, scripts, keys)
-	onlineCounter := redisinfra.NewOnlineCounter(shardedRT, keys, redisinfra.DefaultOnlineCounterTTL)
-	eventLog := redisinfra.NewEventLog(shardedRT, keys)
+	realtimeStore.SetPublishShardedRT(publishShardedRT)
+	realtimeStore.SetRankingShardedRT(rankingShardedRT)
+	onlineCounter := redisinfra.NewOnlineCounterOnCache(rdbCache, keys, redisinfra.DefaultOnlineCounterTTL)
+	// EventLog 是后台 worker 主要消费方（XREADGROUP / ranking 更新 / DLQ），
+	// 改用 worker 专用 pool；accepted 排行榜更新再写到 ranking 专用 pool，
+	// 避免异步展示链路占用主链路出价 Redis。
+	eventLog := redisinfra.NewEventLog(workerShardedRT, keys)
+	eventLog.SetRankingShardedRT(rankingShardedRT)
 	liveSessionRealtimeStore := redisinfra.NewLiveSessionRealtimeStore(shardedRT, keys)
 	kafkaProducer, kafkaBidReader, err := openKafkaClients(cfg)
 	if err != nil {
 		_ = shardedRT.Close()
+		_ = workerShardedRT.Close()
+		_ = publishShardedRT.Close()
+		_ = rankingShardedRT.Close()
 		_ = rdbCache.Close()
 		_ = mysqlinfra.Close(db)
 		panic(err)
@@ -126,7 +138,7 @@ func NewServerWithConfig(cfg appconfig.Config) *server.Hertz {
 		OnlineCounter:             onlineCounter,
 		DistributedRateLimiter:    redisinfra.NewDistributedRateLimiter(scripts, keys),
 		FeatureFlags:              service.NewFeatureFlagService(repository.NewMySQLConfigRepository(db), rdbCache),
-		PubSubClients:             pubSubClientsFromShards(shardedRT),
+		PubSubClients:             pubSubClientsFromShards(publishShardedRT),
 		MetricsRegistry:           metricsRegistry,
 		Tracing:                   tracingProvider,
 		ReadinessProbes:           buildReadinessProbes(db, shardedRT, rdbCache, scripts, kafkaProducer),
@@ -139,12 +151,22 @@ func NewServerWithConfig(cfg appconfig.Config) *server.Hertz {
 	}
 	h := NewServerWithDependencies(cfg, deps)
 	poolStatsCtx, stopPoolStats := context.WithCancel(context.Background())
-	redisinfra.StartPoolStatsCollector(poolStatsCtx, metricsRegistry, shardedRT, rdbCache)
+	redisinfra.StartPoolStatsCollector(poolStatsCtx, metricsRegistry, rdbCache,
+		redisinfra.RedisPoolStatsGroup{Prefix: "rt", Sharded: shardedRT},
+		redisinfra.RedisPoolStatsGroup{Prefix: "rt-worker", Sharded: workerShardedRT},
+		redisinfra.RedisPoolStatsGroup{Prefix: "pubsub", Sharded: publishShardedRT},
+		redisinfra.RedisPoolStatsGroup{Prefix: "ranking", Sharded: rankingShardedRT},
+	)
 	h.OnShutdown = append(h.OnShutdown, func(ctx context.Context) {
 		_ = ctx
 		stopPoolStats()
 	})
+	// 关闭顺序：worker 池先关（worker goroutine 已在 NewServerWithDependencies 注册的
+	// stopWorkers shutdown hook 中先于本 hook 退出），再关主链路池 + cache + mysql。
 	h.OnShutdown = append(h.OnShutdown, func(ctx context.Context) {
+		_ = workerShardedRT.Close()
+		_ = publishShardedRT.Close()
+		_ = rankingShardedRT.Close()
 		_ = shardedRT.Close()
 		_ = rdbCache.Close()
 		if kafkaBidReader != nil {
@@ -366,6 +388,9 @@ func NewServerWithDependencies(cfg appconfig.Config, deps ServerDependencies) *s
 	liveSessionService.SetWriteDeps(deps.TxManager, deps.LiveSessionLock, auctionService)
 	liveSessionService.SetStatsDeps(deps.BidRepo, deps.RealtimeStore, deps.Hub)
 	liveSessionService.SetRealtimeStore(deps.LiveSessionRealtimeStore)
+	marketplaceService := service.NewMarketplaceService(deps.AuctionRepo, deps.LiveSessionRepo, deps.DepositRepo, deps.OrderRepo, deps.UserRepo)
+	marketplaceService.SetRealtime(deps.RealtimeStore)
+	marketplaceService.SetOnlineCounter(deps.Hub)
 	liveAnalysisService := service.NewLiveAnalysisService(deps.LiveAnalysisReportRepo, deps.LiveSessionRepo, deps.LiveAnalysisRequester, service.LiveAnalysisOptions{
 		CallbackURL:    cfg.Agent.LiveAnalysisCallbackURL,
 		CallbackAPIKey: cfg.Agent.LiveAnalysisCallbackAPIKey,
@@ -421,6 +446,13 @@ func NewServerWithDependencies(cfg appconfig.Config, deps ServerDependencies) *s
 			writer.SetMetrics(deps.MetricsRegistry)
 			writer.Start(workerCtx)
 		}
+		// 排行榜更新独立 worker：与 BidRecordWriter 共享同一 stream，但用独立 consumer
+		// group `bid-ranking-updaters`，避免 MySQL 慢拖慢排行榜可见性。
+		rankingWorker := service.NewBidRankingWorker(deps.EventLog, "")
+		rankingWorker.SetMetrics(deps.MetricsRegistry)
+		rankingWorker.Start(workerCtx)
+		streamTrimWorker := service.NewBidStreamTrimWorker(deps.EventLog, 10000)
+		streamTrimWorker.Start(workerCtx, time.Second)
 		reconciler := service.NewBidRecordReconciler(deps.BidRepo, deps.EventLog)
 		reconciler.SetMetrics(deps.MetricsRegistry)
 		reconciler.Start(workerCtx, time.Minute)
@@ -463,7 +495,7 @@ func NewServerWithDependencies(cfg appconfig.Config, deps ServerDependencies) *s
 		LiveVoiceBroadcaster: deps.LiveVoiceBroadcaster,
 		AIAssistant:          aiAssistantService,
 	})
-	h := newServerWithServices(authService, auctionService, bidService, depositService, hammerService, orderService, adminService, liveSessionService, liveAnalysisService, aiAssistantService, mcpReadService, mcpControlService, riskControlService, deps.AuditRepo, deps.Hub, deps.Idempotency, deps.ObjectUploader, deps.DescriptionGen, deps.MetricsRegistry, deps.Tracing, deps.ReadinessProbes, deps.DistributedRateLimiter, deps.FeatureFlags, cfg)
+	h := newServerWithServices(authService, auctionService, bidService, depositService, hammerService, orderService, adminService, liveSessionService, marketplaceService, liveAnalysisService, aiAssistantService, mcpReadService, mcpControlService, riskControlService, deps.AuditRepo, deps.Hub, deps.Idempotency, deps.ObjectUploader, deps.DescriptionGen, deps.MetricsRegistry, deps.Tracing, deps.ReadinessProbes, deps.DistributedRateLimiter, deps.FeatureFlags, cfg)
 	if stopWorkers != nil {
 		h.OnShutdown = append(h.OnShutdown, func(ctx context.Context) {
 			_ = ctx
@@ -521,6 +553,9 @@ func NewServerWithAuth(authService *service.AuthService) *server.Hertz {
 	liveSessionService.SetReadDeps(bidRepo, orderRepo)
 	liveSessionService.SetWriteDeps(repository.NoopTxManager{}, liveSessionLock, auctionService)
 	liveSessionService.SetStatsDeps(bidRepo, realtimeStore, hub)
+	marketplaceService := service.NewMarketplaceService(auctionRepo, liveSessionRepo, depositRepo, orderRepo, userRepo)
+	marketplaceService.SetRealtime(realtimeStore)
+	marketplaceService.SetOnlineCounter(hub)
 	liveAnalysisService := service.NewLiveAnalysisService(repository.NewMemoryLiveAnalysisReportRepository(), liveSessionRepo, service.DisabledLiveAnalysisRequester{}, service.LiveAnalysisOptions{
 		CallbackURL:    cfg.Agent.LiveAnalysisCallbackURL,
 		CallbackAPIKey: cfg.Agent.LiveAnalysisCallbackAPIKey,
@@ -574,6 +609,7 @@ func NewServerWithAuth(authService *service.AuthService) *server.Hertz {
 		orderService,
 		adminService,
 		liveSessionService,
+		marketplaceService,
 		liveAnalysisService,
 		aiAssistantService,
 		mcpReadService,
@@ -602,6 +638,7 @@ func newServerWithServices(
 	orderService *service.OrderService,
 	adminService *service.AdminService,
 	liveSessionService *service.LiveSessionService,
+	marketplaceService *service.MarketplaceService,
 	liveAnalysisService *service.LiveAnalysisService,
 	aiAssistantService *service.AIAssistantService,
 	mcpReadService *service.MCPReadService,
@@ -682,7 +719,9 @@ func newServerWithServices(
 	auctionHandler := httptransport.NewAuctionHandler(auctionService, depositService, hammerService, objectUploader, descriptionGen, cfg.Agent.LiveAnalysisCallbackAPIKey)
 	orderHandler := httptransport.NewOrderHandler(orderService)
 	adminHandler := httptransport.NewAdminHandler(adminService)
+	marketplaceHandler := httptransport.NewMarketplaceHandler(marketplaceService)
 	liveSessionHandler := httptransport.NewLiveSessionHandler(liveSessionService, objectUploader)
+	liveSessionHandler.SetMarketplaceService(marketplaceService)
 	liveAnalysisHandler := httptransport.NewLiveAnalysisHandler(liveAnalysisService, cfg.Agent.LiveAnalysisCallbackAPIKey)
 	aiAssistantHandler := httptransport.NewAIAssistantHandler(aiAssistantService)
 	wsHandler := httptransport.NewWSHandler(hub, bidService, cfg.WebSocket.SendBufferSize, cfg.WebSocket.ReadLimitBytes, cfg.WebSocket.PingInterval.Std(), cfg.WebSocket.PongTimeout.Std())
@@ -711,6 +750,14 @@ func newServerWithServices(
 
 		v1.GET("/audit-logs", authHandler.AuthMiddleware(), httptransport.RoleAuth(domain.RoleMerchant, domain.RoleAdmin), adminHandler.ListOwnAuditLogs)
 
+		marketplace := v1.Group("", authHandler.AuthMiddleware())
+		marketplace.GET("/search/lots", marketplaceHandler.SearchLots)
+		marketplace.GET("/lots/:id", marketplaceHandler.Lot)
+		marketplace.GET("/categories", marketplaceHandler.Categories)
+		marketplace.GET("/search/merchants", marketplaceHandler.SearchMerchants)
+		marketplace.GET("/merchants/:id", marketplaceHandler.Merchant)
+		marketplace.GET("/auction-participations/mine", httptransport.RoleAuth(domain.RoleBuyer), marketplaceHandler.MyParticipations)
+
 		auctionState := v1.Group("/auctions", authHandler.AuthMiddleware())
 		auctionState.GET("/:id/state", auctionHandler.State)
 		auctionState.POST("/:id/enroll", httptransport.RoleAuth(domain.RoleBuyer), auctionHandler.Enroll)
@@ -735,7 +782,7 @@ func newServerWithServices(
 		liveSessionsPublic.GET("/:id/orders", liveSessionHandler.Orders)
 		liveSessionsPublic.GET("/:id/stats", liveSessionHandler.Stats)
 
-		merchantSessions := v1.Group("/merchants", authHandler.AuthMiddleware(), httptransport.RoleAuth(domain.RoleMerchant, domain.RoleAdmin))
+		merchantSessions := v1.Group("/merchants", authHandler.AuthMiddleware())
 		merchantSessions.GET("/:merchantId/live-sessions", liveSessionHandler.ListByMerchant)
 
 		liveAnalysis := v1.Group("/live-analysis", authHandler.AuthMiddleware(), httptransport.RoleAuth(domain.RoleMerchant, domain.RoleAdmin))
@@ -1189,7 +1236,7 @@ func objectKeyFromProxyImageURL(imageURL string) (string, error) {
 	return key, nil
 }
 
-func openClients(ctx context.Context, cfg appconfig.Config, logger *slog.Logger, metricsRegistry *metrics.Registry, tracingProvider *tracing.Provider) (*gorm.DB, *redisinfra.ShardedRTClient, *redisinfra.RedisCacheClient, error) {
+func openClients(ctx context.Context, cfg appconfig.Config, logger *slog.Logger, metricsRegistry *metrics.Registry, tracingProvider *tracing.Provider) (*gorm.DB, *redisinfra.ShardedRTClient, *redisinfra.ShardedRTClient, *redisinfra.ShardedRTClient, *redisinfra.ShardedRTClient, *redisinfra.RedisCacheClient, error) {
 	gormLogger := observability.NewGormLogger(
 		logger,
 		time.Duration(cfg.Observability.SlowSQLThresholdMs)*time.Millisecond,
@@ -1197,7 +1244,7 @@ func openClients(ctx context.Context, cfg appconfig.Config, logger *slog.Logger,
 	)
 	db, err := mysqlinfra.Open(ctx, cfg.MySQL, gormLogger)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, nil, nil, err
 	}
 	// GORM tracing：仅在 trace enabled 时挂 otelgorm，避免 noop tracer 也吃一份 plugin 内存。
 	if tracingProvider != nil && tracingProvider.Enabled() {
@@ -1206,20 +1253,48 @@ func openClients(ctx context.Context, cfg appconfig.Config, logger *slog.Logger,
 		}
 	}
 
-	// Redis 拆分：RT 实例服务实时路径（拍卖/出价/Stream/锁/计数），按聚合根
-	// fnv32 路由到具体 shard；Cache 实例服务查询缓存（L2）。两者使用独立配置 +
-	// 独立 hook 实例标签。RT 多 shard 时每个 shard 都挂上 instance="rt-<idx>"
-	// 的 hook，便于 Prometheus / 链路追踪按 shard 维度区分。
+	// Redis 拆分：RT 实例服务实时路径（拍卖/出价/Stream/锁），按聚合根
+	// fnv32 路由到具体 shard；Cache 实例服务查询缓存、在线人数、PubSub 与
+	// 异步排行榜。两者使用独立配置 + 独立 hook 实例标签。RT 多 shard 时每个
+	// shard 都挂上 instance="rt-<idx>" 的 hook，便于 Prometheus / 链路追踪按
+	// shard 维度区分。
+	// 同时给后台 worker 单独再开一份 ShardedRTClient（同 addr，独立 pool），避免
+	// stream 消费 / DLQ 写入占用主链路 pool 的连接。
 	shardedRT, err := redisinfra.NewShardedRTClient(ctx, cfg.Redis.RT.Shards)
 	if err != nil {
 		_ = mysqlinfra.Close(db)
-		return nil, nil, nil, fmt.Errorf("open redis rt: %w", err)
+		return nil, nil, nil, nil, nil, nil, fmt.Errorf("open redis rt: %w", err)
+	}
+	workerShardedRT, err := redisinfra.NewShardedRTClient(ctx, cfg.Redis.RT.Shards)
+	if err != nil {
+		_ = shardedRT.Close()
+		_ = mysqlinfra.Close(db)
+		return nil, nil, nil, nil, nil, nil, fmt.Errorf("open redis rt worker pool: %w", err)
+	}
+	cacheShardConfig := []appconfig.RedisInstanceConfig{cfg.Redis.Cache}
+	publishShardedRT, err := redisinfra.NewShardedRTClient(ctx, cacheShardConfig)
+	if err != nil {
+		_ = workerShardedRT.Close()
+		_ = shardedRT.Close()
+		_ = mysqlinfra.Close(db)
+		return nil, nil, nil, nil, nil, nil, fmt.Errorf("open redis pubsub pool: %w", err)
+	}
+	rankingShardedRT, err := redisinfra.NewShardedRTClient(ctx, cacheShardConfig)
+	if err != nil {
+		_ = publishShardedRT.Close()
+		_ = workerShardedRT.Close()
+		_ = shardedRT.Close()
+		_ = mysqlinfra.Close(db)
+		return nil, nil, nil, nil, nil, nil, fmt.Errorf("open redis ranking pool: %w", err)
 	}
 	cacheClient, err := redisinfra.OpenCache(ctx, cfg.Redis.Cache)
 	if err != nil {
 		_ = shardedRT.Close()
+		_ = workerShardedRT.Close()
+		_ = publishShardedRT.Close()
+		_ = rankingShardedRT.Close()
 		_ = mysqlinfra.Close(db)
-		return nil, nil, nil, fmt.Errorf("open redis cache: %w", err)
+		return nil, nil, nil, nil, nil, nil, fmt.Errorf("open redis cache: %w", err)
 	}
 	// Redis tracing / metrics 钩子：分别为每个 RT shard 与 Cache 挂上各自 instance 标签的 hook。
 	for i, shard := range shardedRT.Shards() {
@@ -1231,13 +1306,40 @@ func openClients(ctx context.Context, cfg appconfig.Config, logger *slog.Logger,
 		}
 		shard.AddHook(redisinfra.NewMetricsHook(metricsRegistry, instance))
 	}
+	for i, shard := range workerShardedRT.Shards() {
+		instance := fmt.Sprintf("rt-worker-%d", i)
+		if tracingProvider != nil && tracingProvider.Enabled() {
+			if err := redisotel.InstrumentTracing(shard.Client); err != nil {
+				logger.Warn("install redisotel tracing on rt worker shard failed", "shard", i, "error", err)
+			}
+		}
+		shard.AddHook(redisinfra.NewMetricsHook(metricsRegistry, instance))
+	}
+	for i, shard := range publishShardedRT.Shards() {
+		instance := fmt.Sprintf("pubsub-%d", i)
+		if tracingProvider != nil && tracingProvider.Enabled() {
+			if err := redisotel.InstrumentTracing(shard.Client); err != nil {
+				logger.Warn("install redisotel tracing on pubsub shard failed", "shard", i, "error", err)
+			}
+		}
+		shard.AddHook(redisinfra.NewMetricsHook(metricsRegistry, instance))
+	}
+	for i, shard := range rankingShardedRT.Shards() {
+		instance := fmt.Sprintf("ranking-%d", i)
+		if tracingProvider != nil && tracingProvider.Enabled() {
+			if err := redisotel.InstrumentTracing(shard.Client); err != nil {
+				logger.Warn("install redisotel tracing on ranking shard failed", "shard", i, "error", err)
+			}
+		}
+		shard.AddHook(redisinfra.NewMetricsHook(metricsRegistry, instance))
+	}
 	if tracingProvider != nil && tracingProvider.Enabled() {
 		if err := redisotel.InstrumentTracing(cacheClient.Client); err != nil {
 			logger.Warn("install redisotel tracing on cache failed", "error", err)
 		}
 	}
 	cacheClient.AddHook(redisinfra.NewMetricsHook(metricsRegistry, "cache"))
-	return db, shardedRT, cacheClient, nil
+	return db, shardedRT, workerShardedRT, publishShardedRT, rankingShardedRT, cacheClient, nil
 }
 
 // buildLogger 根据 ObservabilityConfig 构建 slog.Logger，自动检测 stdout 是否为 TTY。

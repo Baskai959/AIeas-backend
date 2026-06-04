@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -261,6 +262,35 @@ func TestHubOnlineCounterFallsBackToLocalCount(t *testing.T) {
 	}
 }
 
+func TestHubThrottlesOnlineTouch(t *testing.T) {
+	counter := &countingOnlineCounter{MemoryOnlineCounter: NewMemoryOnlineCounter()}
+	hub := NewHubWithOnlineCounter(counter)
+	hub.SetOnlineTouchInterval(time.Hour)
+	client := NewClient("c1", "u1", 36001, 4)
+	if err := hub.Subscribe(36001, client); err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	drainPresence(t, client)
+
+	if got := hub.Touch(36001, client.ID); got != 1 {
+		t.Fatalf("first throttled touch should return local fallback count 1, got %d", got)
+	}
+	if got := hub.Touch(36001, client.ID); got != 1 {
+		t.Fatalf("second throttled touch should return local fallback count 1, got %d", got)
+	}
+	if got := counter.touchCount.Load(); got != 0 {
+		t.Fatalf("touches within interval should not hit shared counter, got %d", got)
+	}
+
+	hub.SetOnlineTouchInterval(0)
+	if got := hub.Touch(36001, client.ID); got != 1 {
+		t.Fatalf("unthrottled touch should still return online count 1, got %d", got)
+	}
+	if got := counter.touchCount.Load(); got != 1 {
+		t.Fatalf("disabled throttle should hit shared counter once, got %d", got)
+	}
+}
+
 func TestHubHandleInboundAckAndPing(t *testing.T) {
 	hub := NewHub()
 	client := NewClient("c1", "u1", 10001, 4)
@@ -483,4 +513,14 @@ func (failingOnlineCounter) Touch(ctx context.Context, auctionID uint64, connect
 
 func (failingOnlineCounter) Count(ctx context.Context, auctionID uint64) (int, error) {
 	return 0, errors.New("shared counter unavailable")
+}
+
+type countingOnlineCounter struct {
+	*MemoryOnlineCounter
+	touchCount atomic.Int64
+}
+
+func (c *countingOnlineCounter) Touch(ctx context.Context, auctionID uint64, connectionID, userID string) (int, error) {
+	c.touchCount.Add(1)
+	return c.MemoryOnlineCounter.Touch(ctx, auctionID, connectionID, userID)
 }

@@ -108,6 +108,31 @@ func TestLiveSessionServiceListByMerchantOverridesForMerchantRole(t *testing.T) 
 	}
 }
 
+func TestLiveSessionServiceListByMerchantAllowsBuyerLiveOnly(t *testing.T) {
+	svc, _, _ := newLiveSessionFixture(t)
+	ctx := context.Background()
+	live := createStartedLiveSession(t, svc, "m_public", "珠宝直播")
+	if _, err := svc.Create(ctx, CreateLiveSessionInput{ActorID: "m_public", ActorRole: domain.RoleMerchant, Title: "珠宝预告"}); err != nil {
+		t.Fatalf("create draft session: %v", err)
+	}
+
+	sessions, err := svc.ListByMerchantFiltered(ctx, domain.LiveSessionFilter{MerchantID: "m_public", Keyword: "珠宝", Limit: 20}, "u_buyer", domain.RoleBuyer)
+	if err != nil {
+		t.Fatalf("buyer list merchant sessions: %v", err)
+	}
+	if len(sessions) != 1 || sessions[0].ID != live.ID || sessions[0].Status != domain.LiveSessionStatusLive {
+		t.Fatalf("buyer should see only merchant live sessions, got %#v", sessions)
+	}
+
+	sessions, err = svc.ListByMerchantFiltered(ctx, domain.LiveSessionFilter{MerchantID: "m_public", Status: domain.LiveSessionStatusDraft, Limit: 20}, "u_buyer", domain.RoleBuyer)
+	if err != nil {
+		t.Fatalf("buyer list merchant draft sessions: %v", err)
+	}
+	if len(sessions) != 0 {
+		t.Fatalf("buyer should not see draft merchant sessions, got %#v", sessions)
+	}
+}
+
 func TestLiveSessionServiceListVisibleAllowsBuyerLiveSessionsOnly(t *testing.T) {
 	svc, _, _ := newLiveSessionFixture(t)
 	ctx := context.Background()
@@ -130,6 +155,41 @@ func TestLiveSessionServiceListVisibleAllowsBuyerLiveSessionsOnly(t *testing.T) 
 	}
 	if len(sessions) != 0 {
 		t.Fatalf("buyer should not see DRAFT sessions, got %#v", sessions)
+	}
+}
+
+func TestLiveSessionServiceListVisibleSupportsKeywordAndSort(t *testing.T) {
+	svc, _, _ := newLiveSessionFixture(t)
+	ctx := context.Background()
+
+	first := createStartedLiveSession(t, svc, "m_public_1", "珠宝专场")
+	second := createStartedLiveSession(t, svc, "m_public_2", "数码专场")
+	if _, err := svc.Create(ctx, CreateLiveSessionInput{ActorID: "m_public_3", ActorRole: domain.RoleMerchant, Title: "文玩专场"}); err != nil {
+		t.Fatalf("create draft session: %v", err)
+	}
+
+	sessions, err := svc.ListVisibleFiltered(ctx, domain.LiveSessionFilter{Keyword: "专场", Sort: "oldest", Limit: 20}, "u_buyer", domain.RoleBuyer)
+	if err != nil {
+		t.Fatalf("list visible with keyword: %v", err)
+	}
+	if len(sessions) != 2 || sessions[0].ID != first.ID || sessions[1].ID != second.ID {
+		t.Fatalf("expected buyer live sessions sorted oldest first, got %#v", sessions)
+	}
+
+	sessions, err = svc.ListVisibleFiltered(ctx, domain.LiveSessionFilter{Keyword: "珠宝", Limit: 20}, "u_buyer", domain.RoleBuyer)
+	if err != nil {
+		t.Fatalf("list visible with exact keyword: %v", err)
+	}
+	if len(sessions) != 1 || sessions[0].ID != first.ID {
+		t.Fatalf("expected keyword to match title, got %#v", sessions)
+	}
+
+	sessions, err = svc.ListVisibleFiltered(ctx, domain.LiveSessionFilter{Keyword: "文玩", Limit: 20}, "u_buyer", domain.RoleBuyer)
+	if err != nil {
+		t.Fatalf("list visible with draft keyword: %v", err)
+	}
+	if len(sessions) != 0 {
+		t.Fatalf("buyer should not see matching draft sessions, got %#v", sessions)
 	}
 }
 
