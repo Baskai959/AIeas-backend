@@ -16,8 +16,8 @@ server:
 
 # MySQL 连接池配置。
 mysql:
-  # Docker 内部 MySQL DSN；密码需与 docker/prod.env 的 MYSQL_PASSWORD 保持一致。
-  dsn: "auction:change-me-mysql-password@tcp(mysql:3306)/aieas?charset=utf8mb4&parseTime=true&loc=Local"
+  # Docker 内部 MySQL DSN；root 密码需与 docker/prod.env 的 MYSQL_ROOT_PASSWORD 保持一致。
+  dsn: "root:Zjy1029.@tcp(mysql:3306)/aieas?charset=utf8mb4&parseTime=true&loc=Local"
   # 最大打开连接数。
   maxOpenConns: 100
   # 最大空闲连接数。
