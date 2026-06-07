@@ -8,16 +8,15 @@ import (
 	"time"
 
 	"aieas_backend/internal/domain"
-	"aieas_backend/internal/service"
 
 	"github.com/cloudwego/hertz/pkg/app"
 )
 
 type AdminHandler struct {
-	admin *service.AdminService
+	admin AdminUseCase
 }
 
-func NewAdminHandler(admin *service.AdminService) *AdminHandler {
+func NewAdminHandler(admin AdminUseCase) *AdminHandler {
 	return &AdminHandler{admin: admin}
 }
 

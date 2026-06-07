@@ -9,6 +9,12 @@ const (
 	// 一次性推给客户端，避免连上后等出价/extend 才能感知房间状态。
 	// 若 RT 不可用导致退化到 MySQL 兜底，payload.degraded=true。
 	TypeRoomSnapshot = "room.snapshot"
+	// TypeRoomOnline 是直播间在线人数更新帧。
+	TypeRoomOnline = "room.online"
+	// TypeAuctionParticipantUpdated 是拍品参与人数更新帧。
+	TypeAuctionParticipantUpdated = "auction.participant_updated"
+	// TypeRankingUpdated 是拍品排行榜更新帧。
+	TypeRankingUpdated = "ranking.updated"
 	// TypeLiveVoiceBroadcast 是直播语音播报帧，payload 携带已合成的音频内容。
 	TypeLiveVoiceBroadcast = "live.voice_broadcast"
 	// TypeAIAssistantStatus 是 AI 助手运行状态帧。
@@ -19,6 +25,15 @@ const (
 	TypeAIAssistantBroadcast = "ai.assistant.broadcast"
 	// TypeAIAssistantSwitch 是 AI 直播助手开关变更帧，用户端可据此切换 AI 直播状态。
 	TypeAIAssistantSwitch = "ai.assistant.switch"
+	// TypeLiveSessionLotMounted 是直播间拍品上架帧，客户端收到后应刷新直播间拍品列表。
+	TypeLiveSessionLotMounted = "live_session.lot_mounted"
+	// TypeLiveSessionLotUnmounted 是直播间拍品下架帧，客户端收到后应刷新直播间拍品列表。
+	TypeLiveSessionLotUnmounted = "live_session.lot_unmounted"
+	// TypeLiveSessionLotChanged 是直播间拍品状态/时间等信息变更帧，客户端收到后应刷新直播间拍品列表。
+	TypeLiveSessionLotChanged = "live_session.lot_changed"
+	// TypeGatewayDraining 是 ws-gateway 进入排空状态时下发的提示帧，
+	// 客户端收到后应主动断开连接并按 payload.retryAfterMs 退避重连。
+	TypeGatewayDraining = "gateway.draining"
 )
 
 type Envelope struct {

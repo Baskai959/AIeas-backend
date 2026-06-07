@@ -4,14 +4,17 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"hash/fnv"
+	"math/rand"
+	"net"
 	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
 
 	"aieas_backend/internal/domain"
-	"aieas_backend/internal/service"
 	corews "aieas_backend/internal/transport/ws"
 
 	"github.com/cloudwego/hertz/pkg/app"
@@ -19,23 +22,97 @@ import (
 	"github.com/hertz-contrib/websocket"
 )
 
-const websocketWriteTimeout = 5 * time.Second
+const (
+	defaultWebsocketWriteTimeout = 5 * time.Second
+	maxWSChatContentRunes        = 500
+)
 
 var nextWSClientSeq atomic.Uint64
 
-type WSHandler struct {
-	hub            *corews.Hub
-	bids           *service.BidService
-	sessions       *service.LiveSessionService
-	auctions       *service.AuctionService
-	sendBufferSize int
-	readLimitBytes int
-	pingInterval   time.Duration
-	pongTimeout    time.Duration
-	upgrader       websocket.HertzUpgrader
+type wsUint64 uint64
+
+func (id *wsUint64) UnmarshalJSON(data []byte) error {
+	trimmed := strings.TrimSpace(string(data))
+	if trimmed == "" || trimmed == "null" {
+		*id = 0
+		return nil
+	}
+	if strings.HasPrefix(trimmed, "\"") {
+		var raw string
+		if err := json.Unmarshal(data, &raw); err != nil {
+			return err
+		}
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			*id = 0
+			return nil
+		}
+		parsed, err := strconv.ParseUint(raw, 10, 64)
+		if err != nil {
+			return err
+		}
+		*id = wsUint64(parsed)
+		return nil
+	}
+	var parsed uint64
+	if err := json.Unmarshal(data, &parsed); err != nil {
+		return err
+	}
+	*id = wsUint64(parsed)
+	return nil
 }
 
-func NewWSHandler(hub *corews.Hub, bids *service.BidService, sendBufferSize, readLimitBytes int, pingInterval, pongTimeout time.Duration) *WSHandler {
+type WSBidPlaceMode string
+
+const (
+	WSBidPlaceLocal    WSBidPlaceMode = "local"
+	WSBidPlaceDisabled WSBidPlaceMode = "disabled"
+)
+
+type WSLiveSessionLookupMode string
+
+const (
+	WSLiveSessionLookupService  WSLiveSessionLookupMode = "service"
+	WSLiveSessionLookupRealtime WSLiveSessionLookupMode = "realtime"
+)
+
+type WSHandler struct {
+	hub              *corews.Hub
+	bids             WSBidUseCase
+	rankings         WSAuctionRankingUseCase
+	sessions         WSLiveSessionLookupUseCase
+	auctions         WSAuctionStateUseCase
+	realtimeSnapshot WSAuctionRealtimeSnapshotProvider
+	sessionRealtime  WSLiveSessionRealtimeReader
+	bidPlaceMode     WSBidPlaceMode
+	allowDBSnapshot  bool
+	sessionLookup    WSLiveSessionLookupMode
+	sendBufferSize   int
+	readLimitBytes   int
+	pingInterval     time.Duration
+	pongTimeout      time.Duration
+	writeTimeout     time.Duration
+	closeGrace       time.Duration
+	pingJitter       time.Duration
+	handshakeLimiter *corews.HandshakeLimiter
+	metrics          corews.HubMetrics
+	upgrader         websocket.HertzUpgrader
+}
+
+// NewWSHandler 构造 WSHandler。pingJitter / handshakeLimiter / metrics 任一可
+// 为零值（0 / nil），handler 内部按 nil-safe 路径处理：
+//   - pingJitter<=0 时不做初始 ping 错峰；
+//   - handshakeLimiter==nil 时跳过握手限流；
+//   - metrics==nil 时跳过握手拒绝打点。
+func NewWSHandler(
+	hub *corews.Hub,
+	bids WSBidUseCase,
+	sendBufferSize, readLimitBytes int,
+	pingInterval, pongTimeout time.Duration,
+	writeTimeout, pingJitter, closeGrace time.Duration,
+	limiter *corews.HandshakeLimiter,
+	metrics corews.HubMetrics,
+) *WSHandler {
 	if sendBufferSize <= 0 {
 		sendBufferSize = 64
 	}
@@ -48,13 +125,30 @@ func NewWSHandler(hub *corews.Hub, bids *service.BidService, sendBufferSize, rea
 	if pongTimeout <= 0 {
 		pongTimeout = 60 * time.Second
 	}
+	if writeTimeout <= 0 {
+		writeTimeout = defaultWebsocketWriteTimeout
+	}
+	if pingJitter < 0 {
+		pingJitter = 0
+	}
+	if closeGrace <= 0 {
+		closeGrace = time.Second
+	}
 	return &WSHandler{
-		hub:            hub,
-		bids:           bids,
-		sendBufferSize: sendBufferSize,
-		readLimitBytes: readLimitBytes,
-		pingInterval:   pingInterval,
-		pongTimeout:    pongTimeout,
+		hub:              hub,
+		bids:             bids,
+		bidPlaceMode:     WSBidPlaceLocal,
+		allowDBSnapshot:  true,
+		sessionLookup:    WSLiveSessionLookupService,
+		sendBufferSize:   sendBufferSize,
+		readLimitBytes:   readLimitBytes,
+		pingInterval:     pingInterval,
+		pongTimeout:      pongTimeout,
+		writeTimeout:     writeTimeout,
+		closeGrace:       closeGrace,
+		pingJitter:       pingJitter,
+		handshakeLimiter: limiter,
+		metrics:          metrics,
 		upgrader: websocket.HertzUpgrader{
 			ReadBufferSize:  readLimitBytes,
 			WriteBufferSize: readLimitBytes,
@@ -64,19 +158,50 @@ func NewWSHandler(hub *corews.Hub, bids *service.BidService, sendBufferSize, rea
 }
 
 // SetLiveSessionService 注入直播场次服务以支持 /ws/live-sessions/:session_id 入口。
-func (h *WSHandler) SetLiveSessionService(sessions *service.LiveSessionService) {
+func (h *WSHandler) SetLiveSessionService(sessions WSLiveSessionLookupUseCase) {
 	h.sessions = sessions
 }
 
 // SetAuctionService 注入拍卖服务以在握手后下发 room.snapshot（P1-B）。
 // 未注入时握手成功仍可继续，但跳过 snapshot 帧（保留原有读写循环）。
-func (h *WSHandler) SetAuctionService(auctions *service.AuctionService) {
+func (h *WSHandler) SetAuctionService(auctions WSAuctionStateUseCase) {
 	h.auctions = auctions
 }
 
-// LiveSession 处理 `/ws/live-sessions/:session_id` 入口，将客户端订阅到场次当前活跃拍品事件。
+func (h *WSHandler) SetAuctionRankingService(rankings WSAuctionRankingUseCase) {
+	h.rankings = rankings
+}
+
+func (h *WSHandler) SetRealtimeSnapshotProvider(store WSAuctionRealtimeSnapshotProvider) {
+	h.realtimeSnapshot = store
+}
+
+func (h *WSHandler) SetLiveSessionRealtimeStore(store WSLiveSessionRealtimeReader) {
+	h.sessionRealtime = store
+}
+
+func (h *WSHandler) SetBidPlaceMode(mode WSBidPlaceMode) {
+	if mode == "" {
+		mode = WSBidPlaceLocal
+	}
+	h.bidPlaceMode = mode
+}
+
+func (h *WSHandler) SetAllowDBSnapshotFallback(allow bool) {
+	h.allowDBSnapshot = allow
+}
+
+func (h *WSHandler) SetLiveSessionLookupMode(mode WSLiveSessionLookupMode) {
+	if mode == "" {
+		mode = WSLiveSessionLookupService
+	}
+	h.sessionLookup = mode
+}
+
+// LiveSession 处理 `/ws/live-sessions/:session_id` 和 `/ws/live-rooms/:room_id`
+// 入口，将客户端订阅到场次当前活跃拍品事件。
 func (h *WSHandler) LiveSession(ctx context.Context, c *app.RequestContext) {
-	sessionID, ok := parseUintParam(c, "session_id")
+	sessionID, ok := parseLiveSessionWSParam(c)
 	if !ok {
 		return
 	}
@@ -84,15 +209,46 @@ func (h *WSHandler) LiveSession(ctx context.Context, c *app.RequestContext) {
 		WriteError(c, consts.StatusInternalServerError, 90001, "系统内部错误", nil)
 		return
 	}
-	auctionID, liveSessionID, err := h.sessions.ActiveAuctionAndSession(ctx, sessionID)
-	if err != nil {
-		writeLiveSessionError(c, err)
+	if h.hub != nil && h.hub.IsDraining() {
+		h.recordHandshakeReject("draining")
+		c.Response.Header.Set("Retry-After", "5")
+		WriteError(c, consts.StatusServiceUnavailable, 50301, "网关排空中，请稍后重试", nil)
 		return
+	}
+	auctionID, liveSessionID := uint64(0), sessionID
+	if h.sessionLookup == WSLiveSessionLookupRealtime {
+		if h.sessionRealtime == nil {
+			WriteError(c, consts.StatusConflict, 20003, "直播场次实时状态不可用", nil)
+			return
+		}
+		activeAuctionID, ok, err := h.sessionRealtime.ActiveAuction(ctx, sessionID)
+		if err != nil {
+			WriteError(c, consts.StatusConflict, 20003, "直播场次实时状态不可用", nil)
+			return
+		}
+		if ok {
+			auctionID = activeAuctionID
+		}
+	} else {
+		var err error
+		auctionID, liveSessionID, err = h.sessions.ActiveAuctionAndSession(ctx, sessionID)
+		if err != nil {
+			writeLiveSessionError(c, err)
+			return
+		}
 	}
 	clientID := nextWSClientID()
 	userID := AuthUserID(c)
 	if userID == "" {
 		userID = "anonymous"
+	}
+	if h.handshakeLimiter != nil {
+		if allowed, reason := h.handshakeLimiter.Allow(c.ClientIP(), userID, auctionID); !allowed {
+			h.recordHandshakeReject(reason)
+			c.Response.Header.Set("Retry-After", "60")
+			WriteError(c, consts.StatusTooManyRequests, 42901, "握手频率过高，请稍后重试", nil)
+			return
+		}
 	}
 	role := AuthRole(c)
 	client := corews.NewClientWithSession(clientID, userID, auctionID, liveSessionID, h.sendBufferSize)
@@ -100,7 +256,6 @@ func (h *WSHandler) LiveSession(ctx context.Context, c *app.RequestContext) {
 	lastSeq := parseLastSeq(c)
 	if err := h.upgrader.Upgrade(c, func(conn *websocket.Conn) {
 		if auctionID == 0 {
-			client.CountOnline = false
 			if err := h.hub.SubscribeLiveSessionOnly(liveSessionID, client); err != nil {
 				_ = conn.Close()
 				return
@@ -115,16 +270,37 @@ func (h *WSHandler) LiveSession(ctx context.Context, c *app.RequestContext) {
 	}
 }
 
+func parseLiveSessionWSParam(c *app.RequestContext) (uint64, bool) {
+	if strings.TrimSpace(c.Param("session_id")) != "" {
+		return parseUintParam(c, "session_id")
+	}
+	return parseUintParam(c, "room_id")
+}
+
 func (h *WSHandler) Auction(ctx context.Context, c *app.RequestContext) {
 	_ = ctx
 	auctionID, ok := parseUintParam(c, "auction_id")
 	if !ok {
 		return
 	}
+	if h.hub != nil && h.hub.IsDraining() {
+		h.recordHandshakeReject("draining")
+		c.Response.Header.Set("Retry-After", "5")
+		WriteError(c, consts.StatusServiceUnavailable, 50301, "网关排空中，请稍后重试", nil)
+		return
+	}
 	clientID := nextWSClientID()
 	userID := AuthUserID(c)
 	if userID == "" {
 		userID = "anonymous"
+	}
+	if h.handshakeLimiter != nil {
+		if allowed, reason := h.handshakeLimiter.Allow(c.ClientIP(), userID, auctionID); !allowed {
+			h.recordHandshakeReject(reason)
+			c.Response.Header.Set("Retry-After", "60")
+			WriteError(c, consts.StatusTooManyRequests, 42901, "握手频率过高，请稍后重试", nil)
+			return
+		}
 	}
 	role := AuthRole(c)
 	client := corews.NewClient(clientID, userID, auctionID, h.sendBufferSize)
@@ -141,16 +317,24 @@ func (h *WSHandler) Auction(ctx context.Context, c *app.RequestContext) {
 	}
 }
 
+// recordHandshakeReject 在 metrics 注入存在时打点；nil-safe。
+func (h *WSHandler) recordHandshakeReject(reason string) {
+	if h == nil || h.metrics == nil {
+		return
+	}
+	h.metrics.IncWSHandshakeReject(reason)
+}
+
 func (h *WSHandler) serveConn(ctx context.Context, conn *websocket.Conn, client *corews.Client, lastSeq int64) {
 	defer func() {
 		h.hub.UnsubscribeClient(client)
-		_ = writeCloseFrame(conn, client.CloseReason())
+		_ = writeCloseFrameWithGrace(conn, client.CloseReason(), h.closeGrace)
 		_ = conn.Close()
 	}()
 	conn.SetReadLimit(int64(h.readLimitBytes))
 	_ = conn.SetReadDeadline(time.Now().Add(h.pongTimeout))
 	conn.SetPongHandler(func(string) error {
-		h.hub.Touch(client.AuctionID, client.ID)
+		h.hub.TouchClient(client)
 		return conn.SetReadDeadline(time.Now().Add(h.pongTimeout))
 	})
 
@@ -159,8 +343,8 @@ func (h *WSHandler) serveConn(ctx context.Context, conn *websocket.Conn, client 
 	// 中标记 degraded=true。snapshot 直接 deliver 到 client，不再走 Hub.Broadcast，
 	// 避免 seq 占用与 history 写入。
 	h.deliverRoomSnapshot(ctx, client)
+	h.deliverInitialRanking(ctx, client)
 
-	done := make(chan struct{})
 	writeDone := make(chan struct{})
 	go func() {
 		defer func() {
@@ -169,37 +353,80 @@ func (h *WSHandler) serveConn(ctx context.Context, conn *websocket.Conn, client 
 			}
 			close(writeDone)
 		}()
-		ticker := time.NewTicker(h.pingInterval)
-		defer ticker.Stop()
 		h.replayMissed(client, lastSeq)
+		var ticker <-chan time.Time
+		var tickerStop func()
+		startTicker := func() {
+			if ticker != nil {
+				return
+			}
+			t := time.NewTicker(h.pingInterval)
+			ticker = t.C
+			tickerStop = t.Stop
+		}
+		if jitter := h.initialPingJitter(client.ID); jitter > 0 {
+			timer := time.NewTimer(jitter)
+			stopTimer := func() {
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+			}
+			for ticker == nil {
+				select {
+				case env, ok := <-client.Outbound():
+					if !ok {
+						stopTimer()
+						return
+					}
+					if err := writeJSONWithDeadline(conn, env, h.writeTimeout); err != nil {
+						stopTimer()
+						client.MarkSendFailure()
+						return
+					}
+				case <-timer.C:
+					startTicker()
+				}
+			}
+		} else {
+			startTicker()
+		}
+		if tickerStop != nil {
+			defer tickerStop()
+		}
 		for {
 			select {
 			case env, ok := <-client.Outbound():
 				if !ok {
 					return
 				}
-				if err := writeJSONWithDeadline(conn, env); err != nil {
+				if err := writeJSONWithDeadline(conn, env, h.writeTimeout); err != nil {
 					client.MarkSendFailure()
 					return
 				}
-			case <-ticker.C:
-				if err := writePingWithDeadline(conn); err != nil {
+			case <-ticker:
+				if err := writePingWithDeadline(conn, h.writeTimeout); err != nil {
 					client.MarkSendFailure()
 					return
 				}
 			}
 		}
 	}()
+	readDone := make(chan string, 1)
 	go func() {
 		defer func() {
 			if recovered := recover(); recovered != nil {
 				client.MarkSendFailure()
+				readDone <- "read_closed"
+				return
 			}
-			close(done)
 		}()
 		for {
 			messageType, payload, err := readMessage(conn)
 			if err != nil {
+				readDone <- readCloseReason(err)
 				return
 			}
 			if messageType != websocket.TextMessage {
@@ -217,12 +444,29 @@ func (h *WSHandler) serveConn(ctx context.Context, conn *websocket.Conn, client 
 	}()
 
 	select {
-	case <-done:
-		client.CloseWithReason("read_closed")
-		waitWriteDone(writeDone)
+	case reason := <-readDone:
+		client.CloseWithReason(reason)
+		waitWriteDone(writeDone, h.writeTimeout)
 	case <-writeDone:
 		client.CloseWithReason("write_closed")
 	}
+}
+
+func (h *WSHandler) initialPingJitter(clientID string) time.Duration {
+	return h.initialPingJitterAt(clientID, time.Now())
+}
+
+func (h *WSHandler) initialPingJitterAt(clientID string, now time.Time) time.Duration {
+	if h == nil || h.pingJitter <= 0 {
+		return 0
+	}
+	seed := now.UnixNano()
+	if clientID != "" {
+		hash := fnv.New64a()
+		_, _ = hash.Write([]byte(clientID))
+		seed ^= int64(hash.Sum64())
+	}
+	return time.Duration(rand.New(rand.NewSource(seed)).Int63n(int64(h.pingJitter)))
 }
 
 func (h *WSHandler) replayMissed(client *corews.Client, lastSeq int64) {
@@ -231,7 +475,7 @@ func (h *WSHandler) replayMissed(client *corews.Client, lastSeq int64) {
 	}
 	missed, complete := h.hub.ReplaySince(client.AuctionID, lastSeq)
 	if !complete {
-		client.Deliver(jsonEnvelope("room.snapshot_required", "", map[string]interface{}{"auctionId": client.AuctionID, "lastSeq": lastSeq, "reason": "EVENT_WINDOW_EXPIRED"}))
+		client.Deliver(snapshotRequiredEnvelope(client.AuctionID, "EVENT_WINDOW_EXPIRED", map[string]interface{}{"lastSeq": lastSeq}))
 		return
 	}
 	for _, env := range missed {
@@ -262,31 +506,35 @@ func readMessage(conn websocketFrameReader) (messageType int, payload []byte, er
 	return conn.ReadMessage()
 }
 
-func writeJSONWithDeadline(conn websocketFrameWriter, env corews.Envelope) (err error) {
+func writeJSONWithDeadline(conn websocketFrameWriter, env corews.Envelope, timeout ...time.Duration) (err error) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			err = fmt.Errorf("websocket write json panic: %v", recovered)
 		}
 	}()
-	if err := conn.SetWriteDeadline(time.Now().Add(websocketWriteTimeout)); err != nil {
+	if err := conn.SetWriteDeadline(time.Now().Add(resolveWriteTimeout(timeout...))); err != nil {
 		return err
 	}
 	return conn.WriteJSON(env)
 }
 
-func writePingWithDeadline(conn websocketFrameWriter) (err error) {
+func writePingWithDeadline(conn websocketFrameWriter, timeout ...time.Duration) (err error) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			err = fmt.Errorf("websocket write ping panic: %v", recovered)
 		}
 	}()
-	if err := conn.SetWriteDeadline(time.Now().Add(websocketWriteTimeout)); err != nil {
+	if err := conn.SetWriteDeadline(time.Now().Add(resolveWriteTimeout(timeout...))); err != nil {
 		return err
 	}
 	return conn.WriteMessage(websocket.PingMessage, nil)
 }
 
 func writeCloseFrame(conn websocketControlWriter, reason string) (err error) {
+	return writeCloseFrameWithGrace(conn, reason, time.Second)
+}
+
+func writeCloseFrameWithGrace(conn websocketControlWriter, reason string, grace time.Duration) (err error) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			err = fmt.Errorf("websocket close frame panic: %v", recovered)
@@ -295,18 +543,52 @@ func writeCloseFrame(conn websocketControlWriter, reason string) (err error) {
 	if reason == "" {
 		reason = "closed"
 	}
+	if grace <= 0 {
+		grace = time.Second
+	}
 	return conn.WriteControl(
 		websocket.CloseMessage,
-		websocket.FormatCloseMessage(websocket.CloseNormalClosure, reason),
-		time.Now().Add(time.Second),
+		websocket.FormatCloseMessage(closeCodeForReason(reason), reason),
+		time.Now().Add(grace),
 	)
 }
 
-func waitWriteDone(writeDone <-chan struct{}) {
+func waitWriteDone(writeDone <-chan struct{}, timeout ...time.Duration) {
 	select {
 	case <-writeDone:
-	case <-time.After(websocketWriteTimeout):
+	case <-time.After(resolveWriteTimeout(timeout...)):
 	}
+}
+
+func resolveWriteTimeout(timeout ...time.Duration) time.Duration {
+	if len(timeout) > 0 && timeout[0] > 0 {
+		return timeout[0]
+	}
+	return defaultWebsocketWriteTimeout
+}
+
+func closeCodeForReason(reason string) int {
+	switch reason {
+	case "", "closed", "unsubscribe", "read_closed", "write_closed":
+		return websocket.CloseNormalClosure
+	case "slow_consumer":
+		return websocket.ClosePolicyViolation
+	case "pong_timeout", "gateway_draining":
+		return websocket.CloseGoingAway
+	default:
+		return websocket.CloseInternalServerErr
+	}
+}
+
+func readCloseReason(err error) string {
+	if err == nil {
+		return "read_closed"
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return "pong_timeout"
+	}
+	return "read_closed"
 }
 
 func nextWSClientID() string {
@@ -321,35 +603,62 @@ func nextWSClientID() string {
 // snapshot 帧的 seq 字段填当前 Hub Room 的 CurrentSeq()，让客户端把它
 // 当作"已对齐到此点"，后续 broadcast 只要 seq 严格递增即可保证不重不漏。
 func (h *WSHandler) deliverRoomSnapshot(ctx context.Context, client *corews.Client) {
-	if client == nil || client.AuctionID == 0 || h.auctions == nil {
+	if client == nil || client.AuctionID == 0 {
+		return
+	}
+	if h.realtimeSnapshot != nil {
+		if state, ok, err := h.realtimeSnapshot.GetAuctionState(ctx, client.AuctionID); err == nil && ok {
+			h.deliverStateSnapshot(client, state, false)
+			return
+		} else if !h.allowDBSnapshot {
+			reason := "REALTIME_SNAPSHOT_MISSING"
+			if err != nil {
+				reason = "REALTIME_SNAPSHOT_UNAVAILABLE"
+			}
+			client.Deliver(snapshotRequiredEnvelope(client.AuctionID, reason, nil))
+			return
+		}
+	} else if !h.allowDBSnapshot {
+		client.Deliver(snapshotRequiredEnvelope(client.AuctionID, "REALTIME_SNAPSHOT_UNAVAILABLE", nil))
+		return
+	}
+	if h.auctions == nil {
 		return
 	}
 	state, err := h.auctions.State(ctx, client.AuctionID, client.UserID, domain.RoleBuyer)
 	if err != nil {
-		// 拉取失败（auction 不存在 / RT+DB 都失败）：跳过 snapshot，
-		// 老客户端依旧依赖 first broadcast 渲染——保持原有行为。
+		if !h.allowDBSnapshot {
+			client.Deliver(snapshotRequiredEnvelope(client.AuctionID, "REALTIME_SNAPSHOT_UNAVAILABLE", nil))
+		}
 		return
 	}
+	h.deliverStateSnapshot(client, state, strings.EqualFold(state.Source, "db"))
+}
+
+func (h *WSHandler) deliverStateSnapshot(client *corews.Client, state domain.AuctionState, degraded bool) {
 	var seq int64
-	if room, ok := h.hub.Room(client.AuctionID); ok && room != nil {
-		seq = room.CurrentSeq()
+	if h.hub != nil {
+		if room, ok := h.hub.Room(client.AuctionID); ok && room != nil {
+			seq = room.CurrentSeq()
+		}
 	}
-	degraded := strings.EqualFold(state.Source, "db")
+	serverTime := time.Now().UTC().UnixMilli()
 	payload := map[string]interface{}{
-		"auctionId":      state.AuctionID,
-		"status":         state.Status,
-		"startPrice":     state.StartPrice,
-		"capPrice":       state.CapPrice,
-		"currentPrice":   state.CurrentPrice,
-		"leaderBidderId": state.LeaderBidderID,
-		"startTime":      state.StartTime.UTC().UnixMilli(),
-		"endTime":        state.EndTime.UTC().UnixMilli(),
-		"extendCount":    state.ExtendCount,
-		"version":        state.Version,
-		"seq":            seq,
-		"serverTime":     time.Now().UTC().UnixMilli(),
-		"source":         state.Source,
-		"degraded":       degraded,
+		"auctionId":        state.AuctionID,
+		"status":           state.Status,
+		"startPrice":       state.StartPrice,
+		"capPrice":         state.CapPrice,
+		"currentPrice":     state.CurrentPrice,
+		"leaderBidderId":   state.LeaderBidderID,
+		"participantCount": state.ParticipantCount,
+		"startTime":        state.StartTime.UTC().UnixMilli(),
+		"endTime":          state.EndTime.UTC().UnixMilli(),
+		"extendCount":      state.ExtendCount,
+		"version":          state.Version,
+		"seq":              seq,
+		"serverTime":       serverTime,
+		"source":           state.Source,
+		"degraded":         degraded,
 	}
 	if len(state.IncrementRule) > 0 {
 		payload["incrementRule"] = json.RawMessage(state.IncrementRule)
@@ -357,30 +666,87 @@ func (h *WSHandler) deliverRoomSnapshot(ctx context.Context, client *corews.Clie
 	client.Deliver(jsonEnvelope(corews.TypeRoomSnapshot, "", payload))
 }
 
+func (h *WSHandler) deliverInitialRanking(ctx context.Context, client *corews.Client) {
+	if client == nil || client.AuctionID == 0 || h.rankings == nil {
+		return
+	}
+	state, ok := h.initialRankingAuctionState(ctx, client)
+	if !ok || !shouldDeliverInitialRanking(state.Status) {
+		return
+	}
+	ranking, err := h.rankings.TopN(ctx, client.AuctionID, 10)
+	if err != nil {
+		return
+	}
+	payload := map[string]interface{}{
+		"auctionId": client.AuctionID,
+		"ranking":   ranking,
+	}
+	if client.LiveSessionID != 0 {
+		payload["liveSessionId"] = client.LiveSessionID
+	}
+	env := jsonEnvelope(corews.TypeRankingUpdated, "", payload)
+	env.LiveSessionID = client.LiveSessionID
+	client.Deliver(env)
+}
+
+func (h *WSHandler) initialRankingAuctionState(ctx context.Context, client *corews.Client) (domain.AuctionState, bool) {
+	if h.realtimeSnapshot != nil {
+		if state, ok, err := h.realtimeSnapshot.GetAuctionState(ctx, client.AuctionID); err == nil && ok {
+			return state, true
+		} else if !h.allowDBSnapshot {
+			return domain.AuctionState{}, false
+		}
+	} else if !h.allowDBSnapshot {
+		return domain.AuctionState{}, false
+	}
+	if h.auctions == nil {
+		return domain.AuctionState{}, false
+	}
+	state, err := h.auctions.State(ctx, client.AuctionID, client.UserID, domain.RoleBuyer)
+	if err != nil {
+		return domain.AuctionState{}, false
+	}
+	return state, true
+}
+
+func shouldDeliverInitialRanking(status domain.AuctionStatus) bool {
+	switch status {
+	case domain.AuctionStatusRunning, domain.AuctionStatusExtended, domain.AuctionStatusHammerPending:
+		return true
+	default:
+		return false
+	}
+}
+
 func (h *WSHandler) handleInbound(ctx context.Context, client *corews.Client, env corews.Envelope) []corews.Envelope {
 	switch env.Type {
 	case "bid.place":
 		return h.handleBidPlace(ctx, client, env)
+	case "chat.send":
+		return h.handleChatSend(client, env)
 	case "room.subscribe":
 		var payload struct {
-			AuctionID uint64 `json:"auctionId"`
+			AuctionID wsUint64 `json:"auctionId"`
 		}
 		_ = json.Unmarshal(env.Payload, &payload)
-		if payload.AuctionID == 0 {
-			payload.AuctionID = client.AuctionID
+		auctionID := uint64(payload.AuctionID)
+		if auctionID == 0 {
+			auctionID = client.AuctionID
 		}
-		_ = h.hub.Subscribe(payload.AuctionID, client)
-		return []corews.Envelope{jsonEnvelope("room.subscribed", env.RequestID, map[string]interface{}{"auctionId": payload.AuctionID})}
+		_ = h.hub.Subscribe(auctionID, client)
+		return []corews.Envelope{jsonEnvelope("room.subscribed", env.RequestID, map[string]interface{}{"auctionId": auctionID})}
 	case "room.unsubscribe":
 		var payload struct {
-			AuctionID uint64 `json:"auctionId"`
+			AuctionID wsUint64 `json:"auctionId"`
 		}
 		_ = json.Unmarshal(env.Payload, &payload)
-		if payload.AuctionID == 0 {
-			payload.AuctionID = client.AuctionID
+		auctionID := uint64(payload.AuctionID)
+		if auctionID == 0 {
+			auctionID = client.AuctionID
 		}
-		h.hub.Unsubscribe(payload.AuctionID, client.ID)
-		return []corews.Envelope{jsonEnvelope("room.unsubscribed", env.RequestID, map[string]interface{}{"auctionId": payload.AuctionID})}
+		h.hub.Unsubscribe(auctionID, client.ID)
+		return []corews.Envelope{jsonEnvelope("room.unsubscribed", env.RequestID, map[string]interface{}{"auctionId": auctionID})}
 	case "heartbeat":
 		if client.CountOnline {
 			h.hub.Touch(client.AuctionID, client.ID)
@@ -391,30 +757,87 @@ func (h *WSHandler) handleInbound(ctx context.Context, client *corews.Client, en
 	}
 }
 
+func (h *WSHandler) handleChatSend(client *corews.Client, env corews.Envelope) []corews.Envelope {
+	requestID := strings.TrimSpace(env.RequestID)
+	if h.hub == nil || client == nil || client.LiveSessionID == 0 {
+		return []corews.Envelope{chatErrorEnvelope(requestID, "", "", "CHAT_UNAVAILABLE")}
+	}
+	var payload struct {
+		RoomID          string `json:"roomId"`
+		Content         string `json:"content"`
+		ClientMessageID string `json:"clientMessageId"`
+	}
+	decoder := json.NewDecoder(bytes.NewReader(env.Payload))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&payload); err != nil {
+		return []corews.Envelope{chatErrorEnvelope(requestID, strconv.FormatUint(client.LiveSessionID, 10), "", "INVALID_CHAT_MESSAGE")}
+	}
+	roomID := strings.TrimSpace(payload.RoomID)
+	expectedRoomID := strconv.FormatUint(client.LiveSessionID, 10)
+	content := strings.TrimSpace(payload.Content)
+	clientMessageID := strings.TrimSpace(payload.ClientMessageID)
+	if roomID != expectedRoomID || content == "" || clientMessageID == "" || len([]rune(content)) > maxWSChatContentRunes {
+		return []corews.Envelope{chatErrorEnvelope(requestID, expectedRoomID, clientMessageID, "INVALID_CHAT_MESSAGE")}
+	}
+	now := time.Now().UTC()
+	createdAt := now.Format(time.RFC3339Nano)
+	messageID := fmt.Sprintf("chat_%s_%d", expectedRoomID, now.UnixNano())
+	message := map[string]interface{}{
+		"id":              messageID,
+		"roomId":          expectedRoomID,
+		"userId":          client.UserID,
+		"nickname":        client.UserID,
+		"content":         content,
+		"clientMessageId": clientMessageID,
+		"createdAt":       createdAt,
+	}
+	h.hub.BroadcastLiveSession(client.LiveSessionID, jsonEnvelope("chat.message", requestID, message))
+	return []corews.Envelope{
+		jsonEnvelope("chat.ack", requestID, map[string]interface{}{
+			"roomId":          expectedRoomID,
+			"clientMessageId": clientMessageID,
+			"messageId":       messageID,
+			"createdAt":       createdAt,
+		}),
+	}
+}
+
+func chatErrorEnvelope(requestID, roomID, clientMessageID, reason string) corews.Envelope {
+	return jsonEnvelope("chat.error", requestID, map[string]interface{}{
+		"roomId":          roomID,
+		"clientMessageId": clientMessageID,
+		"message":         reason,
+	})
+}
+
 func (h *WSHandler) handleBidPlace(ctx context.Context, client *corews.Client, env corews.Envelope) []corews.Envelope {
+	if h.bidPlaceMode == WSBidPlaceDisabled {
+		return []corews.Envelope{jsonEnvelope("bid.ack", env.RequestID, map[string]interface{}{"accepted": false, "reason": "BID_THROUGH_API_REQUIRED"})}
+	}
 	if h.bids == nil {
 		return []corews.Envelope{jsonEnvelope("bid.ack", env.RequestID, map[string]interface{}{"accepted": false, "reason": "BID_SERVICE_UNAVAILABLE"})}
 	}
 	var payload struct {
-		AuctionID            uint64 `json:"auctionId"`
-		Price                int64  `json:"price"`
-		ExpectedCurrentPrice *int64 `json:"expectedCurrentPrice"`
+		AuctionID            wsUint64 `json:"auctionId"`
+		Price                int64    `json:"price"`
+		ExpectedCurrentPrice *int64   `json:"expectedCurrentPrice"`
 	}
 	decoder := json.NewDecoder(bytes.NewReader(env.Payload))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&payload); err != nil {
 		return []corews.Envelope{jsonEnvelope("bid.ack", env.RequestID, map[string]interface{}{"accepted": false, "reason": "INVALID_PAYLOAD"})}
 	}
-	if payload.AuctionID == 0 {
-		payload.AuctionID = client.AuctionID
+	auctionID := uint64(payload.AuctionID)
+	if auctionID == 0 {
+		auctionID = client.AuctionID
 	}
 	requestID := strings.TrimSpace(env.RequestID)
 	if payload.ExpectedCurrentPrice == nil {
 		return []corews.Envelope{jsonEnvelope("bid.ack", requestID, map[string]interface{}{"accepted": false, "reason": "MISSING_EXPECTED_STATE"})}
 	}
-	result, err := h.bids.Place(ctx, service.PlaceBidInput{
+	result, err := h.bids.Place(ctx, PlaceBidInput{
 		RequestID:            requestID,
-		AuctionID:            payload.AuctionID,
+		AuctionID:            auctionID,
 		BidderID:             client.UserID,
 		UserRole:             domain.RoleBuyer,
 		Price:                payload.Price,
@@ -422,7 +845,7 @@ func (h *WSHandler) handleBidPlace(ctx context.Context, client *corews.Client, e
 		Source:               "live_ws",
 	})
 	if err != nil {
-		_, code, message := service.HTTPStatusAndCode(err)
+		_, code, message := HTTPStatusAndCode(err)
 		return []corews.Envelope{jsonEnvelope("bid.ack", requestID, map[string]interface{}{"accepted": false, "code": code, "reason": message})}
 	}
 	return []corews.Envelope{jsonEnvelope("bid.ack", requestID, result)}
@@ -431,6 +854,18 @@ func (h *WSHandler) handleBidPlace(ctx context.Context, client *corews.Client, e
 func jsonEnvelope(eventType, requestID string, payload interface{}) corews.Envelope {
 	raw, _ := json.Marshal(payload)
 	return corews.Envelope{Type: eventType, RequestID: requestID, Payload: raw}
+}
+
+func snapshotRequiredEnvelope(auctionID uint64, reason string, extra map[string]interface{}) corews.Envelope {
+	payload := map[string]interface{}{
+		"auctionId":  auctionID,
+		"reason":     reason,
+		"serverTime": time.Now().UTC().UnixMilli(),
+	}
+	for key, value := range extra {
+		payload[key] = value
+	}
+	return jsonEnvelope("room.snapshot_required", "", payload)
 }
 
 func parseLastSeq(c *app.RequestContext) int64 {

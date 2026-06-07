@@ -137,6 +137,43 @@ func TestAuditMiddlewareWritesAuthenticatedMutation(t *testing.T) {
 	}
 }
 
+func TestAuditMiddlewareUsesRouteTemplateForLongPath(t *testing.T) {
+	h := server.Default()
+	sink := &captureAuditSink{}
+	h.Use(RequestIDMiddleware(), AuditMiddleware(sink, nil))
+	h.POST("/api/v1/ai-assistant/approvals/:requestID/decision", func(ctx context.Context, c *app.RequestContext) {
+		c.Set(contextUserID, "2001")
+		c.Set(contextRole, string(domain.RoleMerchant))
+		WriteSuccess(c, map[string]string{"ok": "true"})
+	})
+
+	rawPath := "/api/v1/ai-assistant/approvals/ai-approval-90000021-1780768457282415000/decision"
+	resp := ut.PerformRequest(h.Engine, consts.MethodPost, rawPath, nil)
+	if resp.Code != consts.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", resp.Code, resp.Body.String())
+	}
+	if len(sink.logs) != 1 {
+		t.Fatalf("expected one audit log, got %d", len(sink.logs))
+	}
+	log := sink.logs[0]
+	if log.Action != "POST /api/v1/ai-assistant/approvals/:requestID/decision" {
+		t.Fatalf("unexpected audit action: %q", log.Action)
+	}
+	if len(log.Action) > 64 {
+		t.Fatalf("audit action should fit schema, len=%d action=%q", len(log.Action), log.Action)
+	}
+	if log.TargetID != "/api/v1/ai-assistant/approvals/:requestID/decision" {
+		t.Fatalf("unexpected audit target id: %q", log.TargetID)
+	}
+	var payload map[string]interface{}
+	if err := json.Unmarshal(log.Payload, &payload); err != nil {
+		t.Fatalf("unmarshal audit payload: %v", err)
+	}
+	if payload["path"] != rawPath {
+		t.Fatalf("payload should keep raw path, got %+v", payload)
+	}
+}
+
 type captureAuditSink struct {
 	logs []domain.AuditLog
 }
@@ -231,6 +268,20 @@ func TestRateLimiterRejectsAfterLimit(t *testing.T) {
 	second := ut.PerformRequest(h.Engine, consts.MethodGet, "/limited", nil, ut.Header{Key: "X-Real-IP", Value: "10.0.0.1"})
 	if second.Code != 429 {
 		t.Fatalf("expected second request rate limited, got %d body=%s", second.Code, second.Body.String())
+	}
+}
+
+func TestRateLimiterSkipsWebSocketPaths(t *testing.T) {
+	h := server.Default()
+	h.Use(RequestIDMiddleware(), NewRateLimiter(1, time.Minute).Middleware())
+	h.GET("/ws/live-rooms/:room_id", func(ctx context.Context, c *app.RequestContext) {
+		WriteSuccess(c, "ok")
+	})
+
+	first := ut.PerformRequest(h.Engine, consts.MethodGet, "/ws/live-rooms/1", nil, ut.Header{Key: "X-Real-IP", Value: "10.0.0.9"})
+	second := ut.PerformRequest(h.Engine, consts.MethodGet, "/ws/live-rooms/1", nil, ut.Header{Key: "X-Real-IP", Value: "10.0.0.9"})
+	if first.Code != 200 || second.Code != 200 {
+		t.Fatalf("expected websocket paths to skip generic rate limiter, first=%d second=%d", first.Code, second.Code)
 	}
 }
 

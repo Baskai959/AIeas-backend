@@ -9,7 +9,6 @@ import (
 
 	"aieas_backend/internal/domain"
 	"aieas_backend/internal/infra/observability/tracing"
-	"aieas_backend/internal/service"
 
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
@@ -19,7 +18,7 @@ type resourcesReadParams struct {
 	URI string `json:"uri"`
 }
 
-func (h *Handler) readResource(ctx context.Context, rawURI string, actor service.MCPActor, traceID string) (resourceReadResult, error) {
+func (h *Handler) readResource(ctx context.Context, rawURI string, actor MCPActor, traceID string) (resourceReadResult, error) {
 	if h.read == nil {
 		return resourceReadResult{}, domain.ErrNotFound
 	}
@@ -63,7 +62,7 @@ func (h *Handler) readResource(ctx context.Context, rawURI string, actor service
 	}}}, nil
 }
 
-func (h *Handler) resourceData(ctx context.Context, rawURI string, actor service.MCPActor) (interface{}, error) {
+func (h *Handler) resourceData(ctx context.Context, rawURI string, actor MCPActor) (interface{}, error) {
 	u, err := url.Parse(strings.TrimSpace(rawURI))
 	if err != nil || u.Scheme != "aieas" || u.Host == "" {
 		return nil, domain.ErrInvalidArgument
@@ -147,7 +146,7 @@ func (h *Handler) resourceData(ctx context.Context, rawURI string, actor service
 	return nil, domain.ErrInvalidArgument
 }
 
-func (h *Handler) liveSessionResourceData(ctx context.Context, parts []string, q url.Values, actor service.MCPActor) (interface{}, error) {
+func (h *Handler) liveSessionResourceData(ctx context.Context, parts []string, q url.Values, actor MCPActor) (interface{}, error) {
 	if len(parts) == 0 {
 		filter := domain.LiveSessionFilter{
 			MerchantID: strings.TrimSpace(q.Get("merchantId")),

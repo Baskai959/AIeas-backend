@@ -4,7 +4,8 @@ import (
 	"errors"
 
 	"aieas_backend/internal/domain"
-	"aieas_backend/internal/service"
+	aiapp "aieas_backend/internal/modules/ai/app"
+	httptransport "aieas_backend/internal/transport/http"
 )
 
 const (
@@ -24,7 +25,7 @@ func rpcErrorFor(err error, traceID string) *rpcError {
 	if err == nil {
 		return nil
 	}
-	httpStatus, businessCode, message := service.HTTPStatusAndCode(err)
+	httpStatus, businessCode, message := httptransport.HTTPStatusAndCode(err)
 	code := rpcInternalError
 	switch {
 	case errors.Is(err, domain.ErrTokenMissing), errors.Is(err, domain.ErrTokenInvalid):
@@ -42,10 +43,10 @@ func rpcErrorFor(err error, traceID string) *rpcError {
 	case errors.Is(err, domain.ErrConflict), errors.Is(err, domain.ErrInvalidState):
 		code = rpcConflict
 		message = "conflict"
-	case errors.Is(err, service.ErrAIAssistantUserRejected):
+	case errors.Is(err, aiapp.ErrUserRejected):
 		code = rpcForbidden
 		message = "用户拒绝执行"
-	case errors.Is(err, service.ErrAIAssistantApprovalTimeout):
+	case errors.Is(err, aiapp.ErrApprovalTimeout):
 		code = rpcConflict
 		message = "用户未确认执行"
 	case httpStatus >= 500:
@@ -92,9 +93,9 @@ func mcpStatusFromError(err error) string {
 		return "not_found"
 	case errors.Is(err, domain.ErrConflict), errors.Is(err, domain.ErrInvalidState):
 		return "conflict"
-	case errors.Is(err, service.ErrAIAssistantUserRejected):
+	case errors.Is(err, aiapp.ErrUserRejected):
 		return "user_rejected"
-	case errors.Is(err, service.ErrAIAssistantApprovalTimeout):
+	case errors.Is(err, aiapp.ErrApprovalTimeout):
 		return "approval_timeout"
 	default:
 		return "error"

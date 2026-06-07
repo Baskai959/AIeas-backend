@@ -1,8 +1,16 @@
 package main
 
-import "aieas_backend/internal/app"
+import (
+	"flag"
+
+	"aieas_backend/internal/app"
+	"aieas_backend/internal/config"
+)
 
 func main() {
-	h := app.NewServer()
+	configPath := flag.String("config", config.DefaultPath, "config file path")
+	flag.Parse()
+
+	h := app.NewServerFromConfigPath(*configPath)
 	h.Spin()
 }

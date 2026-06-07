@@ -9,7 +9,7 @@ import (
 
 	"aieas_backend/internal/domain"
 	"aieas_backend/internal/infra/observability/tracing"
-	"aieas_backend/internal/service"
+	aiapp "aieas_backend/internal/modules/ai/app"
 
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
@@ -20,7 +20,7 @@ type toolsCallParams struct {
 	Arguments json.RawMessage `json:"arguments"`
 }
 
-func (h *Handler) callTool(ctx context.Context, name string, arguments json.RawMessage, actor service.MCPActor, traceID string) (toolCallResult, error) {
+func (h *Handler) callTool(ctx context.Context, name string, arguments json.RawMessage, actor MCPActor, traceID string) (toolCallResult, error) {
 	if h.read == nil && h.control == nil {
 		return toolCallResult{}, domain.ErrNotFound
 	}
@@ -62,10 +62,10 @@ func (h *Handler) callTool(ctx context.Context, name string, arguments json.RawM
 		h.notifyReadAssistantStatus(ctx, liveSessionID, actor.ID, toolName, resultStatus, resultMessage)
 	}
 	if err != nil {
-		if errors.Is(err, service.ErrAIAssistantUserRejected) || errors.Is(err, service.ErrAIAssistantApprovalTimeout) {
+		if errors.Is(err, aiapp.ErrUserRejected) || errors.Is(err, aiapp.ErrApprovalTimeout) {
 			message := "用户拒绝执行"
-			if errors.Is(err, service.ErrAIAssistantApprovalTimeout) {
-				message = "用户未确认执行"
+			if errors.Is(err, aiapp.ErrApprovalTimeout) {
+				message = "审批请求已自动处理或已过期"
 			}
 			text, encodeErr := h.payloadText(traceID, map[string]interface{}{
 				"message": message,
@@ -132,8 +132,16 @@ func (h *Handler) readToolAssistantStatus(name string, arguments json.RawMessage
 	}
 }
 
-func (h *Handler) toolData(ctx context.Context, name string, arguments json.RawMessage, actor service.MCPActor) (interface{}, error) {
+func (h *Handler) toolData(ctx context.Context, name string, arguments json.RawMessage, actor MCPActor) (interface{}, error) {
 	switch strings.TrimSpace(name) {
+	case "get_current_time":
+		if h.read != nil {
+			return h.read.CurrentTime(ctx, actor)
+		}
+		if h.control != nil {
+			return h.control.CurrentTime(ctx, actor)
+		}
+		return nil, domain.ErrNotFound
 	case "read_user":
 		if h.read == nil {
 			return nil, domain.ErrNotFound
@@ -312,12 +320,13 @@ func (h *Handler) toolData(ctx context.Context, name string, arguments json.RawM
 			return nil, domain.ErrNotFound
 		}
 		var in struct {
-			LiveSessionID      uint64 `json:"liveSessionId"`
-			AuctionID          uint64 `json:"auctionId"`
-			Action             string `json:"action"`
-			AuctionDurationSec int    `json:"auctionDurationSec"`
-			Force              *bool  `json:"force"`
-			RequestID          string `json:"requestId"`
+			LiveSessionID uint64     `json:"liveSessionId"`
+			AuctionID     uint64     `json:"auctionId"`
+			Action        string     `json:"action"`
+			DurationSec   int        `json:"durationSec"`
+			StartTime     *time.Time `json:"startTime"`
+			Force         *bool      `json:"force"`
+			RequestID     string     `json:"requestId"`
 		}
 		if err := decodeParams(arguments, &in); err != nil || in.LiveSessionID == 0 || in.AuctionID == 0 || strings.TrimSpace(in.Action) == "" {
 			return nil, domain.ErrInvalidArgument
@@ -326,13 +335,14 @@ func (h *Handler) toolData(ctx context.Context, name string, arguments json.RawM
 		if in.Force != nil {
 			force = *in.Force
 		}
-		return h.control.OperateLiveSessionLot(ctx, service.MCPLiveLotOperationInput{
-			LiveSessionID:      in.LiveSessionID,
-			AuctionID:          in.AuctionID,
-			Action:             in.Action,
-			AuctionDurationSec: in.AuctionDurationSec,
-			Force:              force,
-			RequestID:          in.RequestID,
+		return h.control.OperateLiveSessionLot(ctx, LiveLotOperationInput{
+			LiveSessionID: in.LiveSessionID,
+			AuctionID:     in.AuctionID,
+			Action:        in.Action,
+			DurationSec:   in.DurationSec,
+			StartTime:     in.StartTime,
+			Force:         force,
+			RequestID:     in.RequestID,
 		}, actor)
 	case "live_voice_broadcast":
 		if h.control == nil {
@@ -346,7 +356,7 @@ func (h *Handler) toolData(ctx context.Context, name string, arguments json.RawM
 		if err := decodeParams(arguments, &in); err != nil || in.LiveSessionID == 0 || strings.TrimSpace(in.Text) == "" {
 			return nil, domain.ErrInvalidArgument
 		}
-		return h.control.CreateLiveVoiceBroadcast(ctx, service.MCPLiveVoiceBroadcastInput{
+		return h.control.CreateLiveVoiceBroadcast(ctx, LiveVoiceBroadcastInput{
 			LiveSessionID: in.LiveSessionID,
 			Text:          in.Text,
 			RequestID:     in.RequestID,

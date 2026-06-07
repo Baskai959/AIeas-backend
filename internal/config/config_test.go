@@ -3,11 +3,12 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
 
-func TestLoadParsesYAMLAndAppliesEnvOverrides(t *testing.T) {
+func TestLoadParsesYAMLAndAppliesSecretEnvOverridesOnly(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yaml")
 	data := []byte(`
@@ -31,20 +32,26 @@ idempotency:
 jwt:
   secret: "from-file"
   accessTokenTTL: 30m
+objectStorage:
+  enabled: true
+  endpoint: "https://tos-cn-boe.volces.com"
+  region: "cn-guilin-boe"
+  bucket: "aieas"
+  bucketURL: "https://aieas.tos-cn-boe.volces.com"
 `)
 	if err := os.WriteFile(path, data, 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
 	t.Setenv("SERVER_ADDR", ":7070")
 	t.Setenv("JWT_SECRET", "from-env")
+	t.Setenv("REDIS_RT_SHARD_0_PASSWORD", "rt-password-from-env")
 	t.Setenv("REDIS_RT_SHARD_0_DB", "3")
+	t.Setenv("REDIS_CACHE_PASSWORD", "cache-password-from-env")
 	t.Setenv("IDEMPOTENCY_TTL", "30m")
 	t.Setenv("AUCTION_BID_IDEMPOTENCY_TTL", "45s")
-	t.Setenv("OBJECT_STORAGE_ENABLED", "true")
-	t.Setenv("OBJECT_STORAGE_ENDPOINT", "https://tos-cn-boe.volces.com")
-	t.Setenv("OBJECT_STORAGE_REGION", "cn-guilin-boe")
-	t.Setenv("OBJECT_STORAGE_BUCKET", "aieas")
-	t.Setenv("OBJECT_STORAGE_BUCKET_URL", "https://aieas.tos-cn-boe.volces.com")
+	t.Setenv("WEBSOCKET_HANDSHAKE_RATE_LIMIT_PER_IP", "0")
+	t.Setenv("OBJECT_STORAGE_ENABLED", "false")
+	t.Setenv("OBJECT_STORAGE_ENDPOINT", "https://ignored.example.com")
 	t.Setenv("OBJECT_STORAGE_ACCESS_KEY", "ak")
 	t.Setenv("OBJECT_STORAGE_SECRET_KEY", "sk")
 	t.Setenv("AGENT_PRODUCT_DESCRIPTION_URL", "http://127.0.0.1:9000/api/v1/product-description")
@@ -58,24 +65,26 @@ jwt:
 	t.Setenv("AGENT_TIMEOUT", "5s")
 	t.Setenv("DOUBAO_TTS_APP_ID", "doubao-appid")
 	t.Setenv("DOUBAO_TTS_ACK_TOKEN", "doubao-acktoken")
-	t.Setenv("DOUBAO_TTS_VOICE", "zh_female_vv_jupiter_bigtts")
+	t.Setenv("DOUBAO_TTS_VOICE", "ignored_voice")
 	t.Setenv("MCP_READ_API_KEY", "mcp-read-from-env")
-	t.Setenv("MCP_READ_ACTOR_ID", "u_9001")
-	t.Setenv("MCP_READ_ACTOR_ROLE", "admin")
+	t.Setenv("MCP_READ_ACTOR_ID", "u_ignored")
+	t.Setenv("MCP_READ_ACTOR_ROLE", "buyer")
 	t.Setenv("MCP_CONTROL_API_KEY", "mcp-control-from-env")
-	t.Setenv("MCP_CONTROL_ACTOR_ID", "u_9001")
-	t.Setenv("MCP_CONTROL_ACTOR_ROLE", "admin")
+	t.Setenv("MCP_CONTROL_ACTOR_ID", "u_ignored")
+	t.Setenv("MCP_CONTROL_ACTOR_ROLE", "buyer")
 	t.Setenv("KAFKA_ENABLED", "true")
 	t.Setenv("KAFKA_BROKERS", "127.0.0.1:9092,127.0.0.1:9093")
 	t.Setenv("KAFKA_BID_EVENTS_TOPIC", "test.bid.events")
+	t.Setenv("OBSERVABILITY_FORMAT", "json")
+	t.Setenv("OBSERVABILITY_METRICS_AUTH_TOKEN", "metrics-token-from-env")
 
 	cfg, err := Load(path)
 	if err != nil {
 		t.Fatalf("load config: %v", err)
 	}
 
-	if cfg.Server.Addr != ":7070" {
-		t.Fatalf("expected env server addr, got %q", cfg.Server.Addr)
+	if cfg.Server.Addr != ":9090" {
+		t.Fatalf("expected server addr from yaml, got %q", cfg.Server.Addr)
 	}
 	if cfg.Server.ReadTimeout.Std() != 2*time.Second {
 		t.Fatalf("expected read timeout 2s, got %s", cfg.Server.ReadTimeout.Std())
@@ -83,36 +92,31 @@ jwt:
 	if cfg.MySQL.MaxOpenConns != 12 {
 		t.Fatalf("expected mysql max open conns 12, got %d", cfg.MySQL.MaxOpenConns)
 	}
-	if cfg.Redis.RT.Shards[0].Addr != "127.0.0.1:6381" || cfg.Redis.RT.Shards[0].DB != 3 {
+	if cfg.Redis.RT.Shards[0].Addr != "127.0.0.1:6381" || cfg.Redis.RT.Shards[0].DB != 2 || cfg.Redis.RT.Shards[0].Password != "rt-password-from-env" {
 		t.Fatalf("unexpected redis rt shard[0] config: %+v", cfg.Redis.RT.Shards[0])
 	}
 	if len(cfg.Redis.RT.Shards) < 2 || cfg.Redis.RT.Shards[1].Addr != "127.0.0.1:6382" {
 		t.Fatalf("unexpected redis rt shard[1] config: %+v", cfg.Redis.RT.Shards)
 	}
-	if cfg.Redis.Cache.Addr != "127.0.0.1:6380" || cfg.Redis.Cache.DB != 1 {
+	if cfg.Redis.Cache.Addr != "127.0.0.1:6380" || cfg.Redis.Cache.DB != 1 || cfg.Redis.Cache.Password != "cache-password-from-env" {
 		t.Fatalf("unexpected redis cache config: %+v", cfg.Redis.Cache)
 	}
 	if cfg.JWT.Secret != "from-env" || cfg.JWT.AccessTokenTTL.Std() != 30*time.Minute {
 		t.Fatalf("unexpected jwt config: %+v", cfg.JWT)
 	}
-	if cfg.Idempotency.TTL.Std() != 30*time.Minute {
-		t.Fatalf("expected idempotency ttl env override, got %s", cfg.Idempotency.TTL.Std())
+	if cfg.Idempotency.TTL.Std() != 2*time.Hour {
+		t.Fatalf("expected idempotency ttl from yaml, got %s", cfg.Idempotency.TTL.Std())
 	}
-	if cfg.Auction.BidIdempotencyTTL.Std() != 45*time.Second {
-		t.Fatalf("expected auction bid idempotency ttl env override, got %s", cfg.Auction.BidIdempotencyTTL.Std())
+	if cfg.Auction.BidIdempotencyTTL.Std() != 30*time.Second {
+		t.Fatalf("expected auction bid idempotency ttl from config/default, got %s", cfg.Auction.BidIdempotencyTTL.Std())
 	}
-	if !cfg.ObjectStorage.Enabled || cfg.ObjectStorage.Bucket != "aieas" || cfg.ObjectStorage.BucketURL != "https://aieas.tos-cn-boe.volces.com" {
+	if !cfg.ObjectStorage.Enabled || cfg.ObjectStorage.Endpoint != "https://tos-cn-boe.volces.com" || cfg.ObjectStorage.AccessKey != "ak" || cfg.ObjectStorage.SecretKey != "sk" {
 		t.Fatalf("unexpected object storage config: %+v", cfg.ObjectStorage)
 	}
-	if cfg.Agent.ProductDescriptionURL != "http://127.0.0.1:9000/api/v1/product-description" ||
-		cfg.Agent.ProductAuditEnabled ||
-		cfg.Agent.ProductAuditURL != "http://127.0.0.1:9000/api/v1/product-audit" ||
-		cfg.Agent.ProductAuditCallbackURL != "http://127.0.0.1:7070/api/v1/auctions/audit/callback" ||
-		cfg.Agent.LiveAnalysisURL != "http://127.0.0.1:9000/api/v1/live-analysis/async" ||
-		cfg.Agent.LiveAnalysisCallbackURL != "http://127.0.0.1:7070/api/v1/live-analysis/callback" ||
+	if cfg.Agent.ProductDescriptionURL != "http://127.0.0.1:8000/api/v1/product-description" ||
+		!cfg.Agent.ProductAuditEnabled ||
 		cfg.Agent.LiveAnalysisCallbackAPIKey != "callback-from-env" ||
-		cfg.Agent.LiveAuctionHookURL != "http://127.0.0.1:9000/api/v1/live-auction-hook" ||
-		cfg.Agent.Timeout.Std() != 5*time.Second {
+		cfg.Agent.Timeout.Std() != 45*time.Second {
 		t.Fatalf("unexpected agent config: %+v", cfg.Agent)
 	}
 	if cfg.MCP.Read.APIKey != "mcp-read-from-env" || cfg.MCP.Read.ActorID != "u_9001" || cfg.MCP.Read.ActorRole != "admin" ||
@@ -122,8 +126,14 @@ jwt:
 	if cfg.DoubaoTTS.AppID != "doubao-appid" || cfg.DoubaoTTS.AckToken != "doubao-acktoken" || cfg.DoubaoTTS.Voice != "zh_female_vv_jupiter_bigtts" {
 		t.Fatalf("unexpected doubao tts config: %+v", cfg.DoubaoTTS)
 	}
-	if !cfg.Kafka.Enabled || len(cfg.Kafka.Brokers) != 2 || cfg.Kafka.Brokers[0] != "127.0.0.1:9092" || cfg.Kafka.BidEventsTopic != "test.bid.events" {
+	if cfg.Kafka.Enabled || len(cfg.Kafka.Brokers) != 1 || cfg.Kafka.BidEventsTopic != "aieas.bid.events" {
 		t.Fatalf("unexpected kafka config: %+v", cfg.Kafka)
+	}
+	if cfg.WebSocket.HandshakeRateLimitPerIP != 60 {
+		t.Fatalf("expected websocket handshake limit from config/default, got %d", cfg.WebSocket.HandshakeRateLimitPerIP)
+	}
+	if cfg.Observability.Format != "text" || cfg.Observability.Metrics.AuthToken != "metrics-token-from-env" {
+		t.Fatalf("unexpected observability config: %+v", cfg.Observability)
 	}
 }
 
@@ -167,6 +177,84 @@ redis:
 	}
 	if cfg.Redis.RT.Shards[0].Password != "redis-from-dotenv" {
 		t.Fatalf("expected Redis password from .env, got %q", cfg.Redis.RT.Shards[0].Password)
+	}
+}
+
+func TestLoadIgnoresEmptySecretEnvOverrides(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	data := []byte(`
+jwt:
+  secret: "jwt-from-file"
+  accessTokenTTL: 30m
+redis:
+  rt:
+    shards:
+      - addr: "127.0.0.1:6381"
+        password: "rt-from-file"
+      - addr: "127.0.0.1:6382"
+        password: "rt2-from-file"
+  cache:
+    addr: "127.0.0.1:6380"
+    password: "cache-from-file"
+objectStorage:
+  enabled: true
+  endpoint: "https://tos-cn-boe.volces.com"
+  region: "cn-guilin-boe"
+  bucket: "aieas"
+  bucketURL: "https://aieas.tos-cn-boe.volces.com"
+  accessKey: "ak-from-file"
+  secretKey: "sk-from-file"
+agent:
+  liveAnalysisCallbackAPIKey: "callback-from-file"
+mcp:
+  read:
+    apiKey: "read-from-file"
+    actorID: "u_9001"
+    actorRole: "admin"
+  control:
+    apiKey: "control-from-file"
+    actorID: "u_9001"
+    actorRole: "admin"
+observability:
+  metrics:
+    authToken: "metrics-from-file"
+`)
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	for _, key := range []string{
+		"JWT_SECRET",
+		"REDIS_RT_SHARD_0_PASSWORD",
+		"REDIS_RT_SHARD_1_PASSWORD",
+		"REDIS_RT_PRIMARY_PASSWORD",
+		"REDIS_CACHE_PASSWORD",
+		"OBJECT_STORAGE_ACCESS_KEY",
+		"OBJECT_STORAGE_SECRET_KEY",
+		"AGENT_LIVE_ANALYSIS_CALLBACK_API_KEY",
+		"MCP_READ_API_KEY",
+		"MCP_CONTROL_API_KEY",
+		"OBSERVABILITY_METRICS_AUTH_TOKEN",
+	} {
+		t.Setenv(key, "")
+	}
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if cfg.JWT.Secret != "jwt-from-file" ||
+		cfg.Redis.RT.Shards[0].Password != "rt-from-file" ||
+		cfg.Redis.RT.Shards[1].Password != "rt2-from-file" ||
+		cfg.Redis.Cache.Password != "cache-from-file" ||
+		cfg.ObjectStorage.AccessKey != "ak-from-file" ||
+		cfg.ObjectStorage.SecretKey != "sk-from-file" ||
+		cfg.Agent.LiveAnalysisCallbackAPIKey != "callback-from-file" ||
+		cfg.MCP.Read.APIKey != "read-from-file" ||
+		cfg.MCP.Control.APIKey != "control-from-file" ||
+		cfg.Observability.Metrics.AuthToken != "metrics-from-file" {
+		t.Fatalf("empty secret env should not override yaml config: %+v", cfg)
 	}
 }
 
@@ -220,7 +308,21 @@ func TestObservabilityDefaults(t *testing.T) {
 	}
 }
 
-func TestObservabilityEnvOverrides(t *testing.T) {
+func TestRepositoryConfigFilesLoad(t *testing.T) {
+	for _, path := range []string{"configs/config.yaml", "configs/config.docker.yaml"} {
+		t.Run(path, func(t *testing.T) {
+			cfg, err := Load(path)
+			if err != nil {
+				t.Fatalf("load %s: %v", path, err)
+			}
+			if strings.TrimSpace(cfg.Server.Addr) == "" {
+				t.Fatalf("%s loaded empty server addr", path)
+			}
+		})
+	}
+}
+
+func TestObservabilityEnvOnlyOverridesMetricsAuthToken(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yaml")
 	if err := os.WriteFile(path, []byte("jwt:\n  secret: \"local\"\n  accessTokenTTL: 30m\n"), 0o600); err != nil {
@@ -228,16 +330,20 @@ func TestObservabilityEnvOverrides(t *testing.T) {
 	}
 	t.Setenv("OBSERVABILITY_FORMAT", "json")
 	t.Setenv("OBSERVABILITY_SLOW_SQL_THRESHOLD_MS", "500")
+	t.Setenv("OBSERVABILITY_METRICS_AUTH_TOKEN", "metrics-secret")
 
 	cfg, err := Load(path)
 	if err != nil {
 		t.Fatalf("load config: %v", err)
 	}
-	if cfg.Observability.Format != "json" {
-		t.Fatalf("expected env override format=json, got %q", cfg.Observability.Format)
+	if cfg.Observability.Format != "text" {
+		t.Fatalf("expected format from config/default, got %q", cfg.Observability.Format)
 	}
-	if cfg.Observability.SlowSQLThresholdMs != 500 {
-		t.Fatalf("expected env override slowSQLThresholdMs=500, got %d", cfg.Observability.SlowSQLThresholdMs)
+	if cfg.Observability.SlowSQLThresholdMs != 200 {
+		t.Fatalf("expected slowSQLThresholdMs from config/default, got %d", cfg.Observability.SlowSQLThresholdMs)
+	}
+	if cfg.Observability.Metrics.AuthToken != "metrics-secret" {
+		t.Fatalf("expected metrics auth token from env, got %q", cfg.Observability.Metrics.AuthToken)
 	}
 }
 
@@ -254,6 +360,79 @@ func TestObservabilityValidateRejectsNegativeSlowThreshold(t *testing.T) {
 	cfg.Observability.SlowSQLThresholdMs = -1
 	if err := cfg.Validate(); err == nil {
 		t.Fatal("expected negative observability.slowSQLThresholdMs to be rejected")
+	}
+}
+
+func TestAppRoleDefaultConfigAndInvalid(t *testing.T) {
+	cfg := Default()
+	if cfg.App.Role != "all" {
+		t.Fatalf("expected default app.role all, got %q", cfg.App.Role)
+	}
+	cfg.App.Role = ""
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("empty role should normalize to all: %v", err)
+	}
+	if cfg.App.Role != "all" {
+		t.Fatalf("expected empty role normalized to all, got %q", cfg.App.Role)
+	}
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(path, []byte("jwt:\n  secret: local\n  accessTokenTTL: 30m\n"), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	t.Setenv("APP_ROLE", "ws-gateway")
+	loaded, err := Load(path)
+	if err != nil {
+		t.Fatalf("load config with ignored APP_ROLE: %v", err)
+	}
+	if loaded.App.Role != "all" {
+		t.Fatalf("expected APP_ROLE env ignored and default all, got %q", loaded.App.Role)
+	}
+
+	cfg = Default()
+	cfg.App.Role = "worker"
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "app.role") {
+		t.Fatalf("expected invalid app.role error, got %v", err)
+	}
+}
+
+func TestWebSocketConfigBounds(t *testing.T) {
+	cfg := Default()
+	cases := []struct {
+		name string
+		mut  func(*Config)
+	}{
+		{name: "write timeout", mut: func(c *Config) { c.WebSocket.WriteTimeout = 0 }},
+		{name: "negative handshake per ip", mut: func(c *Config) { c.WebSocket.HandshakeRateLimitPerIP = -1 }},
+		{name: "negative handshake per user", mut: func(c *Config) { c.WebSocket.HandshakeRateLimitPerUser = -1 }},
+		{name: "negative handshake per auction", mut: func(c *Config) { c.WebSocket.HandshakeRateLimitPerAuction = -1 }},
+		{name: "drain timeout", mut: func(c *Config) { c.WebSocket.DrainTimeout = 0 }},
+		{name: "close grace", mut: func(c *Config) { c.WebSocket.CloseGrace = 0 }},
+		{name: "negative jitter", mut: func(c *Config) { c.WebSocket.PingJitter = Duration(-time.Second) }},
+		{name: "large jitter", mut: func(c *Config) { c.WebSocket.PingJitter = Duration(6 * time.Second) }},
+		{name: "replay too small", mut: func(c *Config) { c.WebSocket.ReplayLimit = 0 }},
+		{name: "replay too large", mut: func(c *Config) { c.WebSocket.ReplayLimit = 4097 }},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			got := cfg
+			tt.mut(&got)
+			if err := got.Validate(); err == nil {
+				t.Fatalf("expected validation error")
+			}
+		})
+	}
+}
+
+func TestWebSocketConfigAllowsZeroHandshakeRateLimits(t *testing.T) {
+	cfg := Default()
+	cfg.WebSocket.HandshakeRateLimitPerIP = 0
+	cfg.WebSocket.HandshakeRateLimitPerUser = 0
+	cfg.WebSocket.HandshakeRateLimitPerAuction = 0
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("expected zero handshake rate limits to disable limiting, got %v", err)
 	}
 }
 

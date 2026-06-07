@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"mime/multipart"
 	"net/url"
 	"strconv"
@@ -15,8 +16,13 @@ import (
 	appconfig "aieas_backend/internal/config"
 	"aieas_backend/internal/domain"
 	"aieas_backend/internal/infra/objectstorage"
-	"aieas_backend/internal/repository"
-	"aieas_backend/internal/service"
+	aiapp "aieas_backend/internal/modules/ai/app"
+	auctionports "aieas_backend/internal/modules/auction/ports"
+	liveanalysisapp "aieas_backend/internal/modules/live_analysis/app"
+	liveanalysisports "aieas_backend/internal/modules/live_analysis/ports"
+	mcpapp "aieas_backend/internal/modules/mcp/app"
+	"aieas_backend/internal/tests/repository"
+	httptransport "aieas_backend/internal/transport/http"
 	wstransport "aieas_backend/internal/transport/ws"
 
 	"github.com/cloudwego/hertz/pkg/app/server"
@@ -32,6 +38,14 @@ type apiResponse struct {
 	TraceID string          `json:"trace_id"`
 }
 
+type appDisabledProductAuditor struct{}
+
+func (appDisabledProductAuditor) AuditProduct(ctx context.Context, in auctionports.ProductAuditInput) (auctionports.ProductAuditResult, error) {
+	_ = ctx
+	_ = in
+	return auctionports.ProductAuditResult{}, nil
+}
+
 func TestPingStillWorks(t *testing.T) {
 	h := newTestServer()
 	resp := ut.PerformRequest(h.Engine, consts.MethodGet, "/ping", nil)
@@ -40,6 +54,198 @@ func TestPingStillWorks(t *testing.T) {
 	}
 	if !strings.Contains(resp.Body.String(), "pong") {
 		t.Fatalf("expected pong response, got %s", resp.Body.String())
+	}
+}
+
+func TestAppRoleRouteRegistration(t *testing.T) {
+	tests := []struct {
+		role       string
+		wantAPI    int
+		wantAPIGET int
+		wantWS     int
+		wantMCP    int
+		wantPing   int
+		wantReady  int
+	}{
+		{role: "all", wantAPI: 200, wantAPIGET: 401, wantWS: 401, wantMCP: 405, wantPing: 200, wantReady: 200},
+		{role: "api", wantAPI: 200, wantAPIGET: 401, wantWS: 404, wantMCP: 405, wantPing: 200, wantReady: 200},
+		{role: "ws-gateway", wantAPI: 404, wantAPIGET: 404, wantWS: 401, wantMCP: 404, wantPing: 200, wantReady: 200},
+	}
+	for _, tt := range tests {
+		t.Run(tt.role, func(t *testing.T) {
+			cfg := appconfig.Default()
+			cfg.App.Role = tt.role
+			h := NewServerWithDependencies(cfg, ServerDependencies{
+				UserRepo:       repository.NewSeedUserRepository(),
+				ObjectUploader: objectstorage.NewMemoryUploader(""),
+				ProductAuditor: appDisabledProductAuditor{},
+			})
+
+			loginBody := `{"account":"buyer001","password":"Passw0rd!","role":"buyer"}`
+			apiResp := ut.PerformRequest(h.Engine, consts.MethodPost, "/api/v1/auth/login", &ut.Body{Body: strings.NewReader(loginBody), Len: len(loginBody)}, ut.Header{Key: "Content-Type", Value: "application/json"})
+			if apiResp.Code != tt.wantAPI {
+				t.Fatalf("api status=%d want %d raw=%s", apiResp.Code, tt.wantAPI, apiResp.Body.String())
+			}
+			apiGetResp := ut.PerformRequest(h.Engine, consts.MethodGet, "/api/v1/auth/me", nil)
+			if apiGetResp.Code != tt.wantAPIGET {
+				t.Fatalf("api get status=%d want %d raw=%s", apiGetResp.Code, tt.wantAPIGET, apiGetResp.Body.String())
+			}
+			wsResp := ut.PerformRequest(h.Engine, consts.MethodGet, "/ws/auctions/1", nil)
+			if wsResp.Code != tt.wantWS {
+				t.Fatalf("ws status=%d want %d body=%s", wsResp.Code, tt.wantWS, wsResp.Body.String())
+			}
+			wsLiveRoomResp := ut.PerformRequest(h.Engine, consts.MethodGet, "/ws/live-rooms/1", nil)
+			if wsLiveRoomResp.Code != tt.wantWS {
+				t.Fatalf("ws live-room status=%d want %d body=%s", wsLiveRoomResp.Code, tt.wantWS, wsLiveRoomResp.Body.String())
+			}
+			mcpResp := ut.PerformRequest(h.Engine, consts.MethodGet, "/mcp/read", nil)
+			if mcpResp.Code != tt.wantMCP {
+				t.Fatalf("mcp status=%d want %d body=%s", mcpResp.Code, tt.wantMCP, mcpResp.Body.String())
+			}
+			pingResp := ut.PerformRequest(h.Engine, consts.MethodGet, "/ping", nil)
+			if pingResp.Code != tt.wantPing {
+				t.Fatalf("ping status=%d want %d", pingResp.Code, tt.wantPing)
+			}
+			readyResp := ut.PerformRequest(h.Engine, consts.MethodGet, "/readyz", nil)
+			if readyResp.Code != tt.wantReady {
+				t.Fatalf("readyz status=%d want %d body=%s", readyResp.Code, tt.wantReady, readyResp.Body.String())
+			}
+		})
+	}
+}
+
+func TestAppRoleWorkerDecisions(t *testing.T) {
+	tests := []struct {
+		role                string
+		wantAPI             bool
+		wantWS              bool
+		wantBusinessWorkers bool
+		wantWSConsumers     bool
+	}{
+		{role: "all", wantAPI: true, wantWS: true, wantBusinessWorkers: true, wantWSConsumers: true},
+		{role: "api", wantAPI: true, wantWS: false, wantBusinessWorkers: true, wantWSConsumers: false},
+		{role: "ws-gateway", wantAPI: false, wantWS: true, wantBusinessWorkers: false, wantWSConsumers: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.role, func(t *testing.T) {
+			cfg := appconfig.Default()
+			cfg.App.Role = tt.role
+			if got := shouldRegisterAPIRoutes(cfg); got != tt.wantAPI {
+				t.Fatalf("shouldRegisterAPIRoutes=%v want %v", got, tt.wantAPI)
+			}
+			if got := shouldRegisterWSRoutes(cfg); got != tt.wantWS {
+				t.Fatalf("shouldRegisterWSRoutes=%v want %v", got, tt.wantWS)
+			}
+			if got := shouldStartBusinessWorkers(cfg); got != tt.wantBusinessWorkers {
+				t.Fatalf("shouldStartBusinessWorkers=%v want %v", got, tt.wantBusinessWorkers)
+			}
+			if got := shouldStartWSConsumers(cfg); got != tt.wantWSConsumers {
+				t.Fatalf("shouldStartWSConsumers=%v want %v", got, tt.wantWSConsumers)
+			}
+		})
+	}
+}
+
+func TestReadyzFailsAfterHubBeginsDraining(t *testing.T) {
+	cfg := appconfig.Default()
+	cfg.App.Role = "ws-gateway"
+	hub := wstransport.NewHub()
+	h := NewServerWithDependencies(cfg, ServerDependencies{
+		UserRepo:       repository.NewSeedUserRepository(),
+		Hub:            hub,
+		ObjectUploader: objectstorage.NewMemoryUploader(""),
+		ProductAuditor: appDisabledProductAuditor{},
+	})
+
+	ready := ut.PerformRequest(h.Engine, consts.MethodGet, "/readyz", nil)
+	if ready.Code != 200 {
+		t.Fatalf("readyz before drain status=%d body=%s", ready.Code, ready.Body.String())
+	}
+	hub.BeginDrain(5000)
+	ready = ut.PerformRequest(h.Engine, consts.MethodGet, "/readyz", nil)
+	if ready.Code != consts.StatusServiceUnavailable {
+		t.Fatalf("readyz after drain status=%d want 503 body=%s", ready.Code, ready.Body.String())
+	}
+}
+
+func TestReadinessProbeRoleFiltering(t *testing.T) {
+	tests := []struct {
+		role       string
+		wantStatus int
+		wantMySQL  bool
+	}{
+		{role: "all", wantStatus: consts.StatusServiceUnavailable, wantMySQL: true},
+		{role: "api", wantStatus: consts.StatusServiceUnavailable, wantMySQL: true},
+		{role: "ws-gateway", wantStatus: consts.StatusOK, wantMySQL: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.role, func(t *testing.T) {
+			calls := make(map[string]int)
+			probe := func(name string, err error) httptransport.ReadinessProbe {
+				return func(ctx context.Context) error {
+					_ = ctx
+					calls[name]++
+					return err
+				}
+			}
+
+			cfg := appconfig.Default()
+			cfg.App.Role = tt.role
+			h := NewServerWithDependencies(cfg, ServerDependencies{
+				UserRepo:       repository.NewSeedUserRepository(),
+				ObjectUploader: objectstorage.NewMemoryUploader(""),
+				ProductAuditor: appDisabledProductAuditor{},
+				ReadinessProbes: map[string]httptransport.ReadinessProbe{
+					"mysql":         probe("mysql", errors.New("mysql down")),
+					"business_x":    probe("business_x", errors.New("business down")),
+					"kafka":         probe("kafka", errors.New("kafka down")),
+					"redis_rt":      probe("redis_rt", nil),
+					"redis_cache":   probe("redis_cache", nil),
+					"scripts":       probe("scripts", nil),
+					"redis_pubsub":  probe("redis_pubsub", nil),
+					"redis_pub_sub": probe("redis_pub_sub", nil),
+					"bid_stream":    probe("bid_stream", nil),
+				},
+			})
+			ready := ut.PerformRequest(h.Engine, consts.MethodGet, "/readyz", nil)
+			if ready.Code != tt.wantStatus {
+				t.Fatalf("readyz status=%d want %d body=%s", ready.Code, tt.wantStatus, ready.Body.String())
+			}
+			var body struct {
+				Components map[string]string `json:"components"`
+			}
+			if err := json.Unmarshal(ready.Body.Bytes(), &body); err != nil {
+				t.Fatalf("decode readyz body: %v raw=%s", err, ready.Body.String())
+			}
+			_, hasMySQL := body.Components["mysql"]
+			if hasMySQL != tt.wantMySQL {
+				t.Fatalf("mysql component present=%v want %v components=%v", hasMySQL, tt.wantMySQL, body.Components)
+			}
+			if tt.wantMySQL && calls["mysql"] != 1 {
+				t.Fatalf("mysql probe calls=%d want 1", calls["mysql"])
+			}
+			if tt.role == "ws-gateway" {
+				for _, name := range []string{"mysql", "business_x", "kafka"} {
+					if _, ok := body.Components[name]; ok {
+						t.Fatalf("%s probe should be filtered in ws-gateway: %v", name, body.Components)
+					}
+					if calls[name] != 0 {
+						t.Fatalf("%s probe calls=%d want 0", name, calls[name])
+					}
+				}
+				for _, name := range []string{"redis_rt", "redis_cache", "scripts", "redis_pubsub", "redis_pub_sub", "bid_stream"} {
+					if body.Components[name] != "ok" {
+						t.Fatalf("ws-gateway should keep %s probe, components=%v", name, body.Components)
+					}
+					if calls[name] != 1 {
+						t.Fatalf("%s probe calls=%d want 1", name, calls[name])
+					}
+				}
+				if body.Components["ws_draining"] != "ok" {
+					t.Fatalf("ws-gateway should keep ws_draining probe, components=%v", body.Components)
+				}
+			}
+		})
 	}
 }
 
@@ -210,7 +416,8 @@ func TestMCPInitializeAndToolsList(t *testing.T) {
 		} `json:"tools"`
 	}
 	mustDecodeData(t, readToolsResp.body.Result, &toolsResult)
-	if !containsTool(toolsResult.Tools, "read_live_session_bids") ||
+	if !containsTool(toolsResult.Tools, "get_current_time") ||
+		!containsTool(toolsResult.Tools, "read_live_session_bids") ||
 		!containsTool(toolsResult.Tools, "read_live_session_settlement") ||
 		containsTool(toolsResult.Tools, "read_item") ||
 		containsTool(toolsResult.Tools, "read_items") ||
@@ -220,6 +427,17 @@ func TestMCPInitializeAndToolsList(t *testing.T) {
 		containsTool(toolsResult.Tools, "operate_live_session_lot") ||
 		containsTool(toolsResult.Tools, "live_voice_broadcast") {
 		t.Fatalf("expected only read tools from read MCP, got %+v", toolsResult.Tools)
+	}
+	readTimeResp := doMCPPath(t, h.Engine, "/mcp/read", readAPIKey, `{"jsonrpc":"2.0","id":22,"method":"tools/call","params":{"name":"get_current_time","arguments":{}}}`)
+	if readTimeResp.status != 200 || readTimeResp.body.Error != nil {
+		t.Fatalf("expected read current time success, status=%d raw=%s", readTimeResp.status, readTimeResp.raw)
+	}
+	readTime := decodeMCPToolEnvelope[mcpapp.CurrentTimeResult](t, readTimeResp)
+	if readTime.Data.CurrentTime == "" || readTime.Data.Timezone != "UTC" || readTime.Data.UnixSeconds <= 0 || readTime.Data.UnixMilliseconds <= 0 {
+		t.Fatalf("unexpected read current time result: %+v", readTime.Data)
+	}
+	if _, err := time.Parse(time.RFC3339Nano, readTime.Data.CurrentTime); err != nil {
+		t.Fatalf("current time is not RFC3339Nano: %v", err)
 	}
 	readResourcesResp := doMCPPath(t, h.Engine, "/mcp/read", readAPIKey, `{"jsonrpc":"2.0","id":21,"method":"resources/templates/list","params":{}}`)
 	if readResourcesResp.status != 200 || readResourcesResp.body.Error != nil {
@@ -256,11 +474,20 @@ func TestMCPInitializeAndToolsList(t *testing.T) {
 	}
 	mustDecodeData(t, controlToolsResp.body.Result, &toolsResult)
 	if containsTool(toolsResult.Tools, "read_live_session_bids") ||
+		!containsTool(toolsResult.Tools, "get_current_time") ||
 		!containsTool(toolsResult.Tools, "get_merchant_live_control_context") ||
 		!containsTool(toolsResult.Tools, "operate_live_session_lot") ||
 		!containsTool(toolsResult.Tools, "live_voice_broadcast") ||
-		len(toolsResult.Tools) != 3 {
+		len(toolsResult.Tools) != 4 {
 		t.Fatalf("expected only control tools from control MCP, got %+v", toolsResult.Tools)
+	}
+	controlTimeResp := doMCPPath(t, h.Engine, "/mcp/control", controlAPIKey, `{"jsonrpc":"2.0","id":23,"method":"tools/call","params":{"name":"get_current_time","arguments":{}}}`)
+	if controlTimeResp.status != 200 || controlTimeResp.body.Error != nil {
+		t.Fatalf("expected control current time success, status=%d raw=%s", controlTimeResp.status, controlTimeResp.raw)
+	}
+	controlTime := decodeMCPToolEnvelope[mcpapp.CurrentTimeResult](t, controlTimeResp)
+	if controlTime.Data.CurrentTime == "" || controlTime.Data.Timezone != "UTC" || controlTime.Data.UnixSeconds <= 0 || controlTime.Data.UnixMilliseconds <= 0 {
+		t.Fatalf("unexpected control current time result: %+v", controlTime.Data)
 	}
 }
 
@@ -271,14 +498,26 @@ func TestAIAssistantHubNotifierBroadcastsSwitchEvent(t *testing.T) {
 	if err := hub.SubscribeLiveSessionOnly(sessionID, client); err != nil {
 		t.Fatalf("subscribe live session: %v", err)
 	}
+	select {
+	case <-client.Outbound():
+	default:
+	}
 	enabled := true
-	delivered, err := (aiAssistantHubNotifier{hub: hub}).NotifyAIAssistantEvent(context.Background(), sessionID, service.AIAssistantEvent{
+	delivered, err := (aiAssistantHubNotifier{hub: hub}).NotifyAIAssistantEvent(context.Background(), sessionID, aiapp.Event{
 		Kind:          "switch",
 		Status:        "enabled",
 		MerchantID:    "u_2001",
 		LiveSessionID: sessionID,
 		Enabled:       &enabled,
-		Message:       "直播场次90001AI直播助手已开启",
+		VideoSource:   "digitalHuman",
+		LiveRoom: map[string]interface{}{
+			"id":                 sessionID,
+			"liveSessionId":      sessionID,
+			"merchantId":         "u_2001",
+			"videoSource":        "digitalHuman",
+			"aiAssistantEnabled": true,
+		},
+		Message: "直播场次90001AI直播助手已开启",
 	})
 	if err != nil {
 		t.Fatalf("notify switch: %v", err)
@@ -291,15 +530,167 @@ func TestAIAssistantHubNotifierBroadcastsSwitchEvent(t *testing.T) {
 		if env.Type != wstransport.TypeAIAssistantSwitch || env.LiveSessionID != sessionID {
 			t.Fatalf("unexpected switch envelope: %+v", env)
 		}
-		var payload service.AIAssistantEvent
+		var payload aiapp.Event
 		if err := json.Unmarshal(env.Payload, &payload); err != nil {
 			t.Fatalf("decode payload: %v", err)
 		}
 		if payload.Enabled == nil || !*payload.Enabled || payload.Kind != "switch" {
 			t.Fatalf("unexpected switch payload: %+v", payload)
 		}
+		if payload.VideoSource != "digitalHuman" || payload.LiveRoom["videoSource"] != "digitalHuman" || payload.LiveRoom["aiAssistantEnabled"] != true {
+			t.Fatalf("expected switch payload to include live room playback mode, got %+v", payload)
+		}
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for switch event")
+	}
+}
+
+func TestLiveSessionLotHubNotifierBroadcastsLotListEvents(t *testing.T) {
+	hub := wstransport.NewHub()
+	const sessionID uint64 = 90003
+	const auctionID uint64 = 91003
+	buyer := wstransport.NewClientWithSession("buyer-lot-event", "u_1001", 0, sessionID, 8)
+	if err := hub.SubscribeLiveSessionOnly(sessionID, buyer); err != nil {
+		t.Fatalf("subscribe live session: %v", err)
+	}
+	drainAppOutbound(buyer)
+
+	notifier := liveSessionLotHubNotifier{hub: hub}
+	if delivered := notifier.NotifyLotMounted(context.Background(), "u_2001", sessionID, auctionID); delivered != 1 {
+		t.Fatalf("expected one mounted event delivered, got %d", delivered)
+	}
+	assertLiveSessionLotEvent(t, buyer, wstransport.TypeLiveSessionLotMounted, sessionID, auctionID, "mounted")
+
+	if delivered := notifier.NotifyLotUnmounted(context.Background(), "u_2001", sessionID, auctionID); delivered != 1 {
+		t.Fatalf("expected one unmounted event delivered, got %d", delivered)
+	}
+	assertLiveSessionLotEvent(t, buyer, wstransport.TypeLiveSessionLotUnmounted, sessionID, auctionID, "unmounted")
+
+	if delivered := notifier.NotifyLotChanged(context.Background(), "u_2001", sessionID, auctionID, "scheduled"); delivered != 1 {
+		t.Fatalf("expected one changed event delivered, got %d", delivered)
+	}
+	assertLiveSessionLotEvent(t, buyer, wstransport.TypeLiveSessionLotChanged, sessionID, auctionID, "scheduled")
+}
+
+func TestAuctionEventPublisherAdapterBroadcastsLifecycleEventsToLiveSession(t *testing.T) {
+	hub := wstransport.NewHub()
+	const sessionID uint64 = 90004
+	const auctionID uint64 = 91004
+	sessionClient := wstransport.NewClientWithSession("buyer-lifecycle-session", "u_1001", 0, sessionID, 8)
+	if err := hub.SubscribeLiveSessionOnly(sessionID, sessionClient); err != nil {
+		t.Fatalf("subscribe live session: %v", err)
+	}
+	drainAppOutbound(sessionClient)
+
+	payload, _ := json.Marshal(map[string]interface{}{
+		"auctionId":     auctionID,
+		"liveSessionId": sessionID,
+		"state": map[string]interface{}{
+			"auctionId":    auctionID,
+			"status":       "RUNNING",
+			"currentPrice": 1000,
+			"endTime":      time.Now().UTC().Add(time.Minute),
+		},
+	})
+	adapter := auctionEventPublisherAdapter{publisher: hub}
+	if delivered := adapter.Broadcast(auctionID, auctionports.EventEnvelope{Type: "auction.started", Payload: payload}); delivered != 1 {
+		t.Fatalf("expected one lifecycle event delivered to live session, got %d", delivered)
+	}
+
+	select {
+	case env := <-sessionClient.Outbound():
+		if env.Type != "auction.started" || env.LiveSessionID != sessionID {
+			t.Fatalf("unexpected lifecycle envelope: %+v", env)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for lifecycle event")
+	}
+
+	changedPayload, _ := json.Marshal(map[string]interface{}{
+		"auctionId":     auctionID,
+		"liveSessionId": sessionID,
+		"merchantId":    "u_2001",
+		"action":        "updated",
+	})
+	if delivered := adapter.Broadcast(auctionID, auctionports.EventEnvelope{Type: wstransport.TypeLiveSessionLotChanged, Payload: changedPayload}); delivered != 1 {
+		t.Fatalf("expected one lot changed event delivered to live session, got %d", delivered)
+	}
+	select {
+	case env := <-sessionClient.Outbound():
+		if env.Type != wstransport.TypeLiveSessionLotChanged || env.LiveSessionID != sessionID {
+			t.Fatalf("unexpected lot changed envelope: %+v", env)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for lot changed event")
+	}
+}
+
+func TestLiveVoiceHubBroadcasterDeliversOnlyOnlineClients(t *testing.T) {
+	hub := wstransport.NewHub()
+	const sessionID uint64 = 90002
+	buyer := wstransport.NewClientWithSession("buyer-voice", "u_1001", 0, sessionID, 4)
+	merchant := wstransport.NewClientWithSession("merchant-voice", "u_2001", 0, sessionID, 4)
+	admin := wstransport.NewClientWithSession("admin-voice", "u_admin", 0, sessionID, 4)
+	merchant.CountOnline = false
+	admin.CountOnline = false
+	for _, client := range []*wstransport.Client{buyer, merchant, admin} {
+		if err := hub.SubscribeLiveSessionOnly(sessionID, client); err != nil {
+			t.Fatalf("subscribe %s: %v", client.ID, err)
+		}
+	}
+	drainAppOutbound(buyer, merchant, admin)
+
+	delivered, err := (liveVoiceHubBroadcaster{hub: hub}).BroadcastLiveVoice(context.Background(), sessionID, mcpapp.LiveVoiceBroadcastPayload{
+		RequestID:   "voice-online-only",
+		AudioBase64: "AQI=",
+		AudioFormat: "pcm_s16le",
+		SampleRate:  24000,
+		Channels:    1,
+	})
+	if err != nil {
+		t.Fatalf("broadcast live voice: %v", err)
+	}
+	if delivered != 1 {
+		t.Fatalf("expected one online client delivered, got %d", delivered)
+	}
+	select {
+	case env := <-buyer.Outbound():
+		if env.Type != wstransport.TypeLiveVoiceBroadcast || env.LiveSessionID != sessionID || env.RequestID != "voice-online-only" {
+			t.Fatalf("unexpected buyer voice envelope: %+v", env)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for buyer voice envelope")
+	}
+	for _, client := range []*wstransport.Client{merchant, admin} {
+		select {
+		case env := <-client.Outbound():
+			t.Fatalf("%s should not receive user voice broadcast: %+v", client.ID, env)
+		default:
+		}
+	}
+}
+
+func assertLiveSessionLotEvent(t *testing.T, client *wstransport.Client, eventType string, sessionID, auctionID uint64, action string) {
+	t.Helper()
+	select {
+	case env := <-client.Outbound():
+		if env.Type != eventType || env.LiveSessionID != sessionID {
+			t.Fatalf("unexpected live session lot envelope: %+v", env)
+		}
+		var payload struct {
+			LiveSessionID uint64 `json:"liveSessionId"`
+			AuctionID     uint64 `json:"auctionId"`
+			MerchantID    string `json:"merchantId"`
+			Action        string `json:"action"`
+		}
+		if err := json.Unmarshal(env.Payload, &payload); err != nil {
+			t.Fatalf("decode payload: %v", err)
+		}
+		if payload.LiveSessionID != sessionID || payload.AuctionID != auctionID || payload.MerchantID != "u_2001" || payload.Action != action {
+			t.Fatalf("unexpected live session lot payload: %+v", payload)
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("timed out waiting for %s event", eventType)
 	}
 }
 
@@ -359,7 +750,7 @@ func TestMCPReadLiveSessionBidsAuthorization(t *testing.T) {
 		BidRepo:         bidRepo,
 		OrderRepo:       orderRepo,
 		ObjectUploader:  objectstorage.NewMemoryUploader(""),
-		ProductAuditor:  service.DisabledProductAuditor{},
+		ProductAuditor:  appDisabledProductAuditor{},
 	})
 
 	body := `{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"read_live_session_bids","arguments":{"sessionId":` + strconv.FormatUint(session.ID, 10) + `,"limit":10}}}`
@@ -395,7 +786,7 @@ func TestMCPReadLiveSessionBidsAuthorization(t *testing.T) {
 		BidRepo:         bidRepo,
 		OrderRepo:       orderRepo,
 		ObjectUploader:  objectstorage.NewMemoryUploader(""),
-		ProductAuditor:  service.DisabledProductAuditor{},
+		ProductAuditor:  appDisabledProductAuditor{},
 	})
 	buyerResp := doMCPPath(t, buyerServer.Engine, "/mcp/read", "buyer-mcp-key", body)
 	if buyerResp.status != 200 || buyerResp.body.Error == nil || buyerResp.body.Error.Code != -32003 {
@@ -405,6 +796,22 @@ func TestMCPReadLiveSessionBidsAuthorization(t *testing.T) {
 	invalidKeyResp := doMCPPath(t, h.Engine, "/mcp/read", "wrong-key", body)
 	if invalidKeyResp.status != 401 || invalidKeyResp.body.Error == nil || invalidKeyResp.body.Error.Code != -32001 {
 		t.Fatalf("expected invalid api key unauthorized, status=%d raw=%s", invalidKeyResp.status, invalidKeyResp.raw)
+	}
+}
+
+func drainAppOutbound(clients ...*wstransport.Client) {
+	for _, client := range clients {
+		for {
+			select {
+			case _, ok := <-client.Outbound():
+				if !ok {
+					goto nextClient
+				}
+			default:
+				goto nextClient
+			}
+		}
+	nextClient:
 	}
 }
 
@@ -457,7 +864,7 @@ func TestMCPLiveControlContextAndOperations(t *testing.T) {
 		AuctionRepo:          auctionRepo,
 		LiveSessionRepo:      sessionRepo,
 		ObjectUploader:       objectstorage.NewMemoryUploader(""),
-		ProductAuditor:       service.DisabledProductAuditor{},
+		ProductAuditor:       appDisabledProductAuditor{},
 		LiveVoiceSynthesizer: appFakeLiveVoiceSynthesizer{},
 		LiveVoiceBroadcaster: &appFakeLiveVoiceBroadcaster{delivered: 0},
 	})
@@ -467,7 +874,7 @@ func TestMCPLiveControlContextAndOperations(t *testing.T) {
 	if contextResp.status != 200 || contextResp.body.Error != nil {
 		t.Fatalf("expected live context success, status=%d raw=%s", contextResp.status, contextResp.raw)
 	}
-	contextPayload := decodeMCPToolEnvelope[service.MCPLiveControlContext](t, contextResp)
+	contextPayload := decodeMCPToolEnvelope[mcpapp.LiveControlContext](t, contextResp)
 	if contextPayload.Data.Session == nil || contextPayload.Data.Session.ID != session.ID {
 		t.Fatalf("unexpected live context: %+v", contextPayload.Data)
 	}
@@ -480,7 +887,7 @@ func TestMCPLiveControlContextAndOperations(t *testing.T) {
 	if onShelfResp.status != 200 || onShelfResp.body.Error != nil {
 		t.Fatalf("expected onShelf success, status=%d raw=%s", onShelfResp.status, onShelfResp.raw)
 	}
-	onShelf := decodeMCPToolEnvelope[service.MCPLiveLotOperationResult](t, onShelfResp)
+	onShelf := decodeMCPToolEnvelope[mcpapp.LiveLotOperationResult](t, onShelfResp)
 	if onShelf.Data.Lot == nil || onShelf.Data.Lot.LiveSessionID == nil || *onShelf.Data.Lot.LiveSessionID != session.ID || onShelf.Data.Context == nil || len(onShelf.Data.Context.Lots.UpcomingLots) != 1 {
 		t.Fatalf("unexpected onShelf result: %+v", onShelf.Data)
 	}
@@ -488,20 +895,28 @@ func TestMCPLiveControlContextAndOperations(t *testing.T) {
 	missingDurationBody := `{"jsonrpc":"2.0","id":13,"method":"tools/call","params":{"name":"operate_live_session_lot","arguments":{"liveSessionId":` + strconv.FormatUint(session.ID, 10) + `,"auctionId":91001,"action":"startExplain"}}}`
 	missingDurationResp := doMCPPath(t, h.Engine, "/mcp/control", "merchant-live-control-key", missingDurationBody)
 	if missingDurationResp.status != 200 || missingDurationResp.body.Error == nil || missingDurationResp.body.Error.Code != -32602 {
-		t.Fatalf("expected missing auctionDurationSec to be invalid params, status=%d raw=%s", missingDurationResp.status, missingDurationResp.raw)
+		t.Fatalf("expected missing durationSec to be invalid params, status=%d raw=%s", missingDurationResp.status, missingDurationResp.raw)
 	}
-	legacyDurationBody := `{"jsonrpc":"2.0","id":13,"method":"tools/call","params":{"name":"operate_live_session_lot","arguments":{"liveSessionId":` + strconv.FormatUint(session.ID, 10) + `,"auctionId":91001,"action":"startExplain","durationSec":600}}}`
-	legacyDurationResp := doMCPPath(t, h.Engine, "/mcp/control", "merchant-live-control-key", legacyDurationBody)
-	if legacyDurationResp.status != 200 || legacyDurationResp.body.Error == nil || legacyDurationResp.body.Error.Code != -32602 {
-		t.Fatalf("expected legacy durationSec to be invalid params, status=%d raw=%s", legacyDurationResp.status, legacyDurationResp.raw)
+	oldDurationBody := `{"jsonrpc":"2.0","id":13,"method":"tools/call","params":{"name":"operate_live_session_lot","arguments":{"liveSessionId":` + strconv.FormatUint(session.ID, 10) + `,"auctionId":91001,"action":"startExplain","auctionDurationSec":600}}}`
+	oldDurationResp := doMCPPath(t, h.Engine, "/mcp/control", "merchant-live-control-key", oldDurationBody)
+	if oldDurationResp.status != 200 || oldDurationResp.body.Error == nil || oldDurationResp.body.Error.Code != -32602 {
+		t.Fatalf("expected old auctionDurationSec to be invalid params, status=%d raw=%s", oldDurationResp.status, oldDurationResp.raw)
 	}
 
-	startBody := `{"jsonrpc":"2.0","id":13,"method":"tools/call","params":{"name":"operate_live_session_lot","arguments":{"liveSessionId":` + strconv.FormatUint(session.ID, 10) + `,"auctionId":91001,"action":"startExplain","auctionDurationSec":600}}}`
+	merchant.AIPermission = domain.MerchantAIPermissionDeny
+	if err := userRepo.Update(&merchant); err != nil {
+		t.Fatalf("update merchant ai permission deny before startExplain: %v", err)
+	}
+	startBody := `{"jsonrpc":"2.0","id":13,"method":"tools/call","params":{"name":"operate_live_session_lot","arguments":{"liveSessionId":` + strconv.FormatUint(session.ID, 10) + `,"auctionId":91001,"action":"startExplain","durationSec":600}}}`
 	startResp := doMCPPath(t, h.Engine, "/mcp/control", "merchant-live-control-key", startBody)
 	if startResp.status != 200 || startResp.body.Error != nil {
-		t.Fatalf("expected startExplain success, status=%d raw=%s", startResp.status, startResp.raw)
+		t.Fatalf("expected startExplain success without AI approval, status=%d raw=%s", startResp.status, startResp.raw)
 	}
-	started := decodeMCPToolEnvelope[service.MCPLiveLotOperationResult](t, startResp)
+	merchant.AIPermission = domain.MerchantAIPermissionAllow
+	if err := userRepo.Update(&merchant); err != nil {
+		t.Fatalf("restore merchant ai permission before hammer: %v", err)
+	}
+	started := decodeMCPToolEnvelope[mcpapp.LiveLotOperationResult](t, startResp)
 	if started.Data.Context == nil || started.Data.Context.Lots.ExplainingLot == nil || started.Data.Context.Lots.ExplainingLot.AuctionID != lot.AuctionID {
 		t.Fatalf("expected explaining lot after start, got %+v", started.Data)
 	}
@@ -516,7 +931,7 @@ func TestMCPLiveControlContextAndOperations(t *testing.T) {
 	if voiceResp.status != 200 || voiceResp.body.Error != nil {
 		t.Fatalf("expected live voice broadcast success, status=%d raw=%s", voiceResp.status, voiceResp.raw)
 	}
-	voice := decodeMCPToolEnvelope[service.MCPLiveVoiceBroadcastResult](t, voiceResp)
+	voice := decodeMCPToolEnvelope[mcpapp.LiveVoiceBroadcastResult](t, voiceResp)
 	if voice.Data.Status != "GENERATED" || voice.Data.LiveSessionID != session.ID || voice.Data.Text == "" || voice.Data.RequestID != "mcp-live-voice-1" || voice.Data.AudioBytes == 0 {
 		t.Fatalf("unexpected live voice broadcast result: %+v", voice.Data)
 	}
@@ -526,7 +941,7 @@ func TestMCPLiveControlContextAndOperations(t *testing.T) {
 	if hammerResp.status != 200 || hammerResp.body.Error != nil {
 		t.Fatalf("expected hammer success, status=%d raw=%s", hammerResp.status, hammerResp.raw)
 	}
-	hammered := decodeMCPToolEnvelope[service.MCPLiveLotOperationResult](t, hammerResp)
+	hammered := decodeMCPToolEnvelope[mcpapp.LiveLotOperationResult](t, hammerResp)
 	if hammered.Data.HammerResult == nil || hammered.Data.HammerResult.Status != domain.AuctionStatusClosedFailed {
 		t.Fatalf("expected closed failed hammer result without bids, got %+v", hammered.Data.HammerResult)
 	}
@@ -629,7 +1044,7 @@ func TestAuctionAuditCallbackRouteAcceptsAuctionContext(t *testing.T) {
 }
 
 func TestAuctionAuditCallbackRouteRequiresExplicitRejectedConclusion(t *testing.T) {
-	auditor := &captureProductAuditor{result: service.ProductAuditResult{Success: true, RequestID: "agent-lot-audit-1", Status: "ACCEPTED"}, called: make(chan struct{}, 1)}
+	auditor := &captureProductAuditor{result: auctionports.ProductAuditResult{Success: true, RequestID: "agent-lot-audit-1", Status: "ACCEPTED"}, called: make(chan struct{}, 1)}
 	h := NewServerWithDependencies(appconfig.Default(), ServerDependencies{
 		UserRepo:       repository.NewSeedUserRepository(),
 		ObjectUploader: objectstorage.NewMemoryUploader(""),
@@ -799,7 +1214,7 @@ func TestBuyerCanListMerchantLiveSessionsRoute(t *testing.T) {
 }
 
 func TestAuctionCreateTriggersLotContentAudit(t *testing.T) {
-	auditor := &captureProductAuditor{result: service.ProductAuditResult{Success: true, RequestID: "agent-lot-audit-1", Status: "ACCEPTED"}, called: make(chan struct{}, 1)}
+	auditor := &captureProductAuditor{result: auctionports.ProductAuditResult{Success: true, RequestID: "agent-lot-audit-1", Status: "ACCEPTED"}, called: make(chan struct{}, 1)}
 	uploader := objectstorage.NewMemoryUploader("")
 	imageBody := "keyboard image bytes"
 	imageURL, err := uploader.Upload(context.Background(), objectstorage.UploadInput{
@@ -849,7 +1264,7 @@ func TestAuctionCreateTriggersLotContentAudit(t *testing.T) {
 }
 
 func TestAuctionCreateSkipsLotContentAuditWhenDisabled(t *testing.T) {
-	auditor := &captureProductAuditor{result: service.ProductAuditResult{Success: true, RequestID: "agent-lot-audit-disabled", Status: "ACCEPTED"}, called: make(chan struct{}, 1)}
+	auditor := &captureProductAuditor{result: auctionports.ProductAuditResult{Success: true, RequestID: "agent-lot-audit-disabled", Status: "ACCEPTED"}, called: make(chan struct{}, 1)}
 	cfg := appconfig.Default()
 	cfg.Agent.ProductAuditEnabled = false
 	cfg.Agent.ProductAuditURL = ""
@@ -877,7 +1292,7 @@ func TestAuctionCreateSkipsLotContentAuditWhenDisabled(t *testing.T) {
 }
 
 func TestAuctionDraftDoesNotTriggerAuditUntilPublish(t *testing.T) {
-	auditor := &captureProductAuditor{result: service.ProductAuditResult{Success: true, RequestID: "agent-lot-audit-1", Status: "ACCEPTED"}, called: make(chan struct{}, 1)}
+	auditor := &captureProductAuditor{result: auctionports.ProductAuditResult{Success: true, RequestID: "agent-lot-audit-1", Status: "ACCEPTED"}, called: make(chan struct{}, 1)}
 	h := NewServerWithDependencies(appconfig.Default(), ServerDependencies{
 		UserRepo:       repository.NewSeedUserRepository(),
 		ObjectUploader: objectstorage.NewMemoryUploader(""),
@@ -910,7 +1325,7 @@ func TestAuctionDraftDoesNotTriggerAuditUntilPublish(t *testing.T) {
 }
 
 func TestAuctionDraftPublishSkipsLotContentAuditWhenDisabled(t *testing.T) {
-	auditor := &captureProductAuditor{result: service.ProductAuditResult{Success: true, RequestID: "agent-lot-audit-disabled", Status: "ACCEPTED"}, called: make(chan struct{}, 1)}
+	auditor := &captureProductAuditor{result: auctionports.ProductAuditResult{Success: true, RequestID: "agent-lot-audit-disabled", Status: "ACCEPTED"}, called: make(chan struct{}, 1)}
 	cfg := appconfig.Default()
 	cfg.Agent.ProductAuditEnabled = false
 	cfg.Agent.ProductAuditURL = ""
@@ -990,7 +1405,7 @@ func TestAuctionUpdateReadyLotRouteReturnsPendingAudit(t *testing.T) {
 }
 
 func TestAuctionUpdateTriggersLotContentAudit(t *testing.T) {
-	auditor := &captureProductAuditor{result: service.ProductAuditResult{Success: true, RequestID: "agent-lot-audit-1", Status: "ACCEPTED"}, called: make(chan struct{}, 2)}
+	auditor := &captureProductAuditor{result: auctionports.ProductAuditResult{Success: true, RequestID: "agent-lot-audit-1", Status: "ACCEPTED"}, called: make(chan struct{}, 2)}
 	h := NewServerWithDependencies(appconfig.Default(), ServerDependencies{
 		UserRepo:       repository.NewSeedUserRepository(),
 		ObjectUploader: objectstorage.NewMemoryUploader(""),
@@ -1034,7 +1449,7 @@ func TestAuctionCreateRejectsMissingDisplayContent(t *testing.T) {
 
 func TestAuctionDescriptionOptimizeRoute(t *testing.T) {
 	generator := &captureProductDescriptionGenerator{
-		result: service.ProductDescriptionResult{
+		result: aiapp.ProductDescriptionResult{
 			Title:       "机械键盘 87键",
 			Category:    "电脑外设/键盘",
 			Description: "这是一款适合日常办公和游戏的 87 键机械键盘，成色良好，键帽干净，敲击手感清脆。",
@@ -1057,7 +1472,7 @@ func TestAuctionDescriptionOptimizeRoute(t *testing.T) {
 	if resp.status != 200 || resp.body.Code != 0 {
 		t.Fatalf("expected description optimize success, got status=%d body=%+v raw=%s", resp.status, resp.body, resp.raw)
 	}
-	var result service.ProductDescriptionResult
+	var result aiapp.ProductDescriptionResult
 	mustDecodeData(t, resp.body.Data, &result)
 	if result.Description == "" || result.Title != "机械键盘 87键" || result.Category != "电脑外设/键盘" {
 		t.Fatalf("unexpected optimize result: %+v", result)
@@ -1079,7 +1494,7 @@ func TestAuctionDescriptionOptimizeRouteUsesImageURL(t *testing.T) {
 		t.Fatalf("upload memory image: %v", err)
 	}
 	generator := &captureProductDescriptionGenerator{
-		result: service.ProductDescriptionResult{
+		result: aiapp.ProductDescriptionResult{
 			Title:       "机械键盘 87键",
 			Category:    "电脑外设/键盘",
 			Description: "已保存图片也可以用于生成商品描述。",
@@ -1385,7 +1800,7 @@ func TestOrderRoutesPayIdempotency(t *testing.T) {
 
 func TestLiveAnalysisReportRoutes(t *testing.T) {
 	requester := &captureLiveAnalysisRequester{
-		result: service.LiveAnalysisAsyncResult{RequestID: "agent-live-analysis-1", Status: "ACCEPTED"},
+		result: liveanalysisports.AsyncRequestResult{RequestID: "agent-live-analysis-1", Status: "ACCEPTED"},
 	}
 	reportRepo := repository.NewMemoryLiveAnalysisReportRepository()
 	sessionRepo := repository.NewMemoryLiveSessionRepository()
@@ -1410,7 +1825,7 @@ func TestLiveAnalysisReportRoutes(t *testing.T) {
 		UserRepo:               repository.NewSeedUserRepository(),
 		LiveSessionRepo:        sessionRepo,
 		ObjectUploader:         objectstorage.NewMemoryUploader(""),
-		ProductAuditor:         service.DisabledProductAuditor{},
+		ProductAuditor:         appDisabledProductAuditor{},
 		LiveAnalysisReportRepo: reportRepo,
 		LiveAnalysisRequester:  requester,
 	})
@@ -1420,7 +1835,7 @@ func TestLiveAnalysisReportRoutes(t *testing.T) {
 	if running.TaskID == "" || running.LiveSessionID != session.ID || running.MerchantID != "u_2001" {
 		t.Fatalf("unexpected running task: %+v", running)
 	}
-	if running.Status != service.LiveAnalysisTaskRunning || running.Report != "" || running.AttemptCount != 1 {
+	if running.Status != liveanalysisapp.LiveAnalysisTaskRunning || running.Report != "" || running.AttemptCount != 1 {
 		t.Fatalf("expected accepted running task with empty report, got %+v", running)
 	}
 	if requester.prompt() != "帮我总结商家id为u_2001直播场次id为"+strconv.FormatUint(session.ID, 10)+"的直播情况，重点看成交、出价、订单和风险问题。" ||
@@ -1443,11 +1858,11 @@ func TestLiveAnalysisReportRoutes(t *testing.T) {
 	}
 
 	got := pollLiveAnalysisTask(t, h.Engine, session.ID, merchantToken)
-	if got.Status != service.LiveAnalysisTaskSucceeded || got.Report != "本场直播共成交 3 件拍品，转化良好。" {
+	if got.Status != liveanalysisapp.LiveAnalysisTaskSucceeded || got.Report != "本场直播共成交 3 件拍品，转化良好。" {
 		t.Fatalf("unexpected finished task: %+v", got)
 	}
 	persisted, err := reportRepo.FindByLiveSessionID(t.Context(), session.ID)
-	if err != nil || persisted.Status != service.LiveAnalysisTaskSucceeded || persisted.Report != got.Report {
+	if err != nil || persisted.Status != liveanalysisapp.LiveAnalysisTaskSucceeded || persisted.Report != got.Report {
 		t.Fatalf("expected persisted succeeded report, report=%+v err=%v", persisted, err)
 	}
 
@@ -1462,7 +1877,7 @@ func TestLiveAnalysisReportRoutes(t *testing.T) {
 
 func TestLiveSessionEndedHookStartsLiveAnalysis(t *testing.T) {
 	requester := &captureLiveAnalysisRequester{
-		result: service.LiveAnalysisAsyncResult{RequestID: "agent-hook-1", Status: "ACCEPTED"},
+		result: liveanalysisports.AsyncRequestResult{RequestID: "agent-hook-1", Status: "ACCEPTED"},
 	}
 	reportRepo := repository.NewMemoryLiveAnalysisReportRepository()
 	sessionRepo := repository.NewMemoryLiveSessionRepository()
@@ -1477,12 +1892,12 @@ func TestLiveSessionEndedHookStartsLiveAnalysis(t *testing.T) {
 	if err := sessionRepo.Create(t.Context(), &session); err != nil {
 		t.Fatalf("create live session: %v", err)
 	}
-	svc := service.NewLiveAnalysisService(reportRepo, sessionRepo, requester, service.LiveAnalysisOptions{
+	svc := liveanalysisapp.NewLiveAnalysisService(reportRepo, sessionRepo, requester, liveanalysisapp.LiveAnalysisOptions{
 		CallbackURL:    appconfig.Default().Agent.LiveAnalysisCallbackURL,
 		CallbackAPIKey: appconfig.Default().Agent.LiveAnalysisCallbackAPIKey,
 	})
 
-	hook := buildLiveSessionEndedHook(nil, svc)
+	hook := buildLiveSessionEndedHook(nil, nil, svc)
 	if hook == nil {
 		t.Fatal("expected hook")
 	}
@@ -1492,7 +1907,7 @@ func TestLiveSessionEndedHookStartsLiveAnalysis(t *testing.T) {
 	if err != nil {
 		t.Fatalf("find report: %v", err)
 	}
-	if task.Status != service.LiveAnalysisTaskRunning || task.LiveSessionID != session.ID || requester.prompt() == "" {
+	if task.Status != liveanalysisapp.LiveAnalysisTaskRunning || task.LiveSessionID != session.ID || requester.prompt() == "" {
 		t.Fatalf("expected hook to start live analysis, task=%+v requester=%+v", task, requester.input)
 	}
 }
@@ -1847,7 +2262,7 @@ func TestAdminDashboardMetrics(t *testing.T) {
 		OrderRepo:       orderRepo,
 		RiskRepo:        riskRepo,
 		ObjectUploader:  objectstorage.NewMemoryUploader(""),
-		ProductAuditor:  service.DisabledProductAuditor{},
+		ProductAuditor:  appDisabledProductAuditor{},
 	})
 	adminToken := loginForToken(t, h.Engine, "admin001", "AdminPassw0rd!", "admin")
 	buyerToken := loginForToken(t, h.Engine, "buyer001", "Passw0rd!", "buyer")
@@ -1894,23 +2309,23 @@ func newTestServer() *server.Hertz {
 	return NewServerWithDependencies(appconfig.Default(), ServerDependencies{
 		UserRepo:       repository.NewSeedUserRepository(),
 		ObjectUploader: objectstorage.NewMemoryUploader(""),
-		ProductAuditor: service.DisabledProductAuditor{},
+		ProductAuditor: appDisabledProductAuditor{},
 	})
 }
 
 type captureProductDescriptionGenerator struct {
-	input     service.ProductDescriptionInput
+	input     aiapp.ProductDescriptionInput
 	imageBody string
-	result    service.ProductDescriptionResult
+	result    aiapp.ProductDescriptionResult
 	err       error
 }
 
-func (g *captureProductDescriptionGenerator) GenerateProductDescription(ctx context.Context, in service.ProductDescriptionInput) (service.ProductDescriptionResult, error) {
+func (g *captureProductDescriptionGenerator) GenerateProductDescription(ctx context.Context, in aiapp.ProductDescriptionInput) (aiapp.ProductDescriptionResult, error) {
 	_ = ctx
 	g.input = in
 	g.imageBody = string(in.Image)
 	if g.err != nil {
-		return service.ProductDescriptionResult{}, g.err
+		return aiapp.ProductDescriptionResult{}, g.err
 	}
 	return g.result, nil
 }
@@ -1962,13 +2377,13 @@ func auctionCreateJSONWithStatus(title, category string, status domain.AuctionSt
 
 type captureProductAuditor struct {
 	mu     sync.Mutex
-	input  service.ProductAuditInput
-	result service.ProductAuditResult
+	input  auctionports.ProductAuditInput
+	result auctionports.ProductAuditResult
 	err    error
 	called chan struct{}
 }
 
-func (a *captureProductAuditor) AuditProduct(ctx context.Context, in service.ProductAuditInput) (service.ProductAuditResult, error) {
+func (a *captureProductAuditor) AuditProduct(ctx context.Context, in auctionports.ProductAuditInput) (auctionports.ProductAuditResult, error) {
 	_ = ctx
 	a.mu.Lock()
 	a.input = in
@@ -1980,12 +2395,12 @@ func (a *captureProductAuditor) AuditProduct(ctx context.Context, in service.Pro
 	}
 	a.mu.Unlock()
 	if a.err != nil {
-		return service.ProductAuditResult{}, a.err
+		return auctionports.ProductAuditResult{}, a.err
 	}
 	return a.result, nil
 }
 
-func (a *captureProductAuditor) waitInput(t *testing.T) service.ProductAuditInput {
+func (a *captureProductAuditor) waitInput(t *testing.T) auctionports.ProductAuditInput {
 	t.Helper()
 	if a.called != nil {
 		select {
@@ -2013,12 +2428,12 @@ func (a *captureProductAuditor) assertNoInput(t *testing.T, timeout time.Duratio
 
 type captureLiveAnalysisRequester struct {
 	mu     sync.Mutex
-	input  service.LiveAnalysisAsyncInput
-	result service.LiveAnalysisAsyncResult
+	input  liveanalysisports.AsyncRequestInput
+	result liveanalysisports.AsyncRequestResult
 	err    error
 }
 
-func (r *captureLiveAnalysisRequester) RequestLiveAnalysis(ctx context.Context, in service.LiveAnalysisAsyncInput) (service.LiveAnalysisAsyncResult, error) {
+func (r *captureLiveAnalysisRequester) RequestLiveAnalysis(ctx context.Context, in liveanalysisports.AsyncRequestInput) (liveanalysisports.AsyncRequestResult, error) {
 	_ = ctx
 	r.mu.Lock()
 	r.input = in
@@ -2026,7 +2441,7 @@ func (r *captureLiveAnalysisRequester) RequestLiveAnalysis(ctx context.Context, 
 	err := r.err
 	r.mu.Unlock()
 	if err != nil {
-		return service.LiveAnalysisAsyncResult{}, err
+		return liveanalysisports.AsyncRequestResult{}, err
 	}
 	return result, nil
 }
@@ -2037,19 +2452,19 @@ func (r *captureLiveAnalysisRequester) prompt() string {
 	return r.input.Prompt
 }
 
-func pollLiveAnalysisTask(t *testing.T, engine *route.Engine, liveSessionID uint64, token string) service.LiveAnalysisTask {
+func pollLiveAnalysisTask(t *testing.T, engine *route.Engine, liveSessionID uint64, token string) liveanalysisapp.LiveAnalysisTask {
 	t.Helper()
 	deadline := time.Now().Add(time.Second)
-	var last service.LiveAnalysisTask
+	var last liveanalysisapp.LiveAnalysisTask
 	for time.Now().Before(deadline) {
 		last = getLiveAnalysisTask(t, engine, liveSessionID, token)
-		if last.Status == service.LiveAnalysisTaskSucceeded || last.Status == service.LiveAnalysisTaskFailed {
+		if last.Status == liveanalysisapp.LiveAnalysisTaskSucceeded || last.Status == liveanalysisapp.LiveAnalysisTaskFailed {
 			return last
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("task did not finish: %+v", last)
-	return service.LiveAnalysisTask{}
+	return liveanalysisapp.LiveAnalysisTask{}
 }
 
 func productAuditCallbackJSON(t *testing.T, success, approved bool, callbackContext map[string]interface{}) string {
@@ -2065,7 +2480,7 @@ func productAuditCallbackJSON(t *testing.T, success, approved bool, callbackCont
 	return string(payload)
 }
 
-func getLiveAnalysisTask(t *testing.T, engine *route.Engine, liveSessionID uint64, token string) service.LiveAnalysisTask {
+func getLiveAnalysisTask(t *testing.T, engine *route.Engine, liveSessionID uint64, token string) liveanalysisapp.LiveAnalysisTask {
 	t.Helper()
 	resp := doJSONWithHeaders(t, engine, consts.MethodGet, "/api/v1/live-analysis/reports/"+strconv.FormatUint(liveSessionID, 10), "",
 		ut.Header{Key: "Authorization", Value: "Bearer " + token},
@@ -2073,7 +2488,7 @@ func getLiveAnalysisTask(t *testing.T, engine *route.Engine, liveSessionID uint6
 	if resp.status != 200 || resp.body.Code != 0 {
 		t.Fatalf("expected poll success, got status=%d raw=%s", resp.status, resp.raw)
 	}
-	var task service.LiveAnalysisTask
+	var task liveanalysisapp.LiveAnalysisTask
 	mustDecodeData(t, resp.body.Data, &task)
 	return task
 }
@@ -2221,9 +2636,9 @@ func ptrString(v string) *string {
 
 type appFakeLiveVoiceSynthesizer struct{}
 
-func (appFakeLiveVoiceSynthesizer) SynthesizeLiveVoice(ctx context.Context, in service.LiveVoiceSynthesisInput) (service.LiveVoiceSynthesisResult, error) {
+func (appFakeLiveVoiceSynthesizer) SynthesizeLiveVoice(ctx context.Context, in mcpapp.LiveVoiceSynthesisInput) (mcpapp.LiveVoiceSynthesisResult, error) {
 	_ = ctx
-	return service.LiveVoiceSynthesisResult{
+	return mcpapp.LiveVoiceSynthesisResult{
 		Audio:       []byte("fake-audio-" + in.Text),
 		AudioFormat: "pcm_s16le",
 		Encoding:    "pcm_s16le",
@@ -2236,10 +2651,10 @@ func (appFakeLiveVoiceSynthesizer) SynthesizeLiveVoice(ctx context.Context, in s
 
 type appFakeLiveVoiceBroadcaster struct {
 	delivered int
-	payload   service.LiveVoiceBroadcastPayload
+	payload   mcpapp.LiveVoiceBroadcastPayload
 }
 
-func (f *appFakeLiveVoiceBroadcaster) BroadcastLiveVoice(ctx context.Context, liveSessionID uint64, payload service.LiveVoiceBroadcastPayload) (int, error) {
+func (f *appFakeLiveVoiceBroadcaster) BroadcastLiveVoice(ctx context.Context, liveSessionID uint64, payload mcpapp.LiveVoiceBroadcastPayload) (int, error) {
 	_ = ctx
 	_ = liveSessionID
 	f.payload = payload

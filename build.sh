@@ -9,10 +9,10 @@
 # 产出结构：
 #   <OUTPUT_DIR>/
 #     ├── bin/aieas              # 主二进制
-#     ├── configs/config.yaml    # 配置（仓库默认值，密钥走 .env 覆盖）
+#     ├── configs/config.yaml    # 普通配置（端口、角色、限流、连接地址等）
 #     ├── scripts/lua/           # 运行时加载的 Redis Lua 脚本
 #     ├── start.sh               # 启动脚本：加载 .env 后运行二进制
-#     └── .env                   # 从 .env.example 拷贝，请上传后填入真实值
+#     └── .env                   # 从 .env.example 拷贝，仅填密钥/凭证类值
 
 set -euo pipefail
 
@@ -68,8 +68,8 @@ chmod +x "${OUTPUT_DIR}/bin/${BINARY_NAME}"
 log "编译完成: ${OUTPUT_DIR}/bin/${BINARY_NAME}"
 
 # ---------- 拷贝配置 ----------
-log "拷贝 configs/config.yaml ..."
-cp "${SCRIPT_DIR}/configs/config.yaml" "${OUTPUT_DIR}/configs/config.yaml"
+log "拷贝 configs/*.yaml ..."
+cp "${SCRIPT_DIR}/configs/"*.yaml "${OUTPUT_DIR}/configs/"
 
 # ---------- 拷贝 Lua 脚本 ----------
 log "拷贝 scripts/lua/*.lua ..."
@@ -80,16 +80,20 @@ if [[ -f "${SCRIPT_DIR}/.env.example" ]]; then
   log "基于 .env.example 生成 .env 模板（请上传后填入真实密钥）"
   cp "${SCRIPT_DIR}/.env.example" "${OUTPUT_DIR}/.env"
 else
-  warn ".env.example 不存在，生成最小化 .env 模板"
+  warn ".env.example 不存在，生成最小化密钥 .env 模板"
   cat > "${OUTPUT_DIR}/.env" <<'EOF'
-# 上线前请替换为真实值；含特殊字符（() & ? 空格 等）的值请用单引号包裹
-MYSQL_DSN='auction:PASSWORD@tcp(rds-host:3306)/auction?charset=utf8mb4&parseTime=true&loc=Local'
-REDIS_RT_PRIMARY_ADDR='redis-rt-host:6379'
-REDIS_RT_PRIMARY_PASSWORD=''
-REDIS_CACHE_ADDR='redis-cache-host:6379'
-REDIS_CACHE_PASSWORD=''
+# .env 只放密钥/凭证；普通配置请改 configs/config.yaml。
 JWT_SECRET='CHANGE_ME'
-OBSERVABILITY_FORMAT='json'
+REDIS_RT_PRIMARY_PASSWORD=''
+REDIS_CACHE_PASSWORD=''
+OBJECT_STORAGE_ACCESS_KEY=''
+OBJECT_STORAGE_SECRET_KEY=''
+AGENT_LIVE_ANALYSIS_CALLBACK_API_KEY='CHANGE_ME'
+DOUBAO_TTS_APP_ID=''
+DOUBAO_TTS_ACK_TOKEN=''
+MCP_READ_API_KEY='CHANGE_ME'
+MCP_CONTROL_API_KEY='CHANGE_ME'
+OBSERVABILITY_METRICS_AUTH_TOKEN=''
 EOF
 fi
 
@@ -134,8 +138,8 @@ if [[ ! -f "${CONFIG_FILE}" ]]; then
   exit 1
 fi
 
-# ---------- 加载环境变量（可选） ----------
-# .env 存在则加载用于覆盖 config.yaml；不存在则完全使用 config.yaml 的值。
+# ---------- 加载密钥环境变量（可选） ----------
+# .env 只用于注入密钥/凭证；普通配置统一使用 configs/config.yaml。
 if [[ -f "${ENV_FILE}" ]]; then
   echo "[start] 加载 .env: ${ENV_FILE}"
   set -a
@@ -143,7 +147,7 @@ if [[ -f "${ENV_FILE}" ]]; then
   source "${ENV_FILE}"
   set +a
 else
-  echo "[start] 未发现 .env，跳过；将完全使用 ${CONFIG_FILE} 的配置"
+  echo "[start] 未发现 .env，跳过；将使用 ${CONFIG_FILE} 与其中的占位密钥"
 fi
 
 # ---------- 子命令 ----------
@@ -244,11 +248,12 @@ fi
 cat <<EOF
 
 ${GREEN}下一步建议:${NC}
-  1. 修改 ${OUTPUT_DIR}/.env 中的 MYSQL_DSN / REDIS_ADDR / JWT_SECRET 等密钥
+  1. 修改 ${OUTPUT_DIR}/configs/config.yaml 中的端口、角色、MySQL/Redis 地址、限流等普通配置
+  2. 修改 ${OUTPUT_DIR}/.env 中的 JWT_SECRET、Redis 密码、MCP API key 等密钥
      （含特殊字符的值要用单引号包裹）
-  2. 上传到服务器:
+  3. 上传到服务器:
        rsync -avz ${OUTPUT_DIR}/ root@your-server:/opt/aieas/
-  3. 服务器上启动:
+  4. 服务器上启动:
        cd /opt/aieas
        ./start.sh            # 前台调试
        ./start.sh -d         # 后台运行

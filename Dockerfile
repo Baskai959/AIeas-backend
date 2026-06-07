@@ -1,9 +1,8 @@
-# syntax=docker/dockerfile:1.7
-
 ARG GO_VERSION=1.26.2
+ARG GO_IMAGE=golang:${GO_VERSION}-bookworm
 ARG GOPROXY=https://goproxy.cn,direct
 
-FROM golang:${GO_VERSION}-bookworm AS build
+FROM ${GO_IMAGE} AS build
 
 ARG GOPROXY
 ENV GOPROXY=${GOPROXY}
@@ -11,7 +10,7 @@ ENV GOPROXY=${GOPROXY}
 WORKDIR /src
 
 COPY go.mod go.sum ./
-RUN --mount=type=cache,target=/go/pkg/mod go mod download
+RUN go mod download
 
 COPY . .
 RUN cat > /tmp/healthcheck.go <<'EOF'
@@ -35,9 +34,7 @@ func main() {
 	}
 }
 EOF
-RUN --mount=type=cache,target=/go/pkg/mod \
-    --mount=type=cache,target=/root/.cache/go-build \
-    CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/aieas-backend . && \
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/aieas-backend . && \
     CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/aieas-healthcheck /tmp/healthcheck.go
 
 FROM scratch

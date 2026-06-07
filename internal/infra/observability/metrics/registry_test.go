@@ -136,6 +136,24 @@ func TestObserveWSBroadcastAndConnect(t *testing.T) {
 	}
 }
 
+func TestWSHandshakeRejectReasonNormalization(t *testing.T) {
+	r := New(Options{Enabled: true})
+	for _, reason := range []string{"rate_limit_ip", "rate_limit_user", "rate_limit_auction", "draining", "auth", "bad_request"} {
+		r.IncWSHandshakeReject(reason)
+		if v := counterVecValue(t, r.wsHandshakeRejectTotal, reason); v != 1 {
+			t.Fatalf("reason %s expected 1, got %v", reason, v)
+		}
+	}
+	r.IncWSHandshakeReject("per_user_123")
+	if v := counterVecValue(t, r.wsHandshakeRejectTotal, "unknown"); v != 1 {
+		t.Fatalf("unknown normalized reason expected 1, got %v", v)
+	}
+	r.IncWSDraining()
+	if v := counterValue(t, r.wsDrainingTotal); v != 1 {
+		t.Fatalf("wsDrainingTotal expected 1, got %v", v)
+	}
+}
+
 func TestStatusBucketBoundaries(t *testing.T) {
 	cases := map[int]string{
 		99: "unknown", 100: "1xx", 199: "1xx",

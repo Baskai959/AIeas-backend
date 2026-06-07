@@ -187,21 +187,23 @@ type AuctionPatch struct {
 }
 
 type AuctionState struct {
-	AuctionID      uint64          `json:"auctionId"`
-	LiveSessionID  uint64          `json:"liveSessionId,omitempty"`
-	Status         AuctionStatus   `json:"status"`
-	StartPrice     int64           `json:"startPrice"`
-	CapPrice       int64           `json:"capPrice"`
-	IncrementRule  json.RawMessage `json:"incrementRule,omitempty"`
-	CurrentPrice   int64           `json:"currentPrice"`
-	LeaderBidderID string          `json:"leaderBidderId,omitempty"`
-	BidCount       int             `json:"bidCount,omitempty"`
-	StartTime      time.Time       `json:"startTime"`
-	EndTime        time.Time       `json:"endTime"`
-	LastBidTSMS    int64           `json:"lastBidTsMs"`
-	ExtendCount    int             `json:"extendCount"`
-	Version        int64           `json:"version"`
-	Source         string          `json:"source"`
+	AuctionID        uint64          `json:"auctionId"`
+	LiveSessionID    uint64          `json:"liveSessionId,omitempty"`
+	Status           AuctionStatus   `json:"status"`
+	StartPrice       int64           `json:"startPrice"`
+	CapPrice         int64           `json:"capPrice"`
+	IncrementRule    json.RawMessage `json:"incrementRule,omitempty"`
+	CurrentPrice     int64           `json:"currentPrice"`
+	LeaderBidderID   string          `json:"leaderBidderId,omitempty"`
+	BidCount         int             `json:"bidCount,omitempty"`
+	ParticipantCount int             `json:"participantCount,omitempty"`
+	StartTime        time.Time       `json:"startTime"`
+	EndTime          time.Time       `json:"endTime"`
+	LastBidTSMS      int64           `json:"lastBidTsMs"`
+	ExtendCount      int             `json:"extendCount"`
+	Version          int64           `json:"version"`
+	Source           string          `json:"source"`
+	ServerTime       *time.Time      `json:"serverTime,omitempty"`
 }
 
 type BidRiskResult string
@@ -269,6 +271,7 @@ type BidResult struct {
 	Seq            int64         `json:"seq,omitempty"`
 	StreamID       string        `json:"streamId,omitempty"`
 	Event          string        `json:"event,omitempty"`
+	ServerTime     *time.Time    `json:"serverTime,omitempty"`
 	RiskResult     BidRiskResult `json:"riskResult"`
 	AuctionStatus  AuctionStatus `json:"auctionStatus,omitempty"`
 	AutoClosed     bool          `json:"autoClosed,omitempty"`

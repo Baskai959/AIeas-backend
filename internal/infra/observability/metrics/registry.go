@@ -85,6 +85,8 @@ type Registry struct {
 	wsBroadcastDuration    prometheus.Histogram
 	wsBroadcastFanoutTotal prometheus.Counter
 	wsSlowClientDisconnect prometheus.Counter
+	wsHandshakeRejectTotal *prometheus.CounterVec
+	wsDrainingTotal        prometheus.Counter
 
 	// Agent
 	agentToolCallTotal   *prometheus.CounterVec
@@ -328,6 +330,12 @@ func (r *Registry) register() {
 	r.wsSlowClientDisconnect = prometheus.NewCounter(prometheus.CounterOpts{
 		Namespace: ns, Name: "ws_slow_client_disconnect_total", Help: "WebSocket slow-client disconnects",
 	})
+	r.wsHandshakeRejectTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: ns, Name: "ws_handshake_reject_total", Help: "WebSocket handshake rejections by reason",
+	}, []string{"reason"})
+	r.wsDrainingTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: ns, Name: "ws_draining_total", Help: "Number of times the ws hub entered drain state",
+	})
 
 	// Agent ----------------------------------------------------------------
 	r.agentToolCallTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
@@ -360,6 +368,7 @@ func (r *Registry) register() {
 		r.workerTaskTotal,
 		r.wsConnections, r.wsConnectionTotal, r.wsBroadcastDuration,
 		r.wsBroadcastFanoutTotal, r.wsSlowClientDisconnect,
+		r.wsHandshakeRejectTotal, r.wsDrainingTotal,
 		r.agentToolCallTotal, r.agentToolCallLatency,
 	}
 	for _, c := range collectors {

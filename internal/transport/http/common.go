@@ -10,8 +10,10 @@ import (
 	"strings"
 
 	"aieas_backend/internal/domain"
-	"aieas_backend/internal/infra/objectstorage"
-	"aieas_backend/internal/service"
+	aiapp "aieas_backend/internal/modules/ai/app"
+	auctionapp "aieas_backend/internal/modules/auction/app"
+	liveanalysisports "aieas_backend/internal/modules/live_analysis/ports"
+	livesessionapp "aieas_backend/internal/modules/live_session/app"
 
 	"github.com/cloudwego/hertz/pkg/app"
 )
@@ -22,21 +24,21 @@ func writeServiceError(c *app.RequestContext, err error) {
 	switch {
 	case errors.Is(err, domain.ErrIdempotencyKey):
 		WriteError(c, 400, 20011, "缺少幂等键", nil)
-	case errors.Is(err, domain.ErrInvalidArgument), errors.Is(err, objectstorage.ErrInvalidObjectKey):
+	case errors.Is(err, domain.ErrInvalidArgument), errors.Is(err, ErrInvalidImageObjectKey):
 		WriteError(c, 400, 20001, "参数不合法", nil)
 	case errors.Is(err, domain.ErrForbidden):
 		WriteError(c, 403, 20003, "无操作权限", nil)
-	case errors.Is(err, service.ErrAIAssistantUserRejected):
+	case errors.Is(err, aiapp.ErrUserRejected):
 		WriteError(c, 403, 20003, "用户拒绝执行", nil)
-	case errors.Is(err, service.ErrAIAssistantApprovalTimeout):
-		WriteError(c, 409, 20010, "用户未确认执行", nil)
-	case errors.Is(err, domain.ErrNotFound), errors.Is(err, domain.ErrUserNotFound), errors.Is(err, objectstorage.ErrObjectNotFound):
+	case errors.Is(err, aiapp.ErrApprovalTimeout):
+		WriteError(c, 409, 20010, "审批请求已自动处理或已过期", nil)
+	case errors.Is(err, domain.ErrNotFound), errors.Is(err, domain.ErrUserNotFound), errors.Is(err, ErrImageObjectNotFound):
 		WriteError(c, 404, 20004, "资源不存在", nil)
 	case errors.Is(err, domain.ErrConflict), errors.Is(err, domain.ErrOptimisticConflict):
 		WriteError(c, 409, 20012, "资源冲突", nil)
-	case errors.Is(err, domain.ErrInvalidState), errors.Is(err, service.ErrLiveSessionBusy), errors.Is(err, service.ErrLotAlreadyMounted):
+	case errors.Is(err, domain.ErrInvalidState), errors.Is(err, livesessionapp.ErrLiveSessionBusy), errors.Is(err, livesessionapp.ErrLotAlreadyMounted):
 		WriteError(c, 409, 20010, "当前状态不允许此操作", nil)
-	case errors.Is(err, service.ErrProductDescriptionUnavailable), errors.Is(err, service.ErrProductAuditUnavailable), errors.Is(err, service.ErrLiveAnalysisUnavailable), errors.Is(err, objectstorage.ErrDisabled):
+	case errors.Is(err, aiapp.ErrProductDescriptionUnavailable), errors.Is(err, auctionapp.ErrProductAuditUnavailable), errors.Is(err, liveanalysisports.ErrLiveAnalysisUnavailable), errors.Is(err, ErrImageStorageDisabled):
 		WriteError(c, 503, 90002, "服务暂不可用", nil)
 	default:
 		WriteError(c, 500, 90001, "系统内部错误", nil)
@@ -120,7 +122,7 @@ func objectKeyFromImageURL(imageURL string) (string, error) {
 	if parsed, err := url.Parse(value); err == nil && parsed.Path != "" {
 		value = parsed.Path
 	}
-	prefix := objectstorage.ProxyPathPrefix()
+	prefix := ImageProxyPathPrefix
 	if !strings.HasPrefix(value, prefix) {
 		return "", domain.ErrInvalidArgument
 	}

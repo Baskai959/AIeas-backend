@@ -108,9 +108,14 @@ func (b KeyBuilder) ConfigItem(configKey string) string {
 	return b.key("config:item:%s", configKey)
 }
 
-// LiveSessionActiveLock 是直播场次活拍互斥锁的 key（值为 active auction id）。
+// LiveSessionActiveLock 是直播场次活拍互斥锁的 key（值为持锁 auction id）。
 func (b KeyBuilder) LiveSessionActiveLock(sessionID uint64) string {
 	return b.key("live_session:%d:active", sessionID)
+}
+
+// LiveSessionActiveAuction 是直播场次当前活跃拍品的实时状态 key。
+func (b KeyBuilder) LiveSessionActiveAuction(sessionID uint64) string {
+	return b.key("live_session:%d:active_auction", sessionID)
 }
 
 // LiveSessionCounters 存放直播场次计数 HASH（lots_total/lots_sold/...）。

@@ -45,6 +45,7 @@ func (d *Duration) UnmarshalYAML(value *yaml.Node) error {
 }
 
 type Config struct {
+	App           AppConfig           `yaml:"app"`
 	Server        ServerConfig        `yaml:"server"`
 	MySQL         MySQLConfig         `yaml:"mysql"`
 	Redis         RedisConfig         `yaml:"redis"`
@@ -67,6 +68,18 @@ type ServerConfig struct {
 	ReadTimeout     Duration `yaml:"readTimeout"`
 	WriteTimeout    Duration `yaml:"writeTimeout"`
 	ShutdownTimeout Duration `yaml:"shutdownTimeout"`
+}
+
+// AppConfig 控制 aieas_backend 进程的部署形态。
+//
+// Role 取值：
+//   - "all"：（默认）注册 REST + WebSocket + 运维端点，与历史行为完全一致；
+//   - "api"：只注册 /api/* /mcp/* + 运维端点，跳过 /ws/*；
+//   - "ws-gateway"：只注册 /ws/* + 运维端点，跳过 /api/*。
+//
+// 空字符串等价于 "all"，由 Validate 归一化。
+type AppConfig struct {
+	Role string `yaml:"role"`
 }
 
 type MySQLConfig struct {
@@ -129,10 +142,18 @@ type RiskControlConfig struct {
 }
 
 type WebSocketConfig struct {
-	ReadLimitBytes int      `yaml:"readLimitBytes"`
-	SendBufferSize int      `yaml:"sendBufferSize"`
-	PingInterval   Duration `yaml:"pingInterval"`
-	PongTimeout    Duration `yaml:"pongTimeout"`
+	ReadLimitBytes               int      `yaml:"readLimitBytes"`
+	SendBufferSize               int      `yaml:"sendBufferSize"`
+	PingInterval                 Duration `yaml:"pingInterval"`
+	PongTimeout                  Duration `yaml:"pongTimeout"`
+	WriteTimeout                 Duration `yaml:"writeTimeout"`
+	HandshakeRateLimitPerIP      int      `yaml:"handshakeRateLimitPerIP"`
+	HandshakeRateLimitPerUser    int      `yaml:"handshakeRateLimitPerUser"`
+	HandshakeRateLimitPerAuction int      `yaml:"handshakeRateLimitPerAuction"`
+	DrainTimeout                 Duration `yaml:"drainTimeout"`
+	CloseGrace                   Duration `yaml:"closeGrace"`
+	PingJitter                   Duration `yaml:"pingJitter"`
+	ReplayLimit                  int      `yaml:"replayLimit"`
 }
 
 type ObjectStorageConfig struct {
@@ -229,10 +250,13 @@ type ObservabilityHealth struct {
 
 func Default() Config {
 	return Config{
+		App: AppConfig{
+			Role: "all",
+		},
 		Server: ServerConfig{
 			Addr:            ":8080",
 			ReadTimeout:     Duration(5 * time.Second),
-			WriteTimeout:    Duration(10 * time.Second),
+			WriteTimeout:    Duration(45 * time.Second),
 			ShutdownTimeout: Duration(20 * time.Second),
 		},
 		MySQL: MySQLConfig{
@@ -292,10 +316,18 @@ func Default() Config {
 			Enabled: true,
 		},
 		WebSocket: WebSocketConfig{
-			ReadLimitBytes: 65536,
-			SendBufferSize: 256,
-			PingInterval:   Duration(20 * time.Second),
-			PongTimeout:    Duration(60 * time.Second),
+			ReadLimitBytes:               65536,
+			SendBufferSize:               256,
+			PingInterval:                 Duration(20 * time.Second),
+			PongTimeout:                  Duration(60 * time.Second),
+			WriteTimeout:                 Duration(5 * time.Second),
+			HandshakeRateLimitPerIP:      60,
+			HandshakeRateLimitPerUser:    30,
+			HandshakeRateLimitPerAuction: 300,
+			DrainTimeout:                 Duration(30 * time.Second),
+			CloseGrace:                   Duration(time.Second),
+			PingJitter:                   Duration(5 * time.Second),
+			ReplayLimit:                  256,
 		},
 		ObjectStorage: ObjectStorageConfig{
 			Enabled:      false,
@@ -313,8 +345,8 @@ func Default() Config {
 			LiveAnalysisURL:            "http://127.0.0.1:8000/api/v1/live-analysis/async",
 			LiveAnalysisCallbackURL:    "http://127.0.0.1:8080/api/v1/live-analysis/callback",
 			LiveAnalysisCallbackAPIKey: "change-me-in-local-dev-live-analysis-callback",
-			LiveAuctionHookURL:         "http://127.0.0.1:8000/api/v1/live-auction-hook",
-			Timeout:                    Duration(30 * time.Second),
+			LiveAuctionHookURL:         "http://127.0.0.1:8000/api/v1/live-assistant",
+			Timeout:                    Duration(45 * time.Second),
 		},
 		DoubaoTTS: DoubaoTTSConfig{
 			Voice: "zh_female_vv_jupiter_bigtts",
@@ -407,7 +439,21 @@ func MustLoad(path string) Config {
 	return cfg
 }
 
-func (c Config) Validate() error {
+func (c *Config) Validate() error {
+	role := strings.TrimSpace(c.App.Role)
+	if role == "" {
+		role = "all"
+		c.App.Role = role
+	}
+	switch role {
+	case "all", "api", "ws-gateway":
+		c.App.Role = role
+	default:
+		return fmt.Errorf("app.role 无效: %q", c.App.Role)
+	}
+	if err := c.WebSocket.validate(); err != nil {
+		return err
+	}
 	if strings.TrimSpace(c.Server.Addr) == "" {
 		return fmt.Errorf("server.addr is required")
 	}
@@ -578,6 +624,47 @@ func validateMCPAuthConfig(prefix string, auth MCPAuthConfig) error {
 	return nil
 }
 
+// validate 校验 WebSocketConfig 关键字段。
+//
+// 不强制 ReadLimit/SendBuffer/PingInterval/PongTimeout > 0：保留与历史
+// Default() 行为一致；新字段则做边界校验，避免运行期出现 0 / 负值。
+func (w WebSocketConfig) validate() error {
+	if w.WriteTimeout.Std() <= 0 {
+		return fmt.Errorf("websocket.writeTimeout must be positive")
+	}
+	if w.HandshakeRateLimitPerIP < 0 {
+		return fmt.Errorf("websocket.handshakeRateLimitPerIP must be non-negative")
+	}
+	if w.HandshakeRateLimitPerUser < 0 {
+		return fmt.Errorf("websocket.handshakeRateLimitPerUser must be non-negative")
+	}
+	if w.HandshakeRateLimitPerAuction < 0 {
+		return fmt.Errorf("websocket.handshakeRateLimitPerAuction must be non-negative")
+	}
+	if w.DrainTimeout.Std() <= 0 {
+		return fmt.Errorf("websocket.drainTimeout must be positive")
+	}
+	if w.CloseGrace.Std() <= 0 {
+		return fmt.Errorf("websocket.closeGrace must be positive")
+	}
+	if w.CloseGrace.Std() > w.DrainTimeout.Std() {
+		return fmt.Errorf("websocket.closeGrace must be <= websocket.drainTimeout")
+	}
+	if w.PingJitter.Std() < 0 {
+		return fmt.Errorf("websocket.pingJitter must be non-negative")
+	}
+	if w.PingInterval.Std() > 0 && w.PingJitter.Std()*4 > w.PingInterval.Std() {
+		return fmt.Errorf("websocket.pingJitter*4 must be <= websocket.pingInterval")
+	}
+	if w.ReplayLimit <= 0 {
+		return fmt.Errorf("websocket.replayLimit must be positive")
+	}
+	if w.ReplayLimit > 4096 {
+		return fmt.Errorf("websocket.replayLimit must be <= 4096")
+	}
+	return nil
+}
+
 func (c DoubaoTTSConfig) validate() error {
 	appID := strings.TrimSpace(c.AppID)
 	ackToken := strings.TrimSpace(c.AckToken)
@@ -658,174 +745,35 @@ func (k KafkaConfig) validate() error {
 }
 
 func (c *Config) applyEnv() error {
-	setString("SERVER_ADDR", &c.Server.Addr)
-	if err := setDuration("SERVER_READ_TIMEOUT", &c.Server.ReadTimeout); err != nil {
-		return err
-	}
-	if err := setDuration("SERVER_WRITE_TIMEOUT", &c.Server.WriteTimeout); err != nil {
-		return err
-	}
-	if err := setDuration("SERVER_SHUTDOWN_TIMEOUT", &c.Server.ShutdownTimeout); err != nil {
-		return err
-	}
-
-	setString("MYSQL_DSN", &c.MySQL.DSN)
-	if err := setInt("MYSQL_MAX_OPEN_CONNS", &c.MySQL.MaxOpenConns); err != nil {
-		return err
-	}
-	if err := setInt("MYSQL_MAX_IDLE_CONNS", &c.MySQL.MaxIdleConns); err != nil {
-		return err
-	}
-	if err := setDuration("MYSQL_CONN_MAX_LIFETIME", &c.MySQL.ConnMaxLifetime); err != nil {
-		return err
-	}
-
-	// RT 分片：支持 REDIS_RT_SHARD_<N>_* 环境变量与 yaml 中的 shards 列表合作。
-	// - 如果 yaml 已定义 shards，env 仅按 index 覆盖对应字段；
-	// - 如果 yaml 没有定义且 env 出现 REDIS_RT_SHARD_<N>_ADDR，则按需扩容。
-	// 兼容历史 REDIS_RT_PRIMARY_*：若给出且 shards 为空/index 0 字段未填，
-	// 则映射到 shards[0]。
-	if err := c.applyRTShardEnv(); err != nil {
-		return err
-	}
-	setString("REDIS_CACHE_ADDR", &c.Redis.Cache.Addr)
-	setString("REDIS_CACHE_USERNAME", &c.Redis.Cache.Username)
-	setString("REDIS_CACHE_PASSWORD", &c.Redis.Cache.Password)
-	if err := setInt("REDIS_CACHE_DB", &c.Redis.Cache.DB); err != nil {
-		return err
-	}
-	if err := setInt("REDIS_CACHE_POOL_SIZE", &c.Redis.Cache.PoolSize); err != nil {
-		return err
-	}
-	if err := setDuration("IDEMPOTENCY_TTL", &c.Idempotency.TTL); err != nil {
-		return err
-	}
-
-	setString("JWT_ISSUER", &c.JWT.Issuer)
+	// 环境变量只承载密钥/凭证类配置。端口、角色、限流、超时、开关、
+	// broker/topic、actor 等普通配置统一写在 configs/config.yaml。
 	setString("JWT_SECRET", &c.JWT.Secret)
-	if err := setDuration("JWT_ACCESS_TOKEN_TTL", &c.JWT.AccessTokenTTL); err != nil {
-		return err
-	}
-
-	if err := setInt("IDGEN_WORKER_ID", &c.IDGen.WorkerID); err != nil {
-		return err
-	}
-
-	if err := setInt64("AUCTION_MIN_INCREMENT_CENT", &c.Auction.MinIncrementCent); err != nil {
-		return err
-	}
-	if err := setInt64("AUCTION_ANTI_SNIPE_MS", &c.Auction.AntiSnipeMs); err != nil {
-		return err
-	}
-	if err := setInt64("AUCTION_EXTEND_MS", &c.Auction.ExtendMs); err != nil {
-		return err
-	}
-	if err := setInt("AUCTION_MAX_EXTEND_COUNT", &c.Auction.MaxExtendCount); err != nil {
-		return err
-	}
-	if err := setInt("AUCTION_FREQ_LIMIT_COUNT", &c.Auction.FreqLimitCount); err != nil {
-		return err
-	}
-	if err := setInt64("AUCTION_FREQ_WINDOW_MS", &c.Auction.FreqWindowMs); err != nil {
-		return err
-	}
-	if err := setDuration("AUCTION_BID_IDEMPOTENCY_TTL", &c.Auction.BidIdempotencyTTL); err != nil {
-		return err
-	}
-	if err := setBool("RISK_CONTROL_ENABLED", &c.RiskControl.Enabled); err != nil {
-		return err
-	}
-
-	if err := setInt("WEBSOCKET_READ_LIMIT_BYTES", &c.WebSocket.ReadLimitBytes); err != nil {
-		return err
-	}
-	if err := setInt("WEBSOCKET_SEND_BUFFER_SIZE", &c.WebSocket.SendBufferSize); err != nil {
-		return err
-	}
-	if err := setDuration("WEBSOCKET_PING_INTERVAL", &c.WebSocket.PingInterval); err != nil {
-		return err
-	}
-	if err := setDuration("WEBSOCKET_PONG_TIMEOUT", &c.WebSocket.PongTimeout); err != nil {
-		return err
-	}
-
-	if err := setBool("OBJECT_STORAGE_ENABLED", &c.ObjectStorage.Enabled); err != nil {
-		return err
-	}
-	setString("OBJECT_STORAGE_ENDPOINT", &c.ObjectStorage.Endpoint)
-	setString("OBJECT_STORAGE_REGION", &c.ObjectStorage.Region)
-	setString("OBJECT_STORAGE_BUCKET", &c.ObjectStorage.Bucket)
-	setString("OBJECT_STORAGE_BUCKET_URL", &c.ObjectStorage.BucketURL)
+	applyRedisPasswordEnv(c.Redis.RT.Shards)
+	setString("REDIS_CACHE_PASSWORD", &c.Redis.Cache.Password)
 	setString("OBJECT_STORAGE_ACCESS_KEY", &c.ObjectStorage.AccessKey)
 	setString("OBJECT_STORAGE_SECRET_KEY", &c.ObjectStorage.SecretKey)
-	setString("OBJECT_STORAGE_OBJECT_PREFIX", &c.ObjectStorage.ObjectPrefix)
-
-	setString("AGENT_PRODUCT_DESCRIPTION_URL", &c.Agent.ProductDescriptionURL)
-	if err := setBool("AGENT_PRODUCT_AUDIT_ENABLED", &c.Agent.ProductAuditEnabled); err != nil {
-		return err
-	}
-	setString("AGENT_PRODUCT_AUDIT_URL", &c.Agent.ProductAuditURL)
-	setString("AGENT_PRODUCT_AUDIT_CALLBACK_URL", &c.Agent.ProductAuditCallbackURL)
-	setString("AGENT_LIVE_ANALYSIS_URL", &c.Agent.LiveAnalysisURL)
-	setString("AGENT_LIVE_ANALYSIS_CALLBACK_URL", &c.Agent.LiveAnalysisCallbackURL)
 	setString("AGENT_LIVE_ANALYSIS_CALLBACK_API_KEY", &c.Agent.LiveAnalysisCallbackAPIKey)
-	setString("AGENT_LIVE_AUCTION_HOOK_URL", &c.Agent.LiveAuctionHookURL)
-	if err := setDuration("AGENT_TIMEOUT", &c.Agent.Timeout); err != nil {
-		return err
-	}
-
 	setString("DOUBAO_TTS_APP_ID", &c.DoubaoTTS.AppID)
 	setString("DOUBAO_TTS_ACK_TOKEN", &c.DoubaoTTS.AckToken)
-	setString("DOUBAO_TTS_VOICE", &c.DoubaoTTS.Voice)
-
-	if err := setBool("KAFKA_ENABLED", &c.Kafka.Enabled); err != nil {
-		return err
-	}
-	setStringSlice("KAFKA_BROKERS", &c.Kafka.Brokers)
-	setString("KAFKA_CLIENT_ID", &c.Kafka.ClientID)
-	setString("KAFKA_BID_EVENTS_TOPIC", &c.Kafka.BidEventsTopic)
-	setString("KAFKA_AUCTION_EVENTS_TOPIC", &c.Kafka.AuctionEventsTopic)
-	setString("KAFKA_ORDER_EVENTS_TOPIC", &c.Kafka.OrderEventsTopic)
-	setString("KAFKA_BID_BRIDGE_GROUP", &c.Kafka.BidBridgeGroup)
-	setString("KAFKA_BID_RECORD_GROUP", &c.Kafka.BidRecordGroup)
-
 	setString("MCP_READ_API_KEY", &c.MCP.Read.APIKey)
-	setString("MCP_READ_ACTOR_ID", &c.MCP.Read.ActorID)
-	setString("MCP_READ_ACTOR_ROLE", &c.MCP.Read.ActorRole)
 	setString("MCP_CONTROL_API_KEY", &c.MCP.Control.APIKey)
-	setString("MCP_CONTROL_ACTOR_ID", &c.MCP.Control.ActorID)
-	setString("MCP_CONTROL_ACTOR_ROLE", &c.MCP.Control.ActorRole)
-
-	setString("OBSERVABILITY_LOG_LEVEL", &c.Observability.LogLevel)
-	setString("OBSERVABILITY_METRICS_PATH", &c.Observability.MetricsPath)
-	setString("OBSERVABILITY_FORMAT", &c.Observability.Format)
-	if err := setInt("OBSERVABILITY_SLOW_SQL_THRESHOLD_MS", &c.Observability.SlowSQLThresholdMs); err != nil {
-		return err
-	}
-	if err := setBool("OBSERVABILITY_METRICS_ENABLED", &c.Observability.Metrics.Enabled); err != nil {
-		return err
-	}
-	setString("OBSERVABILITY_METRICS_PATH_OVERRIDE", &c.Observability.Metrics.Path)
-	setString("OBSERVABILITY_METRICS_NAMESPACE", &c.Observability.Metrics.Namespace)
 	setString("OBSERVABILITY_METRICS_AUTH_TOKEN", &c.Observability.Metrics.AuthToken)
-	if err := setBool("OBSERVABILITY_TRACING_ENABLED", &c.Observability.Tracing.Enabled); err != nil {
-		return err
-	}
-	setString("OBSERVABILITY_TRACING_EXPORTER", &c.Observability.Tracing.Exporter)
-	setString("OBSERVABILITY_TRACING_ENDPOINT", &c.Observability.Tracing.Endpoint)
-	if err := setBool("OBSERVABILITY_TRACING_INSECURE", &c.Observability.Tracing.Insecure); err != nil {
-		return err
-	}
-	setString("OBSERVABILITY_TRACING_SERVICE_NAME", &c.Observability.Tracing.ServiceName)
-	setString("OBSERVABILITY_TRACING_SAMPLER", &c.Observability.Tracing.Sampler)
-	if err := setFloat64("OBSERVABILITY_TRACING_SAMPLE_RATIO", &c.Observability.Tracing.SampleRatio); err != nil {
-		return err
-	}
-	setString("OBSERVABILITY_HEALTH_LIVENESS_PATH", &c.Observability.Health.LivenessPath)
-	setString("OBSERVABILITY_HEALTH_READINESS_PATH", &c.Observability.Health.ReadinessPath)
 	c.Kafka.normalize()
 	c.Observability.normalize()
 	return nil
+}
+
+func applyRedisPasswordEnv(shards []RedisInstanceConfig) {
+	for i := range shards {
+		key := fmt.Sprintf("REDIS_RT_SHARD_%d_PASSWORD", i)
+		if value, ok := os.LookupEnv(key); ok && value != "" {
+			shards[i].Password = value
+			continue
+		}
+		if i == 0 {
+			setString("REDIS_RT_PRIMARY_PASSWORD", &shards[i].Password)
+		}
+	}
 }
 
 func resolvePath(path string) (string, error) {
@@ -856,23 +804,11 @@ func resolvePath(path string) (string, error) {
 
 func setString(name string, target *string) {
 	if value, ok := os.LookupEnv(name); ok {
+		if value == "" {
+			return
+		}
 		*target = value
 	}
-}
-
-func setStringSlice(name string, target *[]string) {
-	value, ok := os.LookupEnv(name)
-	if !ok {
-		return
-	}
-	parts := strings.Split(value, ",")
-	out := make([]string, 0, len(parts))
-	for _, part := range parts {
-		if trimmed := strings.TrimSpace(part); trimmed != "" {
-			out = append(out, trimmed)
-		}
-	}
-	*target = out
 }
 
 func loadDotEnv(startDir string) error {
@@ -982,141 +918,6 @@ func redisHost(addr string) string {
 		return strings.TrimSpace(host)
 	}
 	return strings.Trim(addr, "[]")
-}
-
-func setDuration(name string, target *Duration) error {
-	value, ok := os.LookupEnv(name)
-	if !ok {
-		return nil
-	}
-	parsed, err := time.ParseDuration(value)
-	if err != nil {
-		return fmt.Errorf("parse env %s=%q as duration: %w", name, value, err)
-	}
-	*target = Duration(parsed)
-	return nil
-}
-
-func setInt(name string, target *int) error {
-	value, ok := os.LookupEnv(name)
-	if !ok {
-		return nil
-	}
-	parsed, err := strconv.Atoi(value)
-	if err != nil {
-		return fmt.Errorf("parse env %s=%q as int: %w", name, value, err)
-	}
-	*target = parsed
-	return nil
-}
-
-func setInt64(name string, target *int64) error {
-	value, ok := os.LookupEnv(name)
-	if !ok {
-		return nil
-	}
-	parsed, err := strconv.ParseInt(value, 10, 64)
-	if err != nil {
-		return fmt.Errorf("parse env %s=%q as int64: %w", name, value, err)
-	}
-	*target = parsed
-	return nil
-}
-
-func setBool(name string, target *bool) error {
-	value, ok := os.LookupEnv(name)
-	if !ok {
-		return nil
-	}
-	parsed, err := strconv.ParseBool(value)
-	if err != nil {
-		return fmt.Errorf("parse env %s=%q as bool: %w", name, value, err)
-	}
-	*target = parsed
-	return nil
-}
-
-func setFloat64(name string, target *float64) error {
-	value, ok := os.LookupEnv(name)
-	if !ok {
-		return nil
-	}
-	parsed, err := strconv.ParseFloat(value, 64)
-	if err != nil {
-		return fmt.Errorf("parse env %s=%q as float64: %w", name, value, err)
-	}
-	*target = parsed
-	return nil
-}
-
-// applyRTShardEnv 处理 REDIS_RT_SHARD_<N>_* 环境变量。
-//
-// 规则：
-//   - 当 REDIS_RT_SHARD_<N>_ADDR 显式存在（包含空字符串）时认为对该 index 做覆盖；
-//     必要时把 c.Redis.RT.Shards 扩容到 N+1。
-//   - 其余字段（USERNAME/PASSWORD/DB/POOL_SIZE）只有在 shards[N] 已存在时才生效。
-//   - 如果 shards 当前为空且未显式给出任何 SHARD_<N>_ADDR，则保持 yaml 解析后的列表。
-//   - 兼容旧名 REDIS_RT_PRIMARY_*：等价于 SHARD_0_*；显式 SHARD_0_* 优先。
-//
-// 上游 Validate 会再做最终校验（>=1 shard、地址非空、互不相同、与 cache 不重）。
-func (c *Config) applyRTShardEnv() error {
-	// 兼容历史 REDIS_RT_PRIMARY_* → SHARD_0_*。
-	mapLegacy := func(legacy, modern string) {
-		if _, ok := os.LookupEnv(modern); ok {
-			return
-		}
-		if v, ok := os.LookupEnv(legacy); ok {
-			_ = os.Setenv(modern, v)
-		}
-	}
-	mapLegacy("REDIS_RT_PRIMARY_ADDR", "REDIS_RT_SHARD_0_ADDR")
-	mapLegacy("REDIS_RT_PRIMARY_USERNAME", "REDIS_RT_SHARD_0_USERNAME")
-	mapLegacy("REDIS_RT_PRIMARY_PASSWORD", "REDIS_RT_SHARD_0_PASSWORD")
-	mapLegacy("REDIS_RT_PRIMARY_DB", "REDIS_RT_SHARD_0_DB")
-	mapLegacy("REDIS_RT_PRIMARY_POOL_SIZE", "REDIS_RT_SHARD_0_POOL_SIZE")
-
-	const prefix = "REDIS_RT_SHARD_"
-	maxIndex := -1
-	for _, kv := range os.Environ() {
-		key, _, ok := strings.Cut(kv, "=")
-		if !ok || !strings.HasPrefix(key, prefix) {
-			continue
-		}
-		rest := strings.TrimPrefix(key, prefix)
-		idxStr, _, ok := strings.Cut(rest, "_")
-		if !ok {
-			continue
-		}
-		idx, err := strconv.Atoi(idxStr)
-		if err != nil || idx < 0 {
-			continue
-		}
-		if idx > maxIndex {
-			maxIndex = idx
-		}
-	}
-	for i := 0; i <= maxIndex; i++ {
-		addrKey := fmt.Sprintf("%s%d_ADDR", prefix, i)
-		if _, ok := os.LookupEnv(addrKey); !ok {
-			continue
-		}
-		for len(c.Redis.RT.Shards) <= i {
-			c.Redis.RT.Shards = append(c.Redis.RT.Shards, RedisInstanceConfig{})
-		}
-	}
-	for i := range c.Redis.RT.Shards {
-		shard := &c.Redis.RT.Shards[i]
-		setString(fmt.Sprintf("%s%d_ADDR", prefix, i), &shard.Addr)
-		setString(fmt.Sprintf("%s%d_USERNAME", prefix, i), &shard.Username)
-		setString(fmt.Sprintf("%s%d_PASSWORD", prefix, i), &shard.Password)
-		if err := setInt(fmt.Sprintf("%s%d_DB", prefix, i), &shard.DB); err != nil {
-			return err
-		}
-		if err := setInt(fmt.Sprintf("%s%d_POOL_SIZE", prefix, i), &shard.PoolSize); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 // normalize 在 Validate 之前对 ObservabilityConfig 做兼容性归一化：

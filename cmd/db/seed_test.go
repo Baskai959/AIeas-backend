@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"aieas_backend/internal/repository"
+	userrepo "aieas_backend/internal/modules/user/repository"
 )
 
 func TestDevUsersAlignWithMemorySeedIDs(t *testing.T) {
@@ -12,28 +12,28 @@ func TestDevUsersAlignWithMemorySeedIDs(t *testing.T) {
 		"buyer001": {
 			ID:           1001,
 			Account:      "buyer001",
-			PasswordHash: repository.HashPassword("Passw0rd!"),
+			PasswordHash: userrepo.HashPassword("Passw0rd!"),
 			Role:         "buyer",
 			Status:       "ACTIVE",
 		},
 		"merchant001": {
 			ID:           2001,
 			Account:      "merchant001",
-			PasswordHash: repository.HashPassword("Passw0rd!"),
+			PasswordHash: userrepo.HashPassword("Passw0rd!"),
 			Role:         "merchant",
 			Status:       "ACTIVE",
 		},
 		"admin001": {
 			ID:           9001,
 			Account:      "admin001",
-			PasswordHash: repository.HashPassword("AdminPassw0rd!"),
+			PasswordHash: userrepo.HashPassword("AdminPassw0rd!"),
 			Role:         "admin",
 			Status:       "ACTIVE",
 		},
 		"disabled001": {
 			ID:           1002,
 			Account:      "disabled001",
-			PasswordHash: repository.HashPassword("Passw0rd!"),
+			PasswordHash: userrepo.HashPassword("Passw0rd!"),
 			Role:         "buyer",
 			Status:       "DISABLED",
 		},

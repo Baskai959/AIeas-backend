@@ -10,11 +10,12 @@ type Category struct {
 
 type LiveSessionView struct {
 	LiveSession
-	MerchantName string                 `json:"merchantName"`
-	VideoSource  string                 `json:"videoSource"`
-	VideoURL     string                 `json:"videoUrl"`
-	DigitalHuman map[string]interface{} `json:"digitalHuman"`
-	OnlineCount  int                    `json:"onlineCount"`
+	MerchantName       string                 `json:"merchantName"`
+	VideoSource        string                 `json:"videoSource"`
+	VideoURL           string                 `json:"videoUrl"`
+	DigitalHuman       map[string]interface{} `json:"digitalHuman"`
+	AIAssistantEnabled bool                   `json:"aiAssistantEnabled"`
+	OnlineCount        int                    `json:"onlineCount"`
 }
 
 type MerchantView struct {

@@ -3,18 +3,41 @@ package redis
 import "strings"
 
 const (
-	ScriptBidPlace  = "bid.place"
-	ScriptHammer    = "auction.hammer"
-	ScriptRateLimit = "ratelimit.token_bucket"
+	ScriptBidPlace       = "bid.place"
+	ScriptHammer         = "auction.hammer"
+	ScriptRateLimit      = "ratelimit.token_bucket"
+	ScriptMarkEnrollment = "auction.mark_enrollment"
 )
 
 func DefaultScripts() map[string]string {
 	return map[string]string{
-		ScriptBidPlace:  strings.TrimSpace(bidLua),
-		ScriptHammer:    strings.TrimSpace(hammerLua),
-		ScriptRateLimit: strings.TrimSpace(rateLimitLua),
+		ScriptBidPlace:       strings.TrimSpace(bidLua),
+		ScriptHammer:         strings.TrimSpace(hammerLua),
+		ScriptRateLimit:      strings.TrimSpace(rateLimitLua),
+		ScriptMarkEnrollment: strings.TrimSpace(markEnrollmentLua),
 	}
 }
+
+const markEnrollmentLua = `
+local enrolled_key = KEYS[1]
+local deposits_key = KEYS[2]
+local state_key = KEYS[3]
+local user_id = ARGV[1]
+
+if user_id == nil or user_id == "" then
+  return redis.error_reply("invalid enrollment arguments")
+end
+
+local added = redis.call("SADD", enrolled_key, user_id)
+redis.call("SADD", deposits_key, user_id)
+
+if added == 1 and redis.call("EXISTS", state_key) == 1 then
+  redis.call("HINCRBY", state_key, "participant_count", 1)
+  redis.call("HINCRBY", state_key, "version", 1)
+end
+
+return added
+`
 
 const bidLua = `
 local state_key = KEYS[1]

@@ -136,6 +136,38 @@ func (o *OrderDeal) MarkTimeout(now time.Time) error {
 	return nil
 }
 
+func (o *OrderDeal) MarkShipped(now time.Time) error {
+	if o == nil {
+		return ErrInvalidArgument
+	}
+	if o.FulfillmentStatus == FulfillmentStatusShipped {
+		return nil
+	}
+	if o.Status != OrderStatusPaid || o.PayStatus != PayStatusPaid || NormalizeFulfillmentStatus(o.FulfillmentStatus) != FulfillmentStatusUnshipped {
+		return ErrInvalidState
+	}
+	shippedAt := now.UTC()
+	o.FulfillmentStatus = FulfillmentStatusShipped
+	o.ShippedAt = &shippedAt
+	return nil
+}
+
+func (o *OrderDeal) MarkReceived(now time.Time) error {
+	if o == nil {
+		return ErrInvalidArgument
+	}
+	if o.FulfillmentStatus == FulfillmentStatusReceived {
+		return nil
+	}
+	if o.Status != OrderStatusPaid || o.PayStatus != PayStatusPaid || NormalizeFulfillmentStatus(o.FulfillmentStatus) != FulfillmentStatusShipped {
+		return ErrInvalidState
+	}
+	receivedAt := now.UTC()
+	o.FulfillmentStatus = FulfillmentStatusReceived
+	o.ReceivedAt = &receivedAt
+	return nil
+}
+
 type OrderFilter struct {
 	WinnerID      string
 	SellerID      string

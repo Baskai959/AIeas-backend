@@ -5,16 +5,15 @@ import (
 	"strings"
 
 	"aieas_backend/internal/domain"
-	"aieas_backend/internal/service"
 
 	"github.com/cloudwego/hertz/pkg/app"
 )
 
 type MarketplaceHandler struct {
-	marketplace *service.MarketplaceService
+	marketplace MarketplaceUseCase
 }
 
-func NewMarketplaceHandler(marketplace *service.MarketplaceService) *MarketplaceHandler {
+func NewMarketplaceHandler(marketplace MarketplaceUseCase) *MarketplaceHandler {
 	return &MarketplaceHandler{marketplace: marketplace}
 }
 

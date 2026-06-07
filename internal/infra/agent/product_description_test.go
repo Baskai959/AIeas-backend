@@ -9,7 +9,7 @@ import (
 	"time"
 
 	appconfig "aieas_backend/internal/config"
-	"aieas_backend/internal/service"
+	liveanalysisports "aieas_backend/internal/modules/live_analysis/ports"
 )
 
 func TestLiveAnalysisClientRequestsAsyncReport(t *testing.T) {
@@ -32,7 +32,7 @@ func TestLiveAnalysisClientRequestsAsyncReport(t *testing.T) {
 	defer server.Close()
 
 	client := NewLiveAnalysisClient(appconfig.AgentConfig{LiveAnalysisURL: server.URL, Timeout: appconfig.Duration(time.Second)})
-	got, err := client.RequestLiveAnalysis(t.Context(), service.LiveAnalysisAsyncInput{
+	got, err := client.RequestLiveAnalysis(t.Context(), liveanalysisports.AsyncRequestInput{
 		Prompt:      "帮我总结商家id为u_2001最近一场直播情况。",
 		CallbackURL: "http://backend/api/v1/live-analysis/callback",
 		CallbackHeaders: map[string]string{
@@ -64,7 +64,7 @@ func TestLiveAnalysisClientReturnsAsyncAgentErrorMessage(t *testing.T) {
 	defer server.Close()
 
 	client := NewLiveAnalysisClient(appconfig.AgentConfig{LiveAnalysisURL: server.URL, Timeout: appconfig.Duration(time.Second)})
-	if _, err := client.RequestLiveAnalysis(t.Context(), service.LiveAnalysisAsyncInput{Prompt: "prompt", CallbackURL: "http://backend/callback"}); err == nil || !strings.Contains(err.Error(), "模型服务超时") {
+	if _, err := client.RequestLiveAnalysis(t.Context(), liveanalysisports.AsyncRequestInput{Prompt: "prompt", CallbackURL: "http://backend/callback"}); err == nil || !strings.Contains(err.Error(), "模型服务超时") {
 		t.Fatal("expected agent error")
 	}
 }

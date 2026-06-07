@@ -5,16 +5,15 @@ import (
 	"strings"
 
 	"aieas_backend/internal/domain"
-	"aieas_backend/internal/service"
 
 	"github.com/cloudwego/hertz/pkg/app"
 )
 
 type AIAssistantHandler struct {
-	assistant *service.AIAssistantService
+	assistant AIAssistantUseCase
 }
 
-func NewAIAssistantHandler(assistant *service.AIAssistantService) *AIAssistantHandler {
+func NewAIAssistantHandler(assistant AIAssistantUseCase) *AIAssistantHandler {
 	return &AIAssistantHandler{assistant: assistant}
 }
 
@@ -31,7 +30,7 @@ func (h *AIAssistantHandler) Permission(ctx context.Context, c *app.RequestConte
 		WriteError(c, 503, 90002, "服务暂不可用", nil)
 		return
 	}
-	permission, err := h.assistant.Permission(ctx, service.AIAssistantPermissionInput{
+	permission, err := h.assistant.Permission(ctx, AIAssistantPermissionInput{
 		MerchantID: strings.TrimSpace(c.Query("merchantId")),
 		ActorID:    AuthUserID(c),
 		ActorRole:  AuthRole(c),
@@ -53,7 +52,7 @@ func (h *AIAssistantHandler) UpdatePermission(ctx context.Context, c *app.Reques
 		WriteError(c, 400, 20001, "参数不合法", nil)
 		return
 	}
-	permission, err := h.assistant.UpdatePermission(ctx, service.AIAssistantPermissionUpdateInput{
+	permission, err := h.assistant.UpdatePermission(ctx, AIAssistantPermissionUpdateInput{
 		MerchantID: strings.TrimSpace(c.Query("merchantId")),
 		Permission: req.Permission,
 		ActorID:    AuthUserID(c),
@@ -77,7 +76,7 @@ func (h *AIAssistantHandler) DecideApproval(ctx context.Context, c *app.RequestC
 		WriteError(c, 400, 20001, "参数不合法", nil)
 		return
 	}
-	decision, err := h.assistant.DecideApproval(ctx, service.AIAssistantDecisionInput{
+	decision, err := h.assistant.DecideApproval(ctx, AIAssistantDecisionInput{
 		RequestID: requestID,
 		Approved:  req.Approved,
 		ActorID:   AuthUserID(c),

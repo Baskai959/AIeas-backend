@@ -64,6 +64,88 @@ func TestHubReplaySinceAndSnapshotGap(t *testing.T) {
 	}
 }
 
+func TestHubBeginDrainDeliversWithoutConsumingSeqOrHistory(t *testing.T) {
+	hub := NewHubWithEventWindow(4)
+	metrics := &fakeHubMetrics{}
+	hub.SetMetrics(metrics)
+	client := NewClient("c1", "u1", 20002, 8)
+	if err := hub.Subscribe(20002, client); err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	drainPresence(t, client)
+	hub.Broadcast(20002, Envelope{Type: "e1"})
+	before, ok := hub.Room(20002)
+	if !ok {
+		t.Fatal("expected room")
+	}
+	beforeSeq := before.CurrentSeq()
+	beforeMissed, beforeComplete := hub.ReplaySince(20002, 0)
+	drainPresence(t, client)
+
+	hub.BeginDrain(1234)
+	hub.BeginDrain(5678)
+
+	if !hub.IsDraining() {
+		t.Fatal("hub should be draining")
+	}
+	if metrics.drainingCount != 2 {
+		t.Fatalf("expected draining metric per BeginDrain call, got %d", metrics.drainingCount)
+	}
+	room, _ := hub.Room(20002)
+	if seq := room.CurrentSeq(); seq != beforeSeq {
+		t.Fatalf("drain must not consume seq, before=%d got=%d", beforeSeq, seq)
+	}
+	missed, complete := hub.ReplaySince(20002, 0)
+	if complete != beforeComplete || len(missed) != len(beforeMissed) {
+		t.Fatalf("drain must not change replay history, before complete=%v len=%d after complete=%v len=%d", beforeComplete, len(beforeMissed), complete, len(missed))
+	}
+	for _, env := range missed {
+		if env.Type == TypeGatewayDraining {
+			t.Fatalf("drain envelope must not enter replay history: %+v", missed)
+		}
+	}
+
+	found := 0
+	for len(client.Outbound()) > 0 {
+		env := <-client.Outbound()
+		if env.Type == TypeGatewayDraining {
+			found++
+			var payload map[string]int
+			if err := json.Unmarshal(env.Payload, &payload); err != nil {
+				t.Fatalf("decode draining payload: %v", err)
+			}
+			if payload["retryAfterMs"] == 0 {
+				t.Fatalf("missing retryAfterMs: %+v", payload)
+			}
+		}
+	}
+	if found != 2 {
+		t.Fatalf("expected two direct draining envelopes, got %d", found)
+	}
+}
+
+func TestHubSubscribeRejectsDuringDrainAndAwaitForceCloses(t *testing.T) {
+	hub := NewHub()
+	client := NewClient("c1", "u1", 20003, 8)
+	if err := hub.Subscribe(20003, client); err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	drainPresence(t, client)
+	hub.BeginDrain(1000)
+	if err := hub.Subscribe(20003, NewClient("c2", "u2", 20003, 8)); !errors.Is(err, ErrHubDraining) {
+		t.Fatalf("expected ErrHubDraining from Subscribe, got %v", err)
+	}
+	if err := hub.SubscribeLiveSessionOnly(99, NewClientWithSession("c3", "u3", 0, 99, 8)); !errors.Is(err, ErrHubDraining) {
+		t.Fatalf("expected ErrHubDraining from SubscribeLiveSessionOnly, got %v", err)
+	}
+	if err := hub.AwaitDrained(context.Background(), time.Millisecond); err != nil {
+		t.Fatalf("await drained: %v", err)
+	}
+	if !client.Closed() || client.CloseReason() != "gateway_draining" {
+		t.Fatalf("expected force close with gateway_draining, closed=%v reason=%q", client.Closed(), client.CloseReason())
+	}
+}
+
 func TestHubDeduplicatesBidEventsByPubSeq(t *testing.T) {
 	hub := NewHub()
 	client := NewClient("c1", "u1", 21001, 4)
@@ -133,6 +215,60 @@ func TestHubOnlineCountUpdatesOnSubscribeUnsubscribeAndSlowConsumer(t *testing.T
 	hub.Unsubscribe(30001, c1.ID)
 	if hub.OnlineCount(30001) != 0 {
 		t.Fatalf("expected online count 0 after unsubscribe, got %d", hub.OnlineCount(30001))
+	}
+}
+
+func TestHubLiveSessionOnlineCountWithoutActiveAuction(t *testing.T) {
+	counter := NewMemoryOnlineCounter()
+	hub := NewHubWithOnlineCounter(counter)
+	buyer := NewClientWithSession("buyer", "u1", 0, 9001, 4)
+	merchant := NewClientWithSession("merchant", "m1", 0, 9001, 4)
+	merchant.CountOnline = false
+
+	if err := hub.SubscribeLiveSessionOnly(9001, buyer); err != nil {
+		t.Fatalf("subscribe buyer: %v", err)
+	}
+	if got := hub.LiveSessionOnlineCount(9001); got != 1 {
+		t.Fatalf("expected live session online count 1, got %d", got)
+	}
+	if got := hub.OnlineCount(9001); got != 0 {
+		t.Fatalf("live session online should not collide with auction online count, got %d", got)
+	}
+	if online := lastPresenceOnline(t, buyer); online != 1 {
+		t.Fatalf("expected live session presence online 1, got %d", online)
+	}
+
+	if err := hub.SubscribeLiveSessionOnly(9001, merchant); err != nil {
+		t.Fatalf("subscribe merchant: %v", err)
+	}
+	if got := hub.LiveSessionOnlineCount(9001); got != 1 {
+		t.Fatalf("merchant should not be counted as buyer online, got %d", got)
+	}
+	drainPresence(t, buyer, merchant)
+	hub.UnsubscribeClient(buyer)
+	if got := hub.LiveSessionOnlineCount(9001); got != 0 {
+		t.Fatalf("expected live session online count 0 after buyer leaves, got %d", got)
+	}
+}
+
+func TestHubLiveSessionOnlineCountWithActiveAuction(t *testing.T) {
+	hub := NewHubWithOnlineCounter(NewMemoryOnlineCounter())
+	client := NewClientWithSession("buyer", "u1", 31002, 9002, 4)
+	if err := hub.Subscribe(31002, client); err != nil {
+		t.Fatalf("subscribe active auction client: %v", err)
+	}
+	if got := hub.OnlineCount(31002); got != 1 {
+		t.Fatalf("expected auction online count 1, got %d", got)
+	}
+	if got := hub.LiveSessionOnlineCount(9002); got != 1 {
+		t.Fatalf("expected live session online count 1, got %d", got)
+	}
+	hub.UnsubscribeClient(client)
+	if got := hub.OnlineCount(31002); got != 0 {
+		t.Fatalf("expected auction online count 0 after leave, got %d", got)
+	}
+	if got := hub.LiveSessionOnlineCount(9002); got != 0 {
+		t.Fatalf("expected live session online count 0 after leave, got %d", got)
 	}
 }
 
@@ -406,6 +542,49 @@ func TestHubBroadcastLiveSessionDeliversWithoutCleaningSessionIndex(t *testing.T
 		case <-time.After(time.Second):
 			t.Fatalf("timed out waiting for live voice broadcast on %s", c.ID)
 		}
+	}
+}
+
+func TestHubBroadcastLiveSessionOnlineClientsOnly(t *testing.T) {
+	hub := NewHub()
+	const sessionID uint64 = 9003
+	buyer := NewClientWithSession("buyer", "u1", 0, sessionID, 8)
+	merchant := NewClientWithSession("merchant", "m1", 0, sessionID, 8)
+	admin := NewClientWithSession("admin", "a1", 0, sessionID, 8)
+	merchant.CountOnline = false
+	admin.CountOnline = false
+	if err := hub.SubscribeLiveSessionOnly(sessionID, buyer); err != nil {
+		t.Fatalf("subscribe buyer: %v", err)
+	}
+	if err := hub.SubscribeLiveSessionOnly(sessionID, merchant); err != nil {
+		t.Fatalf("subscribe merchant: %v", err)
+	}
+	if err := hub.SubscribeLiveSessionOnly(sessionID, admin); err != nil {
+		t.Fatalf("subscribe admin: %v", err)
+	}
+	drainPresence(t, buyer, merchant, admin)
+
+	delivered := hub.BroadcastLiveSessionOnlineClients(sessionID, Envelope{Type: TypeLiveVoiceBroadcast, RequestID: "voice-online-1", Payload: json.RawMessage(`{"audioBase64":"AQI="}`)})
+	if delivered != 1 {
+		t.Fatalf("expected 1 delivered, got %d", delivered)
+	}
+	select {
+	case env := <-buyer.Outbound():
+		if env.Type != TypeLiveVoiceBroadcast || env.LiveSessionID != sessionID || env.RequestID != "voice-online-1" {
+			t.Fatalf("unexpected buyer envelope: %+v", env)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for buyer live voice broadcast")
+	}
+	select {
+	case env := <-merchant.Outbound():
+		t.Fatalf("merchant should not receive online-client voice broadcast: %+v", env)
+	default:
+	}
+	select {
+	case env := <-admin.Outbound():
+		t.Fatalf("admin should not receive online-client voice broadcast: %+v", env)
+	default:
 	}
 }
 

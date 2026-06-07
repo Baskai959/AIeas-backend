@@ -25,7 +25,7 @@ import (
 	"syscall"
 	"time"
 
-	"golang.org/x/net/websocket"
+	"github.com/gorilla/websocket"
 )
 
 type config struct {
@@ -269,6 +269,7 @@ func main() {
 
 	stats := &counters{}
 	reasons := newReasonCounters()
+	connectReasons := newReasonCounters()
 	latencies := &latencyRecorder{}
 	tracker := newSentTracker()
 	sharedState := &sharedAuctionState{}
@@ -312,7 +313,7 @@ func main() {
 		wg.Add(1)
 		go func(b buyer, ch <-chan struct{}) {
 			defer wg.Done()
-			runBuyer(runCtx, cfg, b, ch, sharedState, stats, reasons, latencies, tracker)
+			runBuyer(runCtx, cfg, b, ch, sharedState, stats, connectReasons, reasons, latencies, tracker)
 		}(buyers[i], jobs[i])
 	}
 
@@ -325,7 +326,7 @@ func main() {
 	}
 	wg.Wait()
 
-	printFinal(time.Since(start), cfg, stats, reasons, latencies.summary())
+	printFinal(time.Since(start), cfg, stats, connectReasons, reasons, latencies.summary())
 }
 
 func parseFlags() config {
@@ -525,10 +526,11 @@ func pollAuctionState(ctx context.Context, client *http.Client, cfg config, toke
 	}
 }
 
-func runBuyer(ctx context.Context, cfg config, b buyer, jobs <-chan struct{}, sharedState *sharedAuctionState, stats *counters, reasons *reasonCounters, latencies *latencyRecorder, tracker *sentTracker) {
+func runBuyer(ctx context.Context, cfg config, b buyer, jobs <-chan struct{}, sharedState *sharedAuctionState, stats *counters, connectReasons *reasonCounters, bidReasons *reasonCounters, latencies *latencyRecorder, tracker *sentTracker) {
 	conn, err := dialWebSocket(ctx, cfg, b.Token)
 	if err != nil {
 		stats.connectErr.Add(1)
+		connectReasons.inc(classifyConnectError(err))
 		return
 	}
 	stats.connectOK.Add(1)
@@ -538,7 +540,7 @@ func runBuyer(ctx context.Context, cfg config, b buyer, jobs <-chan struct{}, sh
 	var writeMu sync.Mutex
 	go func() {
 		defer close(done)
-		readLoop(ctx, conn, sharedState, stats, reasons, latencies, tracker)
+		readLoop(ctx, conn, sharedState, stats, bidReasons, latencies, tracker)
 	}()
 
 	var seq int64
@@ -567,22 +569,72 @@ func dialWebSocket(ctx context.Context, cfg config, token string) (*websocket.Co
 	if err != nil {
 		return nil, err
 	}
-	origin := websocketOrigin(cfg.BaseURL)
-	wsConfig, err := websocket.NewConfig(wsURL, origin)
-	if err != nil {
-		return nil, err
+	netDialer := &net.Dialer{Timeout: cfg.ConnectTimeout}
+	dialer := websocket.Dialer{
+		HandshakeTimeout: cfg.ConnectTimeout,
+		NetDialContext:   netDialer.DialContext,
 	}
-	wsConfig.Dialer = &net.Dialer{Timeout: cfg.ConnectTimeout}
 	if cfg.InsecureSkipVerify {
-		wsConfig.TlsConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec // Load-test flag for local/staging self-signed certs.
+		dialer.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec // Load-test flag for local/staging self-signed certs.
 	}
-	return wsConfig.DialContext(ctx)
+	header := http.Header{}
+	header.Set("Origin", websocketOrigin(cfg.BaseURL))
+	conn, resp, err := dialer.DialContext(ctx, wsURL, header)
+	if err != nil {
+		return nil, websocketDialError(resp, err)
+	}
+	return conn, nil
+}
+
+func websocketDialError(resp *http.Response, err error) error {
+	if resp == nil {
+		return err
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+	body := strings.TrimSpace(string(raw))
+	if body == "" {
+		return fmt.Errorf("websocket handshake http %d: %w", resp.StatusCode, err)
+	}
+	return fmt.Errorf("websocket handshake http %d: %s: %w", resp.StatusCode, body, err)
+}
+
+func classifyConnectError(err error) string {
+	if err == nil {
+		return ""
+	}
+	text := err.Error()
+	if strings.Contains(text, "http 401") {
+		return "http_401"
+	}
+	if strings.Contains(text, "http 403") {
+		return "http_403"
+	}
+	if strings.Contains(text, "http 404") {
+		return "http_404"
+	}
+	if strings.Contains(text, "http 409") {
+		return "http_409"
+	}
+	if strings.Contains(text, "http 429") {
+		return "http_429"
+	}
+	if strings.Contains(text, "http 503") {
+		return "http_503"
+	}
+	if strings.Contains(text, "timeout") || strings.Contains(text, "deadline") {
+		return "timeout"
+	}
+	if strings.Contains(text, "connection refused") {
+		return "connection_refused"
+	}
+	return "connect_error"
 }
 
 func readLoop(ctx context.Context, conn *websocket.Conn, sharedState *sharedAuctionState, stats *counters, reasons *reasonCounters, latencies *latencyRecorder, tracker *sentTracker) {
 	for {
 		var env envelope
-		if err := websocket.JSON.Receive(conn, &env); err != nil {
+		if err := conn.ReadJSON(&env); err != nil {
 			if ctx.Err() == nil {
 				stats.readErr.Add(1)
 			}
@@ -657,7 +709,7 @@ func sendBid(conn *websocket.Conn, writeMu *sync.Mutex, cfg config, b buyer, seq
 	}
 	tracker.put(requestID, time.Now())
 	writeMu.Lock()
-	err = websocket.JSON.Send(conn, env)
+	err = conn.WriteJSON(env)
 	writeMu.Unlock()
 	if err != nil {
 		_, _ = tracker.take(requestID)
@@ -714,7 +766,7 @@ func printProgress(ctx context.Context, started time.Time, interval time.Duratio
 	}
 }
 
-func printFinal(elapsed time.Duration, cfg config, stats *counters, reasons *reasonCounters, lat latencySummary) {
+func printFinal(elapsed time.Duration, cfg config, stats *counters, connectReasons *reasonCounters, bidReasons *reasonCounters, lat latencySummary) {
 	seconds := elapsed.Seconds()
 	fmt.Println()
 	fmt.Println("bidload summary")
@@ -728,8 +780,14 @@ func printFinal(elapsed time.Duration, cfg config, stats *counters, reasons *rea
 	fmt.Printf("sendQPS=%.2f acceptedQPS=%.2f ackRate=%.2f%%\n", float64(stats.sent.Load())/maxFloat(seconds, 1), float64(stats.accepted.Load())/maxFloat(seconds, 1), ratioPercent(stats.ack.Load(), stats.sent.Load()))
 	fmt.Printf("ackLatency count=%d p50=%s p95=%s p99=%s max=%s\n", lat.Count, formatMicros(lat.P50), formatMicros(lat.P95), formatMicros(lat.P99), formatMicros(lat.Max))
 	fmt.Printf("broadcastFrames accepted=%d rejected=%d\n", stats.broadcastAccepted.Load(), stats.broadcastRejected.Load())
-	if counts := reasons.snapshot(); len(counts) > 0 {
-		fmt.Println("reject reasons:")
+	if counts := connectReasons.snapshot(); len(counts) > 0 {
+		fmt.Println("connect error reasons:")
+		for _, item := range counts {
+			fmt.Printf("  %s=%d\n", item.Reason, item.Count)
+		}
+	}
+	if counts := bidReasons.snapshot(); len(counts) > 0 {
+		fmt.Println("bid reject reasons:")
 		for _, item := range counts {
 			fmt.Printf("  %s=%d\n", item.Reason, item.Count)
 		}

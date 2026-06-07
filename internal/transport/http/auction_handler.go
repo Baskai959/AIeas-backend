@@ -12,8 +12,6 @@ import (
 	"time"
 
 	"aieas_backend/internal/domain"
-	"aieas_backend/internal/infra/objectstorage"
-	"aieas_backend/internal/service"
 
 	"github.com/cloudwego/hertz/pkg/app"
 	"github.com/cloudwego/hertz/pkg/common/utils"
@@ -21,22 +19,23 @@ import (
 )
 
 type AuctionHandler struct {
-	auctions            *service.AuctionService
-	deposits            *service.DepositService
-	hammers             *service.HammerService
-	uploader            objectstorage.Uploader
-	descriptionGen      service.ProductDescriptionGenerator
+	commands            AuctionCommandUseCase
+	queries             AuctionQueryUseCase
+	deposits            DepositUseCase
+	hammers             HammerUseCase
+	uploader            ImageUploader
+	descriptionGen      ProductDescriptionGenerator
 	auditCallbackAPIKey string
 }
 
-func NewAuctionHandler(auctions *service.AuctionService, deposits *service.DepositService, hammers *service.HammerService, uploader objectstorage.Uploader, descriptionGen service.ProductDescriptionGenerator, auditCallbackAPIKey string) *AuctionHandler {
+func NewAuctionHandler(commands AuctionCommandUseCase, queries AuctionQueryUseCase, deposits DepositUseCase, hammers HammerUseCase, uploader ImageUploader, descriptionGen ProductDescriptionGenerator, auditCallbackAPIKey string) *AuctionHandler {
 	if uploader == nil {
-		uploader = objectstorage.DisabledUploader{}
+		uploader = DisabledImageUploader{}
 	}
 	if descriptionGen == nil {
-		descriptionGen = service.DisabledProductDescriptionGenerator{}
+		descriptionGen = DisabledProductDescriptionGenerator{}
 	}
-	return &AuctionHandler{auctions: auctions, deposits: deposits, hammers: hammers, uploader: uploader, descriptionGen: descriptionGen, auditCallbackAPIKey: strings.TrimSpace(auditCallbackAPIKey)}
+	return &AuctionHandler{commands: commands, queries: queries, deposits: deposits, hammers: hammers, uploader: uploader, descriptionGen: descriptionGen, auditCallbackAPIKey: strings.TrimSpace(auditCallbackAPIKey)}
 }
 
 type auctionCreateRequest struct {
@@ -111,7 +110,7 @@ func (h *AuctionHandler) Create(ctx context.Context, c *app.RequestContext) {
 		WriteError(c, 400, 20001, "参数不合法", nil)
 		return
 	}
-	auction, err := h.auctions.Create(ctx, service.CreateAuctionInput{
+	auction, err := h.commands.Create(ctx, AuctionCreateInput{
 		ActorID:        AuthUserID(c),
 		ActorRole:      AuthRole(c),
 		AuctionID:      req.AuctionID,
@@ -156,7 +155,7 @@ func (h *AuctionHandler) AuditCallback(ctx context.Context, c *app.RequestContex
 	}
 	success := auditCallbackSuccess(req)
 	approved := auditCallbackApproved(req)
-	result, err := h.auctions.HandleAuditCallback(ctx, service.AuctionAuditCallbackInput{
+	result, err := h.commands.HandleAuditCallback(ctx, AuctionAuditCallbackInput{
 		RequestID:     firstNonEmpty(req.RequestID, req.RequestIDSnake),
 		Status:        req.Status,
 		Success:       success,
@@ -267,7 +266,7 @@ func (h *AuctionHandler) List(ctx context.Context, c *app.RequestContext) {
 	if sessionID, ok := parseOptionalUintQuery(c, "liveSessionId"); ok {
 		filter.LiveSessionID = sessionID
 	}
-	auctions, err := h.auctions.List(ctx, filter, AuthUserID(c), AuthRole(c))
+	auctions, err := h.queries.List(ctx, filter, AuthUserID(c), AuthRole(c))
 	if err != nil {
 		writeServiceError(c, err)
 		return
@@ -280,7 +279,7 @@ func (h *AuctionHandler) Get(ctx context.Context, c *app.RequestContext) {
 	if !ok {
 		return
 	}
-	auction, err := h.auctions.Get(ctx, id, AuthUserID(c), AuthRole(c))
+	auction, err := h.queries.Get(ctx, id, AuthUserID(c), AuthRole(c))
 	if err != nil {
 		writeServiceError(c, err)
 		return
@@ -298,7 +297,7 @@ func (h *AuctionHandler) Update(ctx context.Context, c *app.RequestContext) {
 		WriteError(c, 400, 20001, "参数不合法", nil)
 		return
 	}
-	auction, err := h.auctions.Update(ctx, id, service.UpdateAuctionInput{
+	auction, err := h.commands.Update(ctx, id, AuctionUpdateInput{
 		ActorID:        AuthUserID(c),
 		ActorRole:      AuthRole(c),
 		Title:          req.Title,
@@ -333,7 +332,7 @@ func (h *AuctionHandler) Delete(ctx context.Context, c *app.RequestContext) {
 	if !ok {
 		return
 	}
-	if err := h.auctions.Delete(ctx, id, AuthUserID(c), AuthRole(c)); err != nil {
+	if err := h.commands.Delete(ctx, id, AuthUserID(c), AuthRole(c)); err != nil {
 		writeServiceError(c, err)
 		return
 	}
@@ -349,9 +348,9 @@ func (h *AuctionHandler) Image(ctx context.Context, c *app.RequestContext) {
 	out, err := h.uploader.Download(ctx, key)
 	if err != nil {
 		switch {
-		case errors.Is(err, objectstorage.ErrInvalidObjectKey):
+		case errors.Is(err, ErrInvalidImageObjectKey):
 			WriteError(c, 400, 20001, "参数不合法", nil)
-		case errors.Is(err, objectstorage.ErrObjectNotFound):
+		case errors.Is(err, ErrImageObjectNotFound):
 			WriteError(c, 404, 20004, "资源不存在", nil)
 		default:
 			WriteError(c, 500, 90001, "系统内部错误", nil)
@@ -430,48 +429,48 @@ func (h *AuctionHandler) OptimizeDescription(ctx context.Context, c *app.Request
 	WriteSuccess(c, result)
 }
 
-func (h *AuctionHandler) bindDescriptionImage(ctx context.Context, c *app.RequestContext) (service.ProductDescriptionInput, error) {
+func (h *AuctionHandler) bindDescriptionImage(ctx context.Context, c *app.RequestContext) (ProductDescriptionInput, error) {
 	fileHeader, err := c.FormFile("image")
 	if err == nil && fileHeader != nil {
 		if fileHeader.Size > maxImageUploadSizeBytes {
-			return service.ProductDescriptionInput{}, domain.ErrInvalidArgument
+			return ProductDescriptionInput{}, domain.ErrInvalidArgument
 		}
 		file, err := fileHeader.Open()
 		if err != nil {
-			return service.ProductDescriptionInput{}, err
+			return ProductDescriptionInput{}, err
 		}
 		imageBytes, readErr := io.ReadAll(file)
 		closeErr := file.Close()
 		if readErr != nil {
-			return service.ProductDescriptionInput{}, readErr
+			return ProductDescriptionInput{}, readErr
 		}
 		if closeErr != nil {
-			return service.ProductDescriptionInput{}, closeErr
+			return ProductDescriptionInput{}, closeErr
 		}
-		return service.ProductDescriptionInput{ImageName: fileHeader.Filename, ContentType: imageContentType(fileHeader), ImageSize: fileHeader.Size, Image: imageBytes}, nil
+		return ProductDescriptionInput{ImageName: fileHeader.Filename, ContentType: imageContentType(fileHeader), ImageSize: fileHeader.Size, Image: imageBytes}, nil
 	}
 
 	imageURL := strings.TrimSpace(c.PostForm("imageUrl"))
 	if imageURL == "" {
-		return service.ProductDescriptionInput{}, nil
+		return ProductDescriptionInput{}, nil
 	}
 	key, err := objectKeyFromImageURL(imageURL)
 	if err != nil {
-		return service.ProductDescriptionInput{}, err
+		return ProductDescriptionInput{}, err
 	}
 	out, err := h.uploader.Download(ctx, key)
 	if err != nil {
-		return service.ProductDescriptionInput{}, err
+		return ProductDescriptionInput{}, err
 	}
 	imageBytes, readErr := io.ReadAll(out.Content)
 	closeErr := out.Content.Close()
 	if readErr != nil {
-		return service.ProductDescriptionInput{}, readErr
+		return ProductDescriptionInput{}, readErr
 	}
 	if closeErr != nil {
-		return service.ProductDescriptionInput{}, closeErr
+		return ProductDescriptionInput{}, closeErr
 	}
-	return service.ProductDescriptionInput{ImageName: filepath.Base(key), ContentType: out.ContentType, ImageSize: out.ContentLength, Image: imageBytes}, nil
+	return ProductDescriptionInput{ImageName: filepath.Base(key), ContentType: out.ContentType, ImageSize: out.ContentLength, Image: imageBytes}, nil
 }
 
 func (h *AuctionHandler) uploadImages(ctx context.Context, files []*multipart.FileHeader) ([]string, error) {
@@ -487,7 +486,7 @@ func (h *AuctionHandler) uploadImages(ctx context.Context, files []*multipart.Fi
 		if err != nil {
 			return nil, err
 		}
-		url, uploadErr := h.uploader.Upload(ctx, objectstorage.UploadInput{Filename: fileHeader.Filename, ContentType: imageContentType(fileHeader), Size: fileHeader.Size, Body: file})
+		url, uploadErr := h.uploader.Upload(ctx, ImageUploadInput{Filename: fileHeader.Filename, ContentType: imageContentType(fileHeader), Size: fileHeader.Size, Body: file})
 		closeErr := file.Close()
 		if uploadErr != nil {
 			return nil, uploadErr
@@ -505,7 +504,7 @@ func (h *AuctionHandler) Start(ctx context.Context, c *app.RequestContext) {
 	if !ok {
 		return
 	}
-	auction, err := h.auctions.Start(ctx, id, AuthUserID(c), AuthRole(c))
+	auction, err := h.commands.Start(ctx, id, AuthUserID(c), AuthRole(c))
 	if err != nil {
 		writeServiceError(c, err)
 		return
@@ -522,7 +521,7 @@ func (h *AuctionHandler) Enroll(ctx context.Context, c *app.RequestContext) {
 		WriteError(c, 500, 90001, "系统内部错误", nil)
 		return
 	}
-	deposit, err := h.deposits.Enroll(ctx, service.EnrollInput{
+	deposit, err := h.deposits.Enroll(ctx, DepositEnrollInput{
 		AuctionID: id,
 		UserID:    AuthUserID(c),
 		UserRole:  AuthRole(c),
@@ -564,7 +563,7 @@ func (h *AuctionHandler) Cancel(ctx context.Context, c *app.RequestContext) {
 	if !ok {
 		return
 	}
-	auction, err := h.auctions.Cancel(ctx, id, AuthUserID(c), AuthRole(c))
+	auction, err := h.commands.Cancel(ctx, id, AuthUserID(c), AuthRole(c))
 	if err != nil {
 		writeServiceError(c, err)
 		return
@@ -577,7 +576,7 @@ func (h *AuctionHandler) State(ctx context.Context, c *app.RequestContext) {
 	if !ok {
 		return
 	}
-	state, err := h.auctions.State(ctx, id, AuthUserID(c), AuthRole(c))
+	state, err := h.queries.State(ctx, id, AuthUserID(c), AuthRole(c))
 	if err != nil {
 		writeServiceError(c, err)
 		return

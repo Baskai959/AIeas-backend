@@ -13,7 +13,10 @@ import (
 
 	appconfig "aieas_backend/internal/config"
 	"aieas_backend/internal/domain"
-	"aieas_backend/internal/service"
+	aiapp "aieas_backend/internal/modules/ai/app"
+	auctionapp "aieas_backend/internal/modules/auction/app"
+	auctionports "aieas_backend/internal/modules/auction/ports"
+	liveanalysisports "aieas_backend/internal/modules/live_analysis/ports"
 
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 )
@@ -98,86 +101,86 @@ func newAgentTransport(spanName string) http.RoundTripper {
 	)
 }
 
-func (c *ProductDescriptionClient) GenerateProductDescription(ctx context.Context, in service.ProductDescriptionInput) (service.ProductDescriptionResult, error) {
+func (c *ProductDescriptionClient) GenerateProductDescription(ctx context.Context, in aiapp.ProductDescriptionInput) (aiapp.ProductDescriptionResult, error) {
 	if c == nil || c.client == nil || c.endpoint == "" {
-		return service.ProductDescriptionResult{}, service.ErrProductDescriptionUnavailable
+		return aiapp.ProductDescriptionResult{}, aiapp.ErrProductDescriptionUnavailable
 	}
 	if strings.TrimSpace(in.Title) == "" || strings.TrimSpace(in.Category) == "" || strings.TrimSpace(in.Condition) == "" || len(in.Image) == 0 {
-		return service.ProductDescriptionResult{}, domain.ErrInvalidArgument
+		return aiapp.ProductDescriptionResult{}, domain.ErrInvalidArgument
 	}
 
 	var body bytes.Buffer
 	writer := multipart.NewWriter(&body)
 	if err := writeImagePart(writer, "image", in.ImageName, in.ContentType, bytes.NewReader(in.Image)); err != nil {
-		return service.ProductDescriptionResult{}, err
+		return aiapp.ProductDescriptionResult{}, err
 	}
 	if err := writer.WriteField("title", strings.TrimSpace(in.Title)); err != nil {
-		return service.ProductDescriptionResult{}, err
+		return aiapp.ProductDescriptionResult{}, err
 	}
 	if err := writer.WriteField("category", strings.TrimSpace(in.Category)); err != nil {
-		return service.ProductDescriptionResult{}, err
+		return aiapp.ProductDescriptionResult{}, err
 	}
 	if err := writer.WriteField("condition", strings.TrimSpace(in.Condition)); err != nil {
-		return service.ProductDescriptionResult{}, err
+		return aiapp.ProductDescriptionResult{}, err
 	}
 	if err := writer.Close(); err != nil {
-		return service.ProductDescriptionResult{}, err
+		return aiapp.ProductDescriptionResult{}, err
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint, &body)
 	if err != nil {
-		return service.ProductDescriptionResult{}, err
+		return aiapp.ProductDescriptionResult{}, err
 	}
 	req.Header.Set("Content-Type", writer.FormDataContentType())
 
 	resp, err := c.client.Do(req)
 	if err != nil {
-		return service.ProductDescriptionResult{}, err
+		return aiapp.ProductDescriptionResult{}, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		preview, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return service.ProductDescriptionResult{}, fmt.Errorf("agent product description status %d: %s", resp.StatusCode, strings.TrimSpace(string(preview)))
+		return aiapp.ProductDescriptionResult{}, fmt.Errorf("agent product description status %d: %s", resp.StatusCode, strings.TrimSpace(string(preview)))
 	}
 
-	var result service.ProductDescriptionResult
+	var result aiapp.ProductDescriptionResult
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return service.ProductDescriptionResult{}, err
+		return aiapp.ProductDescriptionResult{}, err
 	}
 	result.Title = strings.TrimSpace(result.Title)
 	result.Category = strings.TrimSpace(result.Category)
 	result.Description = strings.TrimSpace(result.Description)
 	if result.Description == "" {
-		return service.ProductDescriptionResult{}, fmt.Errorf("agent product description response missing description")
+		return aiapp.ProductDescriptionResult{}, fmt.Errorf("agent product description response missing description")
 	}
 	return result, nil
 }
 
-func (c *ProductAuditClient) AuditProduct(ctx context.Context, in service.ProductAuditInput) (service.ProductAuditResult, error) {
+func (c *ProductAuditClient) AuditProduct(ctx context.Context, in auctionports.ProductAuditInput) (auctionports.ProductAuditResult, error) {
 	if c == nil || c.client == nil || c.endpoint == "" {
-		return service.ProductAuditResult{}, service.ErrProductAuditUnavailable
+		return auctionports.ProductAuditResult{}, auctionapp.ErrProductAuditUnavailable
 	}
 	callbackURL := strings.TrimSpace(in.CallbackURL)
 	if callbackURL == "" {
 		callbackURL = c.callbackURL
 	}
 	if strings.TrimSpace(in.ProductText) == "" || callbackURL == "" {
-		return service.ProductAuditResult{}, domain.ErrInvalidArgument
+		return auctionports.ProductAuditResult{}, domain.ErrInvalidArgument
 	}
 
 	var body bytes.Buffer
 	writer := multipart.NewWriter(&body)
 	if len(in.Image) > 0 {
 		if err := writeImagePart(writer, "image", in.ImageName, in.ContentType, bytes.NewReader(in.Image)); err != nil {
-			return service.ProductAuditResult{}, err
+			return auctionports.ProductAuditResult{}, err
 		}
 	}
 	if err := writer.WriteField("product_text", strings.TrimSpace(in.ProductText)); err != nil {
-		return service.ProductAuditResult{}, err
+		return auctionports.ProductAuditResult{}, err
 	}
 	if err := writer.WriteField("callback_url", callbackURL); err != nil {
-		return service.ProductAuditResult{}, err
+		return auctionports.ProductAuditResult{}, err
 	}
 	if len(in.CallbackHeaders) == 0 && c.callbackAPIKey != "" {
 		in.CallbackHeaders = map[string]string{
@@ -188,52 +191,52 @@ func (c *ProductAuditClient) AuditProduct(ctx context.Context, in service.Produc
 	if len(in.CallbackHeaders) > 0 {
 		headers, err := json.Marshal(in.CallbackHeaders)
 		if err != nil {
-			return service.ProductAuditResult{}, err
+			return auctionports.ProductAuditResult{}, err
 		}
 		if err := writer.WriteField("callback_headers", string(headers)); err != nil {
-			return service.ProductAuditResult{}, err
+			return auctionports.ProductAuditResult{}, err
 		}
 	}
 	if len(in.CallbackContext) > 0 {
 		callbackContext, err := json.Marshal(in.CallbackContext)
 		if err != nil {
-			return service.ProductAuditResult{}, err
+			return auctionports.ProductAuditResult{}, err
 		}
 		if err := writer.WriteField("callback_context", string(callbackContext)); err != nil {
-			return service.ProductAuditResult{}, err
+			return auctionports.ProductAuditResult{}, err
 		}
 	}
 	if err := writer.Close(); err != nil {
-		return service.ProductAuditResult{}, err
+		return auctionports.ProductAuditResult{}, err
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint, &body)
 	if err != nil {
-		return service.ProductAuditResult{}, err
+		return auctionports.ProductAuditResult{}, err
 	}
 	req.Header.Set("Content-Type", writer.FormDataContentType())
 
 	resp, err := c.client.Do(req)
 	if err != nil {
-		return service.ProductAuditResult{}, err
+		return auctionports.ProductAuditResult{}, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		preview, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return service.ProductAuditResult{}, fmt.Errorf("agent product audit status %d: %s", resp.StatusCode, strings.TrimSpace(string(preview)))
+		return auctionports.ProductAuditResult{}, fmt.Errorf("agent product audit status %d: %s", resp.StatusCode, strings.TrimSpace(string(preview)))
 	}
 
 	payload, err := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
 	if err != nil {
-		return service.ProductAuditResult{}, err
+		return auctionports.ProductAuditResult{}, err
 	}
 	if strings.TrimSpace(string(payload)) == "" {
-		return service.ProductAuditResult{Success: true, Status: "ACCEPTED"}, nil
+		return auctionports.ProductAuditResult{Success: true, Status: "ACCEPTED"}, nil
 	}
-	var result service.ProductAuditResult
+	var result auctionports.ProductAuditResult
 	if err := json.Unmarshal(payload, &result); err != nil {
-		return service.ProductAuditResult{}, err
+		return auctionports.ProductAuditResult{}, err
 	}
 	result.RequestID = strings.TrimSpace(result.RequestID)
 	result.Status = strings.TrimSpace(result.Status)
@@ -249,14 +252,14 @@ func (c *ProductAuditClient) AuditProduct(ctx context.Context, in service.Produc
 	return result, nil
 }
 
-func (c *LiveAnalysisClient) RequestLiveAnalysis(ctx context.Context, in service.LiveAnalysisAsyncInput) (service.LiveAnalysisAsyncResult, error) {
+func (c *LiveAnalysisClient) RequestLiveAnalysis(ctx context.Context, in liveanalysisports.AsyncRequestInput) (liveanalysisports.AsyncRequestResult, error) {
 	if c == nil || c.client == nil || c.endpoint == "" {
-		return service.LiveAnalysisAsyncResult{}, service.ErrLiveAnalysisUnavailable
+		return liveanalysisports.AsyncRequestResult{}, liveanalysisports.ErrLiveAnalysisUnavailable
 	}
 	prompt := strings.TrimSpace(in.Prompt)
 	callbackURL := strings.TrimSpace(in.CallbackURL)
 	if prompt == "" || callbackURL == "" {
-		return service.LiveAnalysisAsyncResult{}, domain.ErrInvalidArgument
+		return liveanalysisports.AsyncRequestResult{}, domain.ErrInvalidArgument
 	}
 	payload, err := json.Marshal(liveAnalysisAsyncRequest{
 		Prompt:          prompt,
@@ -267,21 +270,21 @@ func (c *LiveAnalysisClient) RequestLiveAnalysis(ctx context.Context, in service
 		ToolArguments:   in.ToolArguments,
 	})
 	if err != nil {
-		return service.LiveAnalysisAsyncResult{}, err
+		return liveanalysisports.AsyncRequestResult{}, err
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint, bytes.NewReader(payload))
 	if err != nil {
-		return service.LiveAnalysisAsyncResult{}, err
+		return liveanalysisports.AsyncRequestResult{}, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := c.client.Do(req)
 	if err != nil {
-		return service.LiveAnalysisAsyncResult{}, err
+		return liveanalysisports.AsyncRequestResult{}, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		preview, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return service.LiveAnalysisAsyncResult{}, fmt.Errorf("agent live analysis async status %d: %s", resp.StatusCode, strings.TrimSpace(string(preview)))
+		return liveanalysisports.AsyncRequestResult{}, fmt.Errorf("agent live analysis async status %d: %s", resp.StatusCode, strings.TrimSpace(string(preview)))
 	}
 
 	var result struct {
@@ -291,19 +294,19 @@ func (c *LiveAnalysisClient) RequestLiveAnalysis(ctx context.Context, in service
 		Message   string `json:"message"`
 	}
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 2<<20)).Decode(&result); err != nil {
-		return service.LiveAnalysisAsyncResult{}, err
+		return liveanalysisports.AsyncRequestResult{}, err
 	}
 	if !result.Success {
 		message := strings.TrimSpace(result.Message)
 		if message == "" {
 			message = "unknown error"
 		}
-		return service.LiveAnalysisAsyncResult{}, fmt.Errorf("agent live analysis async failed: %s", message)
+		return liveanalysisports.AsyncRequestResult{}, fmt.Errorf("agent live analysis async failed: %s", message)
 	}
 	if strings.TrimSpace(result.RequestID) == "" {
-		return service.LiveAnalysisAsyncResult{}, fmt.Errorf("agent live analysis async response missing request_id")
+		return liveanalysisports.AsyncRequestResult{}, fmt.Errorf("agent live analysis async response missing request_id")
 	}
-	return service.LiveAnalysisAsyncResult{
+	return liveanalysisports.AsyncRequestResult{
 		RequestID: strings.TrimSpace(result.RequestID),
 		Status:    strings.TrimSpace(result.Status),
 		Message:   strings.TrimSpace(result.Message),

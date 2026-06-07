@@ -5,16 +5,14 @@ import (
 	"strings"
 
 	"aieas_backend/internal/domain"
-	"aieas_backend/internal/service"
-
 	"github.com/cloudwego/hertz/pkg/app"
 )
 
 type OrderHandler struct {
-	orders *service.OrderService
+	orders OrderUseCase
 }
 
-func NewOrderHandler(orders *service.OrderService) *OrderHandler {
+func NewOrderHandler(orders OrderUseCase) *OrderHandler {
 	return &OrderHandler{orders: orders}
 }
 
@@ -57,6 +55,32 @@ func (h *OrderHandler) Pay(ctx context.Context, c *app.RequestContext) {
 		return
 	}
 	order, err := h.orders.Pay(ctx, id, AuthUserID(c), AuthRole(c))
+	if err != nil {
+		writeServiceError(c, err)
+		return
+	}
+	WriteSuccess(c, order)
+}
+
+func (h *OrderHandler) Ship(ctx context.Context, c *app.RequestContext) {
+	id, ok := parseUintParam(c, "id")
+	if !ok {
+		return
+	}
+	order, err := h.orders.Ship(ctx, id, AuthUserID(c), AuthRole(c))
+	if err != nil {
+		writeServiceError(c, err)
+		return
+	}
+	WriteSuccess(c, order)
+}
+
+func (h *OrderHandler) Receive(ctx context.Context, c *app.RequestContext) {
+	id, ok := parseUintParam(c, "id")
+	if !ok {
+		return
+	}
+	order, err := h.orders.Receive(ctx, id, AuthUserID(c), AuthRole(c))
 	if err != nil {
 		writeServiceError(c, err)
 		return

@@ -83,7 +83,7 @@ func TestParseArgs(t *testing.T) {
 	}
 }
 
-func TestRunDispatchesMigrateWithConfigLoaderEnvOverride(t *testing.T) {
+func TestRunDispatchesMigrateWithFileConfig(t *testing.T) {
 	configPath := writeTestConfig(t)
 	t.Setenv("MYSQL_DSN", "env-user@tcp(localhost:3306)/envdb")
 
@@ -109,8 +109,8 @@ func TestRunDispatchesMigrateWithConfigLoaderEnvOverride(t *testing.T) {
 	if runner.direction != "up" {
 		t.Fatalf("direction = %q, want up", runner.direction)
 	}
-	if runner.dsn != "env-user@tcp(localhost:3306)/envdb" {
-		t.Fatal("dsn did not come from env override")
+	if runner.dsn != "file-user@tcp(localhost:3306)/filedb" {
+		t.Fatal("dsn did not come from file config")
 	}
 	if got := stdout.String(); got != "migrate up complete\n" {
 		t.Fatalf("stdout = %q", got)

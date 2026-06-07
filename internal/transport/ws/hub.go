@@ -3,6 +3,7 @@ package ws
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"sync"
@@ -15,6 +16,10 @@ const defaultOnlineCounterTimeout = 200 * time.Millisecond
 const defaultPresenceBroadcastDelay = 200 * time.Millisecond
 const defaultPresenceImmediateFanoutLimit = 16
 const defaultOnlineTouchInterval = 30 * time.Second
+const liveSessionOnlineKeyMask uint64 = 1 << 63
+
+// ErrHubDraining 表示 Hub 正在排空（ws-gateway 优雅下线），新的订阅请求应被拒绝。
+var ErrHubDraining = errors.New("hub draining")
 
 var nextHubInstanceID atomic.Uint64
 
@@ -36,6 +41,10 @@ type HubMetrics interface {
 	IncWSDisconnect(reason string)
 	ObserveWSBroadcast(elapsed time.Duration, fanout int)
 	IncWSSlowClientDisconnect()
+	// IncWSHandshakeReject 记录因排空 / 限流 / 鉴权等原因拒绝的握手次数。
+	IncWSHandshakeReject(reason string)
+	// IncWSDraining 记录一次 BeginDrain 触发；调用频率应远低于 IncWSConnect。
+	IncWSDraining()
 }
 
 type Hub struct {
@@ -55,6 +64,9 @@ type Hub struct {
 	onlineTouchMu  sync.Mutex
 	onlineTouchTTL time.Duration
 	onlineTouched  map[string]time.Time
+	// 排空（drain）相关：BeginDrain 后置 1，新订阅会被拒绝；
+	// AwaitDrained 用 drainCond + 房间 / session 状态判断 client 是否全部下线。
+	draining atomic.Bool
 }
 
 type presenceUpdate struct {
@@ -73,6 +85,171 @@ func (h *Hub) SetMetrics(m HubMetrics) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.metrics = m
+}
+
+// IsDraining 报告 Hub 是否处于排空状态。
+func (h *Hub) IsDraining() bool {
+	if h == nil {
+		return false
+	}
+	return h.draining.Load()
+}
+
+// BeginDrain 把 Hub 置为排空状态：
+//   - 设置 draining 标志，新连接通过 Subscribe / SubscribeLiveSessionOnly 收到 ErrHubDraining；
+//   - 对当前所有 room/session 客户端逐一 Deliver 一帧 gateway.draining
+//     （payload.retryAfterMs=retryAfterMs，<=0 时落入 5000 默认）。
+//
+// 注意：必须使用 Client.Deliver（per-client 直投），而不是 Broadcast——
+// 否则会消耗房间 seq 且写进 history，影响 ReplaySince 语义。
+func (h *Hub) BeginDrain(retryAfterMs int) {
+	if h == nil {
+		return
+	}
+	h.draining.Store(true)
+	if retryAfterMs <= 0 {
+		retryAfterMs = 5000
+	}
+	if reg := h.metricsSnapshot(); reg != nil {
+		reg.IncWSDraining()
+	}
+	payload, _ := json.Marshal(map[string]interface{}{"retryAfterMs": retryAfterMs})
+	env := Envelope{Type: TypeGatewayDraining, Payload: payload}
+
+	// 在锁内拷贝快照，再在锁外 Deliver：避免 Deliver 触发的 closeLocked / 慢消费者关闭
+	// 与 Hub 状态变更产生死锁。
+	h.mu.RLock()
+	clients := make([]*Client, 0)
+	seen := make(map[string]struct{})
+	for _, room := range h.rooms {
+		room.mu.RLock()
+		for _, c := range room.clients {
+			if _, ok := seen[c.ID]; ok {
+				continue
+			}
+			seen[c.ID] = struct{}{}
+			clients = append(clients, c)
+		}
+		room.mu.RUnlock()
+	}
+	for _, bucket := range h.sessionClients {
+		for _, c := range bucket {
+			if _, ok := seen[c.ID]; ok {
+				continue
+			}
+			seen[c.ID] = struct{}{}
+			clients = append(clients, c)
+		}
+	}
+	h.mu.RUnlock()
+	for _, c := range clients {
+		c.Deliver(env)
+	}
+}
+
+// AwaitDrained 等待所有客户端自然下线，超过 deadline 则强制关闭剩余客户端，
+// 关闭原因写为 "gateway_draining"。返回值：
+//   - nil：在 deadline 前所有客户端已下线，或 force-close 已完成；
+//   - ctx.Err()：上层 context 取消。
+func (h *Hub) AwaitDrained(ctx context.Context, deadline time.Duration) error {
+	if h == nil {
+		return nil
+	}
+	if deadline <= 0 {
+		deadline = time.Second
+	}
+	tick := 20 * time.Millisecond
+	if deadline < tick {
+		tick = deadline / 2
+		if tick <= 0 {
+			tick = time.Millisecond
+		}
+	}
+	timer := time.NewTimer(deadline)
+	defer timer.Stop()
+	ticker := time.NewTicker(tick)
+	defer ticker.Stop()
+	for {
+		if h.totalClientCount() == 0 {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timer.C:
+			h.forceCloseAllClients("gateway_draining")
+			return nil
+		case <-ticker.C:
+		}
+	}
+}
+
+// Drain = BeginDrain(retryAfter≈deadline/6) → AwaitDrained。
+func (h *Hub) Drain(ctx context.Context, deadline time.Duration) error {
+	if h == nil {
+		return nil
+	}
+	retryMs := int(deadline / time.Millisecond / 6)
+	h.BeginDrain(retryMs)
+	return h.AwaitDrained(ctx, deadline)
+}
+
+// totalClientCount 返回当前 Hub 下所有 room+session 客户端的数量（去重）。
+func (h *Hub) totalClientCount() int {
+	if h == nil {
+		return 0
+	}
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	seen := make(map[string]struct{})
+	for _, room := range h.rooms {
+		room.mu.RLock()
+		for id := range room.clients {
+			seen[id] = struct{}{}
+		}
+		room.mu.RUnlock()
+	}
+	for _, bucket := range h.sessionClients {
+		for id := range bucket {
+			seen[id] = struct{}{}
+		}
+	}
+	return len(seen)
+}
+
+// forceCloseAllClients 强制关闭剩余客户端，关闭原因 reason 通过 CloseWithReason 落到
+// Client.CloseReason()，serveConn 退出时会读取它构造 Close 帧。
+func (h *Hub) forceCloseAllClients(reason string) {
+	if h == nil {
+		return
+	}
+	h.mu.RLock()
+	clients := make([]*Client, 0)
+	seen := make(map[string]struct{})
+	for _, room := range h.rooms {
+		room.mu.RLock()
+		for _, c := range room.clients {
+			if _, ok := seen[c.ID]; ok {
+				continue
+			}
+			seen[c.ID] = struct{}{}
+			clients = append(clients, c)
+		}
+		room.mu.RUnlock()
+	}
+	for _, bucket := range h.sessionClients {
+		for _, c := range bucket {
+			if _, ok := seen[c.ID]; ok {
+				continue
+			}
+			seen[c.ID] = struct{}{}
+			clients = append(clients, c)
+		}
+	}
+	h.mu.RUnlock()
+	for _, c := range clients {
+		c.CloseWithReason(reason)
+	}
 }
 
 type Room struct {
@@ -211,6 +388,9 @@ func (h *Hub) Subscribe(auctionID uint64, client *Client) error {
 	if client == nil || client.ID == "" {
 		return fmt.Errorf("client is required")
 	}
+	if h.draining.Load() {
+		return ErrHubDraining
+	}
 	if client.AuctionID != 0 && client.AuctionID != auctionID {
 		h.Unsubscribe(client.AuctionID, client.ID)
 	}
@@ -225,6 +405,11 @@ func (h *Hub) Subscribe(auctionID uint64, client *Client) error {
 		h.markOnlineTouched(auctionID, client.ID)
 	}
 	h.emitPresence(room, online)
+	if client.LiveSessionID != 0 && client.CountOnline {
+		sessionOnline := h.joinOnline(liveSessionOnlineKey(client.LiveSessionID), client.ID, client.UserID, h.liveSessionOnlineClientCount(client.LiveSessionID))
+		h.markOnlineTouched(liveSessionOnlineKey(client.LiveSessionID), client.ID)
+		h.emitLiveSessionPresence(client.LiveSessionID, sessionOnline)
+	}
 	if reg := h.metricsSnapshot(); reg != nil {
 		reg.IncWSConnect()
 	}
@@ -235,9 +420,17 @@ func (h *Hub) SubscribeLiveSessionOnly(liveSessionID uint64, client *Client) err
 	if h == nil || client == nil || client.ID == "" || liveSessionID == 0 {
 		return fmt.Errorf("live session client is required")
 	}
+	if h.draining.Load() {
+		return ErrHubDraining
+	}
 	client.AuctionID = 0
 	client.LiveSessionID = liveSessionID
 	h.registerSessionClient(client)
+	if client.CountOnline {
+		online := h.joinOnline(liveSessionOnlineKey(liveSessionID), client.ID, client.UserID, h.liveSessionOnlineClientCount(liveSessionID))
+		h.markOnlineTouched(liveSessionOnlineKey(liveSessionID), client.ID)
+		h.emitLiveSessionPresence(liveSessionID, online)
+	}
 	if reg := h.metricsSnapshot(); reg != nil {
 		reg.IncWSConnect()
 	}
@@ -246,7 +439,12 @@ func (h *Hub) SubscribeLiveSessionOnly(liveSessionID uint64, client *Client) err
 
 func (h *Hub) Unsubscribe(auctionID uint64, clientID string) {
 	if auctionID == 0 {
-		h.unregisterSessionClientByID(clientID)
+		for _, removed := range h.unregisterSessionClientByID(clientID) {
+			if removed.CountOnline {
+				online := h.leaveOnline(liveSessionOnlineKey(removed.LiveSessionID), clientID, removed.UserID, h.liveSessionOnlineClientCount(removed.LiveSessionID))
+				h.emitLiveSessionPresence(removed.LiveSessionID, online)
+			}
+		}
 		if reg := h.metricsSnapshot(); reg != nil {
 			reg.IncWSDisconnect("unsubscribe")
 		}
@@ -266,6 +464,10 @@ func (h *Hub) Unsubscribe(auctionID uint64, clientID string) {
 			online = h.leaveOnline(auctionID, clientID, userID, fallback)
 		}
 		h.emitPresence(room, online)
+		if sessionID != 0 && countOnline {
+			sessionOnline := h.leaveOnline(liveSessionOnlineKey(sessionID), clientID, userID, h.liveSessionOnlineClientCount(sessionID))
+			h.emitLiveSessionPresence(sessionID, sessionOnline)
+		}
 		if reg := h.metricsSnapshot(); reg != nil {
 			reg.IncWSDisconnect("unsubscribe")
 		}
@@ -278,6 +480,10 @@ func (h *Hub) UnsubscribeClient(client *Client) {
 	}
 	if client.AuctionID == 0 {
 		h.unregisterSessionClient(client.LiveSessionID, client.ID)
+		if client.LiveSessionID != 0 && client.CountOnline {
+			online := h.leaveOnline(liveSessionOnlineKey(client.LiveSessionID), client.ID, client.UserID, h.liveSessionOnlineClientCount(client.LiveSessionID))
+			h.emitLiveSessionPresence(client.LiveSessionID, online)
+		}
 		if reg := h.metricsSnapshot(); reg != nil {
 			reg.IncWSDisconnect("unsubscribe")
 		}
@@ -297,6 +503,10 @@ func (h *Hub) UnsubscribeClient(client *Client) {
 			online = h.leaveOnline(client.AuctionID, client.ID, userID, fallback)
 		}
 		h.emitPresence(room, online)
+		if sessionID != 0 && countOnline {
+			sessionOnline := h.leaveOnline(liveSessionOnlineKey(sessionID), client.ID, userID, h.liveSessionOnlineClientCount(sessionID))
+			h.emitLiveSessionPresence(sessionID, sessionOnline)
+		}
 		if reg := h.metricsSnapshot(); reg != nil {
 			reg.IncWSDisconnect("unsubscribe")
 		}
@@ -328,11 +538,53 @@ func (h *Hub) Broadcast(auctionID uint64, env Envelope) int {
 			}
 			if sessionID != 0 {
 				h.unregisterSessionClient(sessionID, client.ID)
+				if countOnline {
+					online := h.leaveOnline(liveSessionOnlineKey(sessionID), client.ID, userID, h.liveSessionOnlineClientCount(sessionID))
+					h.emitLiveSessionPresence(sessionID, online)
+				}
 			} else {
 				h.unregisterSessionClientByID(client.ID)
 			}
 		}
 		h.emitPresence(room, h.onlineCount(auctionID, room.OnlineClientCount()))
+	}
+	return delivered
+}
+
+// BroadcastAuctionAndLiveSession writes the event to the auction room and also
+// delivers it to live-session-only clients. A client subscribed to both scopes
+// receives the event once.
+func (h *Hub) BroadcastAuctionAndLiveSession(auctionID, liveSessionID uint64, env Envelope) int {
+	if h == nil {
+		return 0
+	}
+	if liveSessionID == 0 {
+		return h.Broadcast(auctionID, env)
+	}
+	env.LiveSessionID = liveSessionID
+	if auctionID == 0 {
+		return h.BroadcastLiveSession(liveSessionID, env)
+	}
+	delivered := h.Broadcast(auctionID, env)
+	room, ok := h.Room(auctionID)
+	if !ok || room == nil {
+		return delivered + h.BroadcastLiveSession(liveSessionID, env)
+	}
+	roomClientIDs := room.clientIDSet()
+	h.mu.RLock()
+	bucket := h.sessionClients[liveSessionID]
+	clients := make([]*Client, 0, len(bucket))
+	for clientID, client := range bucket {
+		if _, ok := roomClientIDs[clientID]; ok {
+			continue
+		}
+		clients = append(clients, client)
+	}
+	h.mu.RUnlock()
+	for _, client := range clients {
+		if client.Deliver(env) {
+			delivered++
+		}
 	}
 	return delivered
 }
@@ -351,6 +603,34 @@ func (h *Hub) BroadcastLiveSession(liveSessionID uint64, env Envelope) int {
 	clients := make([]*Client, 0, len(bucket))
 	for _, c := range bucket {
 		clients = append(clients, c)
+	}
+	h.mu.RUnlock()
+	if len(clients) == 0 {
+		return 0
+	}
+	delivered := 0
+	for _, c := range clients {
+		if c.Deliver(env) {
+			delivered++
+		}
+	}
+	return delivered
+}
+
+// BroadcastLiveSessionOnlineClients 把事件推送给当前直播场次内计入在线人数的用户连接。
+// 商家/管理员控制台连接通常 CountOnline=false，不接收用户端音频类事件。
+func (h *Hub) BroadcastLiveSessionOnlineClients(liveSessionID uint64, env Envelope) int {
+	if h == nil || liveSessionID == 0 {
+		return 0
+	}
+	env.LiveSessionID = liveSessionID
+	h.mu.RLock()
+	bucket := h.sessionClients[liveSessionID]
+	clients := make([]*Client, 0, len(bucket))
+	for _, c := range bucket {
+		if c.CountOnline {
+			clients = append(clients, c)
+		}
 	}
 	h.mu.RUnlock()
 	if len(clients) == 0 {
@@ -394,6 +674,12 @@ func (h *Hub) BroadcastSessionEnd(liveSessionID uint64, payload json.RawMessage)
 	if len(clients) == 0 {
 		return 0
 	}
+	for _, c := range clients {
+		if c.CountOnline {
+			_ = h.leaveOnline(liveSessionOnlineKey(liveSessionID), c.ID, c.UserID, h.liveSessionOnlineClientCount(liveSessionID))
+		}
+	}
+	h.emitLiveSessionPresence(liveSessionID, 0)
 	env := Envelope{Type: "live_session.ended", LiveSessionID: liveSessionID, Payload: payload}
 	delivered := 0
 	for _, c := range clients {
@@ -412,6 +698,15 @@ func (h *Hub) SessionClientCount(liveSessionID uint64) int {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 	return len(h.sessionClients[liveSessionID])
+}
+
+// LiveSessionOnlineCount 返回直播场次维度的在线人数。与 OnlineCount(auctionID)
+// 不同，它不依赖当前是否已有开拍中的拍品。
+func (h *Hub) LiveSessionOnlineCount(liveSessionID uint64) int {
+	if h == nil || liveSessionID == 0 {
+		return 0
+	}
+	return h.onlineCount(liveSessionOnlineKey(liveSessionID), h.liveSessionOnlineClientCount(liveSessionID))
 }
 
 // HubStats 描述 Hub 的实例级运行状态，对外暴露用于运维 / 调试入口。
@@ -476,20 +771,23 @@ func (h *Hub) unregisterSessionClient(sessionID uint64, clientID string) {
 
 // unregisterSessionClientByID 在不知道 sessionID 的情况下兜底清理所有 bucket 中匹配 clientID 的条目，
 // 避免 slow_consumer 关闭路径漏删反查表项。
-func (h *Hub) unregisterSessionClientByID(clientID string) {
+func (h *Hub) unregisterSessionClientByID(clientID string) []removedClient {
 	if clientID == "" {
-		return
+		return nil
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	removed := make([]removedClient, 0, 1)
 	for sessionID, bucket := range h.sessionClients {
-		if _, ok := bucket[clientID]; ok {
+		if client, ok := bucket[clientID]; ok {
+			removed = append(removed, removedClient{ID: clientID, UserID: client.UserID, LiveSessionID: sessionID, CountOnline: client.CountOnline})
 			delete(bucket, clientID)
 			if len(bucket) == 0 {
 				delete(h.sessionClients, sessionID)
 			}
 		}
 	}
+	return removed
 }
 
 func (h *Hub) ReplaySince(auctionID uint64, lastSeq int64) ([]Envelope, bool) {
@@ -512,18 +810,38 @@ func (h *Hub) Touch(auctionID uint64, clientID string) int {
 	room, ok := h.Room(auctionID)
 	fallback := 0
 	userID := ""
+	sessionID := uint64(0)
 	if ok {
 		fallback = room.OnlineClientCount()
-		countOnline, foundUserID := room.ClientPresence(clientID)
+		countOnline, foundUserID, foundSessionID := room.ClientPresence(clientID)
 		if !countOnline {
 			return h.onlineCount(auctionID, fallback)
 		}
 		userID = foundUserID
+		sessionID = foundSessionID
 	}
 	if h.shouldSkipOnlineTouch(auctionID, clientID) {
 		return fallback
 	}
-	return h.touchOnline(auctionID, clientID, userID, fallback)
+	online := h.touchOnline(auctionID, clientID, userID, fallback)
+	if sessionID != 0 {
+		h.touchLiveSessionOnline(sessionID, clientID, userID)
+	}
+	return online
+}
+
+func (h *Hub) TouchClient(client *Client) int {
+	if h == nil || client == nil || !client.CountOnline {
+		return 0
+	}
+	online := 0
+	if client.AuctionID != 0 {
+		online = h.Touch(client.AuctionID, client.ID)
+	}
+	if client.LiveSessionID != 0 {
+		h.touchLiveSessionOnline(client.LiveSessionID, client.ID, client.UserID)
+	}
+	return online
 }
 
 func (h *Hub) OnlineCount(auctionID uint64) int {
@@ -532,6 +850,18 @@ func (h *Hub) OnlineCount(auctionID uint64) int {
 		return h.onlineCount(auctionID, 0)
 	}
 	return h.onlineCount(auctionID, room.OnlineClientCount())
+}
+
+func (h *Hub) touchLiveSessionOnline(liveSessionID uint64, clientID, userID string) int {
+	if liveSessionID == 0 || clientID == "" {
+		return 0
+	}
+	key := liveSessionOnlineKey(liveSessionID)
+	fallback := h.liveSessionOnlineClientCount(liveSessionID)
+	if h.shouldSkipOnlineTouch(key, clientID) {
+		return fallback
+	}
+	return h.touchOnline(key, clientID, userID, fallback)
 }
 
 func (h *Hub) joinOnline(auctionID uint64, clientID, userID string, fallback int) int {
@@ -645,6 +975,39 @@ func (h *Hub) onlineTouchKey(auctionID uint64, clientID string) string {
 	return strconv.FormatUint(auctionID, 10) + ":" + clientID
 }
 
+func liveSessionOnlineKey(liveSessionID uint64) uint64 {
+	if liveSessionID == 0 {
+		return 0
+	}
+	return liveSessionID | liveSessionOnlineKeyMask
+}
+
+func (h *Hub) liveSessionOnlineClientCount(liveSessionID uint64) int {
+	if h == nil || liveSessionID == 0 {
+		return 0
+	}
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	count := 0
+	for _, client := range h.sessionClients[liveSessionID] {
+		if client.CountOnline {
+			count++
+		}
+	}
+	return count
+}
+
+func (h *Hub) emitLiveSessionPresence(liveSessionID uint64, online int) {
+	if h == nil || liveSessionID == 0 {
+		return
+	}
+	if online < 0 {
+		online = 0
+	}
+	payload, _ := json.Marshal(map[string]interface{}{"liveSessionId": liveSessionID, "online": online})
+	h.BroadcastLiveSession(liveSessionID, Envelope{Type: TypeRoomOnline, LiveSessionID: liveSessionID, Payload: payload})
+}
+
 func (h *Hub) broadcastPresence(room *Room, online int) {
 	if room == nil {
 		return
@@ -657,6 +1020,10 @@ func (h *Hub) broadcastPresence(room *Room, online int) {
 			}
 			if client.LiveSessionID != 0 {
 				h.unregisterSessionClient(client.LiveSessionID, client.ID)
+				if client.CountOnline {
+					online := h.leaveOnline(liveSessionOnlineKey(client.LiveSessionID), client.ID, client.UserID, h.liveSessionOnlineClientCount(client.LiveSessionID))
+					h.emitLiveSessionPresence(client.LiveSessionID, online)
+				}
 			} else {
 				h.unregisterSessionClientByID(client.ID)
 			}
@@ -766,7 +1133,7 @@ func (h *Hub) HandleInbound(ctx context.Context, client *Client, env Envelope) [
 	switch env.Type {
 	case "ping", "heartbeat":
 		if env.Type == "heartbeat" && client.CountOnline {
-			h.Touch(client.AuctionID, client.ID)
+			h.TouchClient(client)
 		}
 		responseType := "pong"
 		if env.Type == "heartbeat" {
@@ -935,6 +1302,16 @@ func dedupeByPubSeq(eventType string) bool {
 	}
 }
 
+func (r *Room) clientIDSet() map[string]struct{} {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	ids := make(map[string]struct{}, len(r.clients))
+	for id := range r.clients {
+		ids[id] = struct{}{}
+	}
+	return ids
+}
+
 func (r *Room) ClientCount() int {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -953,14 +1330,14 @@ func (r *Room) OnlineClientCount() int {
 	return count
 }
 
-func (r *Room) ClientPresence(clientID string) (bool, string) {
+func (r *Room) ClientPresence(clientID string) (bool, string, uint64) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	client := r.clients[clientID]
 	if client == nil {
-		return false, ""
+		return false, "", 0
 	}
-	return client.CountOnline, client.UserID
+	return client.CountOnline, client.UserID, client.LiveSessionID
 }
 
 func (r *Room) ReplaySince(lastSeq int64) ([]Envelope, bool) {
@@ -1011,7 +1388,7 @@ func (r *Room) broadcastPresenceLocked(online int) []removedClient {
 		online = 0
 	}
 	payload, _ := json.Marshal(map[string]interface{}{"auctionId": r.AuctionID, "online": online})
-	env := Envelope{Type: "room.online", Seq: r.NextSeq(), Payload: payload}
+	env := Envelope{Type: TypeRoomOnline, Seq: r.NextSeq(), Payload: payload}
 	r.appendHistoryLocked(env)
 	removed := make([]removedClient, 0)
 	for _, client := range r.clients {

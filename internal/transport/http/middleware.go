@@ -310,7 +310,8 @@ func (l *RateLimiter) SetDistributedEnabledFunc(fn func(context.Context) bool) {
 
 func (l *RateLimiter) Middleware() app.HandlerFunc {
 	return func(ctx context.Context, c *app.RequestContext) {
-		if IsObservabilitySkipPath(string(c.Path())) {
+		path := string(c.Path())
+		if IsObservabilitySkipPath(path) || isWebSocketPath(path) {
 			c.Next(ctx)
 			return
 		}
@@ -330,6 +331,10 @@ func (l *RateLimiter) Middleware() app.HandlerFunc {
 		}
 		c.Next(ctx)
 	}
+}
+
+func isWebSocketPath(path string) bool {
+	return path == "/ws" || strings.HasPrefix(path, "/ws/")
 }
 
 func (l *RateLimiter) enabled(ctx context.Context) bool {
@@ -407,7 +412,7 @@ func AuditMiddleware(sink AuditSink, logger *slog.Logger) app.HandlerFunc {
 			OperatorRole: AuthRole(c),
 			Action:       auditAction(c),
 			TargetType:   "HTTP",
-			TargetID:     string(c.Path()),
+			TargetID:     auditTargetID(c),
 			Payload:      payload,
 			IP:           clientIP(c),
 			UserAgent:    string(c.GetHeader("User-Agent")),
@@ -438,7 +443,18 @@ func shouldSkipAudit(c *app.RequestContext) bool {
 }
 
 func auditAction(c *app.RequestContext) string {
-	return strings.ToUpper(string(c.Method())) + " " + string(c.Path())
+	return strings.ToUpper(string(c.Method())) + " " + auditRoutePath(c)
+}
+
+func auditTargetID(c *app.RequestContext) string {
+	return auditRoutePath(c)
+}
+
+func auditRoutePath(c *app.RequestContext) string {
+	if full := strings.TrimSpace(c.FullPath()); full != "" {
+		return full
+	}
+	return string(c.Path())
 }
 
 func AuthUserID(c *app.RequestContext) string {

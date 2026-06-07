@@ -95,20 +95,25 @@ func (s *AuctionRealtimeStore) InitAuction(ctx context.Context, auction domain.A
 	if auction.LiveSessionID != nil {
 		liveSessionID = *auction.LiveSessionID
 	}
-	state := domain.AuctionState{
-		AuctionID:     auction.AuctionID,
-		LiveSessionID: liveSessionID,
-		Status:        auction.Status,
-		StartPrice:    auction.StartPrice,
-		CapPrice:      auction.CapPrice,
-		IncrementRule: append([]byte(nil), auction.IncrementRule...),
-		CurrentPrice:  auction.StartPrice,
-		StartTime:     auction.StartTime,
-		EndTime:       auction.EndTime,
-		Version:       time.Now().UTC().UnixMilli(),
-		Source:        "redis",
-	}
 	client, _ := s.shardForAuction(auction.AuctionID)
+	participantCount, err := client.SCard(ctx, s.keys.AuctionEnrolled(auction.AuctionID)).Result()
+	if err != nil {
+		return domain.AuctionState{}, err
+	}
+	state := domain.AuctionState{
+		AuctionID:        auction.AuctionID,
+		LiveSessionID:    liveSessionID,
+		Status:           auction.Status,
+		StartPrice:       auction.StartPrice,
+		CapPrice:         auction.CapPrice,
+		IncrementRule:    append([]byte(nil), auction.IncrementRule...),
+		CurrentPrice:     auction.StartPrice,
+		ParticipantCount: int(participantCount),
+		StartTime:        auction.StartTime,
+		EndTime:          auction.EndTime,
+		Version:          time.Now().UTC().UnixMilli(),
+		Source:           "redis",
+	}
 	pipe := client.Pipeline()
 	pipe.Del(ctx,
 		s.keys.AuctionBids(auction.AuctionID),
@@ -129,6 +134,7 @@ func (s *AuctionRealtimeStore) InitAuction(ctx context.Context, auction domain.A
 		"cap_price", auction.CapPrice,
 		"leader_bidder_id", "",
 		"bid_count", 0,
+		"participant_count", participantCount,
 		"start_ts_ms", auction.StartTime.UnixMilli(),
 		"end_ts_ms", auction.EndTime.UnixMilli(),
 		"last_bid_ts_ms", 0,
@@ -165,32 +171,43 @@ func (s *AuctionRealtimeStore) GetAuctionState(ctx context.Context, auctionID ui
 	if len(values) == 0 {
 		return domain.AuctionState{}, false, nil
 	}
+	participantCount := int(parseInt(values["participant_count"], 0))
+	if enrolledCount, countErr := client.SCard(ctx, s.keys.AuctionEnrolled(auctionID)).Result(); countErr == nil && int(enrolledCount) > participantCount {
+		participantCount = int(enrolledCount)
+		_ = client.HSet(ctx, s.keys.AuctionState(auctionID), "participant_count", participantCount).Err()
+	}
 	state := domain.AuctionState{
-		AuctionID:      parseUint(values["auction_id"], auctionID),
-		LiveSessionID:  parseUint(values["live_session_id"], 0),
-		Status:         domain.AuctionStatus(values["status"]),
-		StartPrice:     parseInt(values["start_price"], 0),
-		CapPrice:       parseInt(values["cap_price"], 0),
-		IncrementRule:  parseRawJSON(values["increment_rule"]),
-		CurrentPrice:   parseInt(values["current_price"], 0),
-		LeaderBidderID: values["leader_bidder_id"],
-		BidCount:       int(parseInt(values["bid_count"], 0)),
-		StartTime:      time.UnixMilli(parseInt(values["start_ts_ms"], 0)).UTC(),
-		EndTime:        time.UnixMilli(parseInt(values["end_ts_ms"], 0)).UTC(),
-		LastBidTSMS:    parseInt(values["last_bid_ts_ms"], 0),
-		ExtendCount:    int(parseInt(values["extend_count"], 0)),
-		Version:        parseInt(values["version"], 0),
-		Source:         "redis",
+		AuctionID:        parseUint(values["auction_id"], auctionID),
+		LiveSessionID:    parseUint(values["live_session_id"], 0),
+		Status:           domain.AuctionStatus(values["status"]),
+		StartPrice:       parseInt(values["start_price"], 0),
+		CapPrice:         parseInt(values["cap_price"], 0),
+		IncrementRule:    parseRawJSON(values["increment_rule"]),
+		CurrentPrice:     parseInt(values["current_price"], 0),
+		LeaderBidderID:   values["leader_bidder_id"],
+		BidCount:         int(parseInt(values["bid_count"], 0)),
+		ParticipantCount: participantCount,
+		StartTime:        time.UnixMilli(parseInt(values["start_ts_ms"], 0)).UTC(),
+		EndTime:          time.UnixMilli(parseInt(values["end_ts_ms"], 0)).UTC(),
+		LastBidTSMS:      parseInt(values["last_bid_ts_ms"], 0),
+		ExtendCount:      int(parseInt(values["extend_count"], 0)),
+		Version:          parseInt(values["version"], 0),
+		Source:           "redis",
 	}
 	return state, true, nil
 }
 
 func (s *AuctionRealtimeStore) MarkEnrollment(ctx context.Context, auctionID uint64, userID string) error {
-	client, _ := s.shardForAuction(auctionID)
-	pipe := client.Pipeline()
-	pipe.SAdd(ctx, s.keys.AuctionEnrolled(auctionID), userID)
-	pipe.SAdd(ctx, s.keys.AuctionDeposits(auctionID), userID)
-	_, err := pipe.Exec(ctx)
+	userID = strings.TrimSpace(userID)
+	if userID == "" {
+		return domain.ErrInvalidArgument
+	}
+	_, shardIdx := s.shardForAuction(auctionID)
+	_, err := s.scripts.EvalOnShard(ctx, shardIdx, ScriptMarkEnrollment, []string{
+		s.keys.AuctionEnrolled(auctionID),
+		s.keys.AuctionDeposits(auctionID),
+		s.keys.AuctionState(auctionID),
+	}, userID)
 	return err
 }
 
@@ -303,9 +320,9 @@ func (s *AuctionRealtimeStore) publishAcceptedResult(ctx context.Context, input 
 	if event == "" {
 		event = "bid.accepted"
 	}
-	pubCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 50*time.Millisecond)
 	channel := fmt.Sprintf("auction:%d:events", auctionID)
 	go func() {
+		pubCtx, cancel := realtimePublishContext(ctx)
 		defer cancel()
 		defer func() {
 			if r := recover(); r != nil {
@@ -324,7 +341,7 @@ func (s *AuctionRealtimeStore) publishAcceptedResult(ctx context.Context, input 
 			Reason:         result.Reason,
 			CurrentPrice:   result.CurrentPrice,
 			LeaderBidderID: result.LeaderBidderID,
-			EndTSMS:        result.EndTime.UnixMilli(),
+			EndTime:        result.EndTime,
 			Extended:       result.Extended,
 			ExtendCount:    result.ExtendCount,
 			Version:        result.Version,
@@ -332,6 +349,7 @@ func (s *AuctionRealtimeStore) publishAcceptedResult(ctx context.Context, input 
 			StreamID:       result.StreamID,
 			CreatedAtMS:    bidAt.UnixMilli(),
 			BidTSMS:        bidAt.UnixMilli(),
+			ServerTime:     bidAt.UTC(),
 			Source:         source,
 			Event:          event,
 			RiskResult:     result.RiskResult,
@@ -456,7 +474,7 @@ type bidAcceptedPublishPayload struct {
 	Reason         string               `json:"reason"`
 	CurrentPrice   int64                `json:"currentPrice"`
 	LeaderBidderID string               `json:"leaderBidderId"`
-	EndTSMS        int64                `json:"endTsMs"`
+	EndTime        time.Time            `json:"endTime"`
 	Extended       bool                 `json:"extended"`
 	ExtendCount    int                  `json:"extendCount"`
 	Version        int64                `json:"version"`
@@ -464,6 +482,7 @@ type bidAcceptedPublishPayload struct {
 	StreamID       string               `json:"streamId"`
 	CreatedAtMS    int64                `json:"createdAtMs"`
 	BidTSMS        int64                `json:"bidTsMs"`
+	ServerTime     time.Time            `json:"serverTime"`
 	Source         string               `json:"source"`
 	Event          string               `json:"event"`
 	RiskResult     domain.BidRiskResult `json:"riskResult"`

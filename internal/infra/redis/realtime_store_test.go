@@ -96,6 +96,102 @@ func TestAuctionRealtimeStoreRejectedBidDoesNotWriteStreamAndReplayGap(t *testin
 	}
 }
 
+func TestAuctionRealtimeStoreMarkEnrollmentUpdatesParticipantCount(t *testing.T) {
+	ctx := context.Background()
+	store, client, keys := newMiniredisStore(t)
+	auctionID := uint64(10012)
+	now := time.UnixMilli(1700000000000).UTC()
+	mustInitRunningAuction(t, ctx, client, keys, auctionID, now)
+
+	if err := store.MarkEnrollment(ctx, auctionID, "u_1001"); err != nil {
+		t.Fatalf("mark enrollment 1: %v", err)
+	}
+	if err := store.MarkEnrollment(ctx, auctionID, "u_1001"); err != nil {
+		t.Fatalf("mark duplicate enrollment: %v", err)
+	}
+	if err := store.MarkEnrollment(ctx, auctionID, "u_1002"); err != nil {
+		t.Fatalf("mark enrollment 2: %v", err)
+	}
+
+	state, ok, err := store.GetAuctionState(ctx, auctionID)
+	if err != nil || !ok {
+		t.Fatalf("read state: ok=%v err=%v", ok, err)
+	}
+	if state.ParticipantCount != 2 {
+		t.Fatalf("expected 2 participants after unique enrollments, got %+v", state)
+	}
+	enrolled, depositReady, err := store.BidPrerequisites(ctx, auctionID, "u_1002")
+	if err != nil {
+		t.Fatalf("bid prerequisites: %v", err)
+	}
+	if !enrolled || !depositReady {
+		t.Fatalf("expected u_1002 ready, enrolled=%v depositReady=%v", enrolled, depositReady)
+	}
+}
+
+func TestAuctionRealtimeStoreInitAuctionRestoresParticipantCountFromEnrollmentSet(t *testing.T) {
+	ctx := context.Background()
+	store, client, keys := newMiniredisStore(t)
+	auctionID := uint64(10013)
+	now := time.UnixMilli(1700000000000).UTC()
+	if err := client.SAdd(ctx, keys.AuctionEnrolled(auctionID), "u_1001", "u_1002").Err(); err != nil {
+		t.Fatalf("seed enrollment set: %v", err)
+	}
+	auction := domain.AuctionLot{
+		AuctionID:     auctionID,
+		Status:        domain.AuctionStatusRunning,
+		StartPrice:    1000,
+		ReservePrice:  1000,
+		CapPrice:      2000,
+		StartTime:     now.Add(-time.Minute),
+		EndTime:       now.Add(time.Hour),
+		IncrementRule: json.RawMessage(`{"type":"fixed","amount":100,"maxBidSteps":10}`),
+	}
+	state, err := store.InitAuction(ctx, auction, 100)
+	if err != nil {
+		t.Fatalf("init auction: %v", err)
+	}
+	if state.ParticipantCount != 2 {
+		t.Fatalf("expected init state participant count from enrollment set, got %+v", state)
+	}
+	stored, ok, err := store.GetAuctionState(ctx, auctionID)
+	if err != nil || !ok {
+		t.Fatalf("read state: ok=%v err=%v", ok, err)
+	}
+	if stored.ParticipantCount != 2 {
+		t.Fatalf("expected stored participant count 2, got %+v", stored)
+	}
+}
+
+func TestAuctionRealtimeStoreGetAuctionStateRepairsParticipantCount(t *testing.T) {
+	ctx := context.Background()
+	store, client, keys := newMiniredisStore(t)
+	auctionID := uint64(10014)
+	now := time.UnixMilli(1700000000000).UTC()
+	mustInitRunningAuction(t, ctx, client, keys, auctionID, now)
+	if err := client.HSet(ctx, keys.AuctionState(auctionID), "participant_count", 0).Err(); err != nil {
+		t.Fatalf("seed stale participant count: %v", err)
+	}
+	if err := client.SAdd(ctx, keys.AuctionEnrolled(auctionID), "u_1001", "u_1002").Err(); err != nil {
+		t.Fatalf("seed enrollment set: %v", err)
+	}
+
+	state, ok, err := store.GetAuctionState(ctx, auctionID)
+	if err != nil || !ok {
+		t.Fatalf("read state: ok=%v err=%v", ok, err)
+	}
+	if state.ParticipantCount != 2 {
+		t.Fatalf("expected repaired participant count 2, got %+v", state)
+	}
+	storedCount, err := client.HGet(ctx, keys.AuctionState(auctionID), "participant_count").Int()
+	if err != nil {
+		t.Fatalf("read stored participant count: %v", err)
+	}
+	if storedCount != 2 {
+		t.Fatalf("expected stored participant count repaired to 2, got %d", storedCount)
+	}
+}
+
 func TestAuctionRealtimeStoreHammerUsesStateLeaderWhenRankingIsAsync(t *testing.T) {
 	ctx := context.Background()
 	store, client, keys := newMiniredisStore(t)
@@ -412,9 +508,11 @@ func TestAuctionRealtimeStorePlaceBidPublishesRawPayload(t *testing.T) {
 	ctx := context.Background()
 	store, client, _ := newMiniredisStore(t)
 	auctionID := uint64(10101)
+	liveSessionID := uint64(90101)
 	now := time.UnixMilli(1700000000000).UTC()
 	auction := domain.AuctionLot{
 		AuctionID:     auctionID,
+		LiveSessionID: &liveSessionID,
 		Status:        domain.AuctionStatusRunning,
 		StartPrice:    1000,
 		ReservePrice:  1000,
@@ -441,16 +539,22 @@ func TestAuctionRealtimeStorePlaceBidPublishesRawPayload(t *testing.T) {
 	if err != nil || !result.Accepted {
 		t.Fatalf("place bid: result=%+v err=%v", result, err)
 	}
+	if result.LiveSessionID != liveSessionID || result.CurrentPrice != 1100 {
+		t.Fatalf("accepted result should include live session/current price, got %+v", result)
+	}
 	select {
 	case msg := <-ch:
 		if msg == nil {
 			t.Fatalf("nil message from pubsub")
 		}
 		var payload struct {
-			Event     string `json:"event"`
-			Seq       int64  `json:"seq"`
-			AuctionID uint64 `json:"auctionId"`
-			EndTSMS   int64  `json:"endTsMs"`
+			Event         string    `json:"event"`
+			Seq           int64     `json:"seq"`
+			AuctionID     uint64    `json:"auctionId"`
+			LiveSessionID uint64    `json:"liveSessionId"`
+			CurrentPrice  int64     `json:"currentPrice"`
+			EndTime       string    `json:"endTime"`
+			ServerTime    time.Time `json:"serverTime"`
 		}
 		if err := json.Unmarshal([]byte(msg.Payload), &payload); err != nil {
 			t.Fatalf("unmarshal published payload: %v (%s)", err, msg.Payload)
@@ -458,8 +562,14 @@ func TestAuctionRealtimeStorePlaceBidPublishesRawPayload(t *testing.T) {
 		if payload.Event != "bid.accepted" || payload.Seq != result.Seq || payload.AuctionID != auctionID {
 			t.Fatalf("unexpected published payload: %+v raw=%s", payload, msg.Payload)
 		}
-		if payload.EndTSMS == 0 {
-			t.Fatalf("published payload must keep endTsMs field, raw=%s", msg.Payload)
+		if payload.LiveSessionID != liveSessionID || payload.CurrentPrice != 1100 {
+			t.Fatalf("published payload must include liveSessionId/currentPrice, got %+v raw=%s", payload, msg.Payload)
+		}
+		if payload.EndTime == "" {
+			t.Fatalf("published payload must keep endTime field, raw=%s", msg.Payload)
+		}
+		if payload.ServerTime.IsZero() {
+			t.Fatalf("published payload must include serverTime, raw=%s", msg.Payload)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatalf("expected published event on %s within timeout", channel)

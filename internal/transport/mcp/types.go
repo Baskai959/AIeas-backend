@@ -4,7 +4,8 @@ import (
 	"encoding/json"
 
 	"aieas_backend/internal/infra/observability/metrics"
-	"aieas_backend/internal/service"
+	aiports "aieas_backend/internal/modules/ai/ports"
+	mcpapp "aieas_backend/internal/modules/mcp/app"
 )
 
 const (
@@ -17,30 +18,48 @@ const (
 )
 
 type Handler struct {
-	read          *service.MCPReadService
-	control       *service.MCPControlService
+	read          MCPReadUseCase
+	control       MCPControlUseCase
 	apiKey        string
-	apiActor      service.MCPActor
+	apiActor      MCPActor
 	serverName    string
 	schemaVersion string
 	metrics       *metrics.Registry
-	assistant     *service.AIAssistantService
+	assistant     AIAssistantNotifier
 }
+
+type MCPActor = mcpapp.MCPActor
+
+type MCPReadUseCase = mcpapp.MCPReadUseCase
+
+type MCPControlUseCase = mcpapp.MCPControlUseCase
+
+type LiveControlContext = mcpapp.LiveControlContext
+
+type LiveLotOperationInput = mcpapp.LiveLotOperationInput
+
+type LiveLotOperationResult = mcpapp.LiveLotOperationResult
+
+type LiveVoiceBroadcastInput = mcpapp.LiveVoiceBroadcastInput
+
+type LiveVoiceBroadcastResult = mcpapp.LiveVoiceBroadcastResult
+
+type AIAssistantNotifier = aiports.StatusNotifier
 
 type APIKeyAuthConfig struct {
 	APIKey string
-	Actor  service.MCPActor
+	Actor  MCPActor
 }
 
-func NewReadHandler(read *service.MCPReadService, auth APIKeyAuthConfig) *Handler {
+func NewReadHandler(read MCPReadUseCase, auth APIKeyAuthConfig) *Handler {
 	return newHandler(read, nil, readServerName, readSchemaVersion, auth)
 }
 
-func NewControlHandler(control *service.MCPControlService, auth APIKeyAuthConfig) *Handler {
+func NewControlHandler(control MCPControlUseCase, auth APIKeyAuthConfig) *Handler {
 	return newHandler(nil, control, controlServerName, controlSchemaVersion, auth)
 }
 
-func newHandler(read *service.MCPReadService, control *service.MCPControlService, name, schema string, auth APIKeyAuthConfig) *Handler {
+func newHandler(read MCPReadUseCase, control MCPControlUseCase, name, schema string, auth APIKeyAuthConfig) *Handler {
 	return &Handler{
 		read:          read,
 		control:       control,
@@ -62,7 +81,7 @@ func (h *Handler) SetMetrics(reg *metrics.Registry) {
 	h.metrics = reg
 }
 
-func (h *Handler) SetAIAssistant(assistant *service.AIAssistantService) {
+func (h *Handler) SetAIAssistant(assistant AIAssistantNotifier) {
 	h.assistant = assistant
 }
 

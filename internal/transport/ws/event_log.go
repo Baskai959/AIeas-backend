@@ -99,7 +99,12 @@ func (r *EventRelay) poll(ctx context.Context) {
 			if event.EventType == "bid.rejected" {
 				continue
 			}
-			r.hub.Broadcast(auctionID, Envelope{Type: event.EventType, Seq: event.Seq, Payload: event.PayloadJSON()})
+			env := Envelope{Type: event.EventType, Seq: event.Seq, Payload: event.PayloadJSON()}
+			if event.LiveSessionID != 0 {
+				r.hub.BroadcastAuctionAndLiveSession(auctionID, event.LiveSessionID, env)
+				continue
+			}
+			r.hub.Broadcast(auctionID, env)
 		}
 	}
 }

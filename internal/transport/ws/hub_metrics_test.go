@@ -16,6 +16,8 @@ type fakeHubMetrics struct {
 	disconnectReasons     []string
 	broadcasts            []broadcastEvent
 	slowClientDisconnects int
+	handshakeRejects      []string
+	drainingCount         int
 }
 
 type broadcastEvent struct {
@@ -45,6 +47,18 @@ func (f *fakeHubMetrics) IncWSSlowClientDisconnect() {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.slowClientDisconnects++
+}
+
+func (f *fakeHubMetrics) IncWSHandshakeReject(reason string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.handshakeRejects = append(f.handshakeRejects, reason)
+}
+
+func (f *fakeHubMetrics) IncWSDraining() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.drainingCount++
 }
 
 func (f *fakeHubMetrics) snapshot() (int, []string, []broadcastEvent, int) {

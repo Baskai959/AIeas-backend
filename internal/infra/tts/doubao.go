@@ -16,7 +16,7 @@ import (
 
 	appconfig "aieas_backend/internal/config"
 	"aieas_backend/internal/domain"
-	"aieas_backend/internal/service"
+	mcpapp "aieas_backend/internal/modules/mcp/app"
 
 	"github.com/gorilla/websocket"
 )
@@ -52,19 +52,19 @@ func NewDoubaoClient(cfg appconfig.DoubaoTTSConfig) *DoubaoClient {
 	}
 }
 
-func (c *DoubaoClient) SynthesizeLiveVoice(ctx context.Context, in service.LiveVoiceSynthesisInput) (service.LiveVoiceSynthesisResult, error) {
+func (c *DoubaoClient) SynthesizeLiveVoice(ctx context.Context, in mcpapp.LiveVoiceSynthesisInput) (mcpapp.LiveVoiceSynthesisResult, error) {
 	if c == nil {
-		return service.LiveVoiceSynthesisResult{}, domain.ErrInvalidState
+		return mcpapp.LiveVoiceSynthesisResult{}, domain.ErrInvalidState
 	}
 	text := strings.TrimSpace(in.Text)
 	if text == "" {
-		return service.LiveVoiceSynthesisResult{}, domain.ErrInvalidArgument
+		return mcpapp.LiveVoiceSynthesisResult{}, domain.ErrInvalidArgument
 	}
 	appID := strings.TrimSpace(c.cfg.AppID)
 	ackToken := strings.TrimSpace(c.cfg.AckToken)
 	voice := strings.TrimSpace(c.cfg.Voice)
 	if appID == "" || ackToken == "" || voice == "" {
-		return service.LiveVoiceSynthesisResult{}, fmt.Errorf("doubao tts is not configured: %w", domain.ErrInvalidState)
+		return mcpapp.LiveVoiceSynthesisResult{}, fmt.Errorf("doubao tts is not configured: %w", domain.ErrInvalidState)
 	}
 	if _, ok := ctx.Deadline(); !ok {
 		var cancel context.CancelFunc
@@ -74,7 +74,7 @@ func (c *DoubaoClient) SynthesizeLiveVoice(ctx context.Context, in service.LiveV
 
 	conn, err := c.dial(ctx, appID, ackToken)
 	if err != nil {
-		return service.LiveVoiceSynthesisResult{}, err
+		return mcpapp.LiveVoiceSynthesisResult{}, err
 	}
 	defer conn.Close()
 	done := make(chan struct{})
@@ -89,10 +89,10 @@ func (c *DoubaoClient) SynthesizeLiveVoice(ctx context.Context, in service.LiveV
 
 	sessionID := randomHexID(16)
 	if err := c.startConnection(ctx, conn); err != nil {
-		return service.LiveVoiceSynthesisResult{}, err
+		return mcpapp.LiveVoiceSynthesisResult{}, err
 	}
 	if err := c.startSession(ctx, conn, sessionID, voice); err != nil {
-		return service.LiveVoiceSynthesisResult{}, err
+		return mcpapp.LiveVoiceSynthesisResult{}, err
 	}
 	defer func() {
 		_ = c.sendEvent(context.Background(), conn, doubaoEventFinishSession, sessionID, []byte("{}"), doubaoSerializationJSON)
@@ -100,13 +100,13 @@ func (c *DoubaoClient) SynthesizeLiveVoice(ctx context.Context, in service.LiveV
 	}()
 
 	if err := c.sendSayHello(ctx, conn, sessionID, text); err != nil {
-		return service.LiveVoiceSynthesisResult{}, err
+		return mcpapp.LiveVoiceSynthesisResult{}, err
 	}
 	audio, err := c.readAudio(ctx, conn)
 	if err != nil {
-		return service.LiveVoiceSynthesisResult{}, err
+		return mcpapp.LiveVoiceSynthesisResult{}, err
 	}
-	return service.LiveVoiceSynthesisResult{
+	return mcpapp.LiveVoiceSynthesisResult{
 		Audio:       audio,
 		AudioFormat: doubaoAudioFormat,
 		Encoding:    doubaoAudioEncoding,

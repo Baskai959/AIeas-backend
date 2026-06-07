@@ -9,7 +9,7 @@ import (
 	redisgo "github.com/redis/go-redis/v9"
 )
 
-// LiveSessionRealtimeStore 是 repository.LiveSessionRealtimeStore 的 Redis 实现。
+// LiveSessionRealtimeStore 是 live_session 实时计数端口的 Redis 实现。
 //
 // 计数 HASH key 形如 live_session:%d:counters，字段：
 //
@@ -145,6 +145,47 @@ func (s *LiveSessionRealtimeStore) LoadCounters(ctx context.Context, sessionID u
 	return counters, peak, nil
 }
 
+func (s *LiveSessionRealtimeStore) SetActiveAuction(ctx context.Context, sessionID uint64, auctionID uint64) error {
+	if s == nil || s.sharded == nil || sessionID == 0 {
+		return nil
+	}
+	client := s.shardForSession(sessionID)
+	if client == nil {
+		return nil
+	}
+	key := s.keys.LiveSessionActiveAuction(sessionID)
+	if auctionID == 0 {
+		return client.Del(ctx, key).Err()
+	}
+	return client.Set(ctx, key, strconv.FormatUint(auctionID, 10), 0).Err()
+}
+
+func (s *LiveSessionRealtimeStore) ClearActiveAuction(ctx context.Context, sessionID uint64) error {
+	return s.SetActiveAuction(ctx, sessionID, 0)
+}
+
+func (s *LiveSessionRealtimeStore) ActiveAuction(ctx context.Context, sessionID uint64) (uint64, bool, error) {
+	if s == nil || s.sharded == nil || sessionID == 0 {
+		return 0, false, nil
+	}
+	client := s.shardForSession(sessionID)
+	if client == nil {
+		return 0, false, nil
+	}
+	value, err := client.Get(ctx, s.keys.LiveSessionActiveAuction(sessionID)).Result()
+	if err != nil {
+		if err == redisgo.Nil {
+			return 0, false, nil
+		}
+		return 0, false, err
+	}
+	auctionID, err := strconv.ParseUint(value, 10, 64)
+	if err != nil || auctionID == 0 {
+		return 0, false, err
+	}
+	return auctionID, true, nil
+}
+
 // Reset 在场次关闭后清理 redis key。
 func (s *LiveSessionRealtimeStore) Reset(ctx context.Context, sessionID uint64) error {
 	if s == nil || s.sharded == nil || sessionID == 0 {
@@ -157,5 +198,6 @@ func (s *LiveSessionRealtimeStore) Reset(ctx context.Context, sessionID uint64) 
 	return client.Del(ctx,
 		s.keys.LiveSessionCounters(sessionID),
 		s.keys.LiveSessionViewerPeak(sessionID),
+		s.keys.LiveSessionActiveAuction(sessionID),
 	).Err()
 }

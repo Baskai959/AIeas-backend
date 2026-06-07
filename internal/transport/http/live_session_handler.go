@@ -9,27 +9,26 @@ import (
 	"time"
 
 	"aieas_backend/internal/domain"
-	"aieas_backend/internal/infra/objectstorage"
-	"aieas_backend/internal/service"
 
 	"github.com/cloudwego/hertz/pkg/app"
 )
 
 // LiveSessionHandler 暴露直播场次（live_session）相关读接口。
 type LiveSessionHandler struct {
-	sessions    *service.LiveSessionService
-	marketplace *service.MarketplaceService
-	uploader    objectstorage.Uploader
+	commands    LiveSessionCommandUseCase
+	queries     LiveSessionQueryUseCase
+	marketplace MarketplaceLiveSessionPresenter
+	uploader    ImageUploader
 }
 
-func NewLiveSessionHandler(sessions *service.LiveSessionService, uploader objectstorage.Uploader) *LiveSessionHandler {
+func NewLiveSessionHandler(commands LiveSessionCommandUseCase, queries LiveSessionQueryUseCase, uploader ImageUploader) *LiveSessionHandler {
 	if uploader == nil {
-		uploader = objectstorage.DisabledUploader{}
+		uploader = DisabledImageUploader{}
 	}
-	return &LiveSessionHandler{sessions: sessions, uploader: uploader}
+	return &LiveSessionHandler{commands: commands, queries: queries, uploader: uploader}
 }
 
-func (h *LiveSessionHandler) SetMarketplaceService(marketplace *service.MarketplaceService) {
+func (h *LiveSessionHandler) SetMarketplaceService(marketplace MarketplaceLiveSessionPresenter) {
 	if h == nil {
 		return
 	}
@@ -56,8 +55,9 @@ type liveSessionPatchRequest struct {
 }
 
 type liveSessionActivateRequest struct {
-	AuctionID   uint64 `json:"auctionId"`
-	DurationSec int    `json:"durationSec"`
+	AuctionID   uint64     `json:"auctionId"`
+	DurationSec int        `json:"durationSec"`
+	StartTime   *time.Time `json:"startTime"`
 }
 
 type liveSessionMountRequest struct {
@@ -74,7 +74,7 @@ func (h *LiveSessionHandler) Create(ctx context.Context, c *app.RequestContext) 
 		WriteError(c, 400, 20001, "参数不合法", nil)
 		return
 	}
-	session, err := h.sessions.Create(ctx, service.CreateLiveSessionInput{ActorID: AuthUserID(c), ActorRole: AuthRole(c), MerchantID: req.MerchantID, Title: req.Title, Description: req.Description, CoverURL: req.CoverURL, Status: req.Status, ScheduledStartTime: req.ScheduledStartTime, PlannedDurationSec: req.PlannedDurationSec})
+	session, err := h.commands.Create(ctx, LiveSessionCreateInput{ActorID: AuthUserID(c), ActorRole: AuthRole(c), MerchantID: req.MerchantID, Title: req.Title, Description: req.Description, CoverURL: req.CoverURL, Status: req.Status, ScheduledStartTime: req.ScheduledStartTime, PlannedDurationSec: req.PlannedDurationSec})
 	if err != nil {
 		writeLiveSessionError(c, err)
 		return
@@ -87,7 +87,7 @@ func (h *LiveSessionHandler) List(ctx context.Context, c *app.RequestContext) {
 	if !status.Valid() {
 		status = ""
 	}
-	sessions, err := h.sessions.ListVisibleFiltered(ctx, domain.LiveSessionFilter{
+	sessions, err := h.queries.ListVisibleFiltered(ctx, domain.LiveSessionFilter{
 		MerchantID: strings.TrimSpace(c.Query("merchantId")),
 		Status:     status,
 		Keyword:    strings.TrimSpace(c.Query("keyword")),
@@ -112,7 +112,7 @@ func (h *LiveSessionHandler) Update(ctx context.Context, c *app.RequestContext) 
 		WriteError(c, 400, 20001, "参数不合法", nil)
 		return
 	}
-	session, err := h.sessions.Update(ctx, id, service.UpdateLiveSessionInput{ActorID: AuthUserID(c), ActorRole: AuthRole(c), Title: req.Title, Description: req.Description, CoverURL: req.CoverURL, Status: req.Status, ScheduledStartTime: req.ScheduledStartTime, PlannedDurationSec: req.PlannedDurationSec})
+	session, err := h.commands.Update(ctx, id, LiveSessionUpdateInput{ActorID: AuthUserID(c), ActorRole: AuthRole(c), Title: req.Title, Description: req.Description, CoverURL: req.CoverURL, Status: req.Status, ScheduledStartTime: req.ScheduledStartTime, PlannedDurationSec: req.PlannedDurationSec})
 	if err != nil {
 		writeLiveSessionError(c, err)
 		return
@@ -125,7 +125,7 @@ func (h *LiveSessionHandler) Start(ctx context.Context, c *app.RequestContext) {
 	if !ok {
 		return
 	}
-	session, err := h.sessions.Start(ctx, id, AuthUserID(c), AuthRole(c))
+	session, err := h.commands.Start(ctx, id, AuthUserID(c), AuthRole(c))
 	if err != nil {
 		writeLiveSessionError(c, err)
 		return
@@ -138,7 +138,7 @@ func (h *LiveSessionHandler) End(ctx context.Context, c *app.RequestContext) {
 	if !ok {
 		return
 	}
-	session, err := h.sessions.End(ctx, id, AuthUserID(c), AuthRole(c))
+	session, err := h.commands.End(ctx, id, AuthUserID(c), AuthRole(c))
 	if err != nil {
 		writeLiveSessionError(c, err)
 		return
@@ -156,7 +156,7 @@ func (h *LiveSessionHandler) ListByMerchant(ctx context.Context, c *app.RequestC
 	}
 	limit := parseQueryInt(c, "limit", 20)
 	offset := parseQueryInt(c, "offset", 0)
-	sessions, err := h.sessions.ListByMerchantFiltered(ctx, domain.LiveSessionFilter{
+	sessions, err := h.queries.ListByMerchantFiltered(ctx, domain.LiveSessionFilter{
 		MerchantID: merchantID,
 		Status:     status,
 		Keyword:    strings.TrimSpace(c.Query("keyword")),
@@ -177,7 +177,7 @@ func (h *LiveSessionHandler) Get(ctx context.Context, c *app.RequestContext) {
 	if !ok {
 		return
 	}
-	session, err := h.sessions.Get(ctx, id)
+	session, err := h.queries.Get(ctx, id)
 	if err != nil {
 		writeLiveSessionError(c, err)
 		return
@@ -191,7 +191,7 @@ func (h *LiveSessionHandler) Lots(ctx context.Context, c *app.RequestContext) {
 	if !ok {
 		return
 	}
-	lots, err := h.sessions.ListLots(ctx, id, AuthUserID(c), AuthRole(c))
+	lots, err := h.queries.ListLots(ctx, id, AuthUserID(c), AuthRole(c))
 	if err != nil {
 		writeLiveSessionError(c, err)
 		return
@@ -212,7 +212,7 @@ func (h *LiveSessionHandler) Bids(ctx context.Context, c *app.RequestContext) {
 			WriteError(c, 400, 20001, "参数不合法", nil)
 			return
 		}
-		bids, err := h.sessions.ListAuctionBids(ctx, id, auctionID, limit, AuthUserID(c), AuthRole(c))
+		bids, err := h.queries.ListAuctionBids(ctx, id, auctionID, limit, AuthUserID(c), AuthRole(c))
 		if err != nil {
 			writeLiveSessionError(c, err)
 			return
@@ -220,7 +220,7 @@ func (h *LiveSessionHandler) Bids(ctx context.Context, c *app.RequestContext) {
 		WriteSuccess(c, map[string]interface{}{"bids": bids})
 		return
 	}
-	bids, err := h.sessions.ListBids(ctx, id, limit, AuthUserID(c), AuthRole(c))
+	bids, err := h.queries.ListBids(ctx, id, limit, AuthUserID(c), AuthRole(c))
 	if err != nil {
 		writeLiveSessionError(c, err)
 		return
@@ -236,7 +236,7 @@ func (h *LiveSessionHandler) Orders(ctx context.Context, c *app.RequestContext) 
 	}
 	limit := parseQueryInt(c, "limit", 20)
 	offset := parseQueryInt(c, "offset", 0)
-	orders, err := h.sessions.ListOrders(ctx, id, limit, offset, AuthUserID(c), AuthRole(c))
+	orders, err := h.queries.ListOrders(ctx, id, limit, offset, AuthUserID(c), AuthRole(c))
 	if err != nil {
 		writeLiveSessionError(c, err)
 		return
@@ -249,7 +249,7 @@ func (h *LiveSessionHandler) Stats(ctx context.Context, c *app.RequestContext) {
 	if !ok {
 		return
 	}
-	stats, err := h.sessions.Stats(ctx, id, AuthUserID(c), AuthRole(c))
+	stats, err := h.queries.Stats(ctx, id, AuthUserID(c), AuthRole(c))
 	if err != nil {
 		writeLiveSessionError(c, err)
 		return
@@ -267,7 +267,7 @@ func (h *LiveSessionHandler) MountLot(ctx context.Context, c *app.RequestContext
 		WriteError(c, 400, 20001, "参数不合法", nil)
 		return
 	}
-	lot, err := h.sessions.MountAuction(ctx, id, req.AuctionID, AuthUserID(c), AuthRole(c))
+	lot, err := h.commands.MountAuction(ctx, id, req.AuctionID, AuthUserID(c), AuthRole(c))
 	if err != nil {
 		writeLiveSessionError(c, err)
 		return
@@ -284,7 +284,7 @@ func (h *LiveSessionHandler) UnmountLot(ctx context.Context, c *app.RequestConte
 	if !ok {
 		return
 	}
-	if err := h.sessions.UnmountAuction(ctx, id, auctionID, AuthUserID(c), AuthRole(c)); err != nil {
+	if err := h.commands.UnmountAuction(ctx, id, auctionID, AuthUserID(c), AuthRole(c)); err != nil {
 		writeLiveSessionError(c, err)
 		return
 	}
@@ -301,7 +301,7 @@ func (h *LiveSessionHandler) Activate(ctx context.Context, c *app.RequestContext
 		WriteError(c, 400, 20001, "参数不合法", nil)
 		return
 	}
-	lot, err := h.sessions.ActivateAuctionWithOptions(ctx, service.ActivateLiveSessionAuctionInput{SessionID: id, AuctionID: req.AuctionID, ActorID: AuthUserID(c), ActorRole: AuthRole(c), DurationSec: req.DurationSec})
+	lot, err := h.commands.ActivateAuctionWithOptions(ctx, LiveSessionActivateInput{SessionID: id, AuctionID: req.AuctionID, ActorID: AuthUserID(c), ActorRole: AuthRole(c), DurationSec: req.DurationSec, StartTime: req.StartTime})
 	if err != nil {
 		writeLiveSessionError(c, err)
 		return
@@ -314,7 +314,7 @@ func (h *LiveSessionHandler) Deactivate(ctx context.Context, c *app.RequestConte
 	if !ok {
 		return
 	}
-	session, err := h.sessions.DeactivateAuction(ctx, id, AuthUserID(c), AuthRole(c))
+	session, err := h.commands.DeactivateAuction(ctx, id, AuthUserID(c), AuthRole(c))
 	if err != nil {
 		writeLiveSessionError(c, err)
 		return
@@ -341,7 +341,7 @@ func (h *LiveSessionHandler) UploadCover(ctx context.Context, c *app.RequestCont
 		writeServiceError(c, err)
 		return
 	}
-	session, err := h.sessions.Update(ctx, id, service.UpdateLiveSessionInput{ActorID: AuthUserID(c), ActorRole: AuthRole(c), CoverURL: &coverURL})
+	session, err := h.commands.Update(ctx, id, LiveSessionUpdateInput{ActorID: AuthUserID(c), ActorRole: AuthRole(c), CoverURL: &coverURL})
 	if err != nil {
 		writeLiveSessionError(c, err)
 		return
@@ -354,7 +354,7 @@ func (h *LiveSessionHandler) AgentHookConfig(ctx context.Context, c *app.Request
 	if !ok {
 		return
 	}
-	cfg, err := h.sessions.AgentHookConfig(ctx, id, AuthUserID(c), AuthRole(c))
+	cfg, err := h.queries.AgentHookConfig(ctx, id, AuthUserID(c), AuthRole(c))
 	if err != nil {
 		writeLiveSessionError(c, err)
 		return
@@ -372,7 +372,7 @@ func (h *LiveSessionHandler) UpdateAgentHookConfig(ctx context.Context, c *app.R
 		WriteError(c, 400, 20001, "参数不合法", nil)
 		return
 	}
-	cfg, err := h.sessions.UpdateAgentHookConfig(ctx, id, AuthUserID(c), AuthRole(c), *req.Enabled)
+	cfg, err := h.commands.UpdateAgentHookConfig(ctx, id, AuthUserID(c), AuthRole(c), *req.Enabled)
 	if err != nil {
 		writeLiveSessionError(c, err)
 		return
@@ -388,7 +388,7 @@ func (h *LiveSessionHandler) uploadCover(ctx context.Context, fileHeader *multip
 	if err != nil {
 		return "", err
 	}
-	coverURL, uploadErr := h.uploader.Upload(ctx, objectstorage.UploadInput{Filename: fileHeader.Filename, ContentType: imageContentType(fileHeader), Size: fileHeader.Size, Body: file})
+	coverURL, uploadErr := h.uploader.Upload(ctx, ImageUploadInput{Filename: fileHeader.Filename, ContentType: imageContentType(fileHeader), Size: fileHeader.Size, Body: file})
 	closeErr := file.Close()
 	if uploadErr != nil {
 		return "", uploadErr
@@ -407,21 +407,47 @@ func liveSessionIDParam(c *app.RequestContext) (uint64, bool) {
 }
 
 func (h *LiveSessionHandler) liveSessionView(ctx context.Context, session domain.LiveSession) interface{} {
-	if h == nil || h.marketplace == nil {
-		return session
+	view := domain.LiveSessionView{LiveSession: session, VideoSource: "recorded", DigitalHuman: map[string]interface{}{}}
+	if h != nil && h.marketplace != nil {
+		view = h.marketplace.LiveSessionView(ctx, session)
 	}
-	return h.marketplace.LiveSessionView(ctx, session)
+	h.applyLiveSessionPlaybackMode(ctx, &view)
+	return view
 }
 
 func (h *LiveSessionHandler) liveSessionViews(ctx context.Context, sessions []domain.LiveSession) interface{} {
-	if h == nil || h.marketplace == nil {
-		return sessions
-	}
 	views := make([]domain.LiveSessionView, 0, len(sessions))
 	for _, session := range sessions {
-		views = append(views, h.marketplace.LiveSessionView(ctx, session))
+		view := domain.LiveSessionView{LiveSession: session, VideoSource: "recorded", DigitalHuman: map[string]interface{}{}}
+		if h != nil && h.marketplace != nil {
+			view = h.marketplace.LiveSessionView(ctx, session)
+		}
+		h.applyLiveSessionPlaybackMode(ctx, &view)
+		views = append(views, view)
 	}
 	return views
+}
+
+func (h *LiveSessionHandler) applyLiveSessionPlaybackMode(ctx context.Context, view *domain.LiveSessionView) {
+	if h == nil || h.queries == nil || view == nil || view.ID == 0 {
+		return
+	}
+	snapshot, err := h.queries.AIAssistantSwitchSnapshot(ctx, view.ID)
+	if err != nil {
+		if strings.TrimSpace(view.VideoSource) == "" {
+			view.VideoSource = "recorded"
+		}
+		return
+	}
+	view.AIAssistantEnabled = snapshot.Enabled
+	if snapshot.Enabled {
+		view.VideoSource = "digitalHuman"
+		return
+	}
+	view.VideoSource = "recorded"
+	if view.DigitalHuman == nil {
+		view.DigitalHuman = map[string]interface{}{}
+	}
 }
 
 func writeLiveSessionError(c *app.RequestContext, err error) {
@@ -430,13 +456,13 @@ func writeLiveSessionError(c *app.RequestContext, err error) {
 		WriteError(c, 404, 32001, "直播场次不存在", nil)
 	case errors.Is(err, domain.ErrForbidden):
 		WriteError(c, 403, 32002, "无直播场次操作权限", nil)
-	case errors.Is(err, service.ErrLiveSessionLotInvalidState):
+	case errors.Is(err, ErrLiveSessionLotInvalidState):
 		WriteError(c, 409, 32005, "拍品状态不允许此操作", nil)
 	case errors.Is(err, domain.ErrInvalidState):
 		WriteError(c, 409, 32003, "直播场次状态不允许此操作", nil)
 	case errors.Is(err, domain.ErrInvalidArgument):
 		WriteError(c, 400, 20001, "参数不合法", nil)
-	case errors.Is(err, service.ErrLiveSessionBusy), errors.Is(err, service.ErrLotAlreadyMounted):
+	case errors.Is(err, ErrLiveSessionBusy), errors.Is(err, ErrLotAlreadyMounted):
 		WriteError(c, 409, 32004, "直播场次当前拍品冲突", nil)
 	default:
 		writeServiceError(c, err)

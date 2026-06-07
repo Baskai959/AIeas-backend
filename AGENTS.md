@@ -29,7 +29,8 @@ internal/
   config/              # YAML + env + .env loader, Validate
   domain/              # value objects, entities, status machines, errors
   repository/          # interfaces + GORM (mysql) + Memory implementations
-  service/             # use cases / orchestration; depends on repository
+  modules/*/app/       # module application layer / use cases / orchestration
+  service/             # legacy test-facing compatibility package; not the main business layer
   transport/
     http/              # Hertz handlers, middleware, idempotency, response helpers
     ws/                # Hub, Client, Envelope, online counter, event relay
@@ -87,7 +88,7 @@ The `-config` flag walks up parent dirs to find the file; running from a sub-dir
 ## Testing
 
 - Unit tests live next to the code (`*_test.go`). Memory repos under `internal/repository/*_memory.go` are the default test substrates.
-- Service-layer tests use small fixtures (e.g. `newRealtimeAuctionFixture` in `internal/service/bid_hammer_deposit_order_test.go`).
+- Module/service compatibility tests use small fixtures (e.g. `newRealtimeAuctionFixture` in `internal/service/bid_hammer_deposit_order_test.go`).
 - Integration tests against MySQL + Redis exist under `internal/app/mysql_redis_integration_test.go`; they require live services and are skipped if the env is missing.
 - WebSocket Hub tests live in `internal/transport/ws/hub_test.go`.
 - When adding a feature:

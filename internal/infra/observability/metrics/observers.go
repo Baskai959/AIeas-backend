@@ -315,6 +315,29 @@ func (r *Registry) IncWSSlowClientDisconnect() {
 	r.wsSlowClientDisconnect.Inc()
 }
 
+// IncWSHandshakeReject 记录一次握手被拒绝的事件。reason 限定于封闭集合：
+// rate_limit_ip / rate_limit_user / rate_limit_auction / draining / auth /
+// bad_request；其他值归一为 unknown，避免 label 基数失控。
+func (r *Registry) IncWSHandshakeReject(reason string) {
+	if !r.Enabled() {
+		return
+	}
+	switch reason {
+	case "rate_limit_ip", "rate_limit_user", "rate_limit_auction", "draining", "auth", "bad_request":
+	default:
+		reason = "unknown"
+	}
+	r.wsHandshakeRejectTotal.WithLabelValues(reason).Inc()
+}
+
+// IncWSDraining 记录一次 BeginDrain 触发。
+func (r *Registry) IncWSDraining() {
+	if !r.Enabled() {
+		return
+	}
+	r.wsDrainingTotal.Inc()
+}
+
 // ----- Agent -----
 
 func (r *Registry) ObserveAgentToolCall(tool, status string, elapsed time.Duration) {

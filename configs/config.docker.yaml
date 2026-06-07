@@ -1,0 +1,269 @@
+# Docker/Compose 运行配置。普通应用配置只从本文件读取；docker/prod.env 只放容器凭证与应用密钥。
+app:
+  # 进程角色：all=REST/MCP/WS 单体；api=仅 REST/MCP/业务 worker；ws-gateway=仅 /ws 与运维端点。
+  role: "all"
+
+# Hertz 服务监听与生命周期配置。
+server:
+  # 容器内监听地址；Compose 通过端口映射暴露到宿主机。
+  addr: "0.0.0.0:8888"
+  # 读取 HTTP 请求的超时时间。
+  readTimeout: 5s
+  # 写出 HTTP 响应的超时时间。
+  writeTimeout: 10s
+  # 进程收到退出信号后的优雅关闭等待时间。
+  shutdownTimeout: 20s
+
+# MySQL 连接池配置。
+mysql:
+  # Docker 内部 MySQL DSN；密码需与 docker/prod.env 的 MYSQL_PASSWORD 保持一致。
+  dsn: "auction:change-me-mysql-password@tcp(mysql:3306)/aieas?charset=utf8mb4&parseTime=true&loc=Local"
+  # 最大打开连接数。
+  maxOpenConns: 100
+  # 最大空闲连接数。
+  maxIdleConns: 20
+  # 单条连接最长复用时间。
+  connMaxLifetime: 1h
+
+# Redis 配置：RT 走实时强一致路径，Cache 走可重建缓存/幂等路径。
+redis:
+  # 实时 Redis 分片配置，承载拍卖状态、出价 Lua、Stream、锁、在线计数等。
+  rt:
+    # 分片列表；同一 auction/session 会按哈希固定路由到同一 shard。
+    shards:
+      # RT 分片 0。
+      # 地址固定为 Compose service name；密码可用 REDIS_RT_SHARD_0_PASSWORD 放在 docker/prod.env。
+      - addr: "redis-rt-1:6379"
+        # Redis 用户名。
+        username: "default"
+        # Redis 密码；建议留空并在 docker/prod.env 写 REDIS_RT_SHARD_0_PASSWORD。
+        password: ""
+        # Redis DB 编号。
+        db: 0
+        # Redis 连接池大小。
+        poolSize: 100
+      # RT 分片 1。
+      # 地址固定为 Compose service name；密码可用 REDIS_RT_SHARD_1_PASSWORD 放在 docker/prod.env。
+      - addr: "redis-rt-2:6379"
+        # Redis 用户名。
+        username: "default"
+        # Redis 密码；建议留空并在 docker/prod.env 写 REDIS_RT_SHARD_1_PASSWORD。
+        password: ""
+        # Redis DB 编号。
+        db: 0
+        # Redis 连接池大小。
+        poolSize: 100
+  # 缓存 Redis 实例，承载 L2 缓存、幂等记录等可丢失/可重建数据。
+  cache:
+    # 地址固定为 Compose service name；密码可用 REDIS_CACHE_PASSWORD 放在 docker/prod.env。
+    addr: "redis-cache:6379"
+    # Redis 用户名。
+    username: "default"
+    # Redis 密码；建议留空并在 docker/prod.env 写 REDIS_CACHE_PASSWORD。
+    password: ""
+    # Redis DB 编号。
+    db: 0
+    # Redis 连接池大小。
+    poolSize: 100
+
+# HTTP 幂等记录配置。
+idempotency:
+  # 幂等结果保留时间。
+  ttl: 24h
+
+# JWT 配置。
+jwt:
+  # JWT issuer。
+  issuer: "realtime-auction-master"
+  # JWT 签名密钥；建议留占位值并在 docker/prod.env 写 JWT_SECRET。
+  secret: "change-me-in-local-dev"
+  # access token 有效期。
+  accessTokenTTL: 12h
+
+# 雪花 ID 配置。
+idgen:
+  # workerID 范围 0-255；多实例必须不同。
+  workerID: 1
+
+# 拍卖业务规则配置。
+auction:
+  # 默认最小加价金额，单位：分。
+  minIncrementCent: 100
+  # 防狙击触发窗口，单位：毫秒。
+  antiSnipeMs: 30000
+  # 每次防狙击延长时长，单位：毫秒。
+  extendMs: 30000
+  # 单个拍品最多延长次数。
+  maxExtendCount: 20
+  # 单用户出价频控次数。
+  freqLimitCount: 10
+  # 单用户出价频控窗口，单位：毫秒。
+  freqWindowMs: 1000
+  # 出价请求幂等 key 的短期保留时间。
+  bidIdempotencyTTL: 30s
+
+# 风控总开关配置。
+riskControl:
+  # false 会关闭 HTTP 限流、出价频控、黑名单拦截和自动拉黑。
+  enabled: true
+
+# WebSocket 网关配置。
+websocket:
+  # 单条 WS 文本帧最大读取字节数。
+  readLimitBytes: 65536
+  # 每个客户端 outbound channel 缓冲大小。
+  sendBufferSize: 256
+  # 服务端 ping 间隔；上游网关 proxy_read_timeout/proxy_send_timeout 必须大于该值。
+  pingInterval: 20s
+  # 未收到 pong 时允许连接存活的最长时间。
+  pongTimeout: 60s
+  # 单次 WS 写操作超时时间。
+  writeTimeout: 5s
+  # 单 IP 每分钟 WS 握手上限；0 表示关闭该维度限流。
+  handshakeRateLimitPerIP: 0
+  # 单用户每分钟 WS 握手上限；0 表示关闭该维度限流。
+  handshakeRateLimitPerUser: 0
+  # 单拍品每分钟 WS 握手上限；0 表示关闭该维度限流。
+  handshakeRateLimitPerAuction: 0
+  # ws-gateway 排空时等待旧连接退出的最长时间。
+  drainTimeout: 30s
+  # 写 close frame 的宽限时间，必须小于等于 drainTimeout。
+  closeGrace: 1s
+  # 初始 ping 抖动窗口，避免大量连接同一时刻集中 ping。
+  pingJitter: 5s
+  # Redis Stream replay 的最大补帧数量。
+  replayLimit: 256
+
+# 对象存储配置。
+objectStorage:
+  # 是否启用对象存储；false 时使用 DisabledUploader。
+  enabled: false
+  # TOS endpoint。
+  endpoint: "https://tos-cn-beijing.volces.com"
+  # TOS region。
+  region: "cn-beijing"
+  # TOS bucket 名。
+  bucket: "aieas"
+  # 对外访问 bucket 的基础 URL。
+  bucketURL: "https://aieas.tos-cn-beijing.volces.com"
+  # TOS access key；建议留空并在 docker/prod.env 写 OBJECT_STORAGE_ACCESS_KEY。
+  accessKey: ""
+  # TOS secret key；建议留空并在 docker/prod.env 写 OBJECT_STORAGE_SECRET_KEY。
+  secretKey: ""
+  # 上传对象名前缀，可为空。
+  objectPrefix: ""
+
+# 外部 Agent 服务配置。
+agent:
+  # 商品描述生成接口地址。
+  productDescriptionURL: "http://agent:8000/api/v1/product-description"
+  # 是否启用商品 AI 审核；false 时提交审核默认直接通过。
+  productAuditEnabled: true
+  # 商品 AI 审核接口地址。
+  productAuditURL: "http://agent:8000/api/v1/product-audit"
+  # 商品审核结果回调地址。
+  productAuditCallbackURL: "https://api.example.com/api/v1/auctions/audit/callback"
+  # 直播分析异步接口地址。
+  liveAnalysisURL: "http://agent:8000/api/v1/live-analysis/async"
+  # 直播分析回调地址。
+  liveAnalysisCallbackURL: "https://api.example.com/api/v1/live-analysis/callback"
+  # 直播分析回调鉴权 key；建议留占位值并在 docker/prod.env 写 AGENT_LIVE_ANALYSIS_CALLBACK_API_KEY。
+  liveAnalysisCallbackAPIKey: "change-me-in-local-dev-live-analysis-callback"
+  # 直播拍卖助手 hook 地址。
+  liveAuctionHookURL: "http://agent:8000/api/v1/live-assistant"
+  # Agent HTTP 请求超时时间。
+  timeout: 30s
+
+# 豆包 TTS 配置。
+doubaoTTS:
+  # 豆包 TTS app id；建议留空并在 docker/prod.env 写 DOUBAO_TTS_APP_ID。
+  appID: ""
+  # 豆包 TTS access token；建议留空并在 docker/prod.env 写 DOUBAO_TTS_ACK_TOKEN。
+  ackToken: ""
+  # TTS 音色 ID。
+  voice: "zh_female_vv_jupiter_bigtts"
+
+# Kafka 事件总线配置。
+kafka:
+  # 是否启用 Kafka worker/producer/consumer。
+  enabled: true
+  # Kafka broker 地址列表。
+  brokers:
+    - "kafka:9092"
+  # Kafka client id。
+  clientID: "aieas-backend"
+  # 出价事件 topic。
+  bidEventsTopic: "aieas.bid.events"
+  # 拍卖事件 topic。
+  auctionEventsTopic: "aieas.auction.events"
+  # 订单事件 topic。
+  orderEventsTopic: "aieas.order.events"
+  # 出价事件桥接 consumer group。
+  bidBridgeGroup: "aieas-bid-kafka-bridge"
+  # 出价记录落库 consumer group。
+  bidRecordGroup: "aieas-bid-record-writers"
+
+# MCP 读写接口鉴权配置。
+mcp:
+  # 只读 MCP 身份。
+  read:
+    # 只读 MCP API key；建议留占位值并在 docker/prod.env 写 MCP_READ_API_KEY。
+    apiKey: "change-me-in-local-dev-mcp-read"
+    # 只读 MCP 默认 actor id。
+    actorID: "u_9001"
+    # 只读 MCP 默认 actor role。
+    actorRole: "admin"
+  # 控制 MCP 身份。
+  control:
+    # 控制 MCP API key；建议留占位值并在 docker/prod.env 写 MCP_CONTROL_API_KEY。
+    apiKey: "change-me-in-local-dev-mcp-control"
+    # 控制 MCP 默认 actor id。
+    actorID: "u_9001"
+    # 控制 MCP 默认 actor role。
+    actorRole: "admin"
+
+# 日志、指标、链路追踪、健康检查配置。
+observability:
+  # 日志级别，常用值：debug/info/warn/error/dev。
+  logLevel: "info"
+  # 兼容历史字段；新配置优先使用 metrics.path。
+  metricsPath: "/metrics"
+  # 日志格式：text=开发友好文本，json=生产一行一条 JSON。
+  format: "json"
+  # GORM 慢 SQL 阈值，单位：毫秒；<=0 关闭慢 SQL 检测。
+  slowSQLThresholdMs: 200
+
+  # Prometheus /metrics 配置。
+  metrics:
+    # 是否启用 metrics 采集与导出。
+    enabled: true
+    # metrics endpoint path；为空时回退到 observability.metricsPath。
+    path: "/metrics"
+    # Prometheus metric namespace。
+    namespace: "aieas"
+    # metrics 访问令牌；建议留空并在 docker/prod.env 写 OBSERVABILITY_METRICS_AUTH_TOKEN。
+    authToken: ""
+
+  # OpenTelemetry trace 配置。
+  tracing:
+    # 是否启用 tracing。
+    enabled: false
+    # exporter 类型：otlphttp | otlpgrpc | stdout | noop。
+    exporter: "otlphttp"
+    # exporter endpoint；启用 otlphttp/otlpgrpc 时必填。
+    endpoint: ""
+    # 是否使用非 TLS 连接 collector。
+    insecure: true
+    # trace service.name。
+    serviceName: "aieas-backend"
+    # 采样器：always_on | always_off | traceidratio | parent_based_always_on | parent_based_traceid_ratio。
+    sampler: "parent_based_traceid_ratio"
+    # traceidratio 类采样器的采样率，范围 0-1。
+    sampleRatio: 0.1
+
+  # 健康检查路径配置。
+  health:
+    # 存活检查路径。
+    livenessPath: "/healthz"
+    # 就绪检查路径。
+    readinessPath: "/readyz"

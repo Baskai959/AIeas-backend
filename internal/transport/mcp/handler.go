@@ -1,12 +1,10 @@
 package mcp
 
 import (
+	httptransport "aieas_backend/internal/transport/http"
 	"context"
 	"encoding/json"
 	"strings"
-
-	"aieas_backend/internal/service"
-	httptransport "aieas_backend/internal/transport/http"
 
 	"github.com/cloudwego/hertz/pkg/app"
 	"github.com/cloudwego/hertz/pkg/common/utils"
@@ -59,7 +57,7 @@ func (h *Handler) Get(ctx context.Context, c *app.RequestContext) {
 }
 
 func (h *Handler) writeAuthError(c *app.RequestContext, requests []rpcRequest, batch bool, err error, traceID string) {
-	status, _, _ := service.HTTPStatusAndCode(err)
+	status, _, _ := httptransport.HTTPStatusAndCode(err)
 	if len(requests) == 0 {
 		c.JSON(status, rpcResponse{JSONRPC: "2.0", ID: json.RawMessage("null"), Error: rpcErrorFor(err, traceID)})
 		return
@@ -82,7 +80,7 @@ func (h *Handler) writeAuthError(c *app.RequestContext, requests []rpcRequest, b
 	c.JSON(status, responses[0])
 }
 
-func (h *Handler) handleRequest(ctx context.Context, req rpcRequest, actor service.MCPActor, traceID string) (rpcResponse, bool) {
+func (h *Handler) handleRequest(ctx context.Context, req rpcRequest, actor MCPActor, traceID string) (rpcResponse, bool) {
 	if strings.TrimSpace(req.Method) == "" {
 		return errorResponse(req, protocolError(rpcInvalidRequest, "invalid request", traceID, "method is required")), true
 	}

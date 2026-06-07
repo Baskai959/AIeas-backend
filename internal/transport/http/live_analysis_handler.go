@@ -5,17 +5,15 @@ import (
 	"crypto/subtle"
 	"strings"
 
-	"aieas_backend/internal/service"
-
 	"github.com/cloudwego/hertz/pkg/app"
 )
 
 type LiveAnalysisHandler struct {
-	reports        *service.LiveAnalysisService
+	reports        LiveAnalysisUseCase
 	callbackAPIKey string
 }
 
-func NewLiveAnalysisHandler(reports *service.LiveAnalysisService, callbackAPIKey string) *LiveAnalysisHandler {
+func NewLiveAnalysisHandler(reports LiveAnalysisUseCase, callbackAPIKey string) *LiveAnalysisHandler {
 	return &LiveAnalysisHandler{reports: reports, callbackAPIKey: strings.TrimSpace(callbackAPIKey)}
 }
 
@@ -41,7 +39,7 @@ func (h *LiveAnalysisHandler) CreateReport(ctx context.Context, c *app.RequestCo
 			return
 		}
 	}
-	task, err := h.reports.CreateReport(ctx, service.CreateLiveAnalysisReportInput{
+	task, err := h.reports.CreateReport(ctx, LiveAnalysisCreateReportInput{
 		ActorID:       AuthUserID(c),
 		ActorRole:     AuthRole(c),
 		LiveSessionID: req.LiveSessionID,
@@ -76,7 +74,7 @@ func (h *LiveAnalysisHandler) Callback(ctx context.Context, c *app.RequestContex
 		WriteError(c, 400, 20001, "参数不合法", nil)
 		return
 	}
-	task, err := h.reports.HandleCallback(ctx, service.LiveAnalysisCallbackInput{
+	task, err := h.reports.HandleCallback(ctx, LiveAnalysisCallbackInput{
 		RequestID:       req.RequestID,
 		Success:         req.Success,
 		Status:          req.Status,
