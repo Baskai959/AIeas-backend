@@ -358,10 +358,10 @@ func (r *MemoryOrderRepository) List(ctx context.Context, filter domain.OrderFil
 	defer r.mu.RUnlock()
 	orders := make([]domain.OrderDeal, 0, len(r.orders))
 	for _, order := range r.orders {
-		if filter.WinnerID != "" && order.WinnerID != filter.WinnerID {
+		if filter.WinnerID != "" && normalizeUserIDForDB(order.WinnerID) != normalizeUserIDForDB(filter.WinnerID) {
 			continue
 		}
-		if filter.SellerID != "" && order.SellerID != filter.SellerID {
+		if filter.SellerID != "" && normalizeUserIDForDB(order.SellerID) != normalizeUserIDForDB(filter.SellerID) {
 			continue
 		}
 		if filter.AuctionID != 0 && order.AuctionID != filter.AuctionID {

@@ -212,9 +212,12 @@ func buildReadinessProbes(db *gorm.DB, shardedRT *redisinfra.ShardedRTClient, rd
 }
 
 func serverOptions(cfg appconfig.ServerConfig) []hertzconfig.Option {
-	options := make([]hertzconfig.Option, 0, 4)
+	options := make([]hertzconfig.Option, 0, 5)
 	if cfg.Addr != "" {
 		options = append(options, server.WithHostPorts(cfg.Addr))
+	}
+	if cfg.MaxRequestBodySizeBytes > 0 {
+		options = append(options, server.WithMaxRequestBodySize(cfg.MaxRequestBodySizeBytes))
 	}
 	if cfg.ReadTimeout.Std() > 0 {
 		options = append(options, server.WithReadTimeout(cfg.ReadTimeout.Std()))

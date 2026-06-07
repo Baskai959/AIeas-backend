@@ -176,6 +176,46 @@ func TestOrderServiceShipRequiresPaidOrder(t *testing.T) {
 	}
 }
 
+func TestOrderServiceMatchesPrefixedAndNumericUserIDs(t *testing.T) {
+	ctx := context.Background()
+	deadline := time.Now().UTC().Add(time.Hour)
+	repo := repository.NewMemoryOrderRepository()
+	order, _, err := repo.CreateIfAbsentByAuction(ctx, &domain.OrderDeal{
+		AuctionID:         10005,
+		WinnerID:          "1001",
+		SellerID:          "2001",
+		DealPrice:         12000,
+		DepositAmount:     1000,
+		Status:            domain.OrderStatusCreated,
+		PayStatus:         domain.PayStatusUnpaid,
+		FulfillmentStatus: domain.FulfillmentStatusUnshipped,
+		PayDeadline:       &deadline,
+	})
+	if err != nil {
+		t.Fatalf("seed order: %v", err)
+	}
+	svc := orderapp.NewOrderService(repo, repository.NoopTxManager{})
+
+	mine, err := svc.Mine(ctx, "u_1001", domain.RoleBuyer, domain.OrderFilter{})
+	if err != nil {
+		t.Fatalf("mine: %v", err)
+	}
+	if len(mine) != 1 || mine[0].ID != order.ID {
+		t.Fatalf("unexpected mine orders: %+v", mine)
+	}
+	paid, err := svc.Pay(ctx, order.ID, "u_1001", domain.RoleBuyer)
+	if err != nil {
+		t.Fatalf("pay with prefixed buyer id: %v", err)
+	}
+	shipped, err := svc.Ship(ctx, paid.ID, "u_2001", domain.RoleMerchant)
+	if err != nil {
+		t.Fatalf("ship with prefixed merchant id: %v", err)
+	}
+	if _, err := svc.Receive(ctx, shipped.ID, "1001", domain.RoleBuyer); err != nil {
+		t.Fatalf("receive with numeric buyer id: %v", err)
+	}
+}
+
 func TestOrderStatusCASResolvesPayTimeoutRace(t *testing.T) {
 	ctx := context.Background()
 	now := time.Date(2026, 5, 30, 12, 0, 0, 0, time.UTC)

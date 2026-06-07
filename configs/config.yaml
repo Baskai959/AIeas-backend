@@ -11,6 +11,8 @@ server:
   readTimeout: 5s
   # 写出 HTTP 响应的超时时间。
   writeTimeout: 45s
+  # HTTP 请求体大小上限；图片批量上传允许 20MB，这里预留 multipart 开销。
+  maxRequestBodySizeBytes: 26214400
   # 进程收到退出信号后的优雅关闭等待时间。
   shutdownTimeout: 20s
 

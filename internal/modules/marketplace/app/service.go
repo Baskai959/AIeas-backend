@@ -230,7 +230,7 @@ func (s *MarketplaceService) participationOrder(ctx context.Context, deposit dom
 		}
 		return domain.OrderDeal{}, false
 	}
-	if order.WinnerID != userID {
+	if !sameUserID(order.WinnerID, userID) {
 		return domain.OrderDeal{}, false
 	}
 	return order, true
@@ -282,6 +282,20 @@ func publicAuctionStatus(status domain.AuctionStatus) bool {
 		}
 	}
 	return false
+}
+
+func sameUserID(a, b string) bool {
+	return normalizeUserID(a) != "" && normalizeUserID(a) == normalizeUserID(b)
+}
+
+func normalizeUserID(id string) string {
+	id = strings.TrimSpace(id)
+	for _, prefix := range []string{"u_", "U_"} {
+		if strings.HasPrefix(id, prefix) {
+			return strings.TrimPrefix(id, prefix)
+		}
+	}
+	return id
 }
 
 func defaultCategories() []domain.Category {

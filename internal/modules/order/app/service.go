@@ -82,7 +82,7 @@ func (s *OrderService) Pay(ctx context.Context, id uint64, actorID string, actor
 		if err != nil {
 			return err
 		}
-		if actorRole != domain.RoleAdmin && !(actorRole == domain.RoleBuyer && current.WinnerID == actorID) {
+		if actorRole != domain.RoleAdmin && !(actorRole == domain.RoleBuyer && sameUserID(current.WinnerID, actorID)) {
 			return domain.ErrForbidden
 		}
 		if current.PayStatus == domain.PayStatusPaid && current.Status == domain.OrderStatusPaid {
@@ -132,7 +132,7 @@ func (s *OrderService) Ship(ctx context.Context, id uint64, actorID string, acto
 		if err != nil {
 			return err
 		}
-		if actorRole != domain.RoleAdmin && !(actorRole == domain.RoleMerchant && current.SellerID == actorID) {
+		if actorRole != domain.RoleAdmin && !(actorRole == domain.RoleMerchant && sameUserID(current.SellerID, actorID)) {
 			return domain.ErrForbidden
 		}
 		expectedVersion := current.Version
@@ -158,7 +158,7 @@ func (s *OrderService) Receive(ctx context.Context, id uint64, actorID string, a
 		if err != nil {
 			return err
 		}
-		if actorRole != domain.RoleAdmin && !(actorRole == domain.RoleBuyer && current.WinnerID == actorID) {
+		if actorRole != domain.RoleAdmin && !(actorRole == domain.RoleBuyer && sameUserID(current.WinnerID, actorID)) {
 			return domain.ErrForbidden
 		}
 		expectedVersion := current.Version
@@ -331,10 +331,24 @@ func canAccessOrder(order domain.OrderDeal, actorID string, actorRole domain.Rol
 	case domain.RoleAdmin:
 		return true
 	case domain.RoleMerchant:
-		return actorID != "" && order.SellerID == actorID
+		return actorID != "" && sameUserID(order.SellerID, actorID)
 	case domain.RoleBuyer:
-		return actorID != "" && order.WinnerID == actorID
+		return actorID != "" && sameUserID(order.WinnerID, actorID)
 	default:
 		return false
 	}
+}
+
+func sameUserID(a, b string) bool {
+	return normalizeUserID(a) != "" && normalizeUserID(a) == normalizeUserID(b)
+}
+
+func normalizeUserID(id string) string {
+	id = strings.TrimSpace(id)
+	for _, prefix := range []string{"u_", "U_"} {
+		if strings.HasPrefix(id, prefix) {
+			return strings.TrimPrefix(id, prefix)
+		}
+	}
+	return id
 }

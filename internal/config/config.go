@@ -64,10 +64,11 @@ type Config struct {
 }
 
 type ServerConfig struct {
-	Addr            string   `yaml:"addr"`
-	ReadTimeout     Duration `yaml:"readTimeout"`
-	WriteTimeout    Duration `yaml:"writeTimeout"`
-	ShutdownTimeout Duration `yaml:"shutdownTimeout"`
+	Addr                    string   `yaml:"addr"`
+	ReadTimeout             Duration `yaml:"readTimeout"`
+	WriteTimeout            Duration `yaml:"writeTimeout"`
+	ShutdownTimeout         Duration `yaml:"shutdownTimeout"`
+	MaxRequestBodySizeBytes int      `yaml:"maxRequestBodySizeBytes"`
 }
 
 // AppConfig 控制 aieas_backend 进程的部署形态。
@@ -254,10 +255,11 @@ func Default() Config {
 			Role: "all",
 		},
 		Server: ServerConfig{
-			Addr:            ":8080",
-			ReadTimeout:     Duration(5 * time.Second),
-			WriteTimeout:    Duration(45 * time.Second),
-			ShutdownTimeout: Duration(20 * time.Second),
+			Addr:                    ":8080",
+			ReadTimeout:             Duration(5 * time.Second),
+			WriteTimeout:            Duration(45 * time.Second),
+			ShutdownTimeout:         Duration(20 * time.Second),
+			MaxRequestBodySizeBytes: 25 << 20,
 		},
 		MySQL: MySQLConfig{
 			DSN:             "auction:auction@tcp(mysql:3306)/auction?charset=utf8mb4&parseTime=true&loc=Local",
@@ -456,6 +458,9 @@ func (c *Config) Validate() error {
 	}
 	if strings.TrimSpace(c.Server.Addr) == "" {
 		return fmt.Errorf("server.addr is required")
+	}
+	if c.Server.MaxRequestBodySizeBytes <= 0 {
+		return fmt.Errorf("server.maxRequestBodySizeBytes must be positive")
 	}
 	if strings.TrimSpace(c.JWT.Secret) == "" {
 		return fmt.Errorf("jwt.secret is required")
