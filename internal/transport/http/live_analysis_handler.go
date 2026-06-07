@@ -2,7 +2,6 @@ package http
 
 import (
 	"context"
-	"crypto/subtle"
 	"strings"
 
 	"github.com/cloudwego/hertz/pkg/app"
@@ -65,10 +64,6 @@ func (h *LiveAnalysisHandler) GetReport(ctx context.Context, c *app.RequestConte
 }
 
 func (h *LiveAnalysisHandler) Callback(ctx context.Context, c *app.RequestContext) {
-	if !h.authorizeCallback(c) {
-		WriteError(c, 401, 10002, "访问令牌无效或已过期", nil)
-		return
-	}
 	var req liveAnalysisCallbackRequest
 	if err := c.BindJSON(&req); err != nil {
 		WriteError(c, 400, 20001, "参数不合法", nil)
@@ -87,27 +82,4 @@ func (h *LiveAnalysisHandler) Callback(ctx context.Context, c *app.RequestContex
 		return
 	}
 	WriteSuccess(c, task)
-}
-
-func (h *LiveAnalysisHandler) authorizeCallback(c *app.RequestContext) bool {
-	expected := strings.TrimSpace(h.callbackAPIKey)
-	if expected == "" {
-		return false
-	}
-	if constantTimeStringEqual(strings.TrimSpace(string(c.GetHeader("X-Callback-Key"))), expected) {
-		return true
-	}
-	auth := strings.TrimSpace(string(c.GetHeader("Authorization")))
-	const prefix = "Bearer "
-	if strings.HasPrefix(auth, prefix) {
-		return constantTimeStringEqual(strings.TrimSpace(strings.TrimPrefix(auth, prefix)), expected)
-	}
-	return false
-}
-
-func constantTimeStringEqual(a, b string) bool {
-	if a == "" || b == "" || len(a) != len(b) {
-		return false
-	}
-	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
 }

@@ -46,12 +46,47 @@ func (s *MarketplaceService) SearchLots(ctx context.Context, filter domain.Aucti
 	if filter.Status != "" && !publicAuctionStatus(filter.Status) {
 		return []domain.AuctionLot{}, 0, nil
 	}
+	liveSessionIDs, err := s.liveSessionIDs(ctx)
+	if err != nil {
+		return nil, 0, err
+	}
+	if len(liveSessionIDs) == 0 {
+		return []domain.AuctionLot{}, 0, nil
+	}
+	filter.LiveSessionIDs = liveSessionIDs
 	filter.CategoryValues = categoryValuesForID(filter.CategoryID)
 	lots, total, err := s.auctions.Search(ctx, filter)
 	if err != nil {
 		return nil, 0, err
 	}
 	return s.enrichLots(ctx, lots), total, nil
+}
+
+func (s *MarketplaceService) liveSessionIDs(ctx context.Context) ([]uint64, error) {
+	if s == nil || s.sessions == nil {
+		return nil, nil
+	}
+	const pageSize = 100
+	ids := make([]uint64, 0)
+	for offset := 0; ; offset += pageSize {
+		sessions, err := s.sessions.List(ctx, domain.LiveSessionFilter{
+			Status: domain.LiveSessionStatusLive,
+			Limit:  pageSize,
+			Offset: offset,
+		})
+		if err != nil {
+			return nil, err
+		}
+		for _, session := range sessions {
+			if session.ID != 0 {
+				ids = append(ids, session.ID)
+			}
+		}
+		if len(sessions) < pageSize {
+			break
+		}
+	}
+	return ids, nil
 }
 
 func (s *MarketplaceService) GetLot(ctx context.Context, id uint64) (domain.AuctionLot, error) {

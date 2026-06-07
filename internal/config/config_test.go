@@ -308,6 +308,43 @@ func TestObservabilityDefaults(t *testing.T) {
 	}
 }
 
+func TestCORSDefaultsAllowAllOrigins(t *testing.T) {
+	cfg := Default()
+	if !cfg.Server.CORS.Enabled {
+		t.Fatal("expected server.cors.enabled true by default")
+	}
+	if len(cfg.Server.CORS.AllowOrigins) != 1 || cfg.Server.CORS.AllowOrigins[0] != "*" {
+		t.Fatalf("expected default cors origins to allow all, got %+v", cfg.Server.CORS.AllowOrigins)
+	}
+	if cfg.Server.CORS.AllowCredentials {
+		t.Fatal("expected default cors credentials disabled with wildcard origin")
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("expected default cors config to validate, got %v", err)
+	}
+}
+
+func TestCORSValidateRejectsWildcardWithCredentials(t *testing.T) {
+	cfg := Default()
+	cfg.Server.CORS.AllowCredentials = true
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected wildcard origins with credentials to be rejected")
+	}
+}
+
+func TestDefaultAgentCallbackURLsUseDefaultAPIPort(t *testing.T) {
+	cfg := Default()
+	if cfg.Server.Addr != ":8888" {
+		t.Fatalf("expected default server addr :8888, got %q", cfg.Server.Addr)
+	}
+	if !strings.Contains(cfg.Agent.ProductAuditCallbackURL, "127.0.0.1:8888") {
+		t.Fatalf("expected product audit callback on default api port, got %q", cfg.Agent.ProductAuditCallbackURL)
+	}
+	if !strings.Contains(cfg.Agent.LiveAnalysisCallbackURL, "127.0.0.1:8888") {
+		t.Fatalf("expected live analysis callback on default api port, got %q", cfg.Agent.LiveAnalysisCallbackURL)
+	}
+}
+
 func TestRepositoryConfigFilesLoad(t *testing.T) {
 	for _, path := range []string{"configs/config.yaml", "configs/config.docker.yaml"} {
 		t.Run(path, func(t *testing.T) {

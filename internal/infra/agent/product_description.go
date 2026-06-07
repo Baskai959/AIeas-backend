@@ -182,12 +182,6 @@ func (c *ProductAuditClient) AuditProduct(ctx context.Context, in auctionports.P
 	if err := writer.WriteField("callback_url", callbackURL); err != nil {
 		return auctionports.ProductAuditResult{}, err
 	}
-	if len(in.CallbackHeaders) == 0 && c.callbackAPIKey != "" {
-		in.CallbackHeaders = map[string]string{
-			"X-Callback-Key": c.callbackAPIKey,
-			"Authorization":  "Bearer " + c.callbackAPIKey,
-		}
-	}
 	if len(in.CallbackHeaders) > 0 {
 		headers, err := json.Marshal(in.CallbackHeaders)
 		if err != nil {

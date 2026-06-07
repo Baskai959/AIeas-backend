@@ -175,6 +175,9 @@ func withDefaultServerDependencies(cfg appconfig.Config, deps ServerDependencies
 	if deps.Hub == nil {
 		deps.Hub = wstransport.NewHub()
 	}
+	if deps.RealtimeEventPublisher != nil {
+		deps.Hub.SetLiveSessionEventPublisher(deps.RealtimeEventPublisher)
+	}
 	if deps.ObjectUploader == nil {
 		uploader, err := objectstorage.NewUploader(cfg.ObjectStorage)
 		if err != nil {

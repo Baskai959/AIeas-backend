@@ -159,6 +159,7 @@ type AuctionSearchFilter struct {
 	CategoryID      string
 	CategoryValues  []string
 	MerchantID      string
+	LiveSessionIDs  []uint64
 	VisibleStatuses []AuctionStatus
 	Limit           int
 	Offset          int

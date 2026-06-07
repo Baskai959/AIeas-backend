@@ -13,12 +13,24 @@ import (
 func TestMarketplaceSearchLotsOnlyReturnsPublicVisibleLots(t *testing.T) {
 	ctx := context.Background()
 	auctionRepo := repository.NewMemoryAuctionRepository()
+	sessionRepo := repository.NewMemoryLiveSessionRepository()
 	depositRepo := repository.NewMemoryDepositRepository()
-	svc := marketplaceapp.NewMarketplaceService(auctionRepo, repository.NewMemoryLiveSessionRepository(), depositRepo, repository.NewMemoryOrderRepository(), repository.NewSeedUserRepository())
+	svc := marketplaceapp.NewMarketplaceService(auctionRepo, sessionRepo, depositRepo, repository.NewMemoryOrderRepository(), repository.NewSeedUserRepository())
 	now := time.Now().UTC()
+	liveSession := domain.LiveSession{ID: 70001, MerchantID: "u_2001", Title: "开播直播间", Status: domain.LiveSessionStatusLive}
+	endedSession := domain.LiveSession{ID: 70002, MerchantID: "u_2001", Title: "已结束直播间", Status: domain.LiveSessionStatusEnded}
+	if err := sessionRepo.Create(ctx, &liveSession); err != nil {
+		t.Fatalf("create live session: %v", err)
+	}
+	if err := sessionRepo.Create(ctx, &endedSession); err != nil {
+		t.Fatalf("create ended session: %v", err)
+	}
+	liveSessionID := liveSession.ID
+	endedSessionID := endedSession.ID
 	ready := domain.AuctionLot{
 		AuctionID:      10001,
 		SellerID:       "u_2001",
+		LiveSessionID:  &liveSessionID,
 		Title:          "翡翠手镯",
 		Description:    "冰种翡翠",
 		Category:       "珠宝玉石",
@@ -36,11 +48,18 @@ func TestMarketplaceSearchLotsOnlyReturnsPublicVisibleLots(t *testing.T) {
 	draft.AuctionID = 10002
 	draft.Title = "草稿拍品"
 	draft.Status = domain.AuctionStatusDraft
-	if err := auctionRepo.Create(ctx, &ready); err != nil {
-		t.Fatalf("create ready lot: %v", err)
-	}
-	if err := auctionRepo.Create(ctx, &draft); err != nil {
-		t.Fatalf("create draft lot: %v", err)
+	ended := ready
+	ended.AuctionID = 10003
+	ended.Title = "已结束直播间翡翠"
+	ended.LiveSessionID = &endedSessionID
+	unmounted := ready
+	unmounted.AuctionID = 10004
+	unmounted.Title = "未上架翡翠"
+	unmounted.LiveSessionID = nil
+	for _, lot := range []*domain.AuctionLot{&ready, &draft, &ended, &unmounted} {
+		if err := auctionRepo.Create(ctx, lot); err != nil {
+			t.Fatalf("create lot %d: %v", lot.AuctionID, err)
+		}
 	}
 	if err := depositRepo.Create(ctx, &domain.DepositLedger{AuctionID: ready.AuctionID, UserID: "u_1001", Amount: 5000, Status: domain.DepositStatusReady}); err != nil {
 		t.Fatalf("create deposit: %v", err)

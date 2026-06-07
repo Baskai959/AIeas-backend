@@ -9,6 +9,7 @@ import (
 	"time"
 
 	appconfig "aieas_backend/internal/config"
+	auctionports "aieas_backend/internal/modules/auction/ports"
 	liveanalysisports "aieas_backend/internal/modules/live_analysis/ports"
 )
 
@@ -66,6 +67,38 @@ func TestLiveAnalysisClientReturnsAsyncAgentErrorMessage(t *testing.T) {
 	client := NewLiveAnalysisClient(appconfig.AgentConfig{LiveAnalysisURL: server.URL, Timeout: appconfig.Duration(time.Second)})
 	if _, err := client.RequestLiveAnalysis(t.Context(), liveanalysisports.AsyncRequestInput{Prompt: "prompt", CallbackURL: "http://backend/callback"}); err == nil || !strings.Contains(err.Error(), "模型服务超时") {
 		t.Fatal("expected agent error")
+	}
+}
+
+func TestProductAuditClientUsesConfiguredCallbackURL(t *testing.T) {
+	var gotCallbackURL string
+	var gotCallbackHeaders string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Fatalf("expected POST, got %s", r.Method)
+		}
+		if err := r.ParseMultipartForm(2 << 20); err != nil {
+			t.Fatalf("parse multipart form: %v", err)
+		}
+		gotCallbackURL = r.FormValue("callback_url")
+		gotCallbackHeaders = r.FormValue("callback_headers")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"success":true,"requestId":"audit-1","status":"ACCEPTED"}`))
+	}))
+	defer server.Close()
+
+	cfg := appconfig.Default().Agent
+	cfg.ProductAuditURL = server.URL
+	cfg.Timeout = appconfig.Duration(time.Second)
+	client := NewProductAuditClient(cfg)
+	if _, err := client.AuditProduct(t.Context(), auctionports.ProductAuditInput{ProductText: "商品标题：茶盏"}); err != nil {
+		t.Fatalf("request product audit: %v", err)
+	}
+	if gotCallbackURL != "http://127.0.0.1:8888/api/v1/auctions/audit/callback" {
+		t.Fatalf("unexpected product audit callback url: %q", gotCallbackURL)
+	}
+	if gotCallbackHeaders != "" {
+		t.Fatalf("expected no default callback headers, got %q", gotCallbackHeaders)
 	}
 }
 

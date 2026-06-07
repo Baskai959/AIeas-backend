@@ -15,6 +15,36 @@ server:
   maxRequestBodySizeBytes: 26214400
   # 进程收到退出信号后的优雅关闭等待时间。
   shutdownTimeout: 20s
+  # CORS 跨域配置；使用 Bearer Token，不开启 cookie credentials，因此允许全部来源。
+  cors:
+    # 是否启用 CORS。
+    enabled: true
+    # 允许的浏览器 Origin；"*" 表示全部来源。
+    allowOrigins:
+      - "*"
+    # 允许的跨域方法。
+    allowMethods:
+      - "GET"
+      - "POST"
+      - "PUT"
+      - "PATCH"
+      - "DELETE"
+      - "OPTIONS"
+    # 允许前端携带的请求头。
+    allowHeaders:
+      - "Authorization"
+      - "Content-Type"
+      - "Idempotency-Key"
+      - "X-Request-Id"
+      - "X-Trace-Id"
+      - "X-Metrics-Token"
+    # 允许前端读取的响应头。
+    exposeHeaders:
+      - "X-Request-Id"
+    # 使用 "*" 时必须保持 false，否则浏览器不接受。
+    allowCredentials: false
+    # 预检缓存时间，单位秒。
+    maxAgeSeconds: 600
 
 # MySQL 连接池配置。
 mysql:

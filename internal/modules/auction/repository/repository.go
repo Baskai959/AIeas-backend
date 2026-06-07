@@ -144,6 +144,9 @@ func (r *MySQLAuctionRepository) Search(ctx context.Context, filter domain.Aucti
 	if filter.MerchantID != "" {
 		query = query.Where("seller_id = ?", normalizeUserIDForDB(filter.MerchantID))
 	}
+	if len(filter.LiveSessionIDs) > 0 {
+		query = query.Where("live_session_id IN ?", filter.LiveSessionIDs)
+	}
 	if values := normalizedCategoryValues(filter.CategoryID, filter.CategoryValues); len(values) > 0 {
 		query = query.Where("category IN ?", values)
 	}
@@ -442,6 +445,11 @@ func (r *MemoryAuctionRepository) Search(ctx context.Context, filter domain.Auct
 		}
 		if filter.MerchantID != "" && auction.SellerID != filter.MerchantID {
 			continue
+		}
+		if len(filter.LiveSessionIDs) > 0 {
+			if auction.LiveSessionID == nil || !containsUint64(filter.LiveSessionIDs, *auction.LiveSessionID) {
+				continue
+			}
 		}
 		if len(categorySet) > 0 {
 			if _, ok := categorySet[auction.Category]; !ok {
@@ -1089,6 +1097,15 @@ func normalizedCategoryValues(categoryID string, values []string) []string {
 		add(value)
 	}
 	return out
+}
+
+func containsUint64(values []uint64, target uint64) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
 }
 
 func normalizeOptionalUserIDForDB(id *string) *string {

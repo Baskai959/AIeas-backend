@@ -1012,9 +1012,7 @@ func TestAuctionAuditCallbackRouteAcceptsAuctionContext(t *testing.T) {
 	h := newTestServer()
 	payload := `{"requestId":"audit-callback-1","status":"REJECTED","success":false,"isApproved":false,"rejectReasons":["标题含违禁词"],"riskLabels":["content_policy"],"context":{"auctionId":91001,"scope":"auction_lot_content"}}`
 
-	resp := doJSONWithHeaders(t, h.Engine, consts.MethodPost, "/api/v1/auctions/audit/callback", payload,
-		ut.Header{Key: "X-Callback-Key", Value: appconfig.Default().Agent.LiveAnalysisCallbackAPIKey},
-	)
+	resp := doJSONWithHeaders(t, h.Engine, consts.MethodPost, "/api/v1/auctions/audit/callback", payload)
 	if resp.status != 200 || resp.body.Code != 0 {
 		t.Fatalf("expected auction audit callback success, got status=%d raw=%s", resp.status, resp.raw)
 	}
@@ -1066,9 +1064,7 @@ func TestAuctionAuditCallbackRouteRequiresExplicitRejectedConclusion(t *testing.
 	}
 
 	statusOnlyPayload := `{"requestId":"audit-callback-task-status-only","status":"REJECTED","callback_context":{"auctionId":` + strconv.FormatUint(created.AuctionID, 10) + `,"scope":"auction_lot_content","taskId":"` + taskID + `"}}`
-	statusOnlyResp := doJSONWithHeaders(t, h.Engine, consts.MethodPost, "/api/v1/auctions/audit/callback", statusOnlyPayload,
-		ut.Header{Key: "X-Callback-Key", Value: appconfig.Default().Agent.LiveAnalysisCallbackAPIKey},
-	)
+	statusOnlyResp := doJSONWithHeaders(t, h.Engine, consts.MethodPost, "/api/v1/auctions/audit/callback", statusOnlyPayload)
 	if statusOnlyResp.status != 200 || statusOnlyResp.body.Code != 0 {
 		t.Fatalf("expected audit callback success, got status=%d raw=%s", statusOnlyResp.status, statusOnlyResp.raw)
 	}
@@ -1093,9 +1089,7 @@ func TestAuctionAuditCallbackRouteRequiresExplicitRejectedConclusion(t *testing.
 	}
 
 	payload := `{"requestId":"audit-callback-rejected-conclusion","status":"COMPLETED","isApproved":false,"callback_context":{"auctionId":` + strconv.FormatUint(created.AuctionID, 10) + `,"scope":"auction_lot_content","taskId":"` + taskID + `"}}`
-	callbackResp := doJSONWithHeaders(t, h.Engine, consts.MethodPost, "/api/v1/auctions/audit/callback", payload,
-		ut.Header{Key: "X-Callback-Key", Value: appconfig.Default().Agent.LiveAnalysisCallbackAPIKey},
-	)
+	callbackResp := doJSONWithHeaders(t, h.Engine, consts.MethodPost, "/api/v1/auctions/audit/callback", payload)
 	if callbackResp.status != 200 || callbackResp.body.Code != 0 {
 		t.Fatalf("expected audit callback success, got status=%d raw=%s", callbackResp.status, callbackResp.raw)
 	}
@@ -1842,17 +1836,11 @@ func TestLiveAnalysisReportRoutes(t *testing.T) {
 		requester.input.CallbackContext["taskId"] != running.TaskID ||
 		requester.input.CallbackContext["liveSessionId"] != session.ID ||
 		requester.input.CallbackContext["attempt"] != 1 ||
-		requester.input.CallbackHeaders["X-Callback-Key"] == "" {
+		len(requester.input.CallbackHeaders) != 0 {
 		t.Fatalf("unexpected requester input: %+v", requester.input)
 	}
 
-	badCallback := doJSONWithHeaders(t, h.Engine, consts.MethodPost, "/api/v1/live-analysis/callback", `{"request_id":"agent-live-analysis-1","success":true,"status":"COMPLETED","summary":"bad","callback_context":{"taskId":"`+running.TaskID+`","liveSessionId":`+strconv.FormatUint(session.ID, 10)+`,"attempt":1}}`)
-	if badCallback.status != 401 {
-		t.Fatalf("expected callback auth failure, got status=%d raw=%s", badCallback.status, badCallback.raw)
-	}
-	callback := doJSONWithHeaders(t, h.Engine, consts.MethodPost, "/api/v1/live-analysis/callback", `{"request_id":"agent-live-analysis-1","success":true,"status":"COMPLETED","summary":"本场直播共成交 3 件拍品，转化良好。","error_message":null,"callback_context":{"taskId":"`+running.TaskID+`","liveSessionId":`+strconv.FormatUint(session.ID, 10)+`,"merchantId":"u_2001","attempt":1},"completed_at":"2026-05-26T10:30:00Z"}`,
-		ut.Header{Key: "X-Callback-Key", Value: appconfig.Default().Agent.LiveAnalysisCallbackAPIKey},
-	)
+	callback := doJSONWithHeaders(t, h.Engine, consts.MethodPost, "/api/v1/live-analysis/callback", `{"request_id":"agent-live-analysis-1","success":true,"status":"COMPLETED","summary":"本场直播共成交 3 件拍品，转化良好。","error_message":null,"callback_context":{"taskId":"`+running.TaskID+`","liveSessionId":`+strconv.FormatUint(session.ID, 10)+`,"merchantId":"u_2001","attempt":1},"completed_at":"2026-05-26T10:30:00Z"}`)
 	if callback.status != 200 || callback.body.Code != 0 {
 		t.Fatalf("expected callback success, got status=%d raw=%s", callback.status, callback.raw)
 	}

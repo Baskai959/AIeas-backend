@@ -184,10 +184,6 @@ func (s *LiveAnalysisService) startAttempt(ctx context.Context, task *LiveAnalys
 	result, err := s.requester.RequestLiveAnalysis(ctx, liveanalysisports.AsyncRequestInput{
 		Prompt:      task.Prompt,
 		CallbackURL: strings.TrimSpace(s.options.CallbackURL),
-		CallbackHeaders: map[string]string{
-			"X-Callback-Key": strings.TrimSpace(s.options.CallbackAPIKey),
-			"Authorization":  "Bearer " + strings.TrimSpace(s.options.CallbackAPIKey),
-		},
 		CallbackContext: map[string]interface{}{
 			"taskId":        task.TaskID,
 			"liveSessionId": task.LiveSessionID,

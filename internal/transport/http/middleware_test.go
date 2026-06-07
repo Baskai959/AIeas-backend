@@ -41,6 +41,69 @@ func TestRequestIDMiddlewareSetsTraceCompatibleResponse(t *testing.T) {
 	}
 }
 
+func TestCORSMiddlewareAllowsWildcardPreflightWithoutOptionsRoute(t *testing.T) {
+	h := server.Default()
+	h.Use(CORSMiddleware(CORSOptions{
+		Enabled:       true,
+		AllowOrigins:  []string{"*"},
+		AllowMethods:  []string{"GET", "POST", "OPTIONS"},
+		AllowHeaders:  []string{"Authorization", "Content-Type", "Idempotency-Key"},
+		MaxAgeSeconds: 600,
+	}))
+	h.POST("/api/v1/auth/login", func(ctx context.Context, c *app.RequestContext) {
+		WriteSuccess(c, map[string]string{"ok": "true"})
+	})
+
+	resp := ut.PerformRequest(
+		h.Engine,
+		consts.MethodOptions,
+		"/api/v1/auth/login",
+		nil,
+		ut.Header{Key: "Origin", Value: "http://127.0.0.1:5173"},
+		ut.Header{Key: "Access-Control-Request-Method", Value: "POST"},
+		ut.Header{Key: "Access-Control-Request-Headers", Value: "authorization,content-type"},
+	)
+	if resp.Code != consts.StatusNoContent {
+		t.Fatalf("expected 204 preflight response, got %d body=%s", resp.Code, resp.Body.String())
+	}
+	if got := string(resp.Header().Get("Access-Control-Allow-Origin")); got != "*" {
+		t.Fatalf("expected wildcard allow origin, got %q", got)
+	}
+	if got := string(resp.Header().Get("Access-Control-Allow-Methods")); !strings.Contains(got, "POST") {
+		t.Fatalf("expected allowed methods to include POST, got %q", got)
+	}
+	if got := string(resp.Header().Get("Access-Control-Allow-Headers")); !strings.Contains(strings.ToLower(got), "authorization") {
+		t.Fatalf("expected allowed headers to include Authorization, got %q", got)
+	}
+	if got := string(resp.Header().Get("Access-Control-Max-Age")); got != "600" {
+		t.Fatalf("expected max age 600, got %q", got)
+	}
+}
+
+func TestCORSMiddlewareAddsHeadersOnActualRequest(t *testing.T) {
+	h := server.Default()
+	h.Use(CORSMiddleware(CORSOptions{
+		Enabled:       true,
+		AllowOrigins:  []string{"*"},
+		ExposeHeaders: []string{"X-Request-Id"},
+	}))
+	h.GET("/ok", func(ctx context.Context, c *app.RequestContext) {
+		c.Response.Header.Set("X-Request-Id", "req-cors")
+		WriteSuccess(c, map[string]string{"ok": "true"})
+	})
+
+	resp := ut.PerformRequest(h.Engine, consts.MethodGet, "/ok", nil, ut.Header{Key: "Origin", Value: "http://127.0.0.1:5173"})
+	if resp.Code != consts.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", resp.Code, resp.Body.String())
+	}
+	if got := string(resp.Header().Get("Access-Control-Allow-Origin")); got != "*" {
+		t.Fatalf("expected wildcard allow origin, got %q", got)
+	}
+	if got := string(resp.Header().Get("Access-Control-Expose-Headers")); got != "X-Request-Id" {
+		t.Fatalf("expected exposed request id header, got %q", got)
+	}
+}
+
 func TestRoleAuthAndIdempotencyMiddleware(t *testing.T) {
 	h := server.Default()
 	h.Use(RequestIDMiddleware())

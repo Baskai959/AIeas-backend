@@ -64,11 +64,22 @@ type Config struct {
 }
 
 type ServerConfig struct {
-	Addr                    string   `yaml:"addr"`
-	ReadTimeout             Duration `yaml:"readTimeout"`
-	WriteTimeout            Duration `yaml:"writeTimeout"`
-	ShutdownTimeout         Duration `yaml:"shutdownTimeout"`
-	MaxRequestBodySizeBytes int      `yaml:"maxRequestBodySizeBytes"`
+	Addr                    string     `yaml:"addr"`
+	ReadTimeout             Duration   `yaml:"readTimeout"`
+	WriteTimeout            Duration   `yaml:"writeTimeout"`
+	ShutdownTimeout         Duration   `yaml:"shutdownTimeout"`
+	MaxRequestBodySizeBytes int        `yaml:"maxRequestBodySizeBytes"`
+	CORS                    CORSConfig `yaml:"cors"`
+}
+
+type CORSConfig struct {
+	Enabled          bool     `yaml:"enabled"`
+	AllowOrigins     []string `yaml:"allowOrigins"`
+	AllowMethods     []string `yaml:"allowMethods"`
+	AllowHeaders     []string `yaml:"allowHeaders"`
+	ExposeHeaders    []string `yaml:"exposeHeaders"`
+	AllowCredentials bool     `yaml:"allowCredentials"`
+	MaxAgeSeconds    int      `yaml:"maxAgeSeconds"`
 }
 
 // AppConfig 控制 aieas_backend 进程的部署形态。
@@ -255,11 +266,19 @@ func Default() Config {
 			Role: "all",
 		},
 		Server: ServerConfig{
-			Addr:                    ":8080",
+			Addr:                    ":8888",
 			ReadTimeout:             Duration(5 * time.Second),
 			WriteTimeout:            Duration(45 * time.Second),
 			ShutdownTimeout:         Duration(20 * time.Second),
 			MaxRequestBodySizeBytes: 25 << 20,
+			CORS: CORSConfig{
+				Enabled:       true,
+				AllowOrigins:  []string{"*"},
+				AllowMethods:  []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
+				AllowHeaders:  []string{"Authorization", "Content-Type", "Idempotency-Key", "X-Request-Id", "X-Trace-Id", "X-Metrics-Token"},
+				ExposeHeaders: []string{"X-Request-Id"},
+				MaxAgeSeconds: 600,
+			},
 		},
 		MySQL: MySQLConfig{
 			DSN:             "auction:auction@tcp(mysql:3306)/auction?charset=utf8mb4&parseTime=true&loc=Local",
@@ -343,9 +362,9 @@ func Default() Config {
 			ProductDescriptionURL:      "http://127.0.0.1:8000/api/v1/product-description",
 			ProductAuditEnabled:        true,
 			ProductAuditURL:            "http://127.0.0.1:8000/api/v1/product-audit",
-			ProductAuditCallbackURL:    "http://127.0.0.1:8080/api/v1/auctions/audit/callback",
+			ProductAuditCallbackURL:    "http://127.0.0.1:8888/api/v1/auctions/audit/callback",
 			LiveAnalysisURL:            "http://127.0.0.1:8000/api/v1/live-analysis/async",
-			LiveAnalysisCallbackURL:    "http://127.0.0.1:8080/api/v1/live-analysis/callback",
+			LiveAnalysisCallbackURL:    "http://127.0.0.1:8888/api/v1/live-analysis/callback",
 			LiveAnalysisCallbackAPIKey: "change-me-in-local-dev-live-analysis-callback",
 			LiveAuctionHookURL:         "http://127.0.0.1:8000/api/v1/live-assistant",
 			Timeout:                    Duration(45 * time.Second),
@@ -461,6 +480,10 @@ func (c *Config) Validate() error {
 	}
 	if c.Server.MaxRequestBodySizeBytes <= 0 {
 		return fmt.Errorf("server.maxRequestBodySizeBytes must be positive")
+	}
+	c.Server.CORS.normalize()
+	if err := c.Server.CORS.validate(); err != nil {
+		return err
 	}
 	if strings.TrimSpace(c.JWT.Secret) == "" {
 		return fmt.Errorf("jwt.secret is required")
@@ -670,6 +693,47 @@ func (w WebSocketConfig) validate() error {
 	return nil
 }
 
+func (c *CORSConfig) normalize() {
+	if c == nil {
+		return
+	}
+	c.AllowOrigins = normalizeStringList(c.AllowOrigins)
+	c.AllowMethods = normalizeStringList(c.AllowMethods)
+	c.AllowHeaders = normalizeStringList(c.AllowHeaders)
+	c.ExposeHeaders = normalizeStringList(c.ExposeHeaders)
+	if !c.Enabled {
+		return
+	}
+	if len(c.AllowOrigins) == 0 {
+		c.AllowOrigins = []string{"*"}
+	}
+	if len(c.AllowMethods) == 0 {
+		c.AllowMethods = []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"}
+	}
+	if len(c.AllowHeaders) == 0 {
+		c.AllowHeaders = []string{"Authorization", "Content-Type", "Idempotency-Key", "X-Request-Id", "X-Trace-Id", "X-Metrics-Token"}
+	}
+}
+
+func (c CORSConfig) validate() error {
+	if !c.Enabled {
+		return nil
+	}
+	if len(c.AllowOrigins) == 0 {
+		return fmt.Errorf("server.cors.allowOrigins must contain at least one origin when cors enabled")
+	}
+	if len(c.AllowMethods) == 0 {
+		return fmt.Errorf("server.cors.allowMethods must contain at least one method when cors enabled")
+	}
+	if c.AllowCredentials && containsString(c.AllowOrigins, "*") {
+		return fmt.Errorf("server.cors.allowCredentials cannot be true when allowOrigins contains \"*\"")
+	}
+	if c.MaxAgeSeconds < 0 {
+		return fmt.Errorf("server.cors.maxAgeSeconds must be non-negative")
+	}
+	return nil
+}
+
 func (c DoubaoTTSConfig) validate() error {
 	appID := strings.TrimSpace(c.AppID)
 	ackToken := strings.TrimSpace(c.AckToken)
@@ -686,6 +750,33 @@ func (c DoubaoTTSConfig) validate() error {
 		return fmt.Errorf("doubaoTTS.voice is required when doubao TTS is enabled")
 	}
 	return nil
+}
+
+func normalizeStringList(values []string) []string {
+	normalized := make([]string, 0, len(values))
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		key := strings.ToLower(value)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		normalized = append(normalized, value)
+	}
+	return normalized
+}
+
+func containsString(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
 }
 
 func (k *KafkaConfig) normalize() {

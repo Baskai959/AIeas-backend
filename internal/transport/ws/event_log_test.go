@@ -117,6 +117,40 @@ func TestPubSubBroadcasterBroadcastsLiveSessionEvents(t *testing.T) {
 	}
 }
 
+func TestPubSubBroadcasterBroadcastsLiveSessionOnlinePresence(t *testing.T) {
+	hub := NewHub()
+	const sessionID uint64 = 90004
+	client := NewClientWithSession("buyer-live-session-online", "u_1001", 0, sessionID, 4)
+	if err := hub.SubscribeLiveSessionOnly(sessionID, client); err != nil {
+		t.Fatalf("subscribe live session: %v", err)
+	}
+	drainPresence(t, client)
+
+	broadcaster := &PubSubBroadcaster{hub: hub}
+	broadcaster.handleMessage(&redisgo.Message{
+		Channel: "live_session:90004:events",
+		Payload: `{"liveSessionId":90004,"event":"room.online","online":2}`,
+	})
+	select {
+	case env := <-client.Outbound():
+		if env.Type != TypeRoomOnline || env.LiveSessionID != sessionID {
+			t.Fatalf("unexpected online envelope: %+v", env)
+		}
+		var payload struct {
+			LiveSessionID uint64 `json:"liveSessionId"`
+			Online        int    `json:"online"`
+		}
+		if err := json.Unmarshal(env.Payload, &payload); err != nil {
+			t.Fatalf("decode online payload: %v", err)
+		}
+		if payload.LiveSessionID != sessionID || payload.Online != 2 {
+			t.Fatalf("unexpected online payload: %+v", payload)
+		}
+	default:
+		t.Fatal("expected live session online pubsub event")
+	}
+}
+
 func TestPubSubBroadcasterForwardsAuctionEventsToLiveSessionClients(t *testing.T) {
 	hub := NewHub()
 	const auctionID uint64 = 10001

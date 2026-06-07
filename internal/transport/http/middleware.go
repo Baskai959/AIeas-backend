@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -22,8 +23,145 @@ const (
 	contextIdempotencyKey = "idempotency_key"
 )
 
+type CORSOptions struct {
+	Enabled          bool
+	AllowOrigins     []string
+	AllowMethods     []string
+	AllowHeaders     []string
+	ExposeHeaders    []string
+	AllowCredentials bool
+	MaxAgeSeconds    int
+}
+
 type AuditSink interface {
 	Create(ctx context.Context, log *domain.AuditLog) error
+}
+
+func CORSMiddleware(options CORSOptions) app.HandlerFunc {
+	options.normalize()
+	return func(ctx context.Context, c *app.RequestContext) {
+		origin := strings.TrimSpace(string(c.GetHeader("Origin")))
+		if !options.Enabled || origin == "" {
+			c.Next(ctx)
+			return
+		}
+
+		if allowOrigin, ok := options.allowOrigin(origin); ok {
+			c.Response.Header.Set("Access-Control-Allow-Origin", allowOrigin)
+			if allowOrigin != "*" {
+				addVaryHeader(c, "Origin")
+			}
+			if options.AllowCredentials {
+				c.Response.Header.Set("Access-Control-Allow-Credentials", "true")
+			}
+			if len(options.ExposeHeaders) > 0 {
+				c.Response.Header.Set("Access-Control-Expose-Headers", strings.Join(options.ExposeHeaders, ", "))
+			}
+		} else if string(c.Method()) == consts.MethodOptions {
+			c.AbortWithStatus(consts.StatusForbidden)
+			return
+		}
+
+		if string(c.Method()) == consts.MethodOptions {
+			c.Response.Header.Set("Access-Control-Allow-Methods", strings.Join(options.AllowMethods, ", "))
+			allowHeaders := options.preflightAllowHeaders(string(c.GetHeader("Access-Control-Request-Headers")))
+			if allowHeaders != "" {
+				c.Response.Header.Set("Access-Control-Allow-Headers", allowHeaders)
+			}
+			if options.MaxAgeSeconds > 0 {
+				c.Response.Header.Set("Access-Control-Max-Age", strconv.Itoa(options.MaxAgeSeconds))
+			}
+			addVaryHeader(c, "Access-Control-Request-Method")
+			addVaryHeader(c, "Access-Control-Request-Headers")
+			c.AbortWithStatus(consts.StatusNoContent)
+			return
+		}
+
+		c.Next(ctx)
+	}
+}
+
+func (o *CORSOptions) normalize() {
+	o.AllowOrigins = normalizeHeaderValues(o.AllowOrigins)
+	o.AllowMethods = normalizeHeaderValues(o.AllowMethods)
+	o.AllowHeaders = normalizeHeaderValues(o.AllowHeaders)
+	o.ExposeHeaders = normalizeHeaderValues(o.ExposeHeaders)
+	if len(o.AllowOrigins) == 0 {
+		o.AllowOrigins = []string{"*"}
+	}
+	if len(o.AllowMethods) == 0 {
+		o.AllowMethods = []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"}
+	}
+	if len(o.AllowHeaders) == 0 {
+		o.AllowHeaders = []string{"Authorization", "Content-Type", "Idempotency-Key", "X-Request-Id", "X-Trace-Id", "X-Metrics-Token"}
+	}
+}
+
+func (o CORSOptions) allowOrigin(origin string) (string, bool) {
+	for _, allowed := range o.AllowOrigins {
+		if allowed == "*" {
+			if o.AllowCredentials {
+				return origin, true
+			}
+			return "*", true
+		}
+		if allowed == origin {
+			return origin, true
+		}
+	}
+	return "", false
+}
+
+func (o CORSOptions) preflightAllowHeaders(requestHeaders string) string {
+	if containsHeaderValue(o.AllowHeaders, "*") {
+		requestHeaders = strings.TrimSpace(requestHeaders)
+		if requestHeaders != "" {
+			return requestHeaders
+		}
+		return "*"
+	}
+	return strings.Join(o.AllowHeaders, ", ")
+}
+
+func normalizeHeaderValues(values []string) []string {
+	normalized := make([]string, 0, len(values))
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		key := strings.ToLower(value)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		normalized = append(normalized, value)
+	}
+	return normalized
+}
+
+func containsHeaderValue(values []string, target string) bool {
+	for _, value := range values {
+		if strings.EqualFold(value, target) {
+			return true
+		}
+	}
+	return false
+}
+
+func addVaryHeader(c *app.RequestContext, value string) {
+	current := strings.TrimSpace(string(c.Response.Header.Peek("Vary")))
+	if current == "" {
+		c.Response.Header.Set("Vary", value)
+		return
+	}
+	for _, existing := range strings.Split(current, ",") {
+		if strings.EqualFold(strings.TrimSpace(existing), value) {
+			return
+		}
+	}
+	c.Response.Header.Set("Vary", current+", "+value)
 }
 
 func RequestIDMiddleware() app.HandlerFunc {

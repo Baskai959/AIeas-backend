@@ -221,7 +221,7 @@ func newServerWithServices(
 		tracingProvider = tracing.NewNoop()
 	}
 	h := server.Default(serverOptions(cfg.Server)...)
-	// 中间件顺序固定：Recovery → RequestID → Tracing → Metrics → RateLimiter → Audit。
+	// 中间件顺序固定：Recovery → CORS → RequestID → Tracing → Metrics → RateLimiter → Audit。
 	// Tracing 必须先于 Metrics，让 metric 的请求生命周期完全包在 span 内部，
 	// 也让 metric label 能从 routeLabel 拿到（FullPath 在路由匹配后才有值）。
 	rateLimiter := httptransport.NewRateLimiter(240, timeMinute())
@@ -238,6 +238,7 @@ func newServerWithServices(
 	}
 	h.Use(
 		httptransport.RecoveryMiddleware(logger),
+		httptransport.CORSMiddleware(corsOptions(cfg.Server.CORS)),
 		httptransport.RequestIDMiddleware(),
 		httptransport.TracingMiddleware(tracingProvider),
 		httptransport.MetricsMiddleware(metricsRegistry),
@@ -281,6 +282,18 @@ func newServerWithServices(
 	})
 
 	return h
+}
+
+func corsOptions(cfg appconfig.CORSConfig) httptransport.CORSOptions {
+	return httptransport.CORSOptions{
+		Enabled:          cfg.Enabled,
+		AllowOrigins:     cfg.AllowOrigins,
+		AllowMethods:     cfg.AllowMethods,
+		AllowHeaders:     cfg.AllowHeaders,
+		ExposeHeaders:    cfg.ExposeHeaders,
+		AllowCredentials: cfg.AllowCredentials,
+		MaxAgeSeconds:    cfg.MaxAgeSeconds,
+	}
 }
 
 func timeMinute() time.Duration {

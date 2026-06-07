@@ -144,10 +144,6 @@ func (h *AuctionHandler) Create(ctx context.Context, c *app.RequestContext) {
 }
 
 func (h *AuctionHandler) AuditCallback(ctx context.Context, c *app.RequestContext) {
-	if !h.authorizeAuditCallback(c) {
-		WriteError(c, 401, 10002, "访问令牌无效或已过期", nil)
-		return
-	}
 	var req auctionAuditCallbackRequest
 	if err := c.BindJSON(&req); err != nil {
 		WriteError(c, 400, 20001, "参数不合法", nil)
@@ -216,22 +212,6 @@ func auditCallbackRejectedStatus(status string) bool {
 	default:
 		return false
 	}
-}
-
-func (h *AuctionHandler) authorizeAuditCallback(c *app.RequestContext) bool {
-	expected := strings.TrimSpace(h.auditCallbackAPIKey)
-	if expected == "" {
-		return false
-	}
-	if constantTimeStringEqual(strings.TrimSpace(string(c.GetHeader("X-Callback-Key"))), expected) {
-		return true
-	}
-	auth := strings.TrimSpace(string(c.GetHeader("Authorization")))
-	const prefix = "Bearer "
-	if strings.HasPrefix(auth, prefix) {
-		return constantTimeStringEqual(strings.TrimSpace(strings.TrimPrefix(auth, prefix)), expected)
-	}
-	return false
 }
 
 func firstNonEmptyStringSlice(values ...[]string) []string {

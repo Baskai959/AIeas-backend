@@ -30,6 +30,10 @@ type OnlineCounter interface {
 	Count(ctx context.Context, auctionID uint64) (int, error)
 }
 
+type LiveSessionEventPublisher interface {
+	PublishLiveSessionEvent(ctx context.Context, liveSessionID uint64, eventType, requestID string, seq int64, payload json.RawMessage, onlineOnly bool) error
+}
+
 type ReplaySource interface {
 	ReplaySince(ctx context.Context, auctionID uint64, lastSeq int64) ([]Envelope, bool, error)
 }
@@ -53,6 +57,7 @@ type Hub struct {
 	sessionClients map[uint64]map[string]*Client // liveSessionId -> clientID -> client
 	eventWindow    int
 	onlineCounter  OnlineCounter
+	sessionEvents  LiveSessionEventPublisher
 	replaySource   ReplaySource
 	onlineTimeout  time.Duration
 	instancePrefix string
@@ -78,6 +83,14 @@ func (h *Hub) SetReplaySource(source ReplaySource) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.replaySource = source
+}
+
+// SetLiveSessionEventPublisher 注入直播场次事件发布器。配置后，直播间维度的
+// room.online 会优先走 live_session:<id>:events，由 ws 网关 pubsub 广播到所有进程。
+func (h *Hub) SetLiveSessionEventPublisher(publisher LiveSessionEventPublisher) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.sessionEvents = publisher
 }
 
 // SetMetrics 注入观测性指标实现。nil 安全：传 nil 等同于关闭打点。
@@ -1005,7 +1018,21 @@ func (h *Hub) emitLiveSessionPresence(liveSessionID uint64, online int) {
 		online = 0
 	}
 	payload, _ := json.Marshal(map[string]interface{}{"liveSessionId": liveSessionID, "online": online})
+	if publisher := h.liveSessionEventPublisher(); publisher != nil {
+		if err := publisher.PublishLiveSessionEvent(context.Background(), liveSessionID, TypeRoomOnline, "", 0, payload, false); err == nil {
+			return
+		}
+	}
 	h.BroadcastLiveSession(liveSessionID, Envelope{Type: TypeRoomOnline, LiveSessionID: liveSessionID, Payload: payload})
+}
+
+func (h *Hub) liveSessionEventPublisher() LiveSessionEventPublisher {
+	if h == nil {
+		return nil
+	}
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.sessionEvents
 }
 
 func (h *Hub) broadcastPresence(room *Room, online int) {

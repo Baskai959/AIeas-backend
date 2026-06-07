@@ -272,6 +272,55 @@ func TestHubLiveSessionOnlineCountWithActiveAuction(t *testing.T) {
 	}
 }
 
+func TestHubPublishesLiveSessionOnlinePresence(t *testing.T) {
+	publisher := &fakeLiveSessionEventPublisher{}
+	hub := NewHubWithOnlineCounter(NewMemoryOnlineCounter())
+	hub.SetLiveSessionEventPublisher(publisher)
+	client := NewClientWithSession("buyer-live-session-publish", "u1", 0, 9003, 4)
+
+	if err := hub.SubscribeLiveSessionOnly(9003, client); err != nil {
+		t.Fatalf("subscribe live session client: %v", err)
+	}
+	if got := hub.LiveSessionOnlineCount(9003); got != 1 {
+		t.Fatalf("expected live session online count 1, got %d", got)
+	}
+	if len(publisher.calls) != 1 {
+		t.Fatalf("expected one live session publish, got %d", len(publisher.calls))
+	}
+	call := publisher.calls[0]
+	if call.LiveSessionID != 9003 || call.EventType != TypeRoomOnline || call.OnlineOnly {
+		t.Fatalf("unexpected publish call: %+v", call)
+	}
+	var payload struct {
+		LiveSessionID uint64 `json:"liveSessionId"`
+		Online        int    `json:"online"`
+	}
+	if err := json.Unmarshal(call.Payload, &payload); err != nil {
+		t.Fatalf("decode publish payload: %v", err)
+	}
+	if payload.LiveSessionID != 9003 || payload.Online != 1 {
+		t.Fatalf("unexpected publish payload: %+v", payload)
+	}
+	assertNoPresence(t, client)
+}
+
+func TestHubFallsBackToLocalLiveSessionOnlinePresenceWhenPublisherFails(t *testing.T) {
+	publisher := &fakeLiveSessionEventPublisher{err: errors.New("publish failed")}
+	hub := NewHubWithOnlineCounter(NewMemoryOnlineCounter())
+	hub.SetLiveSessionEventPublisher(publisher)
+	client := NewClientWithSession("buyer-live-session-fallback", "u1", 0, 9004, 4)
+
+	if err := hub.SubscribeLiveSessionOnly(9004, client); err != nil {
+		t.Fatalf("subscribe live session client: %v", err)
+	}
+	if len(publisher.calls) != 1 {
+		t.Fatalf("expected one live session publish attempt, got %d", len(publisher.calls))
+	}
+	if online := lastPresenceOnline(t, client); online != 1 {
+		t.Fatalf("expected local fallback online 1, got %d", online)
+	}
+}
+
 func TestHubDebouncesPresenceForLargeRooms(t *testing.T) {
 	hub := NewHub()
 	hub.SetPresenceImmediateFanoutLimit(1)
@@ -702,4 +751,30 @@ type countingOnlineCounter struct {
 func (c *countingOnlineCounter) Touch(ctx context.Context, auctionID uint64, connectionID, userID string) (int, error) {
 	c.touchCount.Add(1)
 	return c.MemoryOnlineCounter.Touch(ctx, auctionID, connectionID, userID)
+}
+
+type liveSessionPublishCall struct {
+	LiveSessionID uint64
+	EventType     string
+	RequestID     string
+	Seq           int64
+	Payload       json.RawMessage
+	OnlineOnly    bool
+}
+
+type fakeLiveSessionEventPublisher struct {
+	err   error
+	calls []liveSessionPublishCall
+}
+
+func (p *fakeLiveSessionEventPublisher) PublishLiveSessionEvent(_ context.Context, liveSessionID uint64, eventType, requestID string, seq int64, payload json.RawMessage, onlineOnly bool) error {
+	p.calls = append(p.calls, liveSessionPublishCall{
+		LiveSessionID: liveSessionID,
+		EventType:     eventType,
+		RequestID:     requestID,
+		Seq:           seq,
+		Payload:       append(json.RawMessage(nil), payload...),
+		OnlineOnly:    onlineOnly,
+	})
+	return p.err
 }

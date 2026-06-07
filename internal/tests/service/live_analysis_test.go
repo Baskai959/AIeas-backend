@@ -31,7 +31,7 @@ func TestLiveAnalysisServiceGetReportForEndedSession(t *testing.T) {
 	}
 	if !strings.Contains(requester.inputs[0].Prompt, "直播场次id为"+strconvUint(session.ID)) ||
 		requester.inputs[0].CallbackURL != "http://backend/api/v1/live-analysis/callback" ||
-		requester.inputs[0].CallbackHeaders["X-Callback-Key"] != "callback-key" ||
+		len(requester.inputs[0].CallbackHeaders) != 0 ||
 		requester.inputs[0].CallbackContext["liveSessionId"] != session.ID ||
 		requester.inputs[0].CallbackContext["attempt"] != 1 {
 		t.Fatalf("unexpected requester input: %+v", requester.inputs[0])
