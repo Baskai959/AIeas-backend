@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"testing"
+	"time"
 
 	redisinfra "aieas_backend/internal/infra/redis"
 
@@ -114,6 +115,51 @@ func TestPubSubBroadcasterBroadcastsLiveSessionEvents(t *testing.T) {
 		}
 	default:
 		t.Fatal("expected live session pubsub event")
+	}
+}
+
+func TestPubSubBroadcasterDeliversBidResultToTargetUser(t *testing.T) {
+	hub := NewHub()
+	const (
+		sessionID uint64 = 90005
+		auctionID uint64 = 10005
+	)
+	target := NewClientWithSession("buyer-target", "u_1001", 0, sessionID, 4)
+	other := NewClientWithSession("buyer-other", "u_1002", 0, sessionID, 4)
+	if err := hub.SubscribeLiveSessionOnly(sessionID, target); err != nil {
+		t.Fatalf("subscribe target: %v", err)
+	}
+	if err := hub.SubscribeLiveSessionOnly(sessionID, other); err != nil {
+		t.Fatalf("subscribe other: %v", err)
+	}
+	drainPresence(t, target, other)
+
+	coord := NewBidAsyncCoordinator(hub, 10, time.Hour, 3)
+	if ok, reason := coord.TryEnqueue(auctionID, sessionID, "u_1001", "bid-1"); !ok {
+		t.Fatalf("enqueue pending: %s", reason)
+	}
+	broadcaster := &PubSubBroadcaster{hub: hub}
+	broadcaster.SetBidAsyncCoordinator(coord)
+	broadcaster.handleMessage(&redisgo.Message{
+		Channel: "live_session:90005:user:u_1001:events",
+		Payload: `{"liveSessionId":90005,"auctionId":10005,"event":"bid.result","requestId":"bid-1","bidId":"bid-1","finalStatus":"ACCEPTED","currentPrice":1200}`,
+	})
+	select {
+	case env := <-target.Outbound():
+		if env.Type != TypeBidResult || env.RequestID != "bid-1" || env.LiveSessionID != sessionID {
+			t.Fatalf("unexpected target bid result envelope: %+v", env)
+		}
+	default:
+		t.Fatal("expected target bid.result")
+	}
+	select {
+	case env := <-other.Outbound():
+		t.Fatalf("non-target user should not receive bid.result: %+v", env)
+	default:
+	}
+	coord.HandleAck("bid-1")
+	if coord.PendingQueueSize() != 0 {
+		t.Fatalf("expected pending released after ack, got %d", coord.PendingQueueSize())
 	}
 }
 

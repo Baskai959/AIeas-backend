@@ -21,6 +21,7 @@ import (
 type AuctionHandler struct {
 	commands            AuctionCommandUseCase
 	queries             AuctionQueryUseCase
+	rankings            WSAuctionRankingUseCase
 	deposits            DepositUseCase
 	hammers             HammerUseCase
 	uploader            ImageUploader
@@ -36,6 +37,10 @@ func NewAuctionHandler(commands AuctionCommandUseCase, queries AuctionQueryUseCa
 		descriptionGen = DisabledProductDescriptionGenerator{}
 	}
 	return &AuctionHandler{commands: commands, queries: queries, deposits: deposits, hammers: hammers, uploader: uploader, descriptionGen: descriptionGen, auditCallbackAPIKey: strings.TrimSpace(auditCallbackAPIKey)}
+}
+
+func (h *AuctionHandler) SetRankingService(rankings WSAuctionRankingUseCase) {
+	h.rankings = rankings
 }
 
 type auctionCreateRequest struct {
@@ -562,6 +567,33 @@ func (h *AuctionHandler) State(ctx context.Context, c *app.RequestContext) {
 		return
 	}
 	WriteSuccess(c, state)
+}
+
+func (h *AuctionHandler) Ranking(ctx context.Context, c *app.RequestContext) {
+	id, ok := parseUintParam(c, "id")
+	if !ok {
+		return
+	}
+	if h.rankings == nil {
+		WriteError(c, consts.StatusServiceUnavailable, 20005, "排行榜服务不可用", nil)
+		return
+	}
+	limit := 10
+	if parsed, hasLimit := parseOptionalUintQuery(c, "limit"); hasLimit && parsed > 0 {
+		if parsed > 50 {
+			parsed = 50
+		}
+		limit = int(parsed)
+	}
+	ranking, err := h.rankings.TopN(ctx, id, limit)
+	if err != nil {
+		writeServiceError(c, err)
+		return
+	}
+	WriteSuccess(c, map[string]interface{}{
+		"auctionId": id,
+		"ranking":   ranking,
+	})
 }
 
 func parseOptionalUintQuery(c *app.RequestContext, name string) (uint64, bool) {

@@ -132,6 +132,13 @@ type ServerDependencies struct {
 	BidEventKafkaProducer          appruntime.BidEventKafkaProducer
 	BidEventKafkaConsumer          appruntime.BidEventKafkaConsumer
 	SettlementEventPublisher       auctionports.SettlementEventPublisher
+	// 异步竞价裁决依赖：命令消费者 + 命令发布器。仅在 kafka.enabled 时非 nil；
+	// 任一缺失时 WS handler 强制走同步降级（绝不丢请求）。
+	BidCommandConsumer  appruntime.BidCommandConsumer
+	BidCommandPublisher httptransport.BidCommandPublisher
+	// BidAsyncCoordinator 是异步竞价的进程内协调器（队列保护 + 结果重发）。
+	// 由 NewServerWithDependencies 在 async 依赖齐备时构造，worker 与 WS handler 共享同一实例。
+	BidAsyncCoordinator *wstransport.BidAsyncCoordinator
 }
 
 func NewServerWithUserRepository(cfg appconfig.Config, userRepo userports.UserRepository) *server.Hertz {
@@ -154,9 +161,20 @@ func NewServerWithDependencies(cfg appconfig.Config, deps ServerDependencies) *s
 		panic(err)
 	}
 	deps = withDefaultServerDependencies(cfg, deps)
+	// 异步竞价协调器：ws handler 用它登记 pending，ws-gateway 收到 bid.result
+	// PubSub 后也用它定向投递并管理 ack 重发。
+	if deps.BidAsyncCoordinator == nil && deps.Hub != nil && (deps.BidCommandPublisher != nil || deps.BidCommandConsumer != nil) {
+		coord := wstransport.NewBidAsyncCoordinator(deps.Hub, 0, 0, 0)
+		coord.SetMetrics(deps.MetricsRegistry)
+		deps.BidAsyncCoordinator = coord
+	}
 	services := buildAppServices(cfg, deps)
 	workerShutdown := startAppWorkers(cfg, deps, services)
-	h := newServerWithServices(services.auth, services.auction, services.bid, services.deposit, services.hammer, services.order, services.admin, services.liveSession, services.liveSession, deps.RealtimeStore, deps.LiveSessionRealtimeStore, services.marketplace, services.marketplace, services.liveAnalysis, services.aiAssistant, services.aiAssistant, services.mcpRead, services.mcpControl, services.riskControl, deps.AuditRepo, deps.Hub, deps.Idempotency, deps.ObjectUploader, deps.DescriptionGen, deps.MetricsRegistry, deps.Tracing, deps.ReadinessProbes, deps.DistributedRateLimiter, deps.FeatureFlags, deps.WSHandshakeLimiter, cfg)
+	asyncBid := asyncBidWiring{coordinator: deps.BidAsyncCoordinator, publisher: deps.BidCommandPublisher}
+	if asyncBid.coordinator != nil && asyncBid.publisher != nil && services.bid != nil {
+		asyncBid.bids = services.bid
+	}
+	h := newServerWithServices(services.auth, services.auction, services.bid, services.deposit, services.hammer, services.order, services.admin, services.liveSession, services.liveSession, deps.RealtimeStore, deps.LiveSessionRealtimeStore, services.marketplace, services.marketplace, services.liveAnalysis, services.aiAssistant, services.aiAssistant, services.mcpRead, services.mcpControl, services.riskControl, deps.AuditRepo, deps.Hub, deps.Idempotency, deps.ObjectUploader, deps.DescriptionGen, deps.MetricsRegistry, deps.Tracing, deps.ReadinessProbes, deps.DistributedRateLimiter, deps.FeatureFlags, deps.WSHandshakeLimiter, asyncBid, cfg)
 	if deps.Hub != nil {
 		h.OnShutdown = append(h.OnShutdown, func(ctx context.Context) {
 			_ = deps.Hub.Drain(ctx, cfg.WebSocket.DrainTimeout.Std())
@@ -211,6 +229,7 @@ func newServerWithServices(
 	distributedRateLimiter httptransport.DistributedRateLimitStore,
 	featureFlags *adminapp.FeatureFlagService,
 	wsHandshakeLimiter *wstransport.HandshakeLimiter,
+	asyncBid asyncBidWiring,
 	cfg appconfig.Config,
 ) *server.Hertz {
 	logger := buildLogger(cfg.Observability)
@@ -278,6 +297,7 @@ func newServerWithServices(
 		descriptionGen:           descriptionGen,
 		metricsRegistry:          metricsRegistry,
 		wsHandshakeLimiter:       wsHandshakeLimiter,
+		asyncBid:                 asyncBid,
 		cfg:                      cfg,
 	})
 

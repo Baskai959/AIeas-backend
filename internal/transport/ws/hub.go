@@ -630,6 +630,32 @@ func (h *Hub) BroadcastLiveSession(liveSessionID uint64, env Envelope) int {
 	return delivered
 }
 
+// DeliverToUserInSession 把点对点帧（如 bid.result）定向投递给某直播场次内
+// 指定用户的所有连接。它使用 Client.Deliver（不占房间 seq、不写 history），
+// 避免污染 ReplaySince。返回成功投递的连接数。
+func (h *Hub) DeliverToUserInSession(sessionID uint64, userID string, env Envelope) int {
+	if h == nil || sessionID == 0 || userID == "" {
+		return 0
+	}
+	env.LiveSessionID = sessionID
+	h.mu.RLock()
+	bucket := h.sessionClients[sessionID]
+	clients := make([]*Client, 0, len(bucket))
+	for _, c := range bucket {
+		if c != nil && c.UserID == userID {
+			clients = append(clients, c)
+		}
+	}
+	h.mu.RUnlock()
+	delivered := 0
+	for _, c := range clients {
+		if c.Deliver(env) {
+			delivered++
+		}
+	}
+	return delivered
+}
+
 // BroadcastLiveSessionOnlineClients 把事件推送给当前直播场次内计入在线人数的用户连接。
 // 商家/管理员控制台连接通常 CountOnline=false，不接收用户端音频类事件。
 func (h *Hub) BroadcastLiveSessionOnlineClients(liveSessionID uint64, env Envelope) int {

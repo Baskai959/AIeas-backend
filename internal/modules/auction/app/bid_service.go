@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"log/slog"
 	"reflect"
 	"strconv"
@@ -100,8 +99,8 @@ type BidService struct {
 	realtimeStateCache sync.Map // map[uint64]*bidRealtimeStateCell
 	prerequisiteCache  sync.Map // map[string]bidPrerequisiteCacheEntry
 
-	nicknameCacheMu sync.RWMutex
-	nicknameCache   map[string]cachedBidderNickname
+	profileCacheMu sync.RWMutex
+	profileCache   map[string]cachedBidderProfile
 
 	rankingBroadcastMu     sync.Mutex
 	rankingBroadcastTimers map[uint64]*time.Timer
@@ -229,7 +228,7 @@ func NewBidServiceWithDeps(deps BidServiceDeps) *BidService {
 		auctionSnapshots:         deps.AuctionSnapshots,
 		auctionCache:             make(map[uint64]cachedBidAuction),
 		auctionCacheTTL:          bidAuctionCacheTTL,
-		nicknameCache:            make(map[string]cachedBidderNickname),
+		profileCache:             make(map[string]cachedBidderProfile),
 		rankingBroadcastTimers:   make(map[uint64]*time.Timer),
 		liveAgentHookQuietPeriod: defaultBidLiveAgentHookQuiet,
 		pendingLiveAgentHooks:    make(map[string]*pendingBidLiveAgentHook),
@@ -400,13 +399,166 @@ func (s *BidService) Place(ctx context.Context, in PlaceBidInput) (domain.BidRes
 	return result, err
 }
 
+// bidCheckSnapshot 是 preCheck 的"冻结快照"：携带入队前全部校验的产物，
+// 以及 arbitrate 执行 Lua PlaceBid 及其后续后处理所需的全部上下文。
+// 同步路径下 preCheck 直接把它传给 arbitrate；异步路径下它被序列化成
+// BidCommandSnapshot 投递到 Kafka，worker 侧再经 ArbitrateFromCommand 重建。
+type bidCheckSnapshot struct {
+	in                 PlaceBidInput
+	auction            bidAuctionSnapshot
+	liveSessionID      uint64
+	now                time.Time
+	rule               domain.IncrementRule
+	minIncrement       int64
+	freqLimitCount     int
+	freqWindowMS       int64
+	bidderNickname     string
+	bidderAvatarURL    string
+	riskControlEnabled bool
+	blacklistStrategy  domain.BlacklistStrategyConfig
+	streamEnabled      bool
+	gateRelease        func()
+}
+
+// BidCommandSnapshot 是异步竞价的可序列化命令快照：由 PreCheckForAsync 产出、
+// 经 Kafka 投递、再由 ArbitrateFromCommand 在 worker 侧消费。
+// 它只携带 Lua PlaceBid 与后处理所需的"已冻结"字段，绝不携带闭包等不可序列化状态。
+type BidCommandSnapshot struct {
+	BidID                string                   `json:"bidId"`
+	AuctionID            uint64                   `json:"auctionId"`
+	LiveSessionID        uint64                   `json:"liveSessionId"`
+	UserID               string                   `json:"userId"`
+	SellerID             string                   `json:"sellerId"`
+	Price                int64                    `json:"price"`
+	ExpectedCurrentPrice *int64                   `json:"expectedCurrentPrice"`
+	Source               string                   `json:"source"`
+	MinIncrement         int64                    `json:"minIncrement"`
+	AntiSnipingMS        int64                    `json:"antiSnipingMs"`
+	AntiExtendMS         int64                    `json:"antiExtendMs"`
+	AntiExtendMode       domain.AuctionExtendMode `json:"antiExtendMode"`
+	MaxExtendCount       int                      `json:"maxExtendCount"`
+	FreqLimitCount       int                      `json:"freqLimitCount"`
+	FreqWindowMS         int64                    `json:"freqWindowMs"`
+	StartPrice           int64                    `json:"startPrice"`
+	CapPrice             int64                    `json:"capPrice"`
+	IncrementRule        domain.IncrementRule     `json:"incrementRule"`
+	BidderNickname       string                   `json:"bidderNickname"`
+	BidderAvatarURL      string                   `json:"bidderAvatarUrl"`
+}
+
 func (s *BidService) place(ctx context.Context, in PlaceBidInput) (domain.BidResult, error) {
+	snap, terminal, err := s.preCheck(ctx, in)
+	if err != nil {
+		return domain.BidResult{}, err
+	}
+	if terminal != nil {
+		return *terminal, nil
+	}
+	return s.arbitrate(ctx, snap)
+}
+
+// PreCheckForAsync 执行入队前全部同步校验，返回可序列化的命令快照。
+// 当 terminal 非 nil 时表示已在前置阶段裁定（拒绝/重复/本地预拒/闸门拒绝），
+// 调用方应直接回传该结果而不入队。snapshot 仅在 terminal==nil 时有效。
+//
+// 注意：异步路径不跨进程持有同价闸门 slot（worker 顺序消费已天然串行），
+// 因此这里在 preCheck 之后立即释放闸门，避免占用 in-flight 名额。
+func (s *BidService) PreCheckForAsync(ctx context.Context, in PlaceBidInput) (BidCommandSnapshot, *domain.BidResult, error) {
+	snap, terminal, err := s.preCheck(ctx, in)
+	if snap.gateRelease != nil {
+		snap.gateRelease()
+		snap.gateRelease = nil
+	}
+	if err != nil {
+		return BidCommandSnapshot{}, nil, err
+	}
+	if terminal != nil {
+		return BidCommandSnapshot{}, terminal, nil
+	}
+	return BidCommandSnapshot{
+		BidID:                snap.in.RequestID,
+		AuctionID:            snap.in.AuctionID,
+		LiveSessionID:        snap.liveSessionID,
+		UserID:               snap.in.BidderID,
+		SellerID:             snap.auction.SellerID,
+		Price:                snap.in.Price,
+		ExpectedCurrentPrice: snap.in.ExpectedCurrentPrice,
+		Source:               snap.in.Source,
+		MinIncrement:         snap.minIncrement,
+		AntiSnipingMS:        int64(snap.auction.AntiSnipingSec) * 1000,
+		AntiExtendMS:         int64(snap.auction.AntiExtendSec) * 1000,
+		AntiExtendMode:       domain.NormalizeAuctionExtendMode(snap.auction.AntiExtendMode),
+		MaxExtendCount:       s.cfg.MaxExtendCount,
+		FreqLimitCount:       snap.freqLimitCount,
+		FreqWindowMS:         snap.freqWindowMS,
+		StartPrice:           snap.auction.StartPrice,
+		CapPrice:             snap.auction.CapPrice,
+		IncrementRule:        snap.rule,
+		BidderNickname:       snap.bidderNickname,
+		BidderAvatarURL:      snap.bidderAvatarURL,
+	}, nil, nil
+}
+
+// ArbitrateFromCommand 在 worker 侧复用原 Lua PlaceBid 链路执行裁决。
+// 它基于命令快照重建 arbitrate 所需上下文（拍品快照由命令字段合成，
+// 不再回源 DB；风控开关/黑名单策略走进程内缓存读取），保证与同步路径
+// 完全一致的落库/广播/自动黑名单/hook 后处理。
+func (s *BidService) ArbitrateFromCommand(ctx context.Context, cmd BidCommandSnapshot) (domain.BidResult, error) {
+	if cmd.BidID == "" || cmd.AuctionID == 0 || cmd.UserID == "" {
+		return domain.BidResult{}, domain.ErrInvalidArgument
+	}
+	source := cmd.Source
+	if source == "" {
+		source = "live_ws"
+	}
+	auction := bidAuctionSnapshot{
+		AuctionID:      cmd.AuctionID,
+		SellerID:       cmd.SellerID,
+		LiveSessionID:  cmd.LiveSessionID,
+		StartPrice:     cmd.StartPrice,
+		CapPrice:       cmd.CapPrice,
+		ParsedRule:     cmd.IncrementRule,
+		ParsedRuleOK:   true,
+		AntiExtendMode: cmd.AntiExtendMode,
+	}
+	riskControl := s.currentRiskControl(ctx)
+	blacklistStrategy := domain.BlacklistStrategyConfig{}
+	if riskControl.Enabled {
+		blacklistStrategy = s.currentBlacklistStrategy(ctx)
+	}
+	snap := bidCheckSnapshot{
+		in: PlaceBidInput{
+			RequestID:            cmd.BidID,
+			AuctionID:            cmd.AuctionID,
+			BidderID:             cmd.UserID,
+			UserRole:             domain.RoleBuyer,
+			Price:                cmd.Price,
+			ExpectedCurrentPrice: cmd.ExpectedCurrentPrice,
+			Source:               source,
+		},
+		auction:            auction,
+		liveSessionID:      cmd.LiveSessionID,
+		now:                time.Now().UTC(),
+		rule:               cmd.IncrementRule,
+		minIncrement:       cmd.MinIncrement,
+		freqLimitCount:     cmd.FreqLimitCount,
+		freqWindowMS:       cmd.FreqWindowMS,
+		bidderNickname:     cmd.BidderNickname,
+		bidderAvatarURL:    cmd.BidderAvatarURL,
+		riskControlEnabled: riskControl.Enabled,
+		blacklistStrategy:  blacklistStrategy,
+		streamEnabled:      bidStreamEnabled(s.realtime),
+	}
+	return s.arbitrate(ctx, snap)
+}
+
+func (s *BidService) preCheck(ctx context.Context, in PlaceBidInput) (bidCheckSnapshot, *domain.BidResult, error) {
 	stageStart := time.Now()
 	in.RequestID = strings.TrimSpace(in.RequestID)
 	in.BidderID = strings.TrimSpace(in.BidderID)
 	if in.RequestID == "" || in.AuctionID == 0 || in.BidderID == "" || in.Price <= 0 || in.UserRole != domain.RoleBuyer || in.ExpectedCurrentPrice == nil {
 		s.observeBidStage("input_validate", "error", stageStart)
-		return domain.BidResult{}, domain.ErrInvalidArgument
+		return bidCheckSnapshot{}, nil, domain.ErrInvalidArgument
 	}
 	s.observeBidStage("input_validate", "ok", stageStart)
 	// P0-3：bidStreamEnabled=true 时跳过 MySQL `bid_record` 的 FindByRequestID 前置查询。
@@ -417,11 +569,12 @@ func (s *BidService) place(ctx context.Context, in PlaceBidInput) (domain.BidRes
 		record, err := s.bids.FindByRequestID(ctx, in.RequestID)
 		if err == nil {
 			s.observeBidStage("mysql_idempotency", "hit", stageStart)
-			return bidResultFromRecord(record), nil
+			result := bidResultFromRecord(record)
+			return bidCheckSnapshot{}, &result, nil
 		}
 		if !errors.Is(err, domain.ErrNotFound) {
 			s.observeBidStage("mysql_idempotency", "error", stageStart)
-			return domain.BidResult{}, err
+			return bidCheckSnapshot{}, nil, err
 		}
 		s.observeBidStage("mysql_idempotency", "miss", stageStart)
 	}
@@ -429,7 +582,7 @@ func (s *BidService) place(ctx context.Context, in PlaceBidInput) (domain.BidRes
 	auction, err := s.bidAuctionSnapshot(ctx, in.AuctionID)
 	if err != nil {
 		s.observeBidStage("auction_snapshot", "error", stageStart)
-		return domain.BidResult{}, err
+		return bidCheckSnapshot{}, nil, err
 	}
 	s.observeBidStage("auction_snapshot", "ok", stageStart)
 	liveSessionID := auction.LiveSessionID
@@ -463,7 +616,7 @@ func (s *BidService) place(ctx context.Context, in PlaceBidInput) (domain.BidRes
 		isBlacklisted, err := s.risk.IsBlacklisted(ctx, in.BidderID)
 		if err != nil {
 			s.observeBidStage("blacklist_lookup", "error", stageStart)
-			return domain.BidResult{}, err
+			return bidCheckSnapshot{}, nil, err
 		}
 		if isBlacklisted {
 			s.observeBidStage("blacklist_lookup", "hit", stageStart)
@@ -482,17 +635,17 @@ func (s *BidService) place(ctx context.Context, in PlaceBidInput) (domain.BidRes
 				RiskResult:    domain.BidRiskReject,
 			}
 			s.enrichBidResult(ctx, &result, auction.liveSessionPtr())
-			return result, nil
+			return bidCheckSnapshot{}, &result, nil
 		}
 		s.observeBidStage("blacklist_lookup", "miss", stageStart)
 	}
 	if result, ok := s.preRedisLocalReject(ctx, in); ok {
-		return result, nil
+		return bidCheckSnapshot{}, &result, nil
 	}
 	if !riskControlEnabled {
 		s.observeBidStage("bid_prerequisites", "disabled", time.Now())
 	} else if result, ok, err := s.preRedisPrerequisiteReject(ctx, in, auction); err != nil {
-		return domain.BidResult{}, err
+		return bidCheckSnapshot{}, nil, err
 	} else if ok {
 		s.enrichBidResult(ctx, &result, auction.liveSessionPtr())
 		if riskControlEnabled && blacklistStrategy.Enabled && blacklistStrategy.MissingDepositEnabled && s.risk != nil {
@@ -500,7 +653,7 @@ func (s *BidService) place(ctx context.Context, in PlaceBidInput) (domain.BidRes
 			s.scheduleAutoBlacklist(ctx, blacklistStrategy, in.BidderID, in.AuctionID, "AUTO_BLACKLIST_"+result.Reason, result)
 			s.observeBidStage("schedule_auto_blacklist", "missing_deposit", stageStart)
 		}
-		return result, nil
+		return bidCheckSnapshot{}, &result, nil
 	}
 	stageStart = time.Now()
 	var rule domain.IncrementRule
@@ -511,7 +664,7 @@ func (s *BidService) place(ctx context.Context, in PlaceBidInput) (domain.BidRes
 		parsed, err := domain.ParseIncrementRule(auction.IncrementRule)
 		if err != nil {
 			s.observeBidStage("increment_rule", "error", stageStart)
-			return domain.BidResult{}, domain.ErrInvalidArgument
+			return bidCheckSnapshot{}, nil, domain.ErrInvalidArgument
 		}
 		rule = parsed
 		s.observeBidStage("increment_rule", "ok", stageStart)
@@ -533,16 +686,50 @@ func (s *BidService) place(ctx context.Context, in PlaceBidInput) (domain.BidRes
 		freqWindowMS = 0
 	}
 	stageStart = time.Now()
-	bidderNickname := s.bidderNickname(ctx, in.BidderID)
-	if bidderNickname == "" {
+	bidderProfile := s.bidderProfile(ctx, in.BidderID)
+	if bidderProfile.nickname == "" {
 		s.observeBidStage("bidder_nickname", "empty", stageStart)
 	} else {
 		s.observeBidStage("bidder_nickname", "ok", stageStart)
 	}
 	gateRelease, gateRejected, gateResult := s.acquireSamePriceGate(ctx, in, auction)
 	if gateRejected {
-		return gateResult, nil
+		return bidCheckSnapshot{}, &gateResult, nil
 	}
+	return bidCheckSnapshot{
+		in:                 in,
+		auction:            auction,
+		liveSessionID:      liveSessionID,
+		now:                now,
+		rule:               rule,
+		minIncrement:       minIncrement,
+		freqLimitCount:     freqLimitCount,
+		freqWindowMS:       freqWindowMS,
+		bidderNickname:     bidderProfile.nickname,
+		bidderAvatarURL:    bidderProfile.avatarURL,
+		riskControlEnabled: riskControlEnabled,
+		blacklistStrategy:  blacklistStrategy,
+		streamEnabled:      streamEnabled,
+		gateRelease:        gateRelease,
+	}, nil, nil
+}
+
+// arbitrate 执行 Lua PlaceBid 及其后续后处理链路（落库 / 广播 / 自动黑名单 /
+// hook / cap 落槌）。它消费 preCheck（或 ArbitrateFromCommand）产出的冻结快照，
+// 行为与拆分前的 place 后半段完全一致。
+func (s *BidService) arbitrate(ctx context.Context, snap bidCheckSnapshot) (domain.BidResult, error) {
+	in := snap.in
+	auction := snap.auction
+	liveSessionID := snap.liveSessionID
+	now := snap.now
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	rule := snap.rule
+	riskControlEnabled := snap.riskControlEnabled
+	blacklistStrategy := snap.blacklistStrategy
+	streamEnabled := snap.streamEnabled
+	gateRelease := snap.gateRelease
 	if gateRelease != nil {
 		defer func() {
 			if gateRelease != nil {
@@ -550,25 +737,26 @@ func (s *BidService) place(ctx context.Context, in PlaceBidInput) (domain.BidRes
 			}
 		}()
 	}
-	stageStart = time.Now()
+	stageStart := time.Now()
 	s.observeBidRoute("lua_enter", "attempt")
 	result, err := s.realtime.PlaceBid(ctx, domain.BidInput{
 		RequestID:            in.RequestID,
 		AuctionID:            in.AuctionID,
 		LiveSessionID:        liveSessionID,
 		BidderID:             in.BidderID,
-		BidderNickname:       bidderNickname,
+		BidderNickname:       snap.bidderNickname,
+		BidderAvatarURL:      snap.bidderAvatarURL,
 		Price:                in.Price,
 		ExpectedCurrentPrice: in.ExpectedCurrentPrice,
 		Now:                  now,
 		Source:               in.Source,
-		MinIncrement:         minIncrement,
+		MinIncrement:         snap.minIncrement,
 		AntiSnipingMS:        int64(auction.AntiSnipingSec) * 1000,
 		AntiExtendMS:         int64(auction.AntiExtendSec) * 1000,
 		AntiExtendMode:       domain.NormalizeAuctionExtendMode(auction.AntiExtendMode),
 		MaxExtendCount:       s.cfg.MaxExtendCount,
-		FreqLimitCount:       freqLimitCount,
-		FreqWindowMS:         freqWindowMS,
+		FreqLimitCount:       snap.freqLimitCount,
+		FreqWindowMS:         snap.freqWindowMS,
 		IdempotencyTTL:       s.bidIdempotencyTTL(),
 		StartPrice:           auction.StartPrice,
 		CapPrice:             auction.CapPrice,
@@ -620,7 +808,7 @@ func (s *BidService) place(ctx context.Context, in PlaceBidInput) (domain.BidRes
 		s.observeBidStage("schedule_auto_blacklist", "price", stageStart)
 	}
 	if result.Accepted && !result.Duplicate && s.hook != nil && auction.LiveSessionID != 0 {
-		s.scheduleHighestBidHook(auction.SellerID, auction.LiveSessionID, result.BidderID, result.BidderNickname, result.CurrentPrice)
+		s.scheduleHighestBidHook(auction.AuctionID, auction.SellerID, auction.LiveSessionID, result.BidderID, result.BidderNickname, result.CurrentPrice)
 	}
 	if !streamEnabled {
 		stageStart = time.Now()
@@ -664,7 +852,11 @@ func (s *BidService) TopN(ctx context.Context, auctionID uint64, limit int) ([]d
 	if auctionID == 0 {
 		return nil, domain.ErrInvalidArgument
 	}
-	return s.realtime.TopN(ctx, auctionID, limit)
+	ranking, err := s.realtime.TopN(ctx, auctionID, limit)
+	if err != nil {
+		return nil, err
+	}
+	return s.enrichRanking(ctx, ranking), nil
 }
 
 func isNilInterface(v interface{}) bool {
@@ -1252,8 +1444,9 @@ type bidRealtimeStateCell struct {
 	value atomic.Pointer[cachedBidRealtimeState]
 }
 
-type cachedBidderNickname struct {
+type cachedBidderProfile struct {
 	nickname  string
+	avatarURL string
 	expiresAt time.Time
 }
 
@@ -1860,7 +2053,6 @@ func (s *BidService) flushRankingBroadcast(auctionID uint64) {
 	if err != nil {
 		return
 	}
-	ranking = s.enrichRanking(ctx, ranking)
 	payload := map[string]interface{}{
 		"auctionId": auctionID,
 		"ranking":   ranking,
@@ -1888,8 +2080,8 @@ func (s *BidService) rankingLiveSessionID(ctx context.Context, auctionID uint64)
 	return 0
 }
 
-func (s *BidService) scheduleHighestBidHook(merchantID string, sessionID uint64, bidderID string, bidderName string, price int64) {
-	if s == nil || s.hook == nil || strings.TrimSpace(merchantID) == "" || sessionID == 0 || strings.TrimSpace(bidderID) == "" || price <= 0 {
+func (s *BidService) scheduleHighestBidHook(auctionID uint64, merchantID string, sessionID uint64, bidderID string, bidderName string, price int64) {
+	if s == nil || s.hook == nil || auctionID == 0 || strings.TrimSpace(merchantID) == "" || sessionID == 0 || strings.TrimSpace(bidderID) == "" || price <= 0 {
 		return
 	}
 	period := s.highestBidHookQuietPeriod()
@@ -1897,7 +2089,9 @@ func (s *BidService) scheduleHighestBidHook(merchantID string, sessionID uint64,
 		s.emitHighestBidHook(context.Background(), merchantID, sessionID, bidderID, bidderName, price)
 		return
 	}
-	key := fmt.Sprintf("%s:%d", strings.TrimSpace(merchantID), sessionID)
+	// 以拍品(auctionID)为防抖维度：同一拍品的连续出价共享一个计时器，
+	// 不同拍品互不影响、各自独立计时。
+	key := strconv.FormatUint(auctionID, 10)
 	s.liveAgentHookMu.Lock()
 	if s.pendingLiveAgentHooks == nil {
 		s.pendingLiveAgentHooks = make(map[string]*pendingBidLiveAgentHook)
@@ -1982,8 +2176,19 @@ func (s *BidService) enrichBidResult(ctx context.Context, result *domain.BidResu
 		serverTime := time.Now().UTC()
 		result.ServerTime = &serverTime
 	}
-	if result.Accepted && result.BidderNickname == "" {
-		result.BidderNickname = s.bidderNickname(ctx, result.BidderID)
+	if result.Accepted {
+		profile := s.bidderProfile(ctx, result.BidderID)
+		if result.BidderNickname == "" {
+			result.BidderNickname = profile.nickname
+		}
+		if result.BidderAvatarURL == "" {
+			result.BidderAvatarURL = profile.avatarURL
+		}
+		if result.BidderNickname == "" {
+			result.BidderNickname = fallbackBidderNickname(result.BidderID)
+		}
+		result.Nickname = result.BidderNickname
+		result.AvatarURL = result.BidderAvatarURL
 	}
 }
 
@@ -1993,60 +2198,96 @@ func (s *BidService) enrichRanking(ctx context.Context, ranking []domain.Ranking
 	}
 	out := make([]domain.RankingEntry, len(ranking))
 	copy(out, ranking)
-	cache := make(map[string]string, len(out))
+	cache := make(map[string]domain.User, len(out))
 	for i := range out {
 		id := strings.TrimSpace(out[i].BidderID)
 		if id == "" {
 			continue
 		}
-		if nickname, ok := cache[id]; ok {
-			out[i].BidderNickname = nickname
+		if user, ok := cache[id]; ok {
+			applyRankingUserProfile(&out[i], user)
 			continue
 		}
-		nickname := s.bidderNickname(ctx, id)
-		cache[id] = nickname
-		out[i].BidderNickname = nickname
+		user, err := s.users.FindByID(id)
+		if err != nil {
+			continue
+		}
+		cache[id] = user
+		applyRankingUserProfile(&out[i], user)
 	}
 	return out
 }
 
-func (s *BidService) bidderNickname(ctx context.Context, userID string) string {
+func applyRankingUserProfile(entry *domain.RankingEntry, user domain.User) {
+	if entry == nil {
+		return
+	}
+	nickname := strings.TrimSpace(user.Nickname)
+	avatarURL := strings.TrimSpace(user.AvatarURL)
+	if nickname == "" {
+		nickname = fallbackBidderNickname(entry.BidderID)
+	}
+	entry.BidderNickname = nickname
+	entry.Nickname = nickname
+	entry.BidderAvatarURL = avatarURL
+	entry.AvatarURL = avatarURL
+}
+
+func (s *BidService) bidderProfile(ctx context.Context, userID string) cachedBidderProfile {
+	_ = ctx
 	if s == nil || s.users == nil || strings.TrimSpace(userID) == "" {
-		return ""
+		return cachedBidderProfile{}
 	}
 	userID = strings.TrimSpace(userID)
-	if nickname, ok := s.cachedBidderNickname(userID, time.Now()); ok {
-		return nickname
+	if profile, ok := s.cachedBidderProfile(userID, time.Now()); ok {
+		return profile
 	}
 	user, err := s.users.FindByID(userID)
 	if err != nil {
-		return ""
+		return cachedBidderProfile{}
 	}
-	nickname := strings.TrimSpace(user.Nickname)
-	s.storeBidderNickname(userID, nickname, time.Now().Add(bidNicknameCacheTTL))
-	return nickname
+	profile := cachedBidderProfile{nickname: strings.TrimSpace(user.Nickname), avatarURL: strings.TrimSpace(user.AvatarURL)}
+	if profile.nickname == "" {
+		profile.nickname = fallbackBidderNickname(userID)
+	}
+	s.storeBidderProfile(userID, profile, time.Now().Add(bidNicknameCacheTTL))
+	return profile
 }
 
-func (s *BidService) cachedBidderNickname(userID string, now time.Time) (string, bool) {
-	s.nicknameCacheMu.RLock()
-	defer s.nicknameCacheMu.RUnlock()
-	if s.nicknameCache == nil {
-		return "", false
+func fallbackBidderNickname(userID string) string {
+	userID = strings.TrimSpace(userID)
+	if userID == "" {
+		return "用户"
 	}
-	cached, ok := s.nicknameCache[userID]
+	suffix := userID
+	if len([]rune(suffix)) > 4 {
+		runes := []rune(suffix)
+		suffix = string(runes[len(runes)-4:])
+	}
+	return "用户" + suffix
+}
+
+func (s *BidService) cachedBidderProfile(userID string, now time.Time) (cachedBidderProfile, bool) {
+	s.profileCacheMu.RLock()
+	defer s.profileCacheMu.RUnlock()
+	if s.profileCache == nil {
+		return cachedBidderProfile{}, false
+	}
+	cached, ok := s.profileCache[userID]
 	if !ok || now.After(cached.expiresAt) {
-		return "", false
+		return cachedBidderProfile{}, false
 	}
-	return cached.nickname, true
+	return cached, true
 }
 
-func (s *BidService) storeBidderNickname(userID, nickname string, expiresAt time.Time) {
-	s.nicknameCacheMu.Lock()
-	defer s.nicknameCacheMu.Unlock()
-	if s.nicknameCache == nil {
-		s.nicknameCache = make(map[string]cachedBidderNickname)
+func (s *BidService) storeBidderProfile(userID string, profile cachedBidderProfile, expiresAt time.Time) {
+	s.profileCacheMu.Lock()
+	defer s.profileCacheMu.Unlock()
+	if s.profileCache == nil {
+		s.profileCache = make(map[string]cachedBidderProfile)
 	}
-	s.nicknameCache[userID] = cachedBidderNickname{nickname: nickname, expiresAt: expiresAt}
+	profile.expiresAt = expiresAt
+	s.profileCache[userID] = profile
 }
 
 func bidResultFromRecord(record domain.BidRecord) domain.BidResult {
@@ -2056,6 +2297,7 @@ func bidResultFromRecord(record domain.BidRecord) domain.BidResult {
 		AuctionID:      record.AuctionID,
 		BidderID:       record.BidderID,
 		BidderNickname: record.BidderNickname,
+		Nickname:       record.BidderNickname,
 		Price:          record.BidPrice,
 		Accepted:       accepted,
 		Duplicate:      true,

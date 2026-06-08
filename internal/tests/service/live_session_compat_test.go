@@ -24,6 +24,7 @@ type CreateLiveSessionInput = livesessionapp.CreateLiveSessionInput
 type UpdateLiveSessionInput = livesessionapp.UpdateLiveSessionInput
 type ActivateLiveSessionAuctionInput = livesessionapp.ActivateLiveSessionAuctionInput
 type LiveSessionStats = livesessionapp.LiveSessionStats
+type LiveAgentHookConfig = livesessionapp.LiveAgentHookConfig
 
 type LiveSessionServiceDeps struct {
 	Sessions        livesessionports.LiveSessionRepository

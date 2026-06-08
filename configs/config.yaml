@@ -137,7 +137,7 @@ auction:
 # 风控总开关配置。
 riskControl:
   # false 会关闭 HTTP 限流、出价频控、黑名单拦截和自动拉黑。
-  enabled: true
+  enabled: false
 
 # WebSocket 网关配置。
 websocket:
@@ -226,6 +226,8 @@ kafka:
   clientID: "aieas-backend"
   # 出价事件 topic。
   bidEventsTopic: "aieas.bid.events"
+  # 异步竞价命令 topic（独立于结果落库流 bid.events）。
+  bidCommandsTopic: "aieas.bid.commands"
   # 拍卖事件 topic。
   auctionEventsTopic: "aieas.auction.events"
   # 订单事件 topic。
@@ -234,6 +236,8 @@ kafka:
   bidBridgeGroup: "aieas-bid-kafka-bridge"
   # 出价记录落库 consumer group。
   bidRecordGroup: "aieas-bid-record-writers"
+  # 异步竞价裁决 consumer group。
+  bidDecisionGroup: "aieas-bid-decision-workers"
 
 # MCP 读写接口鉴权配置。
 mcp:

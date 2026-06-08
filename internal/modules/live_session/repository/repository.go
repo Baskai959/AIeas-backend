@@ -86,6 +86,7 @@ func (r *MySQLLiveSessionRepository) Update(ctx context.Context, session *domain
 		"description":          row.Description,
 		"cover_url":            row.CoverURL,
 		"status":               row.Status,
+		"is_digital_human":     row.IsDigitalHuman,
 		"active_auction_id":    row.ActiveAuctionID,
 		"opened_at":            row.OpenedAt,
 		"closed_at":            row.ClosedAt,
@@ -273,6 +274,7 @@ type liveSessionRow struct {
 	Description        string                   `gorm:"column:description"`
 	CoverURL           string                   `gorm:"column:cover_url"`
 	Status             domain.LiveSessionStatus `gorm:"column:status"`
+	IsDigitalHuman     bool                     `gorm:"column:is_digital_human"`
 	ActiveAuctionID    uint64                   `gorm:"column:active_auction_id"`
 	OpenedAt           *time.Time               `gorm:"column:opened_at"`
 	ClosedAt           *time.Time               `gorm:"column:closed_at"`
@@ -297,6 +299,7 @@ func liveSessionRowFromDomain(s domain.LiveSession) liveSessionRow {
 		Description:        s.Description,
 		CoverURL:           s.CoverURL,
 		Status:             s.Status,
+		IsDigitalHuman:     s.IsDigitalHuman,
 		ActiveAuctionID:    s.ActiveAuctionID,
 		OpenedAt:           cloneTimePtrUTC(s.OpenedAt),
 		ClosedAt:           s.ClosedAt,
@@ -322,6 +325,7 @@ func (r liveSessionRow) toDomain() domain.LiveSession {
 		Description:        r.Description,
 		CoverURL:           r.CoverURL,
 		Status:             r.Status,
+		IsDigitalHuman:     r.IsDigitalHuman,
 		ActiveAuctionID:    r.ActiveAuctionID,
 		OpenedAt:           cloneTimePtrUTC(r.OpenedAt),
 		ClosedAt:           r.ClosedAt,

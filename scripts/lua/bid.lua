@@ -25,6 +25,7 @@ local trace_parent = ARGV[16]
 local trace_state = ARGV[17]
 local live_session_id_arg = ARGV[18]
 local bidder_nickname = ARGV[19]
+local bidder_avatar_url = ARGV[20]
 
 if request_id == nil then request_id = "" end
 if bidder_id == nil then bidder_id = "" end
@@ -34,6 +35,7 @@ anti_extend_mode = string.upper(tostring(anti_extend_mode))
 if trace_parent == nil then trace_parent = "" end
 if trace_state == nil then trace_state = "" end
 if bidder_nickname == nil then bidder_nickname = "" end
+if bidder_avatar_url == nil then bidder_avatar_url = "" end
 
 if auction_id == nil or auction_id <= 0 or bidder_id == "" or price == nil or price <= 0 or now_ms == nil or now_ms <= 0 then
   return redis.error_reply("invalid bid arguments")
@@ -86,7 +88,8 @@ local function build_result_array(accepted, reason, current_price, leader_id, en
     auction_status or "",
     auto_closed and 1 or 0,
     now_ms,
-    now_ms
+    now_ms,
+    bidder_avatar_url
   }
 end
 
@@ -114,7 +117,8 @@ local function legacy_result_to_array(decoded)
     decoded["auctionStatus"] or "",
     decoded["autoClosed"] and 1 or 0,
     tonumber(decoded["createdAtMs"]) or now_ms,
-    tonumber(decoded["bidTsMs"]) or now_ms
+    tonumber(decoded["bidTsMs"]) or now_ms,
+    decoded["bidderAvatarUrl"] or decoded["avatarUrl"] or bidder_avatar_url
   }
 end
 
@@ -179,6 +183,7 @@ local function append_accepted_event(current_price, leader_id, end_ts, extend_co
     "live_session_id", tostring(live_session_id),
     "bidder_id", bidder_id,
     "bidder_nickname", bidder_nickname,
+    "bidder_avatar_url", bidder_avatar_url,
     "bid_price", tostring(price),
     "bid_ts_ms", tostring(now_ms),
     "source", source,

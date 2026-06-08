@@ -15,6 +15,8 @@ const (
 	TypeAuctionParticipantUpdated = "auction.participant_updated"
 	// TypeRankingUpdated 是拍品排行榜更新帧。
 	TypeRankingUpdated = "ranking.updated"
+	// TypeBidResult 是异步出价裁决终态帧，只定向推给本次出价用户。
+	TypeBidResult = "bid.result"
 	// TypeLiveVoiceBroadcast 是直播语音播报帧，payload 携带已合成的音频内容。
 	TypeLiveVoiceBroadcast = "live.voice_broadcast"
 	// TypeAIAssistantStatus 是 AI 助手运行状态帧。

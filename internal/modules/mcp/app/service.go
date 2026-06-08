@@ -650,10 +650,8 @@ func (s *MCPControlService) OperateLiveSessionLot(ctx context.Context, in MCPLiv
 		return MCPLiveLotOperationResult{}, domain.ErrInvalidArgument
 	}
 	lotName := s.mcpLotDisplayName(ctx, in.AuctionID)
-	if mcpLiveLotActionRequiresApproval(action) {
-		if err := s.requestAIControlPermission(ctx, session, "operate_live_session_lot", action, lotName, in.RequestID); err != nil {
-			return MCPLiveLotOperationResult{}, err
-		}
+	if err := s.requestAIControlPermission(ctx, session, "operate_live_session_lot", action, lotName, in.RequestID); err != nil {
+		return MCPLiveLotOperationResult{}, err
 	}
 	ctx = context.WithoutCancel(ctx)
 	s.notifyAIStatus(ctx, session.ID, session.MerchantID, "operate_live_session_lot", "running", MCPLiveLotActionRunningMessage(action, lotName), in.RequestID)
@@ -1004,10 +1002,6 @@ func normalizeMCPLiveLotAction(action string) string {
 	default:
 		return ""
 	}
-}
-
-func mcpLiveLotActionRequiresApproval(action string) bool {
-	return action != "startExplain"
 }
 
 func (s *MCPControlService) requestAIControlPermission(ctx context.Context, session domain.LiveSession, toolName, action, lotName, requestID string) error {

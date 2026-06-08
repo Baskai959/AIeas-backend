@@ -40,6 +40,18 @@ type Registry struct {
 	bidDuplicateTotal prometheus.Counter
 	bidFreqLimitTotal prometheus.Counter
 
+	// Async bid (异步竞价裁决)
+	bidPlaceModeTotal       *prometheus.CounterVec
+	bidAckDuration          *prometheus.HistogramVec
+	bidKafkaEnqueueDuration prometheus.Histogram
+	bidDecisionDuration     *prometheus.HistogramVec
+	bidPendingQueueSize     prometheus.Gauge
+	bidResultPushDuration   prometheus.Histogram
+	bidResultDuration       *prometheus.HistogramVec
+	bidResultAckTimeoutTot  prometheus.Counter
+	bidQueueRejectTotal     *prometheus.CounterVec
+	bidDecisionOutcomeTotal *prometheus.CounterVec
+
 	// Hammer
 	hammerTotal                   *prometheus.CounterVec
 	hammerDuration                prometheus.Histogram
@@ -209,6 +221,51 @@ func (r *Registry) register() {
 		Namespace: ns, Name: "auction_bid_freq_limit_total", Help: "Bids hitting frequency limit",
 	})
 
+	// Async bid -------------------------------------------------------------
+	r.bidPlaceModeTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: ns, Name: "bid_place_mode_total", Help: "Bid place routing mode (sync/async)",
+	}, []string{"mode"})
+	r.bidAckDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Namespace: ns, Name: "bid_ack_duration_seconds", Help: "WebSocket bid.ack latency from bid.place handling to ack enqueue",
+		Buckets: durBucketsFast,
+	}, []string{"mode", "result"})
+	r.bidKafkaEnqueueDuration = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Namespace: ns, Name: "bid_kafka_enqueue_duration_seconds", Help: "Async bid command enqueue duration",
+		Buckets: durBucketsFast,
+	})
+	r.bidDecisionDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Namespace: ns, Name: "bid_decision_duration_seconds", Help: "Async bid decision (arbitrate) duration",
+		Buckets: durBucketsFast,
+	}, []string{"result"})
+	r.bidPendingQueueSize = prometheus.NewGauge(prometheus.GaugeOpts{
+		Namespace: ns, Name: "bid_pending_queue_size", Help: "Current async bid pending queue size (global)",
+	})
+	r.bidResultPushDuration = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Namespace: ns, Name: "bid_result_push_duration_seconds", Help: "Async bid result directed push duration",
+		Buckets: durBucketsFast,
+	})
+	r.bidResultDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Namespace: ns, Name: "bid_result_duration_seconds", Help: "Async bid result end-to-end latency from pending enqueue to bid.result directed push",
+		Buckets: durBucketsFast,
+	}, []string{"outcome"})
+	r.bidResultAckTimeoutTot = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: ns, Name: "bid_result_ack_timeout_total", Help: "Async bid result ack timeouts / resends",
+	})
+	r.bidQueueRejectTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: ns, Name: "bid_queue_reject_total", Help: "Async bid queue rejections by reason",
+	}, []string{"reason"})
+	r.bidDecisionOutcomeTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: ns, Name: "bid_decision_outcome_total", Help: "Async bid decision outcome",
+	}, []string{"outcome"})
+	for _, mode := range []string{"local", "async", "disabled", "unknown"} {
+		for _, result := range []string{"queued", "accepted", "rejected", "unknown"} {
+			r.bidAckDuration.WithLabelValues(mode, result)
+		}
+	}
+	for _, outcome := range []string{"accepted", "rejected", "unknown"} {
+		r.bidResultDuration.WithLabelValues(outcome)
+	}
+
 	// Hammer ---------------------------------------------------------------
 	r.hammerTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: ns, Name: "auction_hammer_total", Help: "Hammer attempts",
@@ -351,6 +408,9 @@ func (r *Registry) register() {
 		r.httpRequestBodyBytes, r.httpResponseBytes,
 		r.bidTotal, r.bidDuration, r.bidStageDuration, r.bidRouteTotal, r.bidRejectTotal,
 		r.bidDuplicateTotal, r.bidFreqLimitTotal,
+		r.bidPlaceModeTotal, r.bidAckDuration, r.bidKafkaEnqueueDuration, r.bidDecisionDuration,
+		r.bidPendingQueueSize, r.bidResultPushDuration, r.bidResultDuration, r.bidResultAckTimeoutTot,
+		r.bidQueueRejectTotal, r.bidDecisionOutcomeTotal,
 		r.hammerTotal, r.hammerDuration,
 		r.hammerMySQLTxDuration, r.hammerDuplicateTotal,
 		r.hammerOptimisticConflictTotal, r.hammerMySQLFailTotal,

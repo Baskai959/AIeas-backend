@@ -38,6 +38,7 @@ type platformDeps struct {
 	keys             redisinfra.KeyBuilder
 	kafkaProducer    *kafkainfra.Producer
 	kafkaBidReader   *kafkainfra.BidEventReader
+	kafkaCmdReader   *kafkainfra.BidCommandReader
 }
 
 func buildPlatformDeps(ctx context.Context, cfg appconfig.Config) (*platformDeps, error) {
@@ -81,13 +82,14 @@ func buildPlatformDeps(ctx context.Context, cfg appconfig.Config) (*platformDeps
 		p.close(ctx)
 		return nil, fmt.Errorf("load redis scripts: %w", err)
 	}
-	kafkaProducer, kafkaBidReader, err := openKafkaClients(cfg)
+	kafkaProducer, kafkaBidReader, kafkaCmdReader, err := openKafkaClients(cfg)
 	if err != nil {
 		p.close(ctx)
 		return nil, err
 	}
 	p.kafkaProducer = kafkaProducer
 	p.kafkaBidReader = kafkaBidReader
+	p.kafkaCmdReader = kafkaCmdReader
 	return p, nil
 }
 
@@ -123,6 +125,9 @@ func (p *platformDeps) close(ctx context.Context) {
 	if p.kafkaBidReader != nil {
 		_ = p.kafkaBidReader.Close()
 	}
+	if p.kafkaCmdReader != nil {
+		_ = p.kafkaCmdReader.Close()
+	}
 	if p.kafkaProducer != nil {
 		_ = p.kafkaProducer.Close()
 	}
@@ -132,20 +137,21 @@ func (p *platformDeps) close(ctx context.Context) {
 	}
 }
 
-// openKafkaClients 构造 Kafka producer 与 bid event consumer。Kafka disabled 时返回 nil。
-func openKafkaClients(cfg appconfig.Config) (*kafkainfra.Producer, *kafkainfra.BidEventReader, error) {
+// openKafkaClients 构造 Kafka producer 与 bid event / bid command consumer。Kafka disabled 时返回 nil。
+func openKafkaClients(cfg appconfig.Config) (*kafkainfra.Producer, *kafkainfra.BidEventReader, *kafkainfra.BidCommandReader, error) {
 	if !cfg.Kafka.Enabled {
-		return nil, nil, nil
+		return nil, nil, nil, nil
 	}
 	producer, err := kafkainfra.NewProducer(kafkainfra.ProducerConfig{
 		Brokers:            cfg.Kafka.Brokers,
 		ClientID:           cfg.Kafka.ClientID,
 		BidEventsTopic:     cfg.Kafka.BidEventsTopic,
+		BidCommandsTopic:   cfg.Kafka.BidCommandsTopic,
 		AuctionEventsTopic: cfg.Kafka.AuctionEventsTopic,
 		OrderEventsTopic:   cfg.Kafka.OrderEventsTopic,
 	})
 	if err != nil {
-		return nil, nil, fmt.Errorf("init kafka producer: %w", err)
+		return nil, nil, nil, fmt.Errorf("init kafka producer: %w", err)
 	}
 	reader, err := kafkainfra.NewBidEventReader(kafkainfra.BidEventReaderConfig{
 		Brokers: cfg.Kafka.Brokers,
@@ -154,9 +160,19 @@ func openKafkaClients(cfg appconfig.Config) (*kafkainfra.Producer, *kafkainfra.B
 	})
 	if err != nil {
 		_ = producer.Close()
-		return nil, nil, fmt.Errorf("init kafka bid reader: %w", err)
+		return nil, nil, nil, fmt.Errorf("init kafka bid reader: %w", err)
 	}
-	return producer, reader, nil
+	cmdReader, err := kafkainfra.NewBidCommandReader(kafkainfra.BidCommandReaderConfig{
+		Brokers: cfg.Kafka.Brokers,
+		GroupID: cfg.Kafka.BidDecisionGroup,
+		Topic:   cfg.Kafka.BidCommandsTopic,
+	})
+	if err != nil {
+		_ = reader.Close()
+		_ = producer.Close()
+		return nil, nil, nil, fmt.Errorf("init kafka bid command reader: %w", err)
+	}
+	return producer, reader, cmdReader, nil
 }
 
 // buildReadinessProbes 构造默认 /readyz 依赖检查：mysql.ping、redis.ping、

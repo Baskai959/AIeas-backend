@@ -75,10 +75,10 @@ func (r *MySQLOrderRepository) FindByID(ctx context.Context, id uint64) (domain.
 func (r *MySQLOrderRepository) List(ctx context.Context, filter domain.OrderFilter) ([]domain.OrderDeal, error) {
 	query := r.dbFor(ctx).Table("order_deal").Order("id DESC")
 	if filter.WinnerID != "" {
-		query = query.Where("winner_id = ?", normalizeUserIDForDB(filter.WinnerID))
+		query = query.Where("winner_id IN ?", userIDAliasesForDB(filter.WinnerID))
 	}
 	if filter.SellerID != "" {
-		query = query.Where("seller_id = ?", normalizeUserIDForDB(filter.SellerID))
+		query = query.Where("seller_id IN ?", userIDAliasesForDB(filter.SellerID))
 	}
 	if filter.AuctionID != 0 {
 		query = query.Where("auction_id = ?", filter.AuctionID)
@@ -91,6 +91,9 @@ func (r *MySQLOrderRepository) List(ctx context.Context, filter domain.OrderFilt
 	}
 	if filter.PayStatus != "" {
 		query = query.Where("pay_status = ?", filter.PayStatus)
+	}
+	if filter.FulfillmentStatus != "" {
+		query = query.Where("fulfillment_status = ?", domain.NormalizeFulfillmentStatus(filter.FulfillmentStatus))
 	}
 	if filter.Limit <= 0 || filter.Limit > 100 {
 		filter.Limit = 20
@@ -376,6 +379,9 @@ func (r *MemoryOrderRepository) List(ctx context.Context, filter domain.OrderFil
 		if filter.PayStatus != "" && order.PayStatus != filter.PayStatus {
 			continue
 		}
+		if filter.FulfillmentStatus != "" && domain.NormalizeFulfillmentStatus(order.FulfillmentStatus) != domain.NormalizeFulfillmentStatus(filter.FulfillmentStatus) {
+			continue
+		}
 		orders = append(orders, cloneOrder(order))
 	}
 	sort.Slice(orders, func(i, j int) bool { return orders[i].ID > orders[j].ID })
@@ -546,6 +552,32 @@ func normalizeUserIDForDB(id string) string {
 		}
 	}
 	return id
+}
+
+func userIDAliasesForDB(id string) []string {
+	id = strings.TrimSpace(id)
+	normalized := normalizeUserIDForDB(id)
+	if normalized == "" {
+		return []string{""}
+	}
+	aliases := []string{normalized, "u_" + normalized}
+	if id != normalized && id != aliases[1] {
+		aliases = append(aliases, id)
+	}
+	return dedupeStrings(aliases)
+}
+
+func dedupeStrings(values []string) []string {
+	out := make([]string, 0, len(values))
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+	}
+	return out
 }
 
 func cloneUint64Ptr(p *uint64) *uint64 {

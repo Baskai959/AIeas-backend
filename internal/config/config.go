@@ -202,10 +202,12 @@ type KafkaConfig struct {
 	Brokers            []string `yaml:"brokers"`
 	ClientID           string   `yaml:"clientID"`
 	BidEventsTopic     string   `yaml:"bidEventsTopic"`
+	BidCommandsTopic   string   `yaml:"bidCommandsTopic"`
 	AuctionEventsTopic string   `yaml:"auctionEventsTopic"`
 	OrderEventsTopic   string   `yaml:"orderEventsTopic"`
 	BidBridgeGroup     string   `yaml:"bidBridgeGroup"`
 	BidRecordGroup     string   `yaml:"bidRecordGroup"`
+	BidDecisionGroup   string   `yaml:"bidDecisionGroup"`
 }
 
 type MCPConfig struct {
@@ -377,10 +379,12 @@ func Default() Config {
 			Brokers:            []string{"127.0.0.1:9092"},
 			ClientID:           "aieas-backend",
 			BidEventsTopic:     "aieas.bid.events",
+			BidCommandsTopic:   "aieas.bid.commands",
 			AuctionEventsTopic: "aieas.auction.events",
 			OrderEventsTopic:   "aieas.order.events",
 			BidBridgeGroup:     "aieas-bid-kafka-bridge",
 			BidRecordGroup:     "aieas-bid-record-writers",
+			BidDecisionGroup:   "aieas-bid-decision-workers",
 		},
 		MCP: MCPConfig{
 			Read: MCPAuthConfig{
@@ -795,6 +799,9 @@ func (k *KafkaConfig) normalize() {
 	if strings.TrimSpace(k.BidEventsTopic) == "" {
 		k.BidEventsTopic = "aieas.bid.events"
 	}
+	if strings.TrimSpace(k.BidCommandsTopic) == "" {
+		k.BidCommandsTopic = "aieas.bid.commands"
+	}
 	if strings.TrimSpace(k.AuctionEventsTopic) == "" {
 		k.AuctionEventsTopic = "aieas.auction.events"
 	}
@@ -806,6 +813,9 @@ func (k *KafkaConfig) normalize() {
 	}
 	if strings.TrimSpace(k.BidRecordGroup) == "" {
 		k.BidRecordGroup = "aieas-bid-record-writers"
+	}
+	if strings.TrimSpace(k.BidDecisionGroup) == "" {
+		k.BidDecisionGroup = "aieas-bid-decision-workers"
 	}
 }
 

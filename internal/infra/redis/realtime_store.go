@@ -289,6 +289,7 @@ func (s *AuctionRealtimeStore) PlaceBid(ctx context.Context, input domain.BidInp
 		traceState,
 		input.LiveSessionID,
 		input.BidderNickname,
+		input.BidderAvatarURL,
 	)
 	if err != nil {
 		return domain.BidResult{}, err
@@ -296,6 +297,13 @@ func (s *AuctionRealtimeStore) PlaceBid(ctx context.Context, input domain.BidInp
 	result, err := decodeBidResult(raw)
 	if err != nil {
 		return domain.BidResult{}, err
+	}
+	if result.BidderAvatarURL == "" {
+		result.BidderAvatarURL = strings.TrimSpace(input.BidderAvatarURL)
+		result.AvatarURL = result.BidderAvatarURL
+	}
+	if result.Nickname == "" {
+		result.Nickname = result.BidderNickname
 	}
 	if result.Accepted && !result.Duplicate {
 		s.publishAcceptedResult(ctx, input, result, now)
@@ -330,31 +338,34 @@ func (s *AuctionRealtimeStore) publishAcceptedResult(ctx context.Context, input 
 			}
 		}()
 		payload := bidAcceptedPublishPayload{
-			RequestID:      result.RequestID,
-			AuctionID:      result.AuctionID,
-			LiveSessionID:  result.LiveSessionID,
-			BidderID:       result.BidderID,
-			BidderNickname: result.BidderNickname,
-			Price:          result.Price,
-			Accepted:       result.Accepted,
-			Duplicate:      result.Duplicate,
-			Reason:         result.Reason,
-			CurrentPrice:   result.CurrentPrice,
-			LeaderBidderID: result.LeaderBidderID,
-			EndTime:        result.EndTime,
-			Extended:       result.Extended,
-			ExtendCount:    result.ExtendCount,
-			Version:        result.Version,
-			Seq:            result.Seq,
-			StreamID:       result.StreamID,
-			CreatedAtMS:    bidAt.UnixMilli(),
-			BidTSMS:        bidAt.UnixMilli(),
-			ServerTime:     bidAt.UTC(),
-			Source:         source,
-			Event:          event,
-			RiskResult:     result.RiskResult,
-			AuctionStatus:  result.AuctionStatus,
-			AutoClosed:     result.AutoClosed,
+			RequestID:       result.RequestID,
+			AuctionID:       result.AuctionID,
+			LiveSessionID:   result.LiveSessionID,
+			BidderID:        result.BidderID,
+			BidderNickname:  result.BidderNickname,
+			Nickname:        result.BidderNickname,
+			BidderAvatarURL: result.BidderAvatarURL,
+			AvatarURL:       result.BidderAvatarURL,
+			Price:           result.Price,
+			Accepted:        result.Accepted,
+			Duplicate:       result.Duplicate,
+			Reason:          result.Reason,
+			CurrentPrice:    result.CurrentPrice,
+			LeaderBidderID:  result.LeaderBidderID,
+			EndTime:         result.EndTime,
+			Extended:        result.Extended,
+			ExtendCount:     result.ExtendCount,
+			Version:         result.Version,
+			Seq:             result.Seq,
+			StreamID:        result.StreamID,
+			CreatedAtMS:     bidAt.UnixMilli(),
+			BidTSMS:         bidAt.UnixMilli(),
+			ServerTime:      bidAt.UTC(),
+			Source:          source,
+			Event:           event,
+			RiskResult:      result.RiskResult,
+			AuctionStatus:   result.AuctionStatus,
+			AutoClosed:      result.AutoClosed,
 		}
 		rawPayload, err := json.Marshal(payload)
 		if err != nil {
@@ -439,55 +450,59 @@ func (s *AuctionRealtimeStore) TopN(ctx context.Context, auctionID uint64, limit
 }
 
 type luaBidResult struct {
-	RequestID      string               `json:"requestId"`
-	AuctionID      uint64               `json:"auctionId"`
-	LiveSessionID  uint64               `json:"liveSessionId"`
-	BidderID       string               `json:"bidderId"`
-	BidderNickname string               `json:"bidderNickname"`
-	Price          int64                `json:"price"`
-	Accepted       bool                 `json:"accepted"`
-	Duplicate      bool                 `json:"duplicate"`
-	Reason         string               `json:"reason"`
-	CurrentPrice   int64                `json:"currentPrice"`
-	LeaderBidderID string               `json:"leaderBidderId"`
-	EndTSMS        int64                `json:"endTsMs"`
-	Extended       bool                 `json:"extended"`
-	ExtendCount    int                  `json:"extendCount"`
-	Version        int64                `json:"version"`
-	Seq            int64                `json:"seq"`
-	StreamID       string               `json:"streamId"`
-	Event          string               `json:"event"`
-	RiskResult     domain.BidRiskResult `json:"riskResult"`
-	AuctionStatus  domain.AuctionStatus `json:"auctionStatus"`
-	AutoClosed     bool                 `json:"autoClosed"`
+	RequestID       string               `json:"requestId"`
+	AuctionID       uint64               `json:"auctionId"`
+	LiveSessionID   uint64               `json:"liveSessionId"`
+	BidderID        string               `json:"bidderId"`
+	BidderNickname  string               `json:"bidderNickname"`
+	BidderAvatarURL string               `json:"bidderAvatarUrl"`
+	Price           int64                `json:"price"`
+	Accepted        bool                 `json:"accepted"`
+	Duplicate       bool                 `json:"duplicate"`
+	Reason          string               `json:"reason"`
+	CurrentPrice    int64                `json:"currentPrice"`
+	LeaderBidderID  string               `json:"leaderBidderId"`
+	EndTSMS         int64                `json:"endTsMs"`
+	Extended        bool                 `json:"extended"`
+	ExtendCount     int                  `json:"extendCount"`
+	Version         int64                `json:"version"`
+	Seq             int64                `json:"seq"`
+	StreamID        string               `json:"streamId"`
+	Event           string               `json:"event"`
+	RiskResult      domain.BidRiskResult `json:"riskResult"`
+	AuctionStatus   domain.AuctionStatus `json:"auctionStatus"`
+	AutoClosed      bool                 `json:"autoClosed"`
 }
 
 type bidAcceptedPublishPayload struct {
-	RequestID      string               `json:"requestId"`
-	AuctionID      uint64               `json:"auctionId"`
-	LiveSessionID  uint64               `json:"liveSessionId"`
-	BidderID       string               `json:"bidderId"`
-	BidderNickname string               `json:"bidderNickname"`
-	Price          int64                `json:"price"`
-	Accepted       bool                 `json:"accepted"`
-	Duplicate      bool                 `json:"duplicate"`
-	Reason         string               `json:"reason"`
-	CurrentPrice   int64                `json:"currentPrice"`
-	LeaderBidderID string               `json:"leaderBidderId"`
-	EndTime        time.Time            `json:"endTime"`
-	Extended       bool                 `json:"extended"`
-	ExtendCount    int                  `json:"extendCount"`
-	Version        int64                `json:"version"`
-	Seq            int64                `json:"seq"`
-	StreamID       string               `json:"streamId"`
-	CreatedAtMS    int64                `json:"createdAtMs"`
-	BidTSMS        int64                `json:"bidTsMs"`
-	ServerTime     time.Time            `json:"serverTime"`
-	Source         string               `json:"source"`
-	Event          string               `json:"event"`
-	RiskResult     domain.BidRiskResult `json:"riskResult"`
-	AuctionStatus  domain.AuctionStatus `json:"auctionStatus"`
-	AutoClosed     bool                 `json:"autoClosed"`
+	RequestID       string               `json:"requestId"`
+	AuctionID       uint64               `json:"auctionId"`
+	LiveSessionID   uint64               `json:"liveSessionId"`
+	BidderID        string               `json:"bidderId"`
+	BidderNickname  string               `json:"bidderNickname"`
+	Nickname        string               `json:"nickname,omitempty"`
+	BidderAvatarURL string               `json:"bidderAvatarUrl,omitempty"`
+	AvatarURL       string               `json:"avatarUrl,omitempty"`
+	Price           int64                `json:"price"`
+	Accepted        bool                 `json:"accepted"`
+	Duplicate       bool                 `json:"duplicate"`
+	Reason          string               `json:"reason"`
+	CurrentPrice    int64                `json:"currentPrice"`
+	LeaderBidderID  string               `json:"leaderBidderId"`
+	EndTime         time.Time            `json:"endTime"`
+	Extended        bool                 `json:"extended"`
+	ExtendCount     int                  `json:"extendCount"`
+	Version         int64                `json:"version"`
+	Seq             int64                `json:"seq"`
+	StreamID        string               `json:"streamId"`
+	CreatedAtMS     int64                `json:"createdAtMs"`
+	BidTSMS         int64                `json:"bidTsMs"`
+	ServerTime      time.Time            `json:"serverTime"`
+	Source          string               `json:"source"`
+	Event           string               `json:"event"`
+	RiskResult      domain.BidRiskResult `json:"riskResult"`
+	AuctionStatus   domain.AuctionStatus `json:"auctionStatus"`
+	AutoClosed      bool                 `json:"autoClosed"`
 }
 
 func decodeBidResult(raw interface{}) (domain.BidResult, error) {
@@ -523,27 +538,30 @@ func decodeBidResultString(text string) (domain.BidResult, error) {
 
 func bidResultFromLuaObject(decoded luaBidResult) domain.BidResult {
 	return domain.BidResult{
-		RequestID:      decoded.RequestID,
-		AuctionID:      decoded.AuctionID,
-		LiveSessionID:  decoded.LiveSessionID,
-		BidderID:       decoded.BidderID,
-		BidderNickname: decoded.BidderNickname,
-		Price:          decoded.Price,
-		Accepted:       decoded.Accepted,
-		Duplicate:      decoded.Duplicate,
-		Reason:         decoded.Reason,
-		CurrentPrice:   decoded.CurrentPrice,
-		LeaderBidderID: decoded.LeaderBidderID,
-		EndTime:        time.UnixMilli(decoded.EndTSMS).UTC(),
-		Extended:       decoded.Extended,
-		ExtendCount:    decoded.ExtendCount,
-		Version:        decoded.Version,
-		Seq:            decoded.Seq,
-		StreamID:       decoded.StreamID,
-		Event:          decoded.Event,
-		RiskResult:     decoded.RiskResult,
-		AuctionStatus:  decoded.AuctionStatus,
-		AutoClosed:     decoded.AutoClosed,
+		RequestID:       decoded.RequestID,
+		AuctionID:       decoded.AuctionID,
+		LiveSessionID:   decoded.LiveSessionID,
+		BidderID:        decoded.BidderID,
+		BidderNickname:  decoded.BidderNickname,
+		Nickname:        decoded.BidderNickname,
+		BidderAvatarURL: decoded.BidderAvatarURL,
+		AvatarURL:       decoded.BidderAvatarURL,
+		Price:           decoded.Price,
+		Accepted:        decoded.Accepted,
+		Duplicate:       decoded.Duplicate,
+		Reason:          decoded.Reason,
+		CurrentPrice:    decoded.CurrentPrice,
+		LeaderBidderID:  decoded.LeaderBidderID,
+		EndTime:         time.UnixMilli(decoded.EndTSMS).UTC(),
+		Extended:        decoded.Extended,
+		ExtendCount:     decoded.ExtendCount,
+		Version:         decoded.Version,
+		Seq:             decoded.Seq,
+		StreamID:        decoded.StreamID,
+		Event:           decoded.Event,
+		RiskResult:      decoded.RiskResult,
+		AuctionStatus:   decoded.AuctionStatus,
+		AutoClosed:      decoded.AutoClosed,
 	}
 }
 
@@ -552,27 +570,30 @@ func decodeBidResultArray(fields []interface{}) (domain.BidResult, error) {
 		return domain.BidResult{}, fmt.Errorf("decode bid result array: got %d fields, want at least 21", len(fields))
 	}
 	return domain.BidResult{
-		RequestID:      arrayString(fields, 0),
-		AuctionID:      uint64(arrayInt64(fields, 1)),
-		LiveSessionID:  uint64(arrayInt64(fields, 2)),
-		BidderID:       arrayString(fields, 3),
-		BidderNickname: arrayString(fields, 4),
-		Price:          arrayInt64(fields, 5),
-		Accepted:       arrayBool(fields, 6),
-		Duplicate:      arrayBool(fields, 7),
-		Reason:         arrayString(fields, 8),
-		CurrentPrice:   arrayInt64(fields, 9),
-		LeaderBidderID: arrayString(fields, 10),
-		EndTime:        time.UnixMilli(arrayInt64(fields, 11)).UTC(),
-		Extended:       arrayBool(fields, 12),
-		ExtendCount:    int(arrayInt64(fields, 13)),
-		Version:        arrayInt64(fields, 14),
-		Seq:            arrayInt64(fields, 15),
-		StreamID:       arrayString(fields, 16),
-		Event:          arrayString(fields, 17),
-		RiskResult:     domain.BidRiskResult(arrayString(fields, 18)),
-		AuctionStatus:  domain.AuctionStatus(arrayString(fields, 19)),
-		AutoClosed:     arrayBool(fields, 20),
+		RequestID:       arrayString(fields, 0),
+		AuctionID:       uint64(arrayInt64(fields, 1)),
+		LiveSessionID:   uint64(arrayInt64(fields, 2)),
+		BidderID:        arrayString(fields, 3),
+		BidderNickname:  arrayString(fields, 4),
+		Nickname:        arrayString(fields, 4),
+		BidderAvatarURL: arrayString(fields, 23),
+		AvatarURL:       arrayString(fields, 23),
+		Price:           arrayInt64(fields, 5),
+		Accepted:        arrayBool(fields, 6),
+		Duplicate:       arrayBool(fields, 7),
+		Reason:          arrayString(fields, 8),
+		CurrentPrice:    arrayInt64(fields, 9),
+		LeaderBidderID:  arrayString(fields, 10),
+		EndTime:         time.UnixMilli(arrayInt64(fields, 11)).UTC(),
+		Extended:        arrayBool(fields, 12),
+		ExtendCount:     int(arrayInt64(fields, 13)),
+		Version:         arrayInt64(fields, 14),
+		Seq:             arrayInt64(fields, 15),
+		StreamID:        arrayString(fields, 16),
+		Event:           arrayString(fields, 17),
+		RiskResult:      domain.BidRiskResult(arrayString(fields, 18)),
+		AuctionStatus:   domain.AuctionStatus(arrayString(fields, 19)),
+		AutoClosed:      arrayBool(fields, 20),
 	}, nil
 }
 

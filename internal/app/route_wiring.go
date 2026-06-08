@@ -42,7 +42,15 @@ type routeWiring struct {
 	descriptionGen           httptransport.ProductDescriptionGenerator
 	metricsRegistry          *metrics.Registry
 	wsHandshakeLimiter       *wstransport.HandshakeLimiter
+	asyncBid                 asyncBidWiring
 	cfg                      appconfig.Config
+}
+
+// asyncBidWiring 聚合异步竞价的 WS handler 依赖。任一为 nil 时 handler 走同步降级。
+type asyncBidWiring struct {
+	bids        httptransport.WSAsyncBidUseCase
+	publisher   httptransport.BidCommandPublisher
+	coordinator *wstransport.BidAsyncCoordinator
 }
 
 func registerAppRoutes(h *server.Hertz, wiring routeWiring) {
@@ -56,6 +64,9 @@ func registerAppRoutes(h *server.Hertz, wiring routeWiring) {
 	imageUploader := objectStorageImageUploader{uploader: wiring.objectUploader}
 	authHandler := httptransport.NewAuthHandler(wiring.authService, imageUploader)
 	auctionHandler := httptransport.NewAuctionHandler(wiring.auctionService, wiring.auctionService, wiring.depositService, wiring.hammerService, imageUploader, wiring.descriptionGen, wiring.cfg.Agent.LiveAnalysisCallbackAPIKey)
+	if rankingService, ok := wiring.bidService.(httptransport.WSAuctionRankingUseCase); ok {
+		auctionHandler.SetRankingService(rankingService)
+	}
 	orderHandler := httptransport.NewOrderHandler(wiring.orderService)
 	adminHandler := httptransport.NewAdminHandler(wiring.adminService)
 	marketplaceHandler := httptransport.NewMarketplaceHandler(wiring.marketplaceService)
@@ -124,10 +135,21 @@ func newWiredWSHandler(wiring routeWiring) *httptransport.WSHandler {
 	}
 	wsHandler.SetRealtimeSnapshotProvider(wiring.realtimeStore)
 	wsHandler.SetLiveSessionRealtimeStore(wiring.liveSessionRealtimeStore)
+	wsHandler.SetBidModeMetrics(wiring.metricsRegistry)
+	// 异步竞价：仅当 async 依赖齐备（kafka.enabled）时注入并切 async 模式；
+	// 否则保持同步（newServerWithDependencies 仅在依赖齐备时构造 coordinator）。
+	asyncReady := wiring.asyncBid.bids != nil && wiring.asyncBid.publisher != nil && wiring.asyncBid.coordinator != nil
+	if asyncReady {
+		wsHandler.SetAsyncBidDependencies(wiring.asyncBid.bids, wiring.asyncBid.publisher, wiring.asyncBid.coordinator)
+	}
 	if isWSGatewayMode(wiring.cfg) {
 		wsHandler.SetBidPlaceMode(httptransport.WSBidPlaceDisabled)
 		wsHandler.SetAllowDBSnapshotFallback(false)
 		wsHandler.SetLiveSessionLookupMode(httptransport.WSLiveSessionLookupRealtime)
+	} else if asyncReady {
+		wsHandler.SetBidPlaceMode(httptransport.WSBidPlaceAsync)
+		wsHandler.SetAllowDBSnapshotFallback(true)
+		wsHandler.SetLiveSessionLookupMode(httptransport.WSLiveSessionLookupService)
 	} else {
 		wsHandler.SetBidPlaceMode(httptransport.WSBidPlaceLocal)
 		wsHandler.SetAllowDBSnapshotFallback(true)
@@ -178,6 +200,7 @@ func registerRESTAPIRoutes(h *server.Hertz, wiring restRouteWiring) {
 
 		auctionState := v1.Group("/auctions", wiring.authHandler.AuthMiddleware())
 		auctionState.GET("/:id/state", wiring.auctionHandler.State)
+		auctionState.GET("/:id/ranking", wiring.auctionHandler.Ranking)
 		auctionState.POST("/:id/enroll", httptransport.RoleAuth(domain.RoleBuyer), wiring.auctionHandler.Enroll)
 
 		auctions := v1.Group("/auctions", wiring.authHandler.AuthMiddleware(), httptransport.RoleAuth(domain.RoleMerchant, domain.RoleAdmin))

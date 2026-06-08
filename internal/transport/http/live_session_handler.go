@@ -41,6 +41,7 @@ type liveSessionCreateRequest struct {
 	Description        string                   `json:"description"`
 	CoverURL           string                   `json:"coverUrl"`
 	Status             domain.LiveSessionStatus `json:"status"`
+	IsDigitalHuman     bool                     `json:"isDigitalHuman"`
 	ScheduledStartTime *time.Time               `json:"scheduledStartTime"`
 	PlannedDurationSec int                      `json:"plannedDurationSec"`
 }
@@ -74,7 +75,7 @@ func (h *LiveSessionHandler) Create(ctx context.Context, c *app.RequestContext) 
 		WriteError(c, 400, 20001, "参数不合法", nil)
 		return
 	}
-	session, err := h.commands.Create(ctx, LiveSessionCreateInput{ActorID: AuthUserID(c), ActorRole: AuthRole(c), MerchantID: req.MerchantID, Title: req.Title, Description: req.Description, CoverURL: req.CoverURL, Status: req.Status, ScheduledStartTime: req.ScheduledStartTime, PlannedDurationSec: req.PlannedDurationSec})
+	session, err := h.commands.Create(ctx, LiveSessionCreateInput{ActorID: AuthUserID(c), ActorRole: AuthRole(c), MerchantID: req.MerchantID, Title: req.Title, Description: req.Description, CoverURL: req.CoverURL, Status: req.Status, IsDigitalHuman: req.IsDigitalHuman, ScheduledStartTime: req.ScheduledStartTime, PlannedDurationSec: req.PlannedDurationSec})
 	if err != nil {
 		writeLiveSessionError(c, err)
 		return
@@ -429,24 +430,30 @@ func (h *LiveSessionHandler) liveSessionViews(ctx context.Context, sessions []do
 }
 
 func (h *LiveSessionHandler) applyLiveSessionPlaybackMode(ctx context.Context, view *domain.LiveSessionView) {
-	if h == nil || h.queries == nil || view == nil || view.ID == 0 {
+	if h == nil || view == nil {
 		return
 	}
+	// 持久化字段是数字人标识的权威来源：刷新/重拉后据此稳定返回 videoSource。
+	if view.IsDigitalHuman {
+		view.VideoSource = "digitalHuman"
+	} else {
+		view.VideoSource = "recorded"
+	}
+	if view.DigitalHuman == nil {
+		view.DigitalHuman = map[string]interface{}{}
+	}
+	if h.queries == nil || view.ID == 0 {
+		return
+	}
+	// 商家级 AI 托管开关快照仅用于实时叠加：同步 aiAssistantEnabled，
+	// 并对迁移前未落库 is_digital_human 的历史场次做兼容回填（不覆盖已落库的数字人标识）。
 	snapshot, err := h.queries.AIAssistantSwitchSnapshot(ctx, view.ID)
 	if err != nil {
-		if strings.TrimSpace(view.VideoSource) == "" {
-			view.VideoSource = "recorded"
-		}
 		return
 	}
 	view.AIAssistantEnabled = snapshot.Enabled
-	if snapshot.Enabled {
+	if snapshot.Enabled && !view.IsDigitalHuman {
 		view.VideoSource = "digitalHuman"
-		return
-	}
-	view.VideoSource = "recorded"
-	if view.DigitalHuman == nil {
-		view.DigitalHuman = map[string]interface{}{}
 	}
 }
 

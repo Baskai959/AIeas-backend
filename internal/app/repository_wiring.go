@@ -6,8 +6,10 @@ import (
 	"strconv"
 	"time"
 
+	appruntime "aieas_backend/internal/app/runtime"
 	appconfig "aieas_backend/internal/config"
 	"aieas_backend/internal/infra/cache"
+	kafkainfra "aieas_backend/internal/infra/kafka"
 	mysqlinfra "aieas_backend/internal/infra/mysql"
 	redisinfra "aieas_backend/internal/infra/redis"
 	adminapp "aieas_backend/internal/modules/admin/app"
@@ -86,7 +88,25 @@ func buildMySQLServerDependencies(cfg appconfig.Config, platform *platformDeps) 
 		BidEventKafkaProducer:               platform.kafkaProducer,
 		BidEventKafkaConsumer:               platform.kafkaBidReader,
 		SettlementEventPublisher:            platform.kafkaProducer,
+		BidCommandConsumer:                  kafkaBidCommandConsumer(platform.kafkaCmdReader),
+		BidCommandPublisher:                 kafkaBidCommandPublisherOrNil(platform.kafkaProducer),
 	}
+}
+
+// kafkaBidCommandConsumer 仅在 reader 非 nil 时返回非 nil 接口值，避免 typed-nil。
+func kafkaBidCommandConsumer(reader *kafkainfra.BidCommandReader) appruntime.BidCommandConsumer {
+	if reader == nil {
+		return nil
+	}
+	return reader
+}
+
+// kafkaBidCommandPublisherOrNil 仅在 producer 非 nil 时返回非 nil 接口值。
+func kafkaBidCommandPublisherOrNil(producer *kafkainfra.Producer) httptransport.BidCommandPublisher {
+	if producer == nil {
+		return nil
+	}
+	return newKafkaBidCommandPublisher(producer)
 }
 
 func pubSubClientsFromShards(sharded *redisinfra.ShardedRTClient) []wstransport.PubSubClient {

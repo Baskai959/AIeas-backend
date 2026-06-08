@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 
+	"aieas_backend/internal/domain"
 	adminapp "aieas_backend/internal/modules/admin/app"
 	aiapp "aieas_backend/internal/modules/ai/app"
 	aiports "aieas_backend/internal/modules/ai/ports"
@@ -132,6 +133,20 @@ type AuctionUpdateInput = auctionapp.UpdateAuctionInput
 type RiskControlUseCase = riskapp.RiskControlUseCase
 
 type WSBidUseCase = auctionapp.WSBidUseCase
+
+// BidCommandSnapshot 是异步竞价命令快照（auction app 边界类型别名）。
+type BidCommandSnapshot = auctionapp.BidCommandSnapshot
+
+// WSAsyncBidUseCase 是异步竞价入口依赖的 auction app 边界：仅做入队前 preCheck。
+type WSAsyncBidUseCase interface {
+	PreCheckForAsync(ctx context.Context, in PlaceBidInput) (BidCommandSnapshot, *domain.BidResult, error)
+}
+
+// BidCommandPublisher 把竞价命令投递到命令流（key=auctionId）。
+// 装配层用 kafka producer 适配实现；producer 为 nil 时不应注入（强制走同步降级）。
+type BidCommandPublisher interface {
+	PublishBidCommand(ctx context.Context, cmd BidCommandSnapshot) error
+}
 
 type WSAuctionRankingUseCase = auctionapp.WSAuctionRankingUseCase
 

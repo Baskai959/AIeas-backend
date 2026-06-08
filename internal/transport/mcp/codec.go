@@ -67,7 +67,11 @@ func decodeParams(raw json.RawMessage, out interface{}) error {
 }
 
 func (h *Handler) payloadText(traceID string, data interface{}) (string, error) {
-	encoded, err := json.Marshal(payloadEnvelope{SchemaVersion: h.schemaVersion, TraceID: traceID, Data: data})
+	displayData, err := mcpMoneyDisplayData(data)
+	if err != nil {
+		return "", err
+	}
+	encoded, err := json.Marshal(payloadEnvelope{SchemaVersion: h.schemaVersion, TraceID: traceID, Data: displayData})
 	if err != nil {
 		return "", err
 	}

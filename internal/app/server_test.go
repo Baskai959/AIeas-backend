@@ -765,15 +765,18 @@ func TestMCPReadLiveSessionBidsAuthorization(t *testing.T) {
 	}
 	var payload struct {
 		Data struct {
-			Items []domain.BidRecord `json:"items"`
+			Items []struct {
+				BidPrice mcpDisplayMoney `json:"bidPrice"`
+			} `json:"items"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal([]byte(toolResult.Content[0].Text), &payload); err != nil {
 		t.Fatalf("decode tool payload: %v text=%s", err, toolResult.Content[0].Text)
 	}
-	if len(payload.Data.Items) != 1 || payload.Data.Items[0].BidPrice != 120000 {
+	if len(payload.Data.Items) != 1 {
 		t.Fatalf("unexpected bid payload: %+v", payload.Data.Items)
 	}
+	assertMCPDisplayMoney(t, payload.Data.Items[0].BidPrice, "1200.00")
 
 	buyerCfg := appconfig.Default()
 	buyerCfg.MCP.Read.APIKey = "buyer-mcp-key"
@@ -874,7 +877,7 @@ func TestMCPLiveControlContextAndOperations(t *testing.T) {
 	if contextResp.status != 200 || contextResp.body.Error != nil {
 		t.Fatalf("expected live context success, status=%d raw=%s", contextResp.status, contextResp.raw)
 	}
-	contextPayload := decodeMCPToolEnvelope[mcpapp.LiveControlContext](t, contextResp)
+	contextPayload := decodeMCPToolEnvelope[mcpDisplayLiveControlContext](t, contextResp)
 	if contextPayload.Data.Session == nil || contextPayload.Data.Session.ID != session.ID {
 		t.Fatalf("unexpected live context: %+v", contextPayload.Data)
 	}
@@ -887,10 +890,11 @@ func TestMCPLiveControlContextAndOperations(t *testing.T) {
 	if onShelfResp.status != 200 || onShelfResp.body.Error != nil {
 		t.Fatalf("expected onShelf success, status=%d raw=%s", onShelfResp.status, onShelfResp.raw)
 	}
-	onShelf := decodeMCPToolEnvelope[mcpapp.LiveLotOperationResult](t, onShelfResp)
+	onShelf := decodeMCPToolEnvelope[mcpDisplayLiveLotOperationResult](t, onShelfResp)
 	if onShelf.Data.Lot == nil || onShelf.Data.Lot.LiveSessionID == nil || *onShelf.Data.Lot.LiveSessionID != session.ID || onShelf.Data.Context == nil || len(onShelf.Data.Context.Lots.UpcomingLots) != 1 {
 		t.Fatalf("unexpected onShelf result: %+v", onShelf.Data)
 	}
+	assertMCPDisplayMoney(t, onShelf.Data.Lot.StartPrice, "10.00")
 
 	missingDurationBody := `{"jsonrpc":"2.0","id":13,"method":"tools/call","params":{"name":"operate_live_session_lot","arguments":{"liveSessionId":` + strconv.FormatUint(session.ID, 10) + `,"auctionId":91001,"action":"startExplain"}}}`
 	missingDurationResp := doMCPPath(t, h.Engine, "/mcp/control", "merchant-live-control-key", missingDurationBody)
@@ -908,23 +912,33 @@ func TestMCPLiveControlContextAndOperations(t *testing.T) {
 		t.Fatalf("update merchant ai permission deny before startExplain: %v", err)
 	}
 	startBody := `{"jsonrpc":"2.0","id":13,"method":"tools/call","params":{"name":"operate_live_session_lot","arguments":{"liveSessionId":` + strconv.FormatUint(session.ID, 10) + `,"auctionId":91001,"action":"startExplain","durationSec":600}}}`
-	startResp := doMCPPath(t, h.Engine, "/mcp/control", "merchant-live-control-key", startBody)
-	if startResp.status != 200 || startResp.body.Error != nil {
-		t.Fatalf("expected startExplain success without AI approval, status=%d raw=%s", startResp.status, startResp.raw)
+	deniedStartResp := doMCPPath(t, h.Engine, "/mcp/control", "merchant-live-control-key", startBody)
+	if deniedStartResp.status != 200 || deniedStartResp.body.Error != nil {
+		t.Fatalf("expected startExplain denial to return MCP tool result, status=%d raw=%s", deniedStartResp.status, deniedStartResp.raw)
+	}
+	var deniedStartTool mcpToolResult
+	mustDecodeData(t, deniedStartResp.body.Result, &deniedStartTool)
+	if !deniedStartTool.IsError {
+		t.Fatalf("expected startExplain to require AI approval and be rejected when permission is deny, raw=%s", deniedStartResp.raw)
 	}
 	merchant.AIPermission = domain.MerchantAIPermissionAllow
 	if err := userRepo.Update(&merchant); err != nil {
 		t.Fatalf("restore merchant ai permission before hammer: %v", err)
 	}
-	started := decodeMCPToolEnvelope[mcpapp.LiveLotOperationResult](t, startResp)
+	startResp := doMCPPath(t, h.Engine, "/mcp/control", "merchant-live-control-key", startBody)
+	if startResp.status != 200 || startResp.body.Error != nil {
+		t.Fatalf("expected startExplain success after AI approval, status=%d raw=%s", startResp.status, startResp.raw)
+	}
+	started := decodeMCPToolEnvelope[mcpDisplayLiveLotOperationResult](t, startResp)
 	if started.Data.Context == nil || started.Data.Context.Lots.ExplainingLot == nil || started.Data.Context.Lots.ExplainingLot.AuctionID != lot.AuctionID {
 		t.Fatalf("expected explaining lot after start, got %+v", started.Data)
 	}
 	if started.Data.Context.CurrentAuctionState == nil ||
 		started.Data.Context.CurrentAuctionState.AuctionID != lot.AuctionID ||
-		started.Data.Context.CurrentAuctionState.CurrentPrice != lot.StartPrice {
+		started.Data.Context.CurrentAuctionState.CurrentPrice.Value != "10.00" {
 		t.Fatalf("expected current auction state after start, got %+v", started.Data.Context.CurrentAuctionState)
 	}
+	assertMCPDisplayMoney(t, started.Data.Context.CurrentAuctionState.CurrentPrice, "10.00")
 
 	voiceBody := `{"jsonrpc":"2.0","id":15,"method":"tools/call","params":{"name":"live_voice_broadcast","arguments":{"liveSessionId":` + strconv.FormatUint(session.ID, 10) + `,"text":"请大家关注当前拍品细节。","requestId":"mcp-live-voice-1"}}}`
 	voiceResp := doMCPPath(t, h.Engine, "/mcp/control", "merchant-live-control-key", voiceBody)
@@ -941,7 +955,7 @@ func TestMCPLiveControlContextAndOperations(t *testing.T) {
 	if hammerResp.status != 200 || hammerResp.body.Error != nil {
 		t.Fatalf("expected hammer success, status=%d raw=%s", hammerResp.status, hammerResp.raw)
 	}
-	hammered := decodeMCPToolEnvelope[mcpapp.LiveLotOperationResult](t, hammerResp)
+	hammered := decodeMCPToolEnvelope[mcpDisplayLiveLotOperationResult](t, hammerResp)
 	if hammered.Data.HammerResult == nil || hammered.Data.HammerResult.Status != domain.AuctionStatusClosedFailed {
 		t.Fatalf("expected closed failed hammer result without bids, got %+v", hammered.Data.HammerResult)
 	}
@@ -2560,6 +2574,52 @@ type mcpToolResult struct {
 		Text string `json:"text"`
 	} `json:"content"`
 	IsError bool `json:"isError"`
+}
+
+type mcpDisplayMoney struct {
+	Value    string `json:"value"`
+	Unit     string `json:"unit"`
+	Currency string `json:"currency"`
+}
+
+type mcpDisplayLot struct {
+	AuctionID     uint64               `json:"auctionId"`
+	LiveSessionID *uint64              `json:"liveSessionId,omitempty"`
+	StartPrice    mcpDisplayMoney      `json:"startPrice"`
+	Status        domain.AuctionStatus `json:"status"`
+}
+
+type mcpDisplayCurrentAuctionState struct {
+	AuctionID    uint64          `json:"auctionId"`
+	CurrentPrice mcpDisplayMoney `json:"currentPrice"`
+}
+
+type mcpDisplayLiveControlContext struct {
+	Session *struct {
+		ID uint64 `json:"id"`
+	} `json:"session,omitempty"`
+	Lots struct {
+		ExplainingLot *mcpDisplayLot  `json:"explainingLot,omitempty"`
+		CandidateLots []mcpDisplayLot `json:"candidateLots"`
+		UpcomingLots  []mcpDisplayLot `json:"upcomingLots"`
+		UnsoldLots    []mcpDisplayLot `json:"unsoldLots"`
+	} `json:"lots"`
+	CurrentAuctionState *mcpDisplayCurrentAuctionState `json:"currentAuctionState,omitempty"`
+}
+
+type mcpDisplayLiveLotOperationResult struct {
+	Lot          *mcpDisplayLot                `json:"lot,omitempty"`
+	Context      *mcpDisplayLiveControlContext `json:"context,omitempty"`
+	HammerResult *struct {
+		Status domain.AuctionStatus `json:"status"`
+	} `json:"hammerResult,omitempty"`
+}
+
+func assertMCPDisplayMoney(t *testing.T, got mcpDisplayMoney, want string) {
+	t.Helper()
+	if got.Value != want || got.Unit != "元" || got.Currency != "CNY" {
+		t.Fatalf("money=%+v want value=%s unit=元 currency=CNY", got, want)
+	}
 }
 
 func decodeMCPToolEnvelope[T any](t *testing.T, resp testMCPResult) struct {

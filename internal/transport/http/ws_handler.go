@@ -66,6 +66,7 @@ type WSBidPlaceMode string
 
 const (
 	WSBidPlaceLocal    WSBidPlaceMode = "local"
+	WSBidPlaceAsync    WSBidPlaceMode = "async"
 	WSBidPlaceDisabled WSBidPlaceMode = "disabled"
 )
 
@@ -87,6 +88,12 @@ type WSHandler struct {
 	bidPlaceMode     WSBidPlaceMode
 	allowDBSnapshot  bool
 	sessionLookup    WSLiveSessionLookupMode
+	// 异步竞价（aieas.bid.commands）相关依赖。async 模式仅在 asyncBids 与
+	// cmdPublisher 均就绪时生效，否则强制降级同步（绝不丢请求）。
+	asyncBids        WSAsyncBidUseCase
+	cmdPublisher     BidCommandPublisher
+	asyncCoord       *corews.BidAsyncCoordinator
+	bidMetrics       WSBidModeMetrics
 	sendBufferSize   int
 	readLimitBytes   int
 	pingInterval     time.Duration
@@ -185,6 +192,61 @@ func (h *WSHandler) SetBidPlaceMode(mode WSBidPlaceMode) {
 		mode = WSBidPlaceLocal
 	}
 	h.bidPlaceMode = mode
+}
+
+// SetAsyncBidDependencies 注入异步竞价依赖：preCheck 入口、命令发布器、进程内协调器。
+// 任一为 nil 时 async 模式自动降级为同步（绝不丢请求）。
+func (h *WSHandler) SetAsyncBidDependencies(bids WSAsyncBidUseCase, publisher BidCommandPublisher, coord *corews.BidAsyncCoordinator) {
+	h.asyncBids = bids
+	h.cmdPublisher = publisher
+	h.asyncCoord = coord
+}
+
+// asyncReady 报告 async 链路是否完整可用。硬约束降级：缺任一依赖即走同步。
+func (h *WSHandler) asyncReady() bool {
+	return h.asyncBids != nil && h.cmdPublisher != nil && h.asyncCoord != nil
+}
+
+// WSBidModeMetrics 是 ws handler 在竞价模式打点路径上依赖的最小指标接口。
+// 所有实现需 nil 安全。
+type WSBidModeMetrics interface {
+	IncBidPlaceMode(mode string)
+	ObserveBidAckDuration(mode, result string, elapsed time.Duration)
+	ObserveBidKafkaEnqueue(elapsed time.Duration)
+	IncBidQueueReject(reason string)
+}
+
+// SetBidModeMetrics 注入竞价模式打点实现。nil 安全。
+func (h *WSHandler) SetBidModeMetrics(m WSBidModeMetrics) {
+	h.bidMetrics = m
+}
+
+func (h *WSHandler) recordBidPlaceMode(mode string) {
+	if h == nil || h.bidMetrics == nil {
+		return
+	}
+	h.bidMetrics.IncBidPlaceMode(mode)
+}
+
+func (h *WSHandler) recordBidQueueReject(reason string) {
+	if h == nil || h.bidMetrics == nil {
+		return
+	}
+	h.bidMetrics.IncBidQueueReject(reason)
+}
+
+func (h *WSHandler) recordBidEnqueueDuration(elapsed time.Duration) {
+	if h == nil || h.bidMetrics == nil {
+		return
+	}
+	h.bidMetrics.ObserveBidKafkaEnqueue(elapsed)
+}
+
+func (h *WSHandler) recordBidAckDuration(mode, result string, elapsed time.Duration) {
+	if h == nil || h.bidMetrics == nil {
+		return
+	}
+	h.bidMetrics.ObserveBidAckDuration(mode, result, elapsed)
 }
 
 func (h *WSHandler) SetAllowDBSnapshotFallback(allow bool) {
@@ -328,6 +390,9 @@ func (h *WSHandler) recordHandshakeReject(reason string) {
 func (h *WSHandler) serveConn(ctx context.Context, conn *websocket.Conn, client *corews.Client, lastSeq int64) {
 	defer func() {
 		h.hub.UnsubscribeClient(client)
+		if h.asyncCoord != nil && client != nil {
+			h.asyncCoord.ReleaseUser(client.UserID)
+		}
 		_ = writeCloseFrameWithGrace(conn, client.CloseReason(), h.closeGrace)
 		_ = conn.Close()
 	}()
@@ -722,7 +787,14 @@ func shouldDeliverInitialRanking(status domain.AuctionStatus) bool {
 func (h *WSHandler) handleInbound(ctx context.Context, client *corews.Client, env corews.Envelope) []corews.Envelope {
 	switch env.Type {
 	case "bid.place":
-		return h.handleBidPlace(ctx, client, env)
+		start := time.Now()
+		responses := h.handleBidPlace(ctx, client, env)
+		mode, result := bidAckMetricLabels(h.bidPlaceMode, responses)
+		h.recordBidAckDuration(mode, result, time.Since(start))
+		return responses
+	case "bid.result.ack":
+		h.handleBidResultAck(env)
+		return nil
 	case "chat.send":
 		return h.handleChatSend(client, env)
 	case "room.subscribe":
@@ -755,6 +827,46 @@ func (h *WSHandler) handleInbound(ctx context.Context, client *corews.Client, en
 	default:
 		return h.hub.HandleInbound(ctx, client, env)
 	}
+}
+
+func bidAckMetricLabels(handlerMode WSBidPlaceMode, responses []corews.Envelope) (string, string) {
+	mode := strings.ToLower(strings.TrimSpace(string(handlerMode)))
+	if mode == "" {
+		mode = "unknown"
+	}
+	result := "unknown"
+	for _, response := range responses {
+		if response.Type != "bid.ack" {
+			continue
+		}
+		var payload struct {
+			Mode     string `json:"mode"`
+			Status   string `json:"status"`
+			Accepted bool   `json:"accepted"`
+		}
+		if len(response.Payload) > 0 {
+			_ = json.Unmarshal(response.Payload, &payload)
+		}
+		if payload.Mode != "" {
+			mode = strings.ToLower(strings.TrimSpace(payload.Mode))
+		}
+		switch strings.ToUpper(strings.TrimSpace(payload.Status)) {
+		case "QUEUED":
+			result = "queued"
+		case "REJECTED":
+			result = "rejected"
+		case "ACCEPTED", "ALLOW", "ALLOWED":
+			result = "accepted"
+		default:
+			if payload.Accepted {
+				result = "accepted"
+			} else {
+				result = "rejected"
+			}
+		}
+		return mode, result
+	}
+	return mode, result
 }
 
 func (h *WSHandler) handleChatSend(client *corews.Client, env corews.Envelope) []corews.Envelope {
@@ -835,7 +947,7 @@ func (h *WSHandler) handleBidPlace(ctx context.Context, client *corews.Client, e
 	if payload.ExpectedCurrentPrice == nil {
 		return []corews.Envelope{jsonEnvelope("bid.ack", requestID, map[string]interface{}{"accepted": false, "reason": "MISSING_EXPECTED_STATE"})}
 	}
-	result, err := h.bids.Place(ctx, PlaceBidInput{
+	in := PlaceBidInput{
 		RequestID:            requestID,
 		AuctionID:            auctionID,
 		BidderID:             client.UserID,
@@ -843,12 +955,90 @@ func (h *WSHandler) handleBidPlace(ctx context.Context, client *corews.Client, e
 		Price:                payload.Price,
 		ExpectedCurrentPrice: payload.ExpectedCurrentPrice,
 		Source:               "live_ws",
-	})
+	}
+	// 异步模式：仅在 async 链路完整就绪时生效，否则强制降级同步（绝不丢请求）。
+	if h.bidPlaceMode == WSBidPlaceAsync && h.asyncReady() {
+		return h.handleBidPlaceAsync(ctx, client, in)
+	}
+	h.recordBidPlaceMode("sync")
+	result, err := h.bids.Place(ctx, in)
 	if err != nil {
 		_, code, message := HTTPStatusAndCode(err)
 		return []corews.Envelope{jsonEnvelope("bid.ack", requestID, map[string]interface{}{"accepted": false, "code": code, "reason": message})}
 	}
 	return []corews.Envelope{jsonEnvelope("bid.ack", requestID, result)}
+}
+
+// handleBidPlaceAsync 异步分支：preCheck → 队列保护 → 发布命令 → 登记 pending →
+// 立即回 QUEUED。preCheck 失败/前置裁定直接回 ASYNC 终态 ack，不入队。
+func (h *WSHandler) handleBidPlaceAsync(ctx context.Context, client *corews.Client, in PlaceBidInput) []corews.Envelope {
+	h.recordBidPlaceMode("async")
+	snapshot, terminal, err := h.asyncBids.PreCheckForAsync(ctx, in)
+	if err != nil {
+		_, code, message := HTTPStatusAndCode(err)
+		return []corews.Envelope{jsonEnvelope("bid.ack", in.RequestID, map[string]interface{}{
+			"mode": "ASYNC", "status": "REJECTED", "accepted": false, "code": code, "reason": message,
+		})}
+	}
+	if terminal != nil {
+		return []corews.Envelope{jsonEnvelope("bid.ack", in.RequestID, map[string]interface{}{
+			"mode": "ASYNC", "status": "REJECTED", "accepted": terminal.Accepted, "reason": terminal.Reason,
+			"auctionId": in.AuctionID, "bidId": in.RequestID,
+		})}
+	}
+	// 队列保护：超阈值 / 同用户同拍品已在途直接拒，不入队。
+	if ok, reason := h.asyncCoord.TryEnqueue(in.AuctionID, client.LiveSessionID, client.UserID, in.RequestID); !ok {
+		h.recordBidQueueReject(reason)
+		return []corews.Envelope{jsonEnvelope("bid.ack", in.RequestID, map[string]interface{}{
+			"mode": "ASYNC", "status": "REJECTED", "accepted": false, "reason": reason,
+			"auctionId": in.AuctionID, "bidId": in.RequestID,
+		})}
+	}
+	snapshot.LiveSessionID = orDefaultUint64(snapshot.LiveSessionID, client.LiveSessionID)
+	enqueueStart := time.Now()
+	if err := h.cmdPublisher.PublishBidCommand(ctx, snapshot); err != nil {
+		// 发布失败：释放 pending，回退同步执行，绝不丢请求。
+		h.asyncCoord.HandleAck(in.RequestID)
+		h.recordBidPlaceMode("async_fallback_sync")
+		result, syncErr := h.bids.Place(ctx, in)
+		if syncErr != nil {
+			_, code, message := HTTPStatusAndCode(syncErr)
+			return []corews.Envelope{jsonEnvelope("bid.ack", in.RequestID, map[string]interface{}{"accepted": false, "code": code, "reason": message})}
+		}
+		return []corews.Envelope{jsonEnvelope("bid.ack", in.RequestID, result)}
+	}
+	h.recordBidEnqueueDuration(time.Since(enqueueStart))
+	return []corews.Envelope{jsonEnvelope("bid.ack", in.RequestID, map[string]interface{}{
+		"mode": "ASYNC", "status": "QUEUED", "bidId": in.RequestID, "auctionId": in.AuctionID,
+	})}
+}
+
+// handleBidResultAck 处理入站 bid.result.ack：释放该 bidId 的 pending + 停止重发。
+func (h *WSHandler) handleBidResultAck(env corews.Envelope) {
+	if h.asyncCoord == nil {
+		return
+	}
+	var payload struct {
+		BidID string `json:"bidId"`
+	}
+	if len(env.Payload) > 0 {
+		_ = json.Unmarshal(env.Payload, &payload)
+	}
+	bidID := strings.TrimSpace(payload.BidID)
+	if bidID == "" {
+		bidID = strings.TrimSpace(env.RequestID)
+	}
+	if bidID == "" {
+		return
+	}
+	h.asyncCoord.HandleAck(bidID)
+}
+
+func orDefaultUint64(v, fallback uint64) uint64 {
+	if v != 0 {
+		return v
+	}
+	return fallback
 }
 
 func jsonEnvelope(eventType, requestID string, payload interface{}) corews.Envelope {

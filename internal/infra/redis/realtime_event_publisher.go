@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -67,6 +68,30 @@ func (p *RealtimeEventPublisher) PublishLiveSessionEvent(ctx context.Context, li
 	pubCtx, cancel := realtimePublishContext(ctx)
 	defer cancel()
 	channel := "live_session:" + strconv.FormatUint(liveSessionID, 10) + ":events"
+	return client.Publish(pubCtx, channel, raw).Err()
+}
+
+func (p *RealtimeEventPublisher) PublishLiveSessionUserEvent(ctx context.Context, liveSessionID uint64, userID, eventType, requestID string, seq int64, payload json.RawMessage) error {
+	userID = strings.TrimSpace(userID)
+	if p == nil || p.sharded == nil || liveSessionID == 0 || userID == "" || strings.TrimSpace(eventType) == "" {
+		return nil
+	}
+	client := p.sharded.ForSession(liveSessionID)
+	if client == nil {
+		return nil
+	}
+	raw, err := mergeRealtimeEventPayload(payload, map[string]interface{}{
+		"event":         strings.TrimSpace(eventType),
+		"requestId":     strings.TrimSpace(requestID),
+		"seq":           seq,
+		"liveSessionId": liveSessionID,
+	})
+	if err != nil {
+		return err
+	}
+	pubCtx, cancel := realtimePublishContext(ctx)
+	defer cancel()
+	channel := "live_session:" + strconv.FormatUint(liveSessionID, 10) + ":user:" + url.PathEscape(userID) + ":events"
 	return client.Publish(pubCtx, channel, raw).Err()
 }
 

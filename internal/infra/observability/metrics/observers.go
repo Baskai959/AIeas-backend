@@ -117,6 +117,109 @@ func (r *Registry) IncBidFreqLimit() {
 	r.bidFreqLimitTotal.Inc()
 }
 
+// ----- Async bid (异步竞价裁决) -----
+
+// IncBidPlaceMode 记录一次出价走的路由模式（sync/async/async_fallback_sync）。
+func (r *Registry) IncBidPlaceMode(mode string) {
+	if !r.Enabled() {
+		return
+	}
+	if mode == "" {
+		mode = "unknown"
+	}
+	r.bidPlaceModeTotal.WithLabelValues(mode).Inc()
+}
+
+// ObserveBidAckDuration 记录 WS bid.place 到 bid.ack 入出站处理完成的耗时。
+func (r *Registry) ObserveBidAckDuration(mode, result string, elapsed time.Duration) {
+	if !r.Enabled() {
+		return
+	}
+	if mode == "" {
+		mode = "unknown"
+	}
+	if result == "" {
+		result = "unknown"
+	}
+	r.bidAckDuration.WithLabelValues(mode, result).Observe(elapsed.Seconds())
+}
+
+// ObserveBidKafkaEnqueue 记录异步命令入队（PublishBidCommand）耗时。
+func (r *Registry) ObserveBidKafkaEnqueue(elapsed time.Duration) {
+	if !r.Enabled() {
+		return
+	}
+	r.bidKafkaEnqueueDuration.Observe(elapsed.Seconds())
+}
+
+// ObserveBidDecisionDuration 记录 worker 裁决（ArbitrateFromCommand）耗时。
+func (r *Registry) ObserveBidDecisionDuration(result string, elapsed time.Duration) {
+	if !r.Enabled() {
+		return
+	}
+	if result == "" {
+		result = "unknown"
+	}
+	r.bidDecisionDuration.WithLabelValues(result).Observe(elapsed.Seconds())
+}
+
+// SetBidPendingQueueSize 设置当前全局待裁决队列长度。
+func (r *Registry) SetBidPendingQueueSize(size int) {
+	if !r.Enabled() {
+		return
+	}
+	r.bidPendingQueueSize.Set(float64(size))
+}
+
+// ObserveBidResultPush 记录 bid.result 定向推送耗时。
+func (r *Registry) ObserveBidResultPush(elapsed time.Duration) {
+	if !r.Enabled() {
+		return
+	}
+	r.bidResultPushDuration.Observe(elapsed.Seconds())
+}
+
+// ObserveBidResultDuration 记录异步出价从 pending 入队到 bid.result 定向推送的端到端耗时。
+func (r *Registry) ObserveBidResultDuration(outcome string, elapsed time.Duration) {
+	if !r.Enabled() {
+		return
+	}
+	if outcome == "" {
+		outcome = "unknown"
+	}
+	r.bidResultDuration.WithLabelValues(outcome).Observe(elapsed.Seconds())
+}
+
+// IncBidResultAckTimeout 记录一次 bid.result ack 超时（触发重发或超限）。
+func (r *Registry) IncBidResultAckTimeout() {
+	if !r.Enabled() {
+		return
+	}
+	r.bidResultAckTimeoutTot.Inc()
+}
+
+// IncBidQueueReject 记录一次队列保护拒绝。
+func (r *Registry) IncBidQueueReject(reason string) {
+	if !r.Enabled() {
+		return
+	}
+	if reason == "" {
+		reason = "unknown"
+	}
+	r.bidQueueRejectTotal.WithLabelValues(reason).Inc()
+}
+
+// IncBidDecisionOutcome 记录一次裁决终态（accepted/rejected/duplicate/error）。
+func (r *Registry) IncBidDecisionOutcome(outcome string) {
+	if !r.Enabled() {
+		return
+	}
+	if outcome == "" {
+		outcome = "unknown"
+	}
+	r.bidDecisionOutcomeTotal.WithLabelValues(outcome).Inc()
+}
+
 // ----- Hammer -----
 
 func (r *Registry) ObserveHammer(result string, elapsed time.Duration) {

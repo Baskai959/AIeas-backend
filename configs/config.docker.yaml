@@ -196,6 +196,8 @@ kafka:
   clientID: "aieas-backend"
   # 出价事件 topic。
   bidEventsTopic: "aieas.bid.events"
+  # 异步竞价命令 topic。
+  bidCommandsTopic: "aieas.bid.commands"
   # 拍卖事件 topic。
   auctionEventsTopic: "aieas.auction.events"
   # 订单事件 topic。
@@ -204,6 +206,8 @@ kafka:
   bidBridgeGroup: "aieas-bid-kafka-bridge"
   # 出价记录落库 consumer group。
   bidRecordGroup: "aieas-bid-record-writers"
+  # 异步竞价裁决 consumer group。
+  bidDecisionGroup: "aieas-bid-decision-workers"
 
 # MCP 读写接口鉴权配置。
 mcp:

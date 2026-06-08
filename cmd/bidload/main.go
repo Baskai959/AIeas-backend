@@ -88,6 +88,7 @@ type envelope struct {
 	Payload   json.RawMessage `json:"payload,omitempty"`
 }
 
+// bidResult 兼容同步 bid.ack / 房间广播 bid.accepted | bid.rejected payload。
 type bidResult struct {
 	RequestID      string `json:"requestId"`
 	AuctionID      uint64 `json:"auctionId"`
@@ -96,12 +97,46 @@ type bidResult struct {
 	Accepted       bool   `json:"accepted"`
 	Duplicate      bool   `json:"duplicate"`
 	Reason         string `json:"reason"`
+	Code           string `json:"code"`
 	CurrentPrice   int64  `json:"currentPrice"`
 	LeaderBidderID string `json:"leaderBidderId"`
 	Version        int64  `json:"version"`
 	Seq            int64  `json:"seq"`
 	Event          string `json:"event"`
 	AuctionStatus  string `json:"auctionStatus"`
+}
+
+// bidAckPayload 解析 S→C bid.ack 的 payload（同步形态 + 异步 ASYNC 形态）。
+//   - 同步形态：mode 缺省，accepted/code/reason/currentPrice/... 等同 BidResult 字段。
+//   - 异步形态：mode="ASYNC"，status="QUEUED"|"REJECTED"，bidId 必填。
+type bidAckPayload struct {
+	Mode           string `json:"mode"`
+	Status         string `json:"status"`
+	BidID          string `json:"bidId"`
+	AuctionID      uint64 `json:"auctionId"`
+	RequestID      string `json:"requestId"`
+	Reason         string `json:"reason"`
+	Code           string `json:"code"`
+	Accepted       *bool  `json:"accepted"`
+	Duplicate      bool   `json:"duplicate"`
+	CurrentPrice   int64  `json:"currentPrice"`
+	LeaderBidderID string `json:"leaderBidderId"`
+	Version        int64  `json:"version"`
+	Seq            int64  `json:"seq"`
+}
+
+// bidResultPayload 解析异步终态帧 S→C bid.result 的 payload。
+type bidResultPayload struct {
+	BidID          string `json:"bidId"`
+	AuctionID      uint64 `json:"auctionId"`
+	FinalStatus    string `json:"finalStatus"`
+	Reason         string `json:"reason"`
+	Code           string `json:"code"`
+	CurrentPrice   int64  `json:"currentPrice"`
+	LeaderBidderID string `json:"leaderBidderId"`
+	EndTimeMs      int64  `json:"endTimeMs"`
+	ServerTimeMs   int64  `json:"serverTimeMs"`
+	ResultSeq      int64  `json:"resultSeq"`
 }
 
 type sharedAuctionState struct {
@@ -143,9 +178,16 @@ type counters struct {
 	sent              atomic.Int64
 	writeErr          atomic.Int64
 	ack               atomic.Int64
-	accepted          atomic.Int64
-	rejected          atomic.Int64
-	duplicate         atomic.Int64
+	syncAcked         atomic.Int64 // 收到同步 bid.ack（无 mode）的次数
+	asyncQueued       atomic.Int64 // 收到异步 bid.ack mode=ASYNC status=QUEUED 的次数
+	asyncResulted     atomic.Int64 // 收到异步 bid.result 终态帧的次数（去重前）
+	accepted          atomic.Int64 // 终态 ACCEPTED 总数（同步+异步）
+	rejected          atomic.Int64 // 终态 REJECTED 总数（同步+异步，含队列保护）
+	queueRejected     atomic.Int64 // 异步 bid.ack REJECTED（队列保护拒因）数量
+	duplicate         atomic.Int64 // BidResult.duplicate=true 数量
+	resultDuplicates  atomic.Int64 // 同 bidId 多次收到 bid.result 的重复次数
+	resultAckSent     atomic.Int64 // 已回发 bid.result.ack 的次数
+	resultAckErr      atomic.Int64 // 回发 bid.result.ack 失败次数
 	readErr           atomic.Int64
 	broadcastAccepted atomic.Int64
 	broadcastRejected atomic.Int64
@@ -227,29 +269,108 @@ type latencySummary struct {
 	Max   int64
 }
 
+// inflightStage 标记某个 bidId 当前在压测端的处理阶段。
+type inflightStage int
+
+const (
+	stagePending inflightStage = iota // 已发送，未收到任何 bid.ack
+	stageQueued                       // 已收到异步 bid.ack mode=ASYNC status=QUEUED，等待 bid.result
+)
+
+type inflightEntry struct {
+	sentAt time.Time
+	stage  inflightStage
+}
+
+// sentTracker 记录在飞 bid 的发送时间与异步阶段，并对终态做幂等去重（resulted 集合）。
 type sentTracker struct {
-	mu sync.Mutex
-	ts map[string]time.Time
+	mu       sync.Mutex
+	inflight map[string]*inflightEntry
+	resulted map[string]time.Time // 已经计入终态统计的 bidId（用于去重 + 过期清理）
 }
 
 func newSentTracker() *sentTracker {
-	return &sentTracker{ts: make(map[string]time.Time)}
+	return &sentTracker{
+		inflight: make(map[string]*inflightEntry),
+		resulted: make(map[string]time.Time),
+	}
 }
 
 func (s *sentTracker) put(requestID string, t time.Time) {
 	s.mu.Lock()
-	s.ts[requestID] = t
+	s.inflight[requestID] = &inflightEntry{sentAt: t, stage: stagePending}
 	s.mu.Unlock()
 }
 
+// take 返回 bidId 的发送时间并将其从 inflight 表里移除（终态使用）。
 func (s *sentTracker) take(requestID string) (time.Time, bool) {
 	s.mu.Lock()
-	t, ok := s.ts[requestID]
-	if ok {
-		delete(s.ts, requestID)
+	defer s.mu.Unlock()
+	entry, ok := s.inflight[requestID]
+	if !ok {
+		return time.Time{}, false
 	}
-	s.mu.Unlock()
-	return t, ok
+	delete(s.inflight, requestID)
+	return entry.sentAt, true
+}
+
+// peek 仅查看发送时间，不移除（异步 QUEUED 中间态使用）。
+func (s *sentTracker) peek(requestID string) (time.Time, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	entry, ok := s.inflight[requestID]
+	if !ok {
+		return time.Time{}, false
+	}
+	return entry.sentAt, true
+}
+
+// markQueued 将 bidId 标记为已入队，仍保留发送时间。
+func (s *sentTracker) markQueued(requestID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if entry, ok := s.inflight[requestID]; ok {
+		entry.stage = stageQueued
+	}
+}
+
+// finalize 尝试把 bidId 设为终态：
+//   - 返回 sentAt：若该 bidId 仍在 inflight 中则给出，并从表里删除。
+//   - 返回 firstFinal：true 表示这是首个终态（应计入统计）；false 表示重复终态（应忽略统计但仍要回 ack）。
+func (s *sentTracker) finalize(requestID string, now time.Time) (sentAt time.Time, hasSent bool, firstFinal bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, dup := s.resulted[requestID]; dup {
+		// 已经终态过：刷新过期时间避免提前清理，但不计入统计。
+		s.resulted[requestID] = now
+		if entry, ok := s.inflight[requestID]; ok {
+			delete(s.inflight, requestID)
+			return entry.sentAt, true, false
+		}
+		return time.Time{}, false, false
+	}
+	s.resulted[requestID] = now
+	if entry, ok := s.inflight[requestID]; ok {
+		delete(s.inflight, requestID)
+		return entry.sentAt, true, true
+	}
+	return time.Time{}, false, true
+}
+
+// gc 清理超过 ttl 的 inflight 与 resulted 条目，避免长时间运行内存泄漏。
+func (s *sentTracker) gc(now time.Time, inflightTTL, resultedTTL time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for k, entry := range s.inflight {
+		if now.Sub(entry.sentAt) > inflightTTL {
+			delete(s.inflight, k)
+		}
+	}
+	for k, ts := range s.resulted {
+		if now.Sub(ts) > resultedTTL {
+			delete(s.resulted, k)
+		}
+	}
 }
 
 func main() {
@@ -270,7 +391,9 @@ func main() {
 	stats := &counters{}
 	reasons := newReasonCounters()
 	connectReasons := newReasonCounters()
-	latencies := &latencyRecorder{}
+	queueReasons := newReasonCounters()
+	syncLatencies := &latencyRecorder{}
+	asyncLatencies := &latencyRecorder{}
 	tracker := newSentTracker()
 	sharedState := &sharedAuctionState{}
 
@@ -313,12 +436,13 @@ func main() {
 		wg.Add(1)
 		go func(b buyer, ch <-chan struct{}) {
 			defer wg.Done()
-			runBuyer(runCtx, cfg, b, ch, sharedState, stats, connectReasons, reasons, latencies, tracker)
+			runBuyer(runCtx, cfg, b, ch, sharedState, stats, connectReasons, reasons, queueReasons, syncLatencies, asyncLatencies, tracker)
 		}(buyers[i], jobs[i])
 	}
 
 	start := time.Now()
-	go printProgress(runCtx, start, cfg.PrintInterval, stats, latencies)
+	go printProgress(runCtx, start, cfg.PrintInterval, stats, syncLatencies, asyncLatencies)
+	go gcInflight(runCtx, tracker)
 
 	scheduleBids(runCtx, cfg, jobs)
 	for _, ch := range jobs {
@@ -326,7 +450,7 @@ func main() {
 	}
 	wg.Wait()
 
-	printFinal(time.Since(start), cfg, stats, connectReasons, reasons, latencies.summary())
+	printFinal(time.Since(start), cfg, stats, connectReasons, reasons, queueReasons, syncLatencies.summary(), asyncLatencies.summary())
 }
 
 func parseFlags() config {
@@ -526,7 +650,7 @@ func pollAuctionState(ctx context.Context, client *http.Client, cfg config, toke
 	}
 }
 
-func runBuyer(ctx context.Context, cfg config, b buyer, jobs <-chan struct{}, sharedState *sharedAuctionState, stats *counters, connectReasons *reasonCounters, bidReasons *reasonCounters, latencies *latencyRecorder, tracker *sentTracker) {
+func runBuyer(ctx context.Context, cfg config, b buyer, jobs <-chan struct{}, sharedState *sharedAuctionState, stats *counters, connectReasons *reasonCounters, bidReasons *reasonCounters, queueReasons *reasonCounters, syncLatencies *latencyRecorder, asyncLatencies *latencyRecorder, tracker *sentTracker) {
 	conn, err := dialWebSocket(ctx, cfg, b.Token)
 	if err != nil {
 		stats.connectErr.Add(1)
@@ -540,7 +664,7 @@ func runBuyer(ctx context.Context, cfg config, b buyer, jobs <-chan struct{}, sh
 	var writeMu sync.Mutex
 	go func() {
 		defer close(done)
-		readLoop(ctx, conn, sharedState, stats, bidReasons, latencies, tracker)
+		readLoop(ctx, conn, &writeMu, sharedState, stats, bidReasons, queueReasons, syncLatencies, asyncLatencies, tracker)
 	}()
 
 	var seq int64
@@ -631,7 +755,7 @@ func classifyConnectError(err error) string {
 	return "connect_error"
 }
 
-func readLoop(ctx context.Context, conn *websocket.Conn, sharedState *sharedAuctionState, stats *counters, reasons *reasonCounters, latencies *latencyRecorder, tracker *sentTracker) {
+func readLoop(ctx context.Context, conn *websocket.Conn, writeMu *sync.Mutex, sharedState *sharedAuctionState, stats *counters, reasons *reasonCounters, queueReasons *reasonCounters, syncLatencies *latencyRecorder, asyncLatencies *latencyRecorder, tracker *sentTracker) {
 	for {
 		var env envelope
 		if err := conn.ReadJSON(&env); err != nil {
@@ -647,26 +771,9 @@ func readLoop(ctx context.Context, conn *websocket.Conn, sharedState *sharedAuct
 				sharedState.update(state.CurrentPrice, state.Version, env.Seq)
 			}
 		case "bid.ack":
-			stats.ack.Add(1)
-			var result bidResult
-			if json.Unmarshal(env.Payload, &result) == nil {
-				if sentAt, ok := tracker.take(env.RequestID); ok {
-					latencies.add(time.Since(sentAt))
-				}
-				if result.Accepted {
-					stats.accepted.Add(1)
-					sharedState.update(result.CurrentPrice, result.Version, result.Seq)
-				} else {
-					stats.rejected.Add(1)
-					reasons.inc(result.Reason)
-					if result.CurrentPrice > 0 || result.Version > 0 {
-						sharedState.update(result.CurrentPrice, result.Version, result.Seq)
-					}
-				}
-				if result.Duplicate {
-					stats.duplicate.Add(1)
-				}
-			}
+			handleBidAck(env, stats, reasons, queueReasons, syncLatencies, tracker, sharedState)
+		case "bid.result":
+			handleBidResult(conn, writeMu, env, stats, reasons, asyncLatencies, tracker, sharedState)
 		case "bid.accepted":
 			stats.broadcastAccepted.Add(1)
 			var result bidResult
@@ -679,8 +786,171 @@ func readLoop(ctx context.Context, conn *websocket.Conn, sharedState *sharedAuct
 			if json.Unmarshal(env.Payload, &result) == nil {
 				sharedState.update(result.CurrentPrice, result.Version, env.Seq)
 			}
+		default:
+			// 未知/无关帧（ranking.updated / auction.state / presence.snapshot /
+			// live.voice_broadcast / ai.assistant.switch / heartbeat 等）一律忽略，
+			// 不能让它们打断压测或被错误归类。
 		}
 	}
+}
+
+// handleBidAck 同时处理同步和异步形态的 bid.ack。
+func handleBidAck(env envelope, stats *counters, reasons *reasonCounters, queueReasons *reasonCounters, syncLatencies *latencyRecorder, tracker *sentTracker, sharedState *sharedAuctionState) {
+	stats.ack.Add(1)
+	if len(env.Payload) == 0 {
+		return
+	}
+	var ack bidAckPayload
+	if err := json.Unmarshal(env.Payload, &ack); err != nil {
+		return
+	}
+	bidID := ack.BidID
+	if bidID == "" {
+		bidID = ack.RequestID
+	}
+	if bidID == "" {
+		bidID = env.RequestID
+	}
+
+	if strings.EqualFold(ack.Mode, "ASYNC") {
+		// 异步形态：QUEUED 表示已入队待裁决；REJECTED 是终态失败（含队列保护）。
+		switch strings.ToUpper(ack.Status) {
+		case "QUEUED":
+			stats.asyncQueued.Add(1)
+			if bidID != "" {
+				tracker.markQueued(bidID)
+			}
+		case "REJECTED":
+			stats.queueRejected.Add(1)
+			stats.rejected.Add(1)
+			reasonStr := ack.Code
+			if reasonStr == "" {
+				reasonStr = ack.Reason
+			}
+			reasons.inc(reasonStr)
+			queueReasons.inc(reasonStr)
+			if bidID != "" {
+				if sentAt, hasSent, firstFinal := tracker.finalize(bidID, time.Now()); hasSent && firstFinal {
+					syncLatencies.add(time.Since(sentAt))
+				}
+			}
+		default:
+			// 未知 status 不当作终态。
+		}
+		return
+	}
+
+	// 同步形态：直接按 accepted 定终态。
+	stats.syncAcked.Add(1)
+	var result bidResult
+	if err := json.Unmarshal(env.Payload, &result); err != nil {
+		return
+	}
+	target := bidID
+	if target == "" {
+		target = result.RequestID
+	}
+	if target == "" {
+		target = env.RequestID
+	}
+	now := time.Now()
+	if target != "" {
+		if sentAt, hasSent, firstFinal := tracker.finalize(target, now); hasSent && firstFinal {
+			syncLatencies.add(now.Sub(sentAt))
+		} else if !firstFinal {
+			// 重复同步终态，不计入。
+			return
+		}
+	}
+	if result.Accepted {
+		stats.accepted.Add(1)
+		sharedState.update(result.CurrentPrice, result.Version, result.Seq)
+	} else {
+		stats.rejected.Add(1)
+		reasonStr := result.Code
+		if reasonStr == "" {
+			reasonStr = result.Reason
+		}
+		reasons.inc(reasonStr)
+		if result.CurrentPrice > 0 || result.Version > 0 {
+			sharedState.update(result.CurrentPrice, result.Version, result.Seq)
+		}
+	}
+	if result.Duplicate {
+		stats.duplicate.Add(1)
+	}
+}
+
+// handleBidResult 处理异步终态 bid.result 帧：去重统计 + 必须回 bid.result.ack。
+func handleBidResult(conn *websocket.Conn, writeMu *sync.Mutex, env envelope, stats *counters, reasons *reasonCounters, asyncLatencies *latencyRecorder, tracker *sentTracker, sharedState *sharedAuctionState) {
+	stats.asyncResulted.Add(1)
+	if len(env.Payload) == 0 {
+		return
+	}
+	var result bidResultPayload
+	if err := json.Unmarshal(env.Payload, &result); err != nil {
+		return
+	}
+	bidID := result.BidID
+	if bidID == "" {
+		bidID = env.RequestID
+	}
+
+	now := time.Now()
+	firstFinal := true
+	if bidID != "" {
+		sentAt, hasSent, first := tracker.finalize(bidID, now)
+		firstFinal = first
+		if first && hasSent {
+			asyncLatencies.add(now.Sub(sentAt))
+		}
+	}
+
+	if firstFinal {
+		switch strings.ToUpper(result.FinalStatus) {
+		case "ACCEPTED":
+			stats.accepted.Add(1)
+			if result.CurrentPrice > 0 {
+				sharedState.update(result.CurrentPrice, 0, result.ResultSeq)
+			}
+		case "REJECTED":
+			stats.rejected.Add(1)
+			reasonStr := result.Code
+			if reasonStr == "" {
+				reasonStr = result.Reason
+			}
+			reasons.inc(reasonStr)
+		default:
+			// 未知 finalStatus：保守不计 accepted/rejected，但仍回 ack。
+		}
+	} else {
+		stats.resultDuplicates.Add(1)
+	}
+
+	// 不论是否首个终态都必须回 bid.result.ack，否则后端会重发。
+	if bidID != "" {
+		if err := sendResultAck(conn, writeMu, bidID); err != nil {
+			stats.resultAckErr.Add(1)
+		} else {
+			stats.resultAckSent.Add(1)
+		}
+	}
+}
+
+// sendResultAck 发送 C→S bid.result.ack {"type":"bid.result.ack","payload":{"bidId":...}}。
+func sendResultAck(conn *websocket.Conn, writeMu *sync.Mutex, bidID string) error {
+	payload, err := json.Marshal(map[string]string{"bidId": bidID})
+	if err != nil {
+		return err
+	}
+	env := envelope{
+		Type:    "bid.result.ack",
+		Payload: payload,
+	}
+	writeMu.Lock()
+	err = conn.WriteJSON(env)
+	writeMu.Unlock()
+	return err
 }
 
 func sendBid(conn *websocket.Conn, writeMu *sync.Mutex, cfg config, b buyer, seq int64, sharedState *sharedAuctionState, tracker *sentTracker) error {
@@ -739,7 +1009,7 @@ func scheduleBids(ctx context.Context, cfg config, jobs []chan struct{}) {
 	}
 }
 
-func printProgress(ctx context.Context, started time.Time, interval time.Duration, stats *counters, latencies *latencyRecorder) {
+func printProgress(ctx context.Context, started time.Time, interval time.Duration, stats *counters, syncLatencies *latencyRecorder, asyncLatencies *latencyRecorder) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
@@ -748,17 +1018,23 @@ func printProgress(ctx context.Context, started time.Time, interval time.Duratio
 			return
 		case <-ticker.C:
 			elapsed := time.Since(started).Seconds()
-			lat := latencies.summary()
+			syncLat := syncLatencies.summary()
+			asyncLat := asyncLatencies.summary()
 			fmt.Printf(
-				"elapsed=%.0fs sent=%d ack=%d accepted=%d rejected=%d qps=%.1f accepted/s=%.1f p95=%s writeErr=%d readErr=%d\n",
+				"elapsed=%.0fs sent=%d ack=%d syncAcked=%d asyncQueued=%d asyncResulted=%d accepted=%d rejected=%d queueRejected=%d qps=%.1f accepted/s=%.1f syncP95=%s asyncP95=%s writeErr=%d readErr=%d\n",
 				elapsed,
 				stats.sent.Load(),
 				stats.ack.Load(),
+				stats.syncAcked.Load(),
+				stats.asyncQueued.Load(),
+				stats.asyncResulted.Load(),
 				stats.accepted.Load(),
 				stats.rejected.Load(),
+				stats.queueRejected.Load(),
 				float64(stats.sent.Load())/maxFloat(elapsed, 1),
 				float64(stats.accepted.Load())/maxFloat(elapsed, 1),
-				formatMicros(lat.P95),
+				formatMicros(syncLat.P95),
+				formatMicros(asyncLat.P95),
 				stats.writeErr.Load(),
 				stats.readErr.Load(),
 			)
@@ -766,7 +1042,23 @@ func printProgress(ctx context.Context, started time.Time, interval time.Duratio
 	}
 }
 
-func printFinal(elapsed time.Duration, cfg config, stats *counters, connectReasons *reasonCounters, bidReasons *reasonCounters, lat latencySummary) {
+// gcInflight 周期性清理过期的 inflight / resulted 条目，避免长时间运行内存膨胀。
+func gcInflight(ctx context.Context, tracker *sentTracker) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-ticker.C:
+			// 在飞 5 分钟仍未拿到任何终态的视为遗失；
+			// 已终态条目保留 5 分钟用于幂等去重，避免后端晚到的重发把统计搞错。
+			tracker.gc(now, 5*time.Minute, 5*time.Minute)
+		}
+	}
+}
+
+func printFinal(elapsed time.Duration, cfg config, stats *counters, connectReasons *reasonCounters, bidReasons *reasonCounters, queueReasons *reasonCounters, syncLat latencySummary, asyncLat latencySummary) {
 	seconds := elapsed.Seconds()
 	fmt.Println()
 	fmt.Println("bidload summary")
@@ -776,9 +1068,16 @@ func printFinal(elapsed time.Duration, cfg config, stats *counters, connectReaso
 		fmt.Printf("auction=%d buyers=%d duration=%s targetQPS=%.1f expect=%s\n", cfg.AuctionID, cfg.Buyers, cfg.Duration, cfg.QPS, cfg.Expect)
 	}
 	fmt.Printf("loginOK=%d loginErr=%d enrollOK=%d enrollErr=%d connectOK=%d connectErr=%d\n", stats.loginOK.Load(), stats.loginErr.Load(), stats.enrollOK.Load(), stats.enrollErr.Load(), stats.connectOK.Load(), stats.connectErr.Load())
-	fmt.Printf("sent=%d ack=%d accepted=%d rejected=%d duplicate=%d writeErr=%d readErr=%d\n", stats.sent.Load(), stats.ack.Load(), stats.accepted.Load(), stats.rejected.Load(), stats.duplicate.Load(), stats.writeErr.Load(), stats.readErr.Load())
+	fmt.Printf("sent=%d ack=%d syncAcked=%d asyncQueued=%d asyncResulted=%d accepted=%d rejected=%d queueRejected=%d duplicate=%d resultDup=%d writeErr=%d readErr=%d\n",
+		stats.sent.Load(), stats.ack.Load(),
+		stats.syncAcked.Load(), stats.asyncQueued.Load(), stats.asyncResulted.Load(),
+		stats.accepted.Load(), stats.rejected.Load(), stats.queueRejected.Load(),
+		stats.duplicate.Load(), stats.resultDuplicates.Load(),
+		stats.writeErr.Load(), stats.readErr.Load())
+	fmt.Printf("resultAck sent=%d err=%d\n", stats.resultAckSent.Load(), stats.resultAckErr.Load())
 	fmt.Printf("sendQPS=%.2f acceptedQPS=%.2f ackRate=%.2f%%\n", float64(stats.sent.Load())/maxFloat(seconds, 1), float64(stats.accepted.Load())/maxFloat(seconds, 1), ratioPercent(stats.ack.Load(), stats.sent.Load()))
-	fmt.Printf("ackLatency count=%d p50=%s p95=%s p99=%s max=%s\n", lat.Count, formatMicros(lat.P50), formatMicros(lat.P95), formatMicros(lat.P99), formatMicros(lat.Max))
+	fmt.Printf("syncAckLatency  count=%d p50=%s p95=%s p99=%s max=%s\n", syncLat.Count, formatMicros(syncLat.P50), formatMicros(syncLat.P95), formatMicros(syncLat.P99), formatMicros(syncLat.Max))
+	fmt.Printf("asyncResultLatency count=%d p50=%s p95=%s p99=%s max=%s\n", asyncLat.Count, formatMicros(asyncLat.P50), formatMicros(asyncLat.P95), formatMicros(asyncLat.P99), formatMicros(asyncLat.Max))
 	fmt.Printf("broadcastFrames accepted=%d rejected=%d\n", stats.broadcastAccepted.Load(), stats.broadcastRejected.Load())
 	if counts := connectReasons.snapshot(); len(counts) > 0 {
 		fmt.Println("connect error reasons:")
@@ -788,6 +1087,12 @@ func printFinal(elapsed time.Duration, cfg config, stats *counters, connectReaso
 	}
 	if counts := bidReasons.snapshot(); len(counts) > 0 {
 		fmt.Println("bid reject reasons:")
+		for _, item := range counts {
+			fmt.Printf("  %s=%d\n", item.Reason, item.Count)
+		}
+	}
+	if counts := queueReasons.snapshot(); len(counts) > 0 {
+		fmt.Println("async queue reject reasons:")
 		for _, item := range counts {
 			fmt.Printf("  %s=%d\n", item.Reason, item.Count)
 		}

@@ -83,6 +83,36 @@ func TestMarketplaceSearchLotsOnlyReturnsPublicVisibleLots(t *testing.T) {
 	}
 }
 
+func TestMarketplaceCategoriesMatchDiscoverFilterCategories(t *testing.T) {
+	svc := marketplaceapp.NewMarketplaceService(repository.NewMemoryAuctionRepository(), repository.NewMemoryLiveSessionRepository(), repository.NewMemoryDepositRepository(), repository.NewMemoryOrderRepository(), repository.NewSeedUserRepository())
+	categories := svc.Categories(context.Background())
+	expected := []domain.Category{
+		{ID: "jewelry", Name: "珠宝玉石", IconName: "gem"},
+		{ID: "watch", Name: "腕表钟表", IconName: "watch"},
+		{ID: "craft", Name: "工艺收藏", IconName: "sparkles"},
+		{ID: "fashion", Name: "潮流配饰", IconName: "shopping-bag"},
+		{ID: "tea", Name: "茶酒滋补", IconName: "leaf"},
+		{ID: "digital", Name: "数码潮玩", IconName: "badge"},
+		{ID: "painting", Name: "书画篆刻", IconName: "sparkles"},
+		{ID: "ceramic", Name: "瓷器陶艺", IconName: "badge"},
+		{ID: "wine", Name: "名酒陈酿", IconName: "leaf"},
+		{ID: "bag", Name: "箱包皮具", IconName: "shopping-bag"},
+		{ID: "coin", Name: "钱币邮票", IconName: "badge"},
+		{ID: "furniture", Name: "古典家具", IconName: "sparkles"},
+		{ID: "camera", Name: "影像器材", IconName: "badge"},
+		{ID: "music", Name: "乐器音响", IconName: "sparkles"},
+		{ID: "outdoor", Name: "户外收藏", IconName: "badge"},
+	}
+	if len(categories) != len(expected) {
+		t.Fatalf("expected %d categories, got %d: %+v", len(expected), len(categories), categories)
+	}
+	for i := range expected {
+		if categories[i] != expected[i] {
+			t.Fatalf("category %d mismatch: expected %+v, got %+v", i, expected[i], categories[i])
+		}
+	}
+}
+
 func TestMarketplaceMyParticipationsAggregatesDepositLotRoomAndOrder(t *testing.T) {
 	ctx := context.Background()
 	auctionRepo := repository.NewMemoryAuctionRepository()

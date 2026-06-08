@@ -227,6 +227,7 @@ type CreateLiveSessionInput struct {
 	Description        string
 	CoverURL           string
 	Status             domain.LiveSessionStatus
+	IsDigitalHuman     bool
 	ScheduledStartTime *time.Time
 	PlannedDurationSec int
 }
@@ -302,6 +303,7 @@ func (s *LiveSessionService) Create(ctx context.Context, in CreateLiveSessionInp
 		Description:        strings.TrimSpace(in.Description),
 		CoverURL:           strings.TrimSpace(in.CoverURL),
 		Status:             status,
+		IsDigitalHuman:     in.IsDigitalHuman,
 		ScheduledStartTime: in.ScheduledStartTime,
 		PlannedDurationSec: in.PlannedDurationSec,
 		CreatedAt:          now,
@@ -1237,6 +1239,14 @@ func (s *LiveSessionService) UpdateAgentHookConfig(ctx context.Context, sessionI
 	cfg, err := s.hook.SetConfig(ctx, session.MerchantID, actorID, enabled)
 	if err != nil {
 		return LiveAgentHookConfig{}, err
+	}
+	// 数字人直播间标识持久化：开启 AI 托管即标记该场次为数字人直播间，
+	// 关闭则回落为普通直播。落库后刷新/重拉不再依赖商家级开关推断。
+	if session.IsDigitalHuman != enabled {
+		session.IsDigitalHuman = enabled
+		if updateErr := s.sessions.Update(ctx, &session); updateErr != nil {
+			return LiveAgentHookConfig{}, updateErr
+		}
 	}
 	s.hook.EmitConfigChanged(ctx, session.MerchantID, session.ID, enabled)
 	if s.aiSwitch != nil {

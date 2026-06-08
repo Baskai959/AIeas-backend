@@ -75,6 +75,32 @@ func TestBidServiceIdempotencyMinimumIncrementAndTopN(t *testing.T) {
 	}
 }
 
+func TestBidServiceTopNEnrichesNicknameAndAvatar(t *testing.T) {
+	ctx := context.Background()
+	cfg := appconfig.Default().Auction
+	cfg.FreqLimitCount = 100
+	fixture := newRealtimeAuctionFixture(t, cfg)
+	users := repository.NewSeedUserRepository()
+	if err := users.Update(&domain.User{ID: "u_1001", AvatarURL: "/api/v1/images/u_1001.png"}); err != nil {
+		t.Fatalf("update user avatar: %v", err)
+	}
+	fixture.bids.SetUserRepository(users)
+	mustEnroll(t, fixture, "u_1001")
+
+	accepted, err := fixture.bids.Place(ctx, PlaceBidInput{RequestID: "bid-enriched-ranking", AuctionID: fixture.auctionID, BidderID: "u_1001", UserRole: domain.RoleBuyer, Price: 1100, ExpectedCurrentPrice: expectedCurrentPrice(1000)})
+	if err != nil || !accepted.Accepted {
+		t.Fatalf("accepted bid result=%+v err=%v", accepted, err)
+	}
+
+	top, err := fixture.bids.TopN(ctx, fixture.auctionID, 3)
+	if err != nil {
+		t.Fatalf("topn: %v", err)
+	}
+	if len(top) != 1 || top[0].BidderNickname != "竞拍用户001" || top[0].BidderAvatarURL != "/api/v1/images/u_1001.png" {
+		t.Fatalf("expected enriched ranking, got %+v", top)
+	}
+}
+
 func TestBidServiceDebouncesHighestBidLiveAgentHook(t *testing.T) {
 	ctx := context.Background()
 	cfg := appconfig.Default().Auction
@@ -101,6 +127,7 @@ func TestBidServiceDebouncesHighestBidLiveAgentHook(t *testing.T) {
 	if err != nil || !first.Accepted {
 		t.Fatalf("first bid accepted=%v err=%v result=%+v", first.Accepted, err, first)
 	}
+	// 不同用户对同一拍品连续出价：应只触发一次 hook（按拍品维度防抖，刷新计时）。
 	second, err := fixture.bids.Place(ctx, PlaceBidInput{RequestID: "hook-bid-2", AuctionID: fixture.auctionID, BidderID: "u_1002", UserRole: domain.RoleBuyer, Price: 1300, ExpectedCurrentPrice: expectedCurrentPrice(1100)})
 	if err != nil || !second.Accepted {
 		t.Fatalf("second bid accepted=%v err=%v result=%+v", second.Accepted, err, second)
@@ -110,6 +137,60 @@ func TestBidServiceDebouncesHighestBidLiveAgentHook(t *testing.T) {
 	got := hook.wait(t)
 	if got.merchantID != "u_2001" || got.sessionID != sessionID || got.bidderID != "u_1002" || got.price != 1300 {
 		t.Fatalf("expected last highest bid hook only, got %+v", got)
+	}
+	hook.assertNoCall(t, 40*time.Millisecond)
+}
+
+// TestBidServiceHighestBidHookIsPerAuction 验证最高价 hook 的防抖维度是「拍品」而非
+// 「用户」或「商户+场次」：同一直播场次下的两个不同拍品（同一商户）即便在静默窗口内
+// 同时收到出价，也应各自独立触发一次 hook，互不抑制。
+func TestBidServiceHighestBidHookIsPerAuction(t *testing.T) {
+	ctx := context.Background()
+	cfg := appconfig.Default().Auction
+	cfg.FreqLimitCount = 100
+	fixture := newRealtimeAuctionFixtureWithTiming(t, cfg, time.Hour, 1000)
+
+	sessionID := uint64(90001)
+	// 第一个拍品（fixture 自带）挂到直播场次。
+	firstAuctionID := fixture.auctionID
+	lot, err := fixture.auctionRepo.FindByID(ctx, firstAuctionID)
+	if err != nil {
+		t.Fatalf("find auction: %v", err)
+	}
+	lot.LiveSessionID = &sessionID
+	if err := fixture.auctionRepo.Update(ctx, &lot); err != nil {
+		t.Fatalf("update auction live session: %v", err)
+	}
+	mustEnroll(t, fixture, "u_1001")
+
+	// 第二个拍品：同一商户、同一直播场次，但不同拍品。
+	secondAuctionID := addRunningAuctionToFixture(t, fixture, cfg, sessionID)
+	if _, err := fixture.deposits.Enroll(ctx, EnrollInput{AuctionID: secondAuctionID, UserID: "u_1002", UserRole: domain.RoleBuyer}); err != nil {
+		t.Fatalf("enroll second auction: %v", err)
+	}
+
+	hook := newRecordingBidLiveAgentHook()
+	fixture.bids.SetLiveAgentHookService(hook)
+	fixture.bids.SetLiveAgentHookQuietPeriod(30 * time.Millisecond)
+
+	// 在同一静默窗口内分别对两个拍品各出一次价。
+	if r, err := fixture.bids.Place(ctx, PlaceBidInput{RequestID: "per-auction-1", AuctionID: firstAuctionID, BidderID: "u_1001", UserRole: domain.RoleBuyer, Price: 1100, ExpectedCurrentPrice: expectedCurrentPrice(1000)}); err != nil || !r.Accepted {
+		t.Fatalf("first auction bid accepted=%v err=%v result=%+v", r.Accepted, err, r)
+	}
+	if r, err := fixture.bids.Place(ctx, PlaceBidInput{RequestID: "per-auction-2", AuctionID: secondAuctionID, BidderID: "u_1002", UserRole: domain.RoleBuyer, Price: 1100, ExpectedCurrentPrice: expectedCurrentPrice(1000)}); err != nil || !r.Accepted {
+		t.Fatalf("second auction bid accepted=%v err=%v result=%+v", r.Accepted, err, r)
+	}
+
+	// 两个拍品应各自独立触发一次 hook（共两次），而非被合并为一次。
+	firstCall := hook.wait(t)
+	secondCall := hook.wait(t)
+	seen := map[string]bool{firstCall.bidderID: true, secondCall.bidderID: true}
+	if !seen["u_1001"] || !seen["u_1002"] {
+		t.Fatalf("expected one hook per auction (u_1001 & u_1002), got %+v and %+v", firstCall, secondCall)
+	}
+	// 两次都来自同一商户/场次，证明防抖未被场次维度合并。
+	if firstCall.sessionID != sessionID || secondCall.sessionID != sessionID {
+		t.Fatalf("expected both hooks for session %d, got %+v and %+v", sessionID, firstCall, secondCall)
 	}
 	hook.assertNoCall(t, 40*time.Millisecond)
 }
@@ -697,6 +778,55 @@ func mustEnroll(t *testing.T, fixture realtimeAuctionFixture, userID string) {
 	if _, err := fixture.deposits.Enroll(context.Background(), EnrollInput{AuctionID: fixture.auctionID, UserID: userID, UserRole: domain.RoleBuyer}); err != nil {
 		t.Fatalf("enroll %s: %v", userID, err)
 	}
+}
+
+// addRunningAuctionToFixture 在现有 fixture 的同一套仓储/服务上再创建并启动一个
+// 处于 RUNNING 状态的拍品（同一商户 u_2001），并挂到给定直播场次，返回其拍品 ID。
+// 用于验证 hook 防抖按拍品而非按场次/用户维度。
+func addRunningAuctionToFixture(t *testing.T, fixture realtimeAuctionFixture, cfg appconfig.AuctionConfig, sessionID uint64) uint64 {
+	t.Helper()
+	ctx := context.Background()
+	rule, _ := json.Marshal(map[string]interface{}{"type": "fixed", "amount": 100, "maxBidSteps": 10})
+	auctionSvc := NewAuctionServiceWithDeps(AuctionServiceDeps{Auctions: fixture.auctionRepo, Tx: repository.NoopTxManager{}, Realtime: fixture.realtime, AuctionConfig: cfg})
+
+	now := time.Now().UTC()
+	startTime := now.Add(-time.Minute)
+	endTime := now.Add(time.Hour)
+	auction, err := auctionSvc.Create(ctx, CreateAuctionInput{
+		ActorID:           "u_2001",
+		ActorRole:         domain.RoleMerchant,
+		Title:             "Watch-2",
+		Category:          "luxury",
+		ConditionGrade:    domain.ConditionNew,
+		Description:       "second lot",
+		AuctionType:       domain.AuctionTypeEnglish,
+		StartPrice:        1000,
+		ReservePrice:      1000,
+		CapPrice:          2000,
+		IncrementRule:     rule,
+		AntiSnipingSec:    60,
+		AntiExtendSec:     30,
+		DepositAmount:     100,
+		Status:            domain.AuctionStatusReady,
+		StartTime:         startTime,
+		EndTime:           endTime,
+		AllowSystemStatus: true,
+	})
+	if err != nil {
+		t.Fatalf("create second auction: %v", err)
+	}
+	if _, err := auctionSvc.StartWithTiming(ctx, auction.AuctionID, "u_2001", domain.RoleMerchant, startTime, endTime); err != nil {
+		t.Fatalf("start second auction: %v", err)
+	}
+	lot, err := fixture.auctionRepo.FindByID(ctx, auction.AuctionID)
+	if err != nil {
+		t.Fatalf("find second auction: %v", err)
+	}
+	lot.LiveSessionID = &sessionID
+	if err := fixture.auctionRepo.Update(ctx, &lot); err != nil {
+		t.Fatalf("update second auction live session: %v", err)
+	}
+	return auction.AuctionID
 }
 
 func expectedCurrentPrice(price int64) *int64 {

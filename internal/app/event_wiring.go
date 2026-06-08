@@ -14,6 +14,7 @@ import (
 type RealtimeEventPublisher interface {
 	PublishAuctionEvent(ctx context.Context, auctionID uint64, eventType, requestID string, seq int64, payload json.RawMessage) error
 	PublishLiveSessionEvent(ctx context.Context, liveSessionID uint64, eventType, requestID string, seq int64, payload json.RawMessage, onlineOnly bool) error
+	PublishLiveSessionUserEvent(ctx context.Context, liveSessionID uint64, userID, eventType, requestID string, seq int64, payload json.RawMessage) error
 }
 
 // buildLiveSessionEndedHook 构造 LiveSession 闭播完成后的回调。
@@ -65,6 +66,25 @@ type liveSessionLotHubNotifier struct {
 type aiAssistantHubNotifier struct {
 	hub            *wstransport.Hub
 	eventPublisher RealtimeEventPublisher
+}
+
+type bidResultDelivery struct {
+	coordinator    *wstransport.BidAsyncCoordinator
+	eventPublisher RealtimeEventPublisher
+}
+
+func (d bidResultDelivery) DeliverBidResult(sessionID, auctionID uint64, userID string, payload wstransport.BidResultPayload) {
+	if d.eventPublisher != nil && sessionID != 0 && userID != "" {
+		raw, err := json.Marshal(payload)
+		if err == nil {
+			if err := d.eventPublisher.PublishLiveSessionUserEvent(context.Background(), sessionID, userID, wstransport.TypeBidResult, payload.BidID, payload.ResultSeq, raw); err == nil {
+				return
+			}
+		}
+	}
+	if d.coordinator != nil {
+		d.coordinator.DeliverBidResult(sessionID, auctionID, userID, payload)
+	}
 }
 
 func (n aiAssistantHubNotifier) NotifyAIAssistantEvent(ctx context.Context, liveSessionID uint64, event aiapp.Event) (int, error) {

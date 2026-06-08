@@ -20,6 +20,7 @@ type ProducerConfig struct {
 	Brokers            []string
 	ClientID           string
 	BidEventsTopic     string
+	BidCommandsTopic   string
 	AuctionEventsTopic string
 	OrderEventsTopic   string
 }
@@ -28,6 +29,7 @@ type Producer struct {
 	brokers            []string
 	clientID           string
 	bidEventsTopic     string
+	bidCommandsTopic   string
 	auctionEventsTopic string
 	orderEventsTopic   string
 
@@ -48,10 +50,62 @@ func NewProducer(cfg ProducerConfig) (*Producer, error) {
 		brokers:            brokers,
 		clientID:           clientID,
 		bidEventsTopic:     defaultString(cfg.BidEventsTopic, "aieas.bid.events"),
+		bidCommandsTopic:   defaultString(cfg.BidCommandsTopic, "aieas.bid.commands"),
 		auctionEventsTopic: defaultString(cfg.AuctionEventsTopic, "aieas.auction.events"),
 		orderEventsTopic:   defaultString(cfg.OrderEventsTopic, "aieas.order.events"),
 		writers:            make(map[string]*kafkago.Writer),
 	}, nil
+}
+
+// BidCommand 是异步竞价裁决的命令消息：由 WS handler 在 preCheck 通过后投递，
+// 由 BidDecisionWorker 顺序消费并复用 Lua 裁决。key 必须是 auctionId，
+// 保证同一拍品的命令落在同一 partition 内、严格有序。
+type BidCommand struct {
+	BidID                string          `json:"bidId"`
+	AuctionID            uint64          `json:"auctionId"`
+	LiveSessionID        uint64          `json:"liveSessionId"`
+	UserID               string          `json:"userId"`
+	SellerID             string          `json:"sellerId"`
+	Price                int64           `json:"price"`
+	ExpectedCurrentPrice *int64          `json:"expectedCurrentPrice"`
+	Source               string          `json:"source"`
+	MinIncrement         int64           `json:"minIncrement"`
+	AntiSnipingMS        int64           `json:"antiSnipingMs"`
+	AntiExtendMS         int64           `json:"antiExtendMs"`
+	AntiExtendMode       string          `json:"antiExtendMode"`
+	MaxExtendCount       int             `json:"maxExtendCount"`
+	FreqLimitCount       int             `json:"freqLimitCount"`
+	FreqWindowMS         int64           `json:"freqWindowMs"`
+	StartPrice           int64           `json:"startPrice"`
+	CapPrice             int64           `json:"capPrice"`
+	IncrementRule        json.RawMessage `json:"incrementRule"`
+	BidderNickname       string          `json:"bidderNickname"`
+	BidderAvatarURL      string          `json:"bidderAvatarUrl"`
+	PreCheckPassed       bool            `json:"preCheckPassed"`
+	EnqueuedAtMS         int64           `json:"enqueuedAtMs"`
+	OriginInstanceID     string          `json:"originInstanceId,omitempty"`
+
+	// TraceParent / TraceState 仅用于跨进程链路透传，不参与 JSON 消息体编码。
+	TraceParent string `json:"-"`
+	TraceState  string `json:"-"`
+}
+
+// PublishBidCommand 把竞价命令投递到 aieas.bid.commands。key=auctionId 以保证
+// 同 auction 同 partition 顺序。Kafka disabled 时 Producer 为 nil，直接返回 nil。
+func (p *Producer) PublishBidCommand(ctx context.Context, cmd BidCommand) error {
+	if p == nil {
+		return nil
+	}
+	if cmd.EnqueuedAtMS == 0 {
+		cmd.EnqueuedAtMS = time.Now().UTC().UnixMilli()
+	}
+	value, err := json.Marshal(cmd)
+	if err != nil {
+		return fmt.Errorf("marshal bid command: %w", err)
+	}
+	headers := map[string]string{"command_type": "bid.place"}
+	tracing.InjectMap(ctx, headers)
+	return p.publish(ctx, p.bidCommandsTopic, strconv.FormatUint(cmd.AuctionID, 10), value, headers)
 }
 
 func (p *Producer) PublishBidEvent(ctx context.Context, event redisinfra.BidEvent) error {
@@ -295,6 +349,67 @@ func (r *BidEventReader) FetchBidEvent(ctx context.Context) (redisinfra.BidEvent
 }
 
 func (r *BidEventReader) Close() error {
+	if r == nil || r.reader == nil {
+		return nil
+	}
+	return r.reader.Close()
+}
+
+// BidCommandReader 顺序消费 aieas.bid.commands。GroupID 内按 partition 顺序消费，
+// 单 partition 单 goroutine（由调用方保证不在 partition 内并发）。
+type BidCommandReader struct {
+	reader *kafkago.Reader
+}
+
+type BidCommandReaderConfig struct {
+	Brokers []string
+	GroupID string
+	Topic   string
+}
+
+func NewBidCommandReader(cfg BidCommandReaderConfig) (*BidCommandReader, error) {
+	brokers := normalizeBrokers(cfg.Brokers)
+	if len(brokers) == 0 {
+		return nil, fmt.Errorf("kafka bid command reader requires at least one broker")
+	}
+	groupID := strings.TrimSpace(cfg.GroupID)
+	if groupID == "" {
+		groupID = "aieas-bid-decision-workers"
+	}
+	topic := defaultString(cfg.Topic, "aieas.bid.commands")
+	return &BidCommandReader{reader: kafkago.NewReader(kafkago.ReaderConfig{
+		Brokers:  brokers,
+		GroupID:  groupID,
+		Topic:    topic,
+		MinBytes: 1,
+		MaxBytes: 10 << 20,
+		MaxWait:  200 * time.Millisecond,
+	})}, nil
+}
+
+// FetchBidCommand 拉取下一条命令，返回 commit 回调用于消费成功后提交位点。
+// 解码失败时仍返回 commit（跳过坏消息，避免卡住 partition）。
+func (r *BidCommandReader) FetchBidCommand(ctx context.Context) (BidCommand, func(context.Context) error, error) {
+	if r == nil || r.reader == nil {
+		return BidCommand{}, nil, fmt.Errorf("kafka bid command reader is not configured")
+	}
+	msg, err := r.reader.FetchMessage(ctx)
+	if err != nil {
+		return BidCommand{}, nil, err
+	}
+	commit := func(commitCtx context.Context) error {
+		return r.reader.CommitMessages(commitCtx, msg)
+	}
+	var cmd BidCommand
+	if err := json.Unmarshal(msg.Value, &cmd); err != nil {
+		return BidCommand{}, commit, fmt.Errorf("decode kafka bid command: %w", err)
+	}
+	cmd.TraceParent = headerValue(msg.Headers, "traceparent")
+	cmd.TraceState = headerValue(msg.Headers, "tracestate")
+	return cmd, commit, nil
+}
+
+func (r *BidCommandReader) Close() error {
 	if r == nil || r.reader == nil {
 		return nil
 	}

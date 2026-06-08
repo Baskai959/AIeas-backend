@@ -982,3 +982,59 @@ func TestMemoryLiveSessionRealtimeStoreBumpViewerPeakMaxSemantics(t *testing.T) 
 		t.Fatalf("LoadCounters peak=%d want 9", peak)
 	}
 }
+
+// fakeLiveAgentHook 是用于断言 AI 托管开关持久化数字人标识的最小桩实现。
+type fakeLiveAgentHook struct {
+	enabled bool
+}
+
+func (h *fakeLiveAgentHook) EmitLiveStarted(context.Context, string, uint64)                  {}
+func (h *fakeLiveAgentHook) EmitLotMounted(context.Context, string, uint64, uint64)           {}
+func (h *fakeLiveAgentHook) EmitLotUnmounted(context.Context, string, uint64, uint64)         {}
+func (h *fakeLiveAgentHook) EmitLotStarted(context.Context, string, uint64, uint64, int)      {}
+func (h *fakeLiveAgentHook) EmitLotScheduled(context.Context, string, uint64, uint64, time.Time, int) {
+}
+func (h *fakeLiveAgentHook) EmitLotCancelled(context.Context, string, uint64, uint64) {}
+func (h *fakeLiveAgentHook) GetConfig(context.Context, string) (LiveAgentHookConfig, error) {
+	return LiveAgentHookConfig{Enabled: h.enabled}, nil
+}
+func (h *fakeLiveAgentHook) SetConfig(_ context.Context, _, _ string, enabled bool) (LiveAgentHookConfig, error) {
+	h.enabled = enabled
+	return LiveAgentHookConfig{Enabled: enabled}, nil
+}
+func (h *fakeLiveAgentHook) EmitConfigChanged(context.Context, string, uint64, bool) {}
+
+// TestLiveSessionServiceUpdateAgentHookPersistsDigitalHumanFlag 验证：开启 AI 托管会把
+// 场次自身持久化为数字人直播间，关闭则回落，刷新重拉（重新 Get）后标识仍稳定。
+func TestLiveSessionServiceUpdateAgentHookPersistsDigitalHumanFlag(t *testing.T) {
+	svc, sessionRepo, _ := newLiveSessionFixture(t)
+	svc.SetLiveAgentHookService(&fakeLiveAgentHook{})
+	ctx := context.Background()
+
+	opened := createStartedLiveSession(t, svc, "m_dh", "数字人专场")
+	if opened.IsDigitalHuman {
+		t.Fatalf("expected new session not digital human by default")
+	}
+
+	if _, err := svc.UpdateAgentHookConfig(ctx, opened.ID, "m_dh", domain.RoleMerchant, true); err != nil {
+		t.Fatalf("enable agent hook: %v", err)
+	}
+	reloaded, err := sessionRepo.Get(ctx, opened.ID)
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if !reloaded.IsDigitalHuman {
+		t.Fatalf("expected persisted IsDigitalHuman=true after enabling agent hook")
+	}
+
+	if _, err := svc.UpdateAgentHookConfig(ctx, opened.ID, "m_dh", domain.RoleMerchant, false); err != nil {
+		t.Fatalf("disable agent hook: %v", err)
+	}
+	reloaded, err = sessionRepo.Get(ctx, opened.ID)
+	if err != nil {
+		t.Fatalf("reload after disable: %v", err)
+	}
+	if reloaded.IsDigitalHuman {
+		t.Fatalf("expected persisted IsDigitalHuman=false after disabling agent hook")
+	}
+}

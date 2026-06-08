@@ -236,6 +236,7 @@ type BidInput struct {
 	LiveSessionID        uint64
 	BidderID             string
 	BidderNickname       string
+	BidderAvatarURL      string
 	Price                int64
 	ExpectedCurrentPrice *int64
 	Now                  time.Time
@@ -254,35 +255,41 @@ type BidInput struct {
 }
 
 type BidResult struct {
-	RequestID      string        `json:"requestId"`
-	AuctionID      uint64        `json:"auctionId"`
-	LiveSessionID  uint64        `json:"liveSessionId,omitempty"`
-	BidderID       string        `json:"bidderId,omitempty"`
-	BidderNickname string        `json:"bidderNickname,omitempty"`
-	Price          int64         `json:"price,omitempty"`
-	Accepted       bool          `json:"accepted"`
-	Duplicate      bool          `json:"duplicate,omitempty"`
-	Reason         string        `json:"reason,omitempty"`
-	CurrentPrice   int64         `json:"currentPrice"`
-	LeaderBidderID string        `json:"leaderBidderId,omitempty"`
-	EndTime        time.Time     `json:"endTime"`
-	Extended       bool          `json:"extended,omitempty"`
-	ExtendCount    int           `json:"extendCount,omitempty"`
-	Version        int64         `json:"version,omitempty"`
-	Seq            int64         `json:"seq,omitempty"`
-	StreamID       string        `json:"streamId,omitempty"`
-	Event          string        `json:"event,omitempty"`
-	ServerTime     *time.Time    `json:"serverTime,omitempty"`
-	RiskResult     BidRiskResult `json:"riskResult"`
-	AuctionStatus  AuctionStatus `json:"auctionStatus,omitempty"`
-	AutoClosed     bool          `json:"autoClosed,omitempty"`
+	RequestID       string        `json:"requestId"`
+	AuctionID       uint64        `json:"auctionId"`
+	LiveSessionID   uint64        `json:"liveSessionId,omitempty"`
+	BidderID        string        `json:"bidderId,omitempty"`
+	BidderNickname  string        `json:"bidderNickname,omitempty"`
+	Nickname        string        `json:"nickname,omitempty"`
+	BidderAvatarURL string        `json:"bidderAvatarUrl,omitempty"`
+	AvatarURL       string        `json:"avatarUrl,omitempty"`
+	Price           int64         `json:"price,omitempty"`
+	Accepted        bool          `json:"accepted"`
+	Duplicate       bool          `json:"duplicate,omitempty"`
+	Reason          string        `json:"reason,omitempty"`
+	CurrentPrice    int64         `json:"currentPrice"`
+	LeaderBidderID  string        `json:"leaderBidderId,omitempty"`
+	EndTime         time.Time     `json:"endTime"`
+	Extended        bool          `json:"extended,omitempty"`
+	ExtendCount     int           `json:"extendCount,omitempty"`
+	Version         int64         `json:"version,omitempty"`
+	Seq             int64         `json:"seq,omitempty"`
+	StreamID        string        `json:"streamId,omitempty"`
+	Event           string        `json:"event,omitempty"`
+	ServerTime      *time.Time    `json:"serverTime,omitempty"`
+	RiskResult      BidRiskResult `json:"riskResult"`
+	AuctionStatus   AuctionStatus `json:"auctionStatus,omitempty"`
+	AutoClosed      bool          `json:"autoClosed,omitempty"`
 }
 
 type RankingEntry struct {
-	Rank           int    `json:"rank"`
-	BidderID       string `json:"bidderId"`
-	BidderNickname string `json:"bidderNickname,omitempty"`
-	Price          int64  `json:"price"`
+	Rank            int    `json:"rank"`
+	BidderID        string `json:"bidderId"`
+	BidderNickname  string `json:"bidderNickname,omitempty"`
+	Nickname        string `json:"nickname,omitempty"`
+	BidderAvatarURL string `json:"bidderAvatarUrl,omitempty"`
+	AvatarURL       string `json:"avatarUrl,omitempty"`
+	Price           int64  `json:"price"`
 }
 
 type HammerInput struct {

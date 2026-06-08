@@ -97,6 +97,8 @@ func TestObserveBidAndDuplicate(t *testing.T) {
 	r := New(Options{Enabled: true})
 	r.ObserveBid("accepted", "ok", 2*time.Millisecond)
 	r.ObserveBidStage("lua_place_bid", "accepted", 2*time.Millisecond)
+	r.ObserveBidAckDuration("async", "queued", 3*time.Millisecond)
+	r.ObserveBidResultDuration("accepted", 8*time.Millisecond)
 	r.IncBidRoute("lua_enter", "attempt")
 	r.IncBidDuplicate()
 	if v := counterVecValue(t, r.bidTotal, "accepted", "ok"); v != 1 {
@@ -104,6 +106,12 @@ func TestObserveBidAndDuplicate(t *testing.T) {
 	}
 	if v := histogramVecCount(t, r.bidStageDuration, "lua_place_bid", "accepted"); v != 1 {
 		t.Fatalf("bidStageDuration expected 1, got %v", v)
+	}
+	if v := histogramVecCount(t, r.bidAckDuration, "async", "queued"); v != 1 {
+		t.Fatalf("bidAckDuration expected 1, got %v", v)
+	}
+	if v := histogramVecCount(t, r.bidResultDuration, "accepted"); v != 1 {
+		t.Fatalf("bidResultDuration expected 1, got %v", v)
 	}
 	if v := counterVecValue(t, r.bidRouteTotal, "lua_enter", "attempt"); v != 1 {
 		t.Fatalf("bidRouteTotal expected 1, got %v", v)

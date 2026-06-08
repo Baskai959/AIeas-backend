@@ -51,12 +51,19 @@ func TestWSHandlerBidPlaceAckAndBroadcast(t *testing.T) {
 	if !ack.Accepted || ack.CurrentPrice != 1100 {
 		t.Fatalf("unexpected bid ack: %+v", ack)
 	}
+	if ack.Nickname != "竞拍用户001" || ack.BidderNickname != "竞拍用户001" || ack.AvatarURL != "/api/v1/images/u_1001.png" || ack.BidderAvatarURL != "/api/v1/images/u_1001.png" {
+		t.Fatalf("expected enriched bid ack profile, got %+v", ack)
+	}
 
 	seenAccepted := false
+	var accepted domain.BidResult
 	for i := 0; i < 3; i++ {
 		select {
 		case env := <-client.Outbound():
 			if env.Type == "bid.accepted" {
+				if err := json.Unmarshal(env.Payload, &accepted); err != nil {
+					t.Fatalf("decode bid.accepted: %v", err)
+				}
 				seenAccepted = true
 			}
 		default:
@@ -64,6 +71,42 @@ func TestWSHandlerBidPlaceAckAndBroadcast(t *testing.T) {
 	}
 	if !seenAccepted {
 		t.Fatal("expected bid.accepted broadcast")
+	}
+	if accepted.Nickname != "竞拍用户001" || accepted.BidderNickname != "竞拍用户001" || accepted.AvatarURL != "/api/v1/images/u_1001.png" || accepted.BidderAvatarURL != "/api/v1/images/u_1001.png" {
+		t.Fatalf("expected enriched bid.accepted profile, got %+v", accepted)
+	}
+
+	select {
+	case env := <-client.Outbound():
+		if env.Type != corews.TypeRankingUpdated {
+			t.Fatalf("expected ranking.updated after accepted bid, got %s", env.Type)
+		}
+		var payload struct {
+			Ranking []domain.RankingEntry `json:"ranking"`
+		}
+		if err := json.Unmarshal(env.Payload, &payload); err != nil {
+			t.Fatalf("decode ranking.updated: %v", err)
+		}
+		if len(payload.Ranking) != 1 || payload.Ranking[0].Nickname != "竞拍用户001" || payload.Ranking[0].BidderNickname != "竞拍用户001" || payload.Ranking[0].AvatarURL != "/api/v1/images/u_1001.png" || payload.Ranking[0].BidderAvatarURL != "/api/v1/images/u_1001.png" {
+			t.Fatalf("expected enriched ranking.updated profile, got %+v", payload.Ranking)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("expected ranking.updated broadcast")
+	}
+}
+
+func TestBidAckMetricLabels(t *testing.T) {
+	mode, result := bidAckMetricLabels(WSBidPlaceAsync, []corews.Envelope{
+		jsonEnvelope("bid.ack", "bid-1", map[string]interface{}{"mode": "ASYNC", "status": "QUEUED", "bidId": "bid-1"}),
+	})
+	if mode != "async" || result != "queued" {
+		t.Fatalf("queued labels = %s/%s", mode, result)
+	}
+	mode, result = bidAckMetricLabels(WSBidPlaceLocal, []corews.Envelope{
+		jsonEnvelope("bid.ack", "bid-2", map[string]interface{}{"accepted": true}),
+	})
+	if mode != "local" || result != "accepted" {
+		t.Fatalf("accepted labels = %s/%s", mode, result)
 	}
 }
 
@@ -564,6 +607,9 @@ func TestWSHandlerDeliverInitialRankingForRunningAuction(t *testing.T) {
 		if len(payload.Ranking) != 1 || payload.Ranking[0].Rank != 1 || payload.Ranking[0].BidderID != "u_1001" || payload.Ranking[0].Price != 1100 {
 			t.Fatalf("unexpected initial ranking: %+v", payload.Ranking)
 		}
+		if payload.Ranking[0].Nickname != "竞拍用户001" || payload.Ranking[0].BidderNickname != "竞拍用户001" || payload.Ranking[0].AvatarURL != "/api/v1/images/u_1001.png" || payload.Ranking[0].BidderAvatarURL != "/api/v1/images/u_1001.png" {
+			t.Fatalf("expected enriched initial ranking profile: %+v", payload.Ranking[0])
+		}
 	default:
 		t.Fatal("expected initial ranking envelope")
 	}
@@ -722,9 +768,13 @@ func newWSBidFixtureWithAuctionService(t *testing.T, cfg appconfig.AuctionConfig
 	realtime := repository.NewMemoryRealtimeStore()
 	riskSvc := riskapp.NewRiskService(riskRepo, nil)
 	depositSvc := depositapp.NewDepositService(depositRepo, auctionRepo, realtime, riskSvc, repository.NoopTxManager{})
+	userRepo := repository.NewSeedUserRepository()
+	if err := userRepo.Update(&domain.User{ID: "u_1001", AvatarURL: "/api/v1/images/u_1001.png"}); err != nil {
+		t.Fatalf("seed user avatar: %v", err)
+	}
 	publisher := wsAuctionEventPublisherAdapter{hub: hub}
 	auctionSvc := auctionapp.NewAuctionServiceWithDeps(auctionapp.AuctionServiceDeps{Auctions: auctionRepo, Tx: repository.NoopTxManager{}, Realtime: realtime, Publisher: publisher, AuctionConfig: cfg})
-	bidSvc := auctionapp.NewBidServiceWithDeps(auctionapp.BidServiceDeps{Bids: bidRepo, Auctions: auctionRepo, Realtime: realtime, Risk: riskSvc, Publisher: publisher, Config: cfg})
+	bidSvc := auctionapp.NewBidServiceWithDeps(auctionapp.BidServiceDeps{Bids: bidRepo, Auctions: auctionRepo, Realtime: realtime, Risk: riskSvc, Publisher: publisher, Config: cfg, Users: userRepo})
 
 	rule, _ := json.Marshal(map[string]interface{}{"type": "fixed", "amount": 100, "maxBidSteps": 10})
 	auction, err := auctionSvc.Create(ctx, auctionapp.CreateAuctionInput{

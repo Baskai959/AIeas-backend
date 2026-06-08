@@ -169,14 +169,15 @@ func (o *OrderDeal) MarkReceived(now time.Time) error {
 }
 
 type OrderFilter struct {
-	WinnerID      string
-	SellerID      string
-	AuctionID     uint64
-	LiveSessionID uint64
-	Status        OrderStatus
-	PayStatus     PayStatus
-	Limit         int
-	Offset        int
+	WinnerID          string
+	SellerID          string
+	AuctionID         uint64
+	LiveSessionID     uint64
+	Status            OrderStatus
+	PayStatus         PayStatus
+	FulfillmentStatus FulfillmentStatus
+	Limit             int
+	Offset            int
 }
 
 type DepositStatus string

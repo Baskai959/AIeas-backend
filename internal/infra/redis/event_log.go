@@ -63,32 +63,33 @@ return 1
 `)
 
 type BidEvent struct {
-	AuctionID      uint64
-	LiveSessionID  uint64
-	StreamID       string
-	Seq            int64
-	RequestID      string
-	BidderID       string
-	BidderNickname string
-	BidPrice       int64
-	BidTSMS        int64
-	Source         string
-	RiskResult     domain.BidRiskResult
-	RejectReason   string
-	Accepted       bool
-	CurrentPrice   int64
-	LeaderBidderID string
-	EndTSMS        int64
-	Extended       bool
-	ExtendCount    int
-	CreatedAtMS    int64
-	EventType      string
-	AuctionStatus  domain.AuctionStatus
-	AutoClosed     bool
-	Deliveries     int64
-	TraceParent    string
-	TraceState     string
-	Raw            map[string]string
+	AuctionID       uint64
+	LiveSessionID   uint64
+	StreamID        string
+	Seq             int64
+	RequestID       string
+	BidderID        string
+	BidderNickname  string
+	BidderAvatarURL string
+	BidPrice        int64
+	BidTSMS         int64
+	Source          string
+	RiskResult      domain.BidRiskResult
+	RejectReason    string
+	Accepted        bool
+	CurrentPrice    int64
+	LeaderBidderID  string
+	EndTSMS         int64
+	Extended        bool
+	ExtendCount     int
+	CreatedAtMS     int64
+	EventType       string
+	AuctionStatus   domain.AuctionStatus
+	AutoClosed      bool
+	Deliveries      int64
+	TraceParent     string
+	TraceState      string
+	Raw             map[string]string
 }
 
 // TraceCarrier 返回事件携带的 W3C trace context，便于消费端通过
@@ -527,7 +528,8 @@ func (e BidEvent) ToBidRecord() domain.BidRecord {
 
 func (e BidEvent) PayloadJSON() []byte {
 	payload := map[string]interface{}{
-		"requestId": e.RequestID, "auctionId": e.AuctionID, "liveSessionId": e.LiveSessionID, "bidderId": e.BidderID, "bidderNickname": e.BidderNickname, "price": e.BidPrice,
+		"requestId": e.RequestID, "auctionId": e.AuctionID, "liveSessionId": e.LiveSessionID, "bidderId": e.BidderID, "bidderNickname": e.BidderNickname,
+		"nickname": e.BidderNickname, "bidderAvatarUrl": e.BidderAvatarURL, "avatarUrl": e.BidderAvatarURL, "price": e.BidPrice,
 		"accepted": e.Accepted, "reason": e.RejectReason, "currentPrice": e.CurrentPrice, "leaderBidderId": e.LeaderBidderID,
 		"endTsMs": e.EndTSMS, "extended": e.Extended, "extendCount": e.ExtendCount, "seq": e.Seq,
 		"streamId": e.StreamID, "createdAtMs": e.CreatedAtMS, "bidTsMs": e.BidTSMS, "source": e.Source,
@@ -555,7 +557,7 @@ func bidEventFromXMessage(msg redisgo.XMessage, deliveries int64) BidEvent {
 	auctionID, _ := strconv.ParseUint(raw["auction_id"], 10, 64)
 	seq := parseInt64(raw["seq"], parseStreamSeq(msg.ID))
 	return BidEvent{
-		AuctionID: auctionID, LiveSessionID: uint64(parseInt64(raw["live_session_id"], 0)), StreamID: msg.ID, Seq: seq, RequestID: raw["request_id"], BidderID: raw["bidder_id"], BidderNickname: raw["bidder_nickname"],
+		AuctionID: auctionID, LiveSessionID: uint64(parseInt64(raw["live_session_id"], 0)), StreamID: msg.ID, Seq: seq, RequestID: raw["request_id"], BidderID: raw["bidder_id"], BidderNickname: raw["bidder_nickname"], BidderAvatarURL: raw["bidder_avatar_url"],
 		BidPrice: parseInt64(raw["bid_price"], 0), BidTSMS: parseInt64(raw["bid_ts_ms"], 0), Source: raw["source"],
 		RiskResult: domain.BidRiskResult(raw["risk_result"]), RejectReason: raw["reject_reason"], Accepted: raw["accepted"] == "1" || raw["accepted"] == "true",
 		CurrentPrice: parseInt64(raw["current_price"], 0), LeaderBidderID: raw["leader_bidder_id"], EndTSMS: parseInt64(raw["end_ts_ms"], 0),

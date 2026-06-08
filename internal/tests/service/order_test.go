@@ -216,6 +216,46 @@ func TestOrderServiceMatchesPrefixedAndNumericUserIDs(t *testing.T) {
 	}
 }
 
+func TestOrderServiceMineFiltersByFulfillmentStatus(t *testing.T) {
+	ctx := context.Background()
+	now := time.Now().UTC()
+	repo := repository.NewMemoryOrderRepository()
+	if _, _, err := repo.CreateIfAbsentByAuction(ctx, &domain.OrderDeal{
+		AuctionID:         10006,
+		WinnerID:          "u_1001",
+		SellerID:          "u_2001",
+		DealPrice:         12000,
+		Status:            domain.OrderStatusPaid,
+		PayStatus:         domain.PayStatusPaid,
+		FulfillmentStatus: domain.FulfillmentStatusUnshipped,
+		PaidAt:            &now,
+	}); err != nil {
+		t.Fatalf("seed unshipped order: %v", err)
+	}
+	shipped, _, err := repo.CreateIfAbsentByAuction(ctx, &domain.OrderDeal{
+		AuctionID:         10007,
+		WinnerID:          "1001",
+		SellerID:          "2001",
+		DealPrice:         13000,
+		Status:            domain.OrderStatusPaid,
+		PayStatus:         domain.PayStatusPaid,
+		FulfillmentStatus: domain.FulfillmentStatusShipped,
+		PaidAt:            &now,
+	})
+	if err != nil {
+		t.Fatalf("seed shipped order: %v", err)
+	}
+	svc := orderapp.NewOrderService(repo, repository.NoopTxManager{})
+
+	mine, err := svc.Mine(ctx, "u_1001", domain.RoleBuyer, domain.OrderFilter{Status: domain.OrderStatusPaid, FulfillmentStatus: domain.FulfillmentStatusShipped})
+	if err != nil {
+		t.Fatalf("mine shipped: %v", err)
+	}
+	if len(mine) != 1 || mine[0].ID != shipped.ID {
+		t.Fatalf("unexpected shipped mine orders: %+v", mine)
+	}
+}
+
 func TestOrderStatusCASResolvesPayTimeoutRace(t *testing.T) {
 	ctx := context.Background()
 	now := time.Date(2026, 5, 30, 12, 0, 0, 0, time.UTC)

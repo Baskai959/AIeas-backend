@@ -47,6 +47,7 @@ type LiveSession struct {
 	Description        string            `json:"description,omitempty"`
 	CoverURL           string            `json:"coverUrl,omitempty"`
 	Status             LiveSessionStatus `json:"status"`
+	IsDigitalHuman     bool              `json:"isDigitalHuman"`
 	ActiveAuctionID    uint64            `json:"activeAuctionId,omitempty"`
 	OpenedAt           *time.Time        `json:"openedAt,omitempty"`
 	ClosedAt           *time.Time        `json:"closedAt,omitempty"`

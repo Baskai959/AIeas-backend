@@ -62,7 +62,9 @@ func startAppWorkers(cfg appconfig.Config, deps ServerDependencies, services app
 	}
 	if startWSConsumers {
 		for _, pubSubClient := range deps.PubSubClients {
-			wstransport.NewPubSubBroadcaster(pubSubClient, deps.Hub).Start(workerCtx)
+			broadcaster := wstransport.NewPubSubBroadcaster(pubSubClient, deps.Hub)
+			broadcaster.SetBidAsyncCoordinator(deps.BidAsyncCoordinator)
+			broadcaster.Start(workerCtx)
 		}
 	}
 	if startBusinessWorkers && deps.EventLog != nil && deps.EventLog.Enabled() {
@@ -94,6 +96,15 @@ func startAppWorkers(cfg appconfig.Config, deps ServerDependencies, services app
 	}
 	if startWSConsumers && deps.OnlineCounter != nil {
 		deps.OnlineCounter.StartJanitor(workerCtx, time.Minute)
+	}
+
+	// 异步竞价裁决 worker：从 aieas.bid.commands 顺序消费，复用 Lua 裁决，
+	// 再通过实时事件总线按 liveSessionId + userId 定向推 bid.result 给 ws-gateway。
+	if startBusinessWorkers && deps.BidCommandConsumer != nil && services.bid != nil {
+		delivery := bidResultDelivery{coordinator: deps.BidAsyncCoordinator, eventPublisher: deps.RealtimeEventPublisher}
+		decisionWorker := appruntime.NewBidDecisionWorker(deps.BidCommandConsumer, services.bid, delivery)
+		decisionWorker.SetMetrics(deps.MetricsRegistry)
+		decisionWorker.Start(workerCtx)
 	}
 
 	// P1-A：押金一致性巡检。仅在显式 enable 时启动；测试场景默认关闭，
