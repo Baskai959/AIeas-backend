@@ -17,21 +17,23 @@ import (
 )
 
 type ProducerConfig struct {
-	Brokers            []string
-	ClientID           string
-	BidEventsTopic     string
-	BidCommandsTopic   string
-	AuctionEventsTopic string
-	OrderEventsTopic   string
+	Brokers               []string
+	ClientID              string
+	BidEventsTopic        string
+	BidCommandsTopic      string
+	BidCommandsPartitions int
+	AuctionEventsTopic    string
+	OrderEventsTopic      string
 }
 
 type Producer struct {
-	brokers            []string
-	clientID           string
-	bidEventsTopic     string
-	bidCommandsTopic   string
-	auctionEventsTopic string
-	orderEventsTopic   string
+	brokers               []string
+	clientID              string
+	bidEventsTopic        string
+	bidCommandsTopic      string
+	bidCommandsPartitions int
+	auctionEventsTopic    string
+	orderEventsTopic      string
 
 	mu      sync.Mutex
 	writers map[string]*kafkago.Writer
@@ -46,20 +48,80 @@ func NewProducer(cfg ProducerConfig) (*Producer, error) {
 	if clientID == "" {
 		clientID = "aieas-backend"
 	}
+	partitions := cfg.BidCommandsPartitions
+	if partitions <= 0 {
+		partitions = defaultBidCommandsPartitions
+	}
 	return &Producer{
-		brokers:            brokers,
-		clientID:           clientID,
-		bidEventsTopic:     defaultString(cfg.BidEventsTopic, "aieas.bid.events"),
-		bidCommandsTopic:   defaultString(cfg.BidCommandsTopic, "aieas.bid.commands"),
-		auctionEventsTopic: defaultString(cfg.AuctionEventsTopic, "aieas.auction.events"),
-		orderEventsTopic:   defaultString(cfg.OrderEventsTopic, "aieas.order.events"),
-		writers:            make(map[string]*kafkago.Writer),
+		brokers:               brokers,
+		clientID:              clientID,
+		bidEventsTopic:        defaultString(cfg.BidEventsTopic, "aieas.bid.events"),
+		bidCommandsTopic:      defaultString(cfg.BidCommandsTopic, "aieas.bid.commands"),
+		bidCommandsPartitions: partitions,
+		auctionEventsTopic:    defaultString(cfg.AuctionEventsTopic, "aieas.auction.events"),
+		orderEventsTopic:      defaultString(cfg.OrderEventsTopic, "aieas.order.events"),
+		writers:               make(map[string]*kafkago.Writer),
 	}, nil
 }
 
+// defaultBidCommandsPartitions 与 config.DefaultBidCommandsPartitions 保持一致；
+// 这里复制一个常量是为了避免 infra/kafka 反向依赖 internal/config。
+const defaultBidCommandsPartitions = 16
+
+// EnsureBidCommandsTopic 在装配期幂等地创建 aieas.bid.commands topic 并使用配置
+// 的分区数。CreateTopics 对已存在的 topic 是 no-op（不会改写已有分区），所以本
+// 方法仅保证“首次启动 / 新环境”自动建出 16 partition 的 topic；存量 topic 的
+// 扩容仍需 DBA/运维手工执行：
+//
+//	kafka-topics.sh --alter --topic aieas.bid.commands --partitions 16
+//
+// 实现使用 segmentio/kafka-go 的 (*kafka.Conn).CreateTopics——它内部会先
+// 通过任意 broker 拿到 controller 信息再执行 CreateTopics RPC。失败时由调用方
+// log warn 不阻塞启动，以避免 Kafka 临时不可达把整个服务 readiness 拖垮。
+func (p *Producer) EnsureBidCommandsTopic(ctx context.Context) error {
+	if p == nil {
+		return nil
+	}
+	topic := strings.TrimSpace(p.bidCommandsTopic)
+	if topic == "" {
+		return nil
+	}
+	partitions := p.bidCommandsPartitions
+	if partitions <= 0 {
+		partitions = defaultBidCommandsPartitions
+	}
+	dialer := &kafkago.Dialer{ClientID: p.clientID, Timeout: 5 * time.Second}
+	var lastErr error
+	for _, broker := range p.brokers {
+		conn, err := dialer.DialContext(ctx, "tcp", broker)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		// CreateTopics 在 segmentio/kafka-go 中会自动定位 controller，所以
+		// 任意一个可达 broker 都可以发起调用。
+		err = conn.CreateTopics(kafkago.TopicConfig{
+			Topic:             topic,
+			NumPartitions:     partitions,
+			ReplicationFactor: -1, // 让 broker 使用 default.replication.factor
+		})
+		_ = conn.Close()
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+	}
+	if lastErr == nil {
+		return fmt.Errorf("ensure topic %s: no kafka brokers configured", topic)
+	}
+	return fmt.Errorf("ensure topic %s with %d partitions: %w", topic, partitions, lastErr)
+}
+
 // BidCommand 是异步竞价裁决的命令消息：由 WS handler 在 preCheck 通过后投递，
-// 由 BidDecisionWorker 顺序消费并复用 Lua 裁决。key 必须是 auctionId，
-// 保证同一拍品的命令落在同一 partition 内、严格有序。
+// 由 BidDecisionWorker 并发消费并复用 Lua 裁决。
+//
+// Route X：Kafka key 使用 bid/request 维度，不再用 auctionId 固定分区；Kafka
+// 不承载同拍品顺序保证，业务正确性边界由 Redis EvalOnShard + bid.lua + idem key 提供。
 type BidCommand struct {
 	BidID                string          `json:"bidId"`
 	AuctionID            uint64          `json:"auctionId"`
@@ -90,22 +152,46 @@ type BidCommand struct {
 	TraceState  string `json:"-"`
 }
 
-// PublishBidCommand 把竞价命令投递到 aieas.bid.commands。key=auctionId 以保证
-// 同 auction 同 partition 顺序。Kafka disabled 时 Producer 为 nil，直接返回 nil。
+// PublishBidCommand 把竞价命令投递到 aieas.bid.commands。
+//
+// Route X：message key 不再是 auctionId，而是包含 bid/request 维度的 command key；
+// 继续配合 Hash balancer，让同一 auction 的不同 bid 可分散到不同 partition。
+// 同拍品并发乱序由 Redis Lua / EvalOnShard / idem key 保证正确性。
+// Kafka disabled 时 Producer 为 nil，直接返回 nil。
 func (p *Producer) PublishBidCommand(ctx context.Context, cmd BidCommand) error {
 	if p == nil {
 		return nil
 	}
+	msg, err := bidCommandMessage(ctx, cmd)
+	if err != nil {
+		return err
+	}
+	return p.publishMessages(ctx, p.bidCommandsTopic, msg)
+}
+
+func bidCommandMessage(ctx context.Context, cmd BidCommand) (kafkago.Message, error) {
 	if cmd.EnqueuedAtMS == 0 {
 		cmd.EnqueuedAtMS = time.Now().UTC().UnixMilli()
 	}
 	value, err := json.Marshal(cmd)
 	if err != nil {
-		return fmt.Errorf("marshal bid command: %w", err)
+		return kafkago.Message{}, fmt.Errorf("marshal bid command: %w", err)
 	}
 	headers := map[string]string{"command_type": "bid.place"}
 	tracing.InjectMap(ctx, headers)
-	return p.publish(ctx, p.bidCommandsTopic, strconv.FormatUint(cmd.AuctionID, 10), value, headers)
+	return kafkago.Message{
+		Key:     []byte(bidCommandKey(cmd)),
+		Value:   value,
+		Time:    time.Now().UTC(),
+		Headers: kafkaHeaders(headers),
+	}, nil
+}
+
+func bidCommandKey(cmd BidCommand) string {
+	if bidID := strings.TrimSpace(cmd.BidID); bidID != "" {
+		return fmt.Sprintf("bid:%d:%s", cmd.AuctionID, bidID)
+	}
+	return fmt.Sprintf("bid:%d:fallback:%s:%d:%d", cmd.AuctionID, strings.TrimSpace(cmd.UserID), cmd.Price, cmd.EnqueuedAtMS)
 }
 
 func (p *Producer) PublishBidEvent(ctx context.Context, event redisinfra.BidEvent) error {
@@ -286,8 +372,10 @@ func (p *Producer) writer(topic string) *kafkago.Writer {
 		return writer
 	}
 	writer := &kafkago.Writer{
-		Addr:         kafkago.TCP(p.brokers...),
-		Topic:        topic,
+		Addr:  kafkago.TCP(p.brokers...),
+		Topic: topic,
+		// Hash 保持按 message key 路由；bid commands 的 key 已是 bid/request 维度，
+		// 因此同 auction 的不同 bid 不再被固定到同一 partition。
 		Balancer:     &kafkago.Hash{},
 		RequiredAcks: kafkago.RequireAll,
 		BatchTimeout: 10 * time.Millisecond,
@@ -355,10 +443,20 @@ func (r *BidEventReader) Close() error {
 	return r.reader.Close()
 }
 
-// BidCommandReader 顺序消费 aieas.bid.commands。GroupID 内按 partition 顺序消费，
-// 单 partition 单 goroutine（由调用方保证不在 partition 内并发）。
+// BidCommandReader 从 aieas.bid.commands 拉取命令。Kafka 仍保证单 partition 内位点顺序，
+// 但 Route X 不依赖同 auction 落同 partition，也不把 Kafka FIFO 作为业务正确性边界。
 type BidCommandReader struct {
 	reader *kafkago.Reader
+
+	// 按 partition 缓存最近一次 fetch 出来的 lag 值（HighWaterMark - Offset - 1）。
+	// segmentio/kafka-go 的 Reader.Stats() 在 group consumer 模式下只返回当前
+	// reader 持有的单个 partition；且 Partition 字段在多 reader 实例下经常表
+	// 现为 "" 或 -1（聚合占位），无法直接拿到真实 partition 编号。这里改为从
+	// 每条 FetchMessage 返回的 Message.Partition / Message.HighWaterMark / Offset
+	// 自行推算并按 partition 缓存，配合周期上报实现 bid_kafka_partition_lag
+	// 的真实 partition 标签。
+	lagMu      sync.Mutex
+	partitions map[int]int64
 }
 
 type BidCommandReaderConfig struct {
@@ -377,14 +475,17 @@ func NewBidCommandReader(cfg BidCommandReaderConfig) (*BidCommandReader, error) 
 		groupID = "aieas-bid-decision-workers"
 	}
 	topic := defaultString(cfg.Topic, "aieas.bid.commands")
-	return &BidCommandReader{reader: kafkago.NewReader(kafkago.ReaderConfig{
-		Brokers:  brokers,
-		GroupID:  groupID,
-		Topic:    topic,
-		MinBytes: 1,
-		MaxBytes: 10 << 20,
-		MaxWait:  200 * time.Millisecond,
-	})}, nil
+	return &BidCommandReader{
+		reader: kafkago.NewReader(kafkago.ReaderConfig{
+			Brokers:  brokers,
+			GroupID:  groupID,
+			Topic:    topic,
+			MinBytes: 1,
+			MaxBytes: 10 << 20,
+			MaxWait:  200 * time.Millisecond,
+		}),
+		partitions: make(map[int]int64),
+	}, nil
 }
 
 // FetchBidCommand 拉取下一条命令，返回 commit 回调用于消费成功后提交位点。
@@ -397,6 +498,7 @@ func (r *BidCommandReader) FetchBidCommand(ctx context.Context) (BidCommand, fun
 	if err != nil {
 		return BidCommand{}, nil, err
 	}
+	r.recordPartitionLag(msg)
 	commit := func(commitCtx context.Context) error {
 		return r.reader.CommitMessages(commitCtx, msg)
 	}
@@ -409,11 +511,50 @@ func (r *BidCommandReader) FetchBidCommand(ctx context.Context) (BidCommand, fun
 	return cmd, commit, nil
 }
 
+// recordPartitionLag 在每次成功 fetch 后更新 reader 持有 partition 的最近 lag。
+// HighWaterMark 是 broker 端 partition 当前最高 offset+1；Offset 是已读取该条
+// 消息的位点。lag 反映该 partition 后面还有多少消息未消费。
+func (r *BidCommandReader) recordPartitionLag(msg kafkago.Message) {
+	if r == nil {
+		return
+	}
+	lag := msg.HighWaterMark - msg.Offset - 1
+	if lag < 0 {
+		lag = 0
+	}
+	r.lagMu.Lock()
+	if r.partitions == nil {
+		r.partitions = make(map[int]int64)
+	}
+	r.partitions[msg.Partition] = lag
+	r.lagMu.Unlock()
+}
+
 func (r *BidCommandReader) Close() error {
 	if r == nil || r.reader == nil {
 		return nil
 	}
 	return r.reader.Close()
+}
+
+// PartitionLag 暴露 reader 当前已观测到的所有 partition 的最近 lag。
+// 多 reader 实例（同一 group 不同进程）下，每个实例只会看到自己被分配的
+// partition，分别上报；同一 partition 在多个实例间不会出现重复 series（同
+// 一 group 同一 partition 同一时刻只会被一个实例消费）。
+//
+// 返回值是 map[partition]lag 的副本，调用方可安全迭代。当 reader 还没拉到
+// 任何消息时返回空 map（非 nil）。
+func (r *BidCommandReader) PartitionLag() map[int]int64 {
+	if r == nil {
+		return map[int]int64{}
+	}
+	r.lagMu.Lock()
+	defer r.lagMu.Unlock()
+	out := make(map[int]int64, len(r.partitions))
+	for p, lag := range r.partitions {
+		out[p] = lag
+	}
+	return out
 }
 
 func decodeBidEventMessage(msg kafkago.Message) (redisinfra.BidEvent, error) {

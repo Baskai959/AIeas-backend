@@ -202,17 +202,59 @@ type DoubaoTTSConfig struct {
 }
 
 type KafkaConfig struct {
-	Enabled            bool     `yaml:"enabled"`
-	Brokers            []string `yaml:"brokers"`
-	ClientID           string   `yaml:"clientID"`
-	BidEventsTopic     string   `yaml:"bidEventsTopic"`
-	BidCommandsTopic   string   `yaml:"bidCommandsTopic"`
-	AuctionEventsTopic string   `yaml:"auctionEventsTopic"`
-	OrderEventsTopic   string   `yaml:"orderEventsTopic"`
-	BidBridgeGroup     string   `yaml:"bidBridgeGroup"`
-	BidRecordGroup     string   `yaml:"bidRecordGroup"`
-	BidDecisionGroup   string   `yaml:"bidDecisionGroup"`
+	Enabled               bool     `yaml:"enabled"`
+	Brokers               []string `yaml:"brokers"`
+	ClientID              string   `yaml:"clientID"`
+	BidEventsTopic        string   `yaml:"bidEventsTopic"`
+	BidCommandsTopic      string   `yaml:"bidCommandsTopic"`
+	BidCommandsPartitions int      `yaml:"bidCommandsPartitions"`
+	AuctionEventsTopic    string   `yaml:"auctionEventsTopic"`
+	OrderEventsTopic      string   `yaml:"orderEventsTopic"`
+	BidBridgeGroup        string   `yaml:"bidBridgeGroup"`
+	BidRecordGroup        string   `yaml:"bidRecordGroup"`
+	BidDecisionGroup      string   `yaml:"bidDecisionGroup"`
+
+	// BidDecisionWorkerPoolSize 是 BidDecisionWorker 主消费循环的并发裁决 goroutine 上限。
+	// 同 auction 串行性由 Redis 同 shard 单线程兜底（路线 X），不再依赖 partition FIFO。
+	// 默认 128；允许 [16,256]；非法/负值/0 在 normalize 时回退默认 128。
+	BidDecisionWorkerPoolSize int `yaml:"bidDecisionWorkerPoolSize"`
+	// BidDecisionCommitMode 取值 "single" | "batch"。默认 "batch"：
+	// 主循环按 BatchSize/MaxLatency 触发批量 commit；非法值在 normalize 时回退 "batch"。
+	// 配合 Lua idem_key TTL 30s 提供 at-least-once 兜底。
+	BidDecisionCommitMode string `yaml:"bidDecisionCommitMode"`
+	// BidDecisionCommitBatchSize 是 batch commit 的最大攒批条数。默认 64。<=0 兜底默认。
+	BidDecisionCommitBatchSize int `yaml:"bidDecisionCommitBatchSize"`
+	// BidDecisionCommitMaxLatencyMs 是 batch commit 的最大攒批等待时长（毫秒）。默认 200。<=0 兜底默认。
+	BidDecisionCommitMaxLatencyMs int `yaml:"bidDecisionCommitMaxLatencyMs"`
+	// BidAsyncMaxPendingPerAuction 是异步竞价协调器（BidAsyncCoordinator）每个 auction
+	// in-flight 待裁决命令上限；超过该上限的入队请求会被回 HOT_AUCTION_QUEUE_FULL。
+	// 默认 2000；允许 [100,10000]；0/负值/超界在 normalize 时回退/收敛。
+	BidAsyncMaxPendingPerAuction int `yaml:"bidAsyncMaxPendingPerAuction"`
 }
+
+// DefaultBidCommandsPartitions 是 aieas.bid.commands topic 的默认分区数。
+// 16 个分区配合 bid/request 维度 key + Hash 平衡器，让同 auction 的不同 bid
+// 也可分散到不同 partition；Route X 不依赖 Kafka 同拍品顺序，正确性由 Redis
+// Lua / EvalOnShard / idem key 兜底。0/负值会兜底回 16，防止线上误填把 topic
+// 变成单分区导致整个裁决链路串行化。
+const DefaultBidCommandsPartitions = 16
+
+// 路线 X：放弃 partition FIFO，worker pool 完全并发消费。这些常量是
+// BidDecisionWorker 池/批量 commit 的默认值与上下限。
+const (
+	DefaultBidDecisionWorkerPoolSize     = 128
+	MinBidDecisionWorkerPoolSize         = 16
+	MaxBidDecisionWorkerPoolSize         = 256
+	DefaultBidDecisionCommitMode         = "batch"
+	DefaultBidDecisionCommitBatchSize    = 64
+	DefaultBidDecisionCommitMaxLatencyMs = 200
+	// BidAsyncCoordinator pending 上限的默认值与上下限。in-flight 命令在 ws
+	// handler 入队时占名额；上限撞顶会回 HOT_AUCTION_QUEUE_FULL，因此这是
+	// "热点拍品最多能积压多少未裁决命令" 的总闸门。
+	DefaultBidAsyncMaxPendingPerAuction = 2000
+	MinBidAsyncMaxPendingPerAuction     = 100
+	MaxBidAsyncMaxPendingPerAuction     = 10000
+)
 
 type MCPConfig struct {
 	Read    MCPAuthConfig `yaml:"read"`
@@ -383,16 +425,22 @@ func Default() Config {
 			Voice: "zh_female_vv_jupiter_bigtts",
 		},
 		Kafka: KafkaConfig{
-			Enabled:            false,
-			Brokers:            []string{"127.0.0.1:9092"},
-			ClientID:           "aieas-backend",
-			BidEventsTopic:     "aieas.bid.events",
-			BidCommandsTopic:   "aieas.bid.commands",
-			AuctionEventsTopic: "aieas.auction.events",
-			OrderEventsTopic:   "aieas.order.events",
-			BidBridgeGroup:     "aieas-bid-kafka-bridge",
-			BidRecordGroup:     "aieas-bid-record-writers",
-			BidDecisionGroup:   "aieas-bid-decision-workers",
+			Enabled:                       false,
+			Brokers:                       []string{"127.0.0.1:9092"},
+			ClientID:                      "aieas-backend",
+			BidEventsTopic:                "aieas.bid.events",
+			BidCommandsTopic:              "aieas.bid.commands",
+			BidCommandsPartitions:         DefaultBidCommandsPartitions,
+			AuctionEventsTopic:            "aieas.auction.events",
+			OrderEventsTopic:              "aieas.order.events",
+			BidBridgeGroup:                "aieas-bid-kafka-bridge",
+			BidRecordGroup:                "aieas-bid-record-writers",
+			BidDecisionGroup:              "aieas-bid-decision-workers",
+			BidDecisionWorkerPoolSize:     DefaultBidDecisionWorkerPoolSize,
+			BidDecisionCommitMode:         DefaultBidDecisionCommitMode,
+			BidDecisionCommitBatchSize:    DefaultBidDecisionCommitBatchSize,
+			BidDecisionCommitMaxLatencyMs: DefaultBidDecisionCommitMaxLatencyMs,
+			BidAsyncMaxPendingPerAuction:  DefaultBidAsyncMaxPendingPerAuction,
 		},
 		MCP: MCPConfig{
 			Read: MCPAuthConfig{
@@ -827,6 +875,44 @@ func (k *KafkaConfig) normalize() {
 	}
 	if strings.TrimSpace(k.BidDecisionGroup) == "" {
 		k.BidDecisionGroup = "aieas-bid-decision-workers"
+	}
+	// 0/负值兜底默认分区数，避免线上误填导致 topic 退化为单分区。
+	if k.BidCommandsPartitions <= 0 {
+		k.BidCommandsPartitions = DefaultBidCommandsPartitions
+	}
+	// 路线 X：worker pool / batch commit 配置归一化。
+	if k.BidDecisionWorkerPoolSize <= 0 {
+		k.BidDecisionWorkerPoolSize = DefaultBidDecisionWorkerPoolSize
+	}
+	if k.BidDecisionWorkerPoolSize < MinBidDecisionWorkerPoolSize {
+		k.BidDecisionWorkerPoolSize = MinBidDecisionWorkerPoolSize
+	}
+	if k.BidDecisionWorkerPoolSize > MaxBidDecisionWorkerPoolSize {
+		k.BidDecisionWorkerPoolSize = MaxBidDecisionWorkerPoolSize
+	}
+	switch strings.ToLower(strings.TrimSpace(k.BidDecisionCommitMode)) {
+	case "single":
+		k.BidDecisionCommitMode = "single"
+	case "batch", "":
+		k.BidDecisionCommitMode = DefaultBidDecisionCommitMode
+	default:
+		k.BidDecisionCommitMode = DefaultBidDecisionCommitMode
+	}
+	if k.BidDecisionCommitBatchSize <= 0 {
+		k.BidDecisionCommitBatchSize = DefaultBidDecisionCommitBatchSize
+	}
+	if k.BidDecisionCommitMaxLatencyMs <= 0 {
+		k.BidDecisionCommitMaxLatencyMs = DefaultBidDecisionCommitMaxLatencyMs
+	}
+	// BidAsyncCoordinator pending 上限：默认 2000，下限 100，上限 10000。
+	if k.BidAsyncMaxPendingPerAuction <= 0 {
+		k.BidAsyncMaxPendingPerAuction = DefaultBidAsyncMaxPendingPerAuction
+	}
+	if k.BidAsyncMaxPendingPerAuction < MinBidAsyncMaxPendingPerAuction {
+		k.BidAsyncMaxPendingPerAuction = MinBidAsyncMaxPendingPerAuction
+	}
+	if k.BidAsyncMaxPendingPerAuction > MaxBidAsyncMaxPendingPerAuction {
+		k.BidAsyncMaxPendingPerAuction = MaxBidAsyncMaxPendingPerAuction
 	}
 }
 

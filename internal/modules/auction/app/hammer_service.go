@@ -259,14 +259,14 @@ func (s *HammerService) broadcastHammerPendingState(auction domain.AuctionLot, n
 		return
 	}
 	state := domain.AuctionState{
-		AuctionID:     auction.AuctionID,
-		Status:        domain.AuctionStatusHammerPending,
-		StartPrice:    auction.StartPrice,
-		CapPrice:      auction.CapPrice,
-		IncrementRule: auction.IncrementRule,
-		CurrentPrice:  auction.CurrentPrice,
-		LeaderBidderID: auction.LeaderBidderID,
-		BidCount:       auction.BidCount,
+		AuctionID:        auction.AuctionID,
+		Status:           domain.AuctionStatusHammerPending,
+		StartPrice:       auction.StartPrice,
+		CapPrice:         auction.CapPrice,
+		IncrementRule:    auction.IncrementRule,
+		CurrentPrice:     auction.CurrentPrice,
+		LeaderBidderID:   auction.LeaderBidderID,
+		BidCount:         auction.BidCount,
 		ParticipantCount: auction.ParticipantCount,
 		StartTime:        auction.StartTime,
 		EndTime:          auction.EndTime,
@@ -337,7 +337,7 @@ func (s *HammerService) Hammer(ctx context.Context, in domain.HammerInput) (doma
 //  3. 真正落锤（finalizeHammer）；
 //  4. finalize 完成后清理闸门（不论成功/失败）。
 //
-// 屏障 ok=false 时强制 finalize（fallback），并打 IncHammerDrainTimeout 指标。
+// 屏障 ok=false 时保持 HAMMER_PENDING，不 finalize；下一轮 timer/调用会继续等待。
 func (s *HammerService) hammerWithDrain(ctx context.Context, in domain.HammerInput) (domain.HammerResult, *domain.OrderDeal, error) {
 	pending, err := s.BeginHammerPending(ctx, in)
 	if err != nil {
@@ -359,11 +359,10 @@ func (s *HammerService) hammerWithDrain(ctx context.Context, in domain.HammerInp
 	if s.barrier != nil {
 		ok = s.barrier.WaitDrain(ctx, in.AuctionID, maxWait)
 	}
-	if !ok && s.metrics != nil {
-		// barrier 内部已埋一次 timeout 指标；这里是包装语义，不重复打。
-		_ = ok
+	if !ok {
+		return domain.HammerResult{}, nil, domain.ErrInvalidState
 	}
-	// 真正落锤。无论 ok=true/false 都进 finalize。
+	// 真正落锤。只有 drain 完成才进 finalize。
 	result, order, finalErr := s.hammerInternal(ctx, pending.HammerInput)
 	s.openGate(in.AuctionID)
 	return result, order, finalErr
@@ -594,6 +593,7 @@ func buildLotDealSnapshot(lot domain.AuctionLot, dealPrice int64, winnerID strin
 		"sellerId":      lot.SellerID,
 		"liveSessionId": lot.LiveSessionID,
 		"title":         lot.Title,
+		"subtitle":      lot.Subtitle,
 		"description":   lot.Description,
 		"category":      lot.Category,
 		"brand":         lot.Brand,

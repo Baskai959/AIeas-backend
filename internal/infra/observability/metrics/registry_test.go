@@ -30,6 +30,9 @@ func TestNewNoopAndDefaultAreDisabled(t *testing.T) {
 	nilReg.IncBidDuplicate()
 	nilReg.IncWSConnect()
 	nilReg.ObserveRedisLua("foo", time.Millisecond, "")
+	nilReg.IncBidLuaQueueDepth("0", "rt-0", "bid.place")
+	nilReg.DecBidLuaQueueDepth("0", "rt-0", "bid.place")
+	nilReg.ObserveBidLuaRoundTrip("0", "rt-0", "bid.place", "ok", time.Millisecond)
 }
 
 func TestNewEnabledRegistersCollectors(t *testing.T) {
@@ -127,6 +130,24 @@ func TestObserveRedisCommandRecordsErrorsOnly(t *testing.T) {
 	r.ObserveRedisCommand("default", "HGET", time.Millisecond, errors.New("boom"))
 	if v := counterVecValue(t, r.redisCommandErrors, "default", "HGET"); v != 1 {
 		t.Fatalf("redisCommandErrors expected 1, got %v", v)
+	}
+}
+
+func TestObserveBidLuaQueueAndRoundTrip(t *testing.T) {
+	r := New(Options{Enabled: true})
+	r.IncBidLuaQueueDepth("0", "rt-0", "bid.place")
+	r.IncBidLuaQueueDepth("0", "rt-0", "bid.place")
+	r.DecBidLuaQueueDepth("0", "rt-0", "bid.place")
+	r.ObserveBidLuaRoundTrip("0", "rt-0", "bid.place", "ok", time.Millisecond)
+	r.ObserveBidLuaRoundTrip("0", "rt-0", "bid.place", "timeout", time.Millisecond)
+	if v := gaugeVecValue(t, r.bidLuaQueueDepth, "0", "rt-0", "bid.place"); v != 1 {
+		t.Fatalf("bidLuaQueueDepth expected 1, got %v", v)
+	}
+	if v := histogramVecCount(t, r.bidLuaRoundTrip, "0", "rt-0", "bid.place", "ok"); v != 1 {
+		t.Fatalf("bidLuaRoundTrip ok expected 1, got %v", v)
+	}
+	if v := histogramVecCount(t, r.bidLuaRoundTrip, "0", "rt-0", "bid.place", "timeout"); v != 1 {
+		t.Fatalf("bidLuaRoundTrip timeout expected 1, got %v", v)
 	}
 }
 

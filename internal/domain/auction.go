@@ -115,6 +115,7 @@ type AuctionLot struct {
 	SellerID          string            `json:"sellerId"`
 	LiveSessionID     *uint64           `json:"liveSessionId,omitempty"`
 	Title             string            `json:"title"`
+	Subtitle          string            `json:"subtitle,omitempty"`
 	Description       string            `json:"description,omitempty"`
 	Category          string            `json:"category"`
 	CategoryID        string            `json:"categoryId,omitempty"`
@@ -216,8 +217,8 @@ type AuctionState struct {
 	Version          int64           `json:"version"`
 	Source           string          `json:"source"`
 	ServerTime       *time.Time      `json:"serverTime,omitempty"`
-	// AntiSnipingMS / AntiExtendMS 在 InitAuction 写入 Redis state，timer 读出做
-	// anti-sniping grace 兜底；变更走 invalidateAuctionSnapshot + 下一轮 InitAuction。
+	// AntiSnipingMS / AntiExtendMS 在 InitAuction 写入 Redis state，出价命中尾段时
+	// 用于延长 EndTime；变更走 invalidateAuctionSnapshot + 下一轮 InitAuction。
 	AntiSnipingMS int64 `json:"antiSnipingMs,omitempty"`
 	AntiExtendMS  int64 `json:"antiExtendMs,omitempty"`
 }

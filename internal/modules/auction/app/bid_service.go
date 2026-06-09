@@ -461,8 +461,9 @@ func (s *BidService) place(ctx context.Context, in PlaceBidInput) (domain.BidRes
 // 当 terminal 非 nil 时表示已在前置阶段裁定（拒绝/重复/本地预拒/闸门拒绝），
 // 调用方应直接回传该结果而不入队。snapshot 仅在 terminal==nil 时有效。
 //
-// 注意：异步路径不跨进程持有同价闸门 slot（worker 顺序消费已天然串行），
-// 因此这里在 preCheck 之后立即释放闸门，避免占用 in-flight 名额。
+// 注意：异步路径不跨进程持有同价闸门 slot；Route X 允许同 auction 命令并发乱序，
+// 最终一致性由 Redis Lua / idem key 原子裁决兜底。因此这里在 preCheck 之后立即释放闸门，
+// 避免占用 in-flight 名额。
 func (s *BidService) PreCheckForAsync(ctx context.Context, in PlaceBidInput) (BidCommandSnapshot, *domain.BidResult, error) {
 	snap, terminal, err := s.preCheck(ctx, in)
 	if snap.gateRelease != nil {
@@ -503,6 +504,12 @@ func (s *BidService) PreCheckForAsync(ctx context.Context, in PlaceBidInput) (Bi
 // 它基于命令快照重建 arbitrate 所需上下文（拍品快照由命令字段合成，
 // 不再回源 DB；风控开关/黑名单策略走进程内缓存读取），保证与同步路径
 // 完全一致的落库/广播/自动黑名单/hook 后处理。
+//
+// 与同步 Place() 一致：本方法负责把 arbitrate 的最终结果落到通用业务指标
+// （ObserveBid / IncBidReject / IncBidDuplicate / IncBidFreqLimit）。worker 侧
+// 的 bid_decision_outcome_total 只反映 worker 视角的 outcome，并非裁决拒因；
+// 这里的埋点保证 aieas_bid_reject_total{reason} 在异步路径上同步递增，前端
+// dashboard 可据此定位拒因细分。
 func (s *BidService) ArbitrateFromCommand(ctx context.Context, cmd BidCommandSnapshot) (domain.BidResult, error) {
 	if cmd.BidID == "" || cmd.AuctionID == 0 || cmd.UserID == "" {
 		return domain.BidResult{}, domain.ErrInvalidArgument
@@ -556,7 +563,38 @@ func (s *BidService) ArbitrateFromCommand(ctx context.Context, cmd BidCommandSna
 		blacklistStrategy:  blacklistStrategy,
 		streamEnabled:      bidStreamEnabled(s.realtime),
 	}
-	return s.arbitrate(ctx, snap)
+	start := time.Now()
+	result, err := s.arbitrate(ctx, snap)
+	s.recordArbitrateMetrics(result, err, time.Since(start))
+	return result, err
+}
+
+// recordArbitrateMetrics 把 arbitrate 的终态映射到通用业务指标。这是异步路径上
+// aieas_bid_reject_total{reason} 的唯一埋点（同步 Place() 在 wrapper 里有等价
+// 调用，二者不会双计）。
+func (s *BidService) recordArbitrateMetrics(result domain.BidResult, err error, elapsed time.Duration) {
+	if s == nil || s.metrics == nil {
+		return
+	}
+	switch {
+	case err != nil:
+		s.metrics.ObserveBid("error", "internal", elapsed)
+	case result.Duplicate:
+		s.metrics.IncBidDuplicate()
+		s.metrics.ObserveBid("duplicate", "", elapsed)
+	case result.Accepted:
+		s.metrics.ObserveBid("accepted", "", elapsed)
+	default:
+		reason := strings.TrimSpace(result.Reason)
+		if reason == "" {
+			reason = "unknown"
+		}
+		s.metrics.IncBidReject(reason)
+		s.metrics.ObserveBid("rejected", reason, elapsed)
+		if reason == "FREQ_LIMIT" {
+			s.metrics.IncBidFreqLimit()
+		}
+	}
 }
 
 func (s *BidService) preCheck(ctx context.Context, in PlaceBidInput) (bidCheckSnapshot, *domain.BidResult, error) {
@@ -800,7 +838,7 @@ func (s *BidService) arbitrate(ctx context.Context, snap bidCheckSnapshot) (doma
 		}
 	}
 	stageStart = time.Now()
-	s.enrichBidResult(ctx, &result, auction.liveSessionPtr())
+	s.enrichBidResultWithMode(ctx, &result, auction.liveSessionPtr(), streamEnabled)
 	s.observeBidStage("enrich_result", bidStageResult(result), stageStart)
 	if !result.Accepted && !result.Duplicate && riskControlEnabled && blacklistStrategy.Enabled && blacklistStrategy.MissingDepositEnabled && s.risk != nil &&
 		(result.Reason == "NOT_ENROLLED" || result.Reason == "DEPOSIT_NOT_READY") {
@@ -824,7 +862,7 @@ func (s *BidService) arbitrate(ctx context.Context, snap bidCheckSnapshot) (doma
 	}
 	if result.Accepted && !result.Duplicate && result.AutoClosed && s.hammer != nil {
 		stageStart = time.Now()
-		if _, _, err := s.hammer.Hammer(ctx, domain.HammerInput{
+		hammerInput := domain.HammerInput{
 			RequestID:      "cap-" + in.RequestID,
 			AuctionID:      in.AuctionID,
 			ActorID:        "system",
@@ -833,15 +871,62 @@ func (s *BidService) arbitrate(ctx context.Context, snap bidCheckSnapshot) (doma
 			Force:          true,
 			Now:            now,
 			IdempotencyTTL: 24 * time.Hour,
-		}); err != nil {
-			s.observeBidStage("cap_hammer", "error", stageStart)
-			return domain.BidResult{}, err
 		}
-		s.observeBidStage("cap_hammer", "ok", stageStart)
+		if streamEnabled {
+			// 路线 X：异步路径下 cap_hammer 改异步触发，避免阻塞 worker 主路径。
+			// hammer 内部 BeginHammerPending + InFlightBarrier 仍然能等同 auction
+			// pending 排空再落锤；Force=true 保留快路径语义，但落锤本身从主链路上移除。
+			// 用 detached background ctx + 30s timeout，避免主 ctx 取消时落锤被中断。
+			hammerSvc := s.hammer
+			input := hammerInput
+			go func() {
+				defer func() {
+					if r := recover(); r != nil {
+						slog.Default().Error("cap_hammer async panic recovered",
+							"auction_id", input.AuctionID, "request_id", input.RequestID,
+							"panic", r)
+					}
+				}()
+				hctx, hcancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer hcancel()
+				if _, _, err := hammerSvc.Hammer(hctx, input); err != nil {
+					slog.Default().Warn("cap_hammer async failed",
+						"auction_id", input.AuctionID, "request_id", input.RequestID,
+						"error", err)
+				}
+			}()
+			s.observeBidStage("cap_hammer", "async_dispatched", stageStart)
+		} else {
+			if _, _, err := s.hammer.Hammer(ctx, hammerInput); err != nil {
+				s.observeBidStage("cap_hammer", "error", stageStart)
+				return domain.BidResult{}, err
+			}
+			s.observeBidStage("cap_hammer", "ok", stageStart)
+		}
 	}
 	if result.Reason == "FREQ_LIMIT" && !result.Duplicate && s.risk != nil {
 		stageStart = time.Now()
-		s.risk.RecordEvent(ctx, "BID_FREQ", in.BidderID, in.AuctionID, domain.RiskSeverityMid, result)
+		if streamEnabled {
+			// 路线 X：FREQ_LIMIT 同步写 risk_event 改异步，风控分析最终一致即可，
+			// 不影响 worker 主路径返回。
+			risk := s.risk
+			bidderID := in.BidderID
+			auctionID := in.AuctionID
+			payload := result
+			go func() {
+				defer func() {
+					if r := recover(); r != nil {
+						slog.Default().Error("risk record async panic recovered",
+							"auction_id", auctionID, "bidder_id", bidderID, "panic", r)
+					}
+				}()
+				rctx, rcancel := context.WithTimeout(context.Background(), 3*time.Second)
+				defer rcancel()
+				risk.RecordEvent(rctx, "BID_FREQ", bidderID, auctionID, domain.RiskSeverityMid, payload)
+			}()
+		} else {
+			s.risk.RecordEvent(ctx, "BID_FREQ", in.BidderID, in.AuctionID, domain.RiskSeverityMid, result)
+		}
 		if riskControlEnabled && blacklistStrategy.Enabled && blacklistStrategy.FrequencyEnabled {
 			s.scheduleAutoBlacklist(ctx, blacklistStrategy, in.BidderID, in.AuctionID, "AUTO_BLACKLIST_FREQ_LIMIT", result)
 		}
@@ -2173,6 +2258,13 @@ func (s *BidService) emitHighestBidHook(ctx context.Context, merchantID string, 
 }
 
 func (s *BidService) enrichBidResult(ctx context.Context, result *domain.BidResult, liveSessionID *uint64) {
+	s.enrichBidResultWithMode(ctx, result, liveSessionID, false)
+}
+
+// enrichBidResultWithMode 在异步模式下不做同步 users.FindByID：cache miss 时
+// 仅用 Lua ARGV 带回的 nickname/avatar 兜底返回，并 go func 异步刷 profile cache，
+// 下次出价命中。同步模式行为完全不变（保持原 BidderProfile 行为）。
+func (s *BidService) enrichBidResultWithMode(ctx context.Context, result *domain.BidResult, liveSessionID *uint64, asyncMode bool) {
 	if result == nil {
 		return
 	}
@@ -2184,7 +2276,12 @@ func (s *BidService) enrichBidResult(ctx context.Context, result *domain.BidResu
 		result.ServerTime = &serverTime
 	}
 	if result.Accepted {
-		profile := s.bidderProfile(ctx, result.BidderID)
+		var profile cachedBidderProfile
+		if asyncMode {
+			profile = s.bidderProfileAsyncRefresh(result.BidderID)
+		} else {
+			profile = s.bidderProfile(ctx, result.BidderID)
+		}
 		if result.BidderNickname == "" {
 			result.BidderNickname = profile.nickname
 		}
@@ -2259,6 +2356,42 @@ func (s *BidService) bidderProfile(ctx context.Context, userID string) cachedBid
 	}
 	s.storeBidderProfile(userID, profile, time.Now().Add(bidNicknameCacheTTL))
 	return profile
+}
+
+// bidderProfileAsyncRefresh 是 worker 主路径专用的非阻塞变体：cache miss 时
+// 立刻返回空 profile（caller 端应使用 Lua ARGV 带回的 nickname/avatar，再
+// 由 fallbackBidderNickname 兜底），同时 go func 异步刷 cache，下次出价直接命中。
+// 仅在 streamEnabled（异步路径）下使用。
+func (s *BidService) bidderProfileAsyncRefresh(userID string) cachedBidderProfile {
+	if s == nil || s.users == nil || strings.TrimSpace(userID) == "" {
+		return cachedBidderProfile{}
+	}
+	userID = strings.TrimSpace(userID)
+	if profile, ok := s.cachedBidderProfile(userID, time.Now()); ok {
+		return profile
+	}
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				slog.Default().Error("bidder profile async refresh panic recovered",
+					"user_id", userID, "panic", r)
+			}
+		}()
+		// 不影响主路径，所以直接 detached ctx；FindByID 走 GORM 通常 <50ms。
+		user, err := s.users.FindByID(userID)
+		if err != nil {
+			return
+		}
+		profile := cachedBidderProfile{
+			nickname:  strings.TrimSpace(user.Nickname),
+			avatarURL: strings.TrimSpace(user.AvatarURL),
+		}
+		if profile.nickname == "" {
+			profile.nickname = fallbackBidderNickname(userID)
+		}
+		s.storeBidderProfile(userID, profile, time.Now().Add(bidNicknameCacheTTL))
+	}()
+	return cachedBidderProfile{}
 }
 
 func fallbackBidderNickname(userID string) string {

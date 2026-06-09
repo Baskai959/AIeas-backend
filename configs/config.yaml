@@ -137,8 +137,8 @@ auction:
   hammerDrainMaxWaitMs: 5000
   # 异步模式下，落锤屏障轮询周期（毫秒）；不要忙等。
   hammerDrainPollMs: 50
-  # timer 触发落锤的 anti-sniping 宽限期（毫秒）：到点后再等待 max(state.antiSnipingMs, 该值)
-  # 才允许进入 hammer 分支，给异步出价命令最后一刻的延长留窗口。默认 500ms。
+  # timer 触发落锤的短宽限期（毫秒）：到点后再等待该值才进入 hammer 分支，
+  # 给异步出价命令最后一刻的延长留窗口。防狙击窗口本身由延长后的 endTime 表达。
   hammerAntiSnipingGraceMs: 500
 
 # 风控总开关配置。
@@ -237,6 +237,10 @@ kafka:
   bidEventsTopic: "aieas.bid.events"
   # 异步竞价命令 topic（独立于结果落库流 bid.events）。
   bidCommandsTopic: "aieas.bid.commands"
+  # 异步竞价命令 topic 的默认分区数；启动期会 ensure topic 存在并使用该分区数。
+  # bid command 使用 bid/request 维度 key 配合 Hash balancer 分散到不同 partition；
+  # 同 auction 不再由 Kafka partition FIFO 保序，裁决正确性由 Redis EvalOnShard + bid.lua + idem key 保证。0/负值会兜底回 16。
+  bidCommandsPartitions: 16
   # 拍卖事件 topic。
   auctionEventsTopic: "aieas.auction.events"
   # 订单事件 topic。
@@ -247,6 +251,20 @@ kafka:
   bidRecordGroup: "aieas-bid-record-writers"
   # 异步竞价裁决 consumer group。
   bidDecisionGroup: "aieas-bid-decision-workers"
+  # 路线 X：BidDecisionWorker 主消费循环并发裁决 goroutine 上限。同 auction
+  # 串行性由 Redis 同 shard 单线程兜底，不再依赖 partition FIFO。允许 [16,256]，
+  # 0/负值/非法值会归一化回退默认 128。
+  bidDecisionWorkerPoolSize: 128
+  # commit 模式：single（单条 commit，与历史行为一致）或 batch（批量 commit，
+  # 默认）。配合 Lua idem_key 30s TTL 提供 at-least-once 兜底。
+  bidDecisionCommitMode: "batch"
+  # batch commit 攒批最大条数（>=1）。
+  bidDecisionCommitBatchSize: 64
+  # batch commit 攒批最大等待时长（毫秒）。
+  bidDecisionCommitMaxLatencyMs: 200
+  # 异步竞价协调器（BidAsyncCoordinator）每个 auction in-flight 待裁决命令上限；
+  # 撞顶后入队请求会回 HOT_AUCTION_QUEUE_FULL。允许 [100,10000]，0/负值会归一化回 2000。
+  bidAsyncMaxPendingPerAuction: 2000
 
 # MCP 读写接口鉴权配置。
 mcp:

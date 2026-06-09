@@ -47,6 +47,7 @@ type auctionCreateRequest struct {
 	AuctionID      uint64                   `json:"auctionId"`
 	SellerID       string                   `json:"sellerId"`
 	Title          string                   `json:"title"`
+	Subtitle       string                   `json:"subtitle"`
 	Description    string                   `json:"description"`
 	Category       string                   `json:"category"`
 	Brand          string                   `json:"brand"`
@@ -70,6 +71,7 @@ type auctionCreateRequest struct {
 
 type auctionPatchRequest struct {
 	Title          *string                   `json:"title"`
+	Subtitle       *string                   `json:"subtitle"`
 	Description    *string                   `json:"description"`
 	Category       *string                   `json:"category"`
 	Brand          *string                   `json:"brand"`
@@ -123,6 +125,7 @@ func (h *AuctionHandler) Create(ctx context.Context, c *app.RequestContext) {
 		AuctionID:      req.AuctionID,
 		SellerID:       req.SellerID,
 		Title:          req.Title,
+		Subtitle:       req.Subtitle,
 		Description:    req.Description,
 		Category:       req.Category,
 		Brand:          req.Brand,
@@ -297,6 +300,7 @@ func (h *AuctionHandler) Update(ctx context.Context, c *app.RequestContext) {
 		ActorID:        AuthUserID(c),
 		ActorRole:      AuthRole(c),
 		Title:          req.Title,
+		Subtitle:       req.Subtitle,
 		Description:    req.Description,
 		Category:       req.Category,
 		Brand:          req.Brand,

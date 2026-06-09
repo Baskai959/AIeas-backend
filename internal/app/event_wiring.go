@@ -3,12 +3,15 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"log/slog"
 
 	"aieas_backend/internal/domain"
 	aiapp "aieas_backend/internal/modules/ai/app"
 	liveanalysisapp "aieas_backend/internal/modules/live_analysis/app"
 	mcpapp "aieas_backend/internal/modules/mcp/app"
 	wstransport "aieas_backend/internal/transport/ws"
+
+	traceapi "go.opentelemetry.io/otel/trace"
 )
 
 type RealtimeEventPublisher interface {
@@ -77,9 +80,26 @@ func (d bidResultDelivery) DeliverBidResult(sessionID, auctionID uint64, userID 
 	if d.eventPublisher != nil && sessionID != 0 && userID != "" {
 		raw, err := json.Marshal(payload)
 		if err == nil {
-			if err := d.eventPublisher.PublishLiveSessionUserEvent(context.Background(), sessionID, userID, wstransport.TypeBidResult, payload.BidID, payload.ResultSeq, raw); err == nil {
-				return
-			}
+			// 路线 X：bid.result Redis PUBLISH 改 fire-and-forget，避免阻塞 worker
+			// 主路径。失败仅 Warn（保留 trace_id）；不阻塞主链路。失败也不是致命的，
+			// 因为 BidAsyncCoordinator 的 ack 重发态（armResendLocked）会兜底，
+			// 客户端最终能拿到 bid.result。
+			ctx := context.Background()
+			go func(ctx context.Context, raw []byte) {
+				if err := d.eventPublisher.PublishLiveSessionUserEvent(ctx, sessionID, userID, wstransport.TypeBidResult, payload.BidID, payload.ResultSeq, raw); err != nil {
+					attrs := []any{
+						"live_session_id", sessionID,
+						"auction_id", auctionID,
+						"bid_id", payload.BidID,
+						"error", err,
+					}
+					if traceID := traceapi.SpanContextFromContext(ctx).TraceID(); traceID.IsValid() {
+						attrs = append(attrs, "trace_id", traceID.String())
+					}
+					slog.Default().Warn("bid result publish (fire-and-forget) failed", attrs...)
+				}
+			}(ctx, raw)
+			return
 		}
 	}
 	if d.coordinator != nil {

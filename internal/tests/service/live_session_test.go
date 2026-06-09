@@ -661,6 +661,22 @@ func TestLiveSessionServiceScheduleFutureAuctionDoesNotActivateSession(t *testin
 	if lotEvents.changedSession != session.ID || lotEvents.changedID != lot.AuctionID || lotEvents.changedAction != "scheduled" {
 		t.Fatalf("expected scheduled lot changed event, got session=%d auction=%d action=%q", lotEvents.changedSession, lotEvents.changedID, lotEvents.changedAction)
 	}
+	if err := svc.UnmountAuction(ctx, session.ID, lot.AuctionID, "m_schedule", domain.RoleMerchant); !errors.Is(err, domain.ErrInvalidState) {
+		t.Fatalf("scheduled lot should require cancellation before unmount, got %v", err)
+	}
+	if _, err := svc.DeactivateAuction(ctx, session.ID, "m_schedule", domain.RoleMerchant); err != nil {
+		t.Fatalf("cancel scheduled auction: %v", err)
+	}
+	cancelledLot, err := auctionRepo.FindByID(ctx, lot.AuctionID)
+	if err != nil {
+		t.Fatalf("find cancelled scheduled lot: %v", err)
+	}
+	if cancelledLot.Status != domain.AuctionStatusReady || !cancelledLot.StartTime.IsZero() || !cancelledLot.EndTime.IsZero() {
+		t.Fatalf("expected scheduled lot reset to READY with timing cleared, got %+v", cancelledLot)
+	}
+	if err := svc.UnmountAuction(ctx, session.ID, lot.AuctionID, "m_schedule", domain.RoleMerchant); err != nil {
+		t.Fatalf("unmount cancelled scheduled lot: %v", err)
+	}
 }
 
 func TestLiveSessionServiceActivateDueScheduledAuctionStartsAuction(t *testing.T) {

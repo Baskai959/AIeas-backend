@@ -90,6 +90,17 @@ func buildPlatformDeps(ctx context.Context, cfg appconfig.Config) (*platformDeps
 	p.kafkaProducer = kafkaProducer
 	p.kafkaBidReader = kafkaBidReader
 	p.kafkaCmdReader = kafkaCmdReader
+	// 启动期 ensure aieas.bid.commands topic 存在并使用配置的分区数（默认 16）。
+	// CreateTopics 是幂等的，对已存在的 topic 无副作用；存量 topic 想扩容仍需运维
+	// 手工 alter。失败仅 log warn，不阻塞启动——避免 Kafka 临时不可达把整个进程
+	// 启动卡死，business writer/consumer 自身的重连仍会兜底建立连接。
+	if kafkaProducer != nil {
+		ensureCtx, cancelEnsure := context.WithTimeout(ctx, 5*time.Second)
+		if err := kafkaProducer.EnsureBidCommandsTopic(ensureCtx); err != nil {
+			logger.Warn("ensure kafka bid commands topic failed", "error", err)
+		}
+		cancelEnsure()
+	}
 	return p, nil
 }
 
@@ -143,12 +154,13 @@ func openKafkaClients(cfg appconfig.Config) (*kafkainfra.Producer, *kafkainfra.B
 		return nil, nil, nil, nil
 	}
 	producer, err := kafkainfra.NewProducer(kafkainfra.ProducerConfig{
-		Brokers:            cfg.Kafka.Brokers,
-		ClientID:           cfg.Kafka.ClientID,
-		BidEventsTopic:     cfg.Kafka.BidEventsTopic,
-		BidCommandsTopic:   cfg.Kafka.BidCommandsTopic,
-		AuctionEventsTopic: cfg.Kafka.AuctionEventsTopic,
-		OrderEventsTopic:   cfg.Kafka.OrderEventsTopic,
+		Brokers:               cfg.Kafka.Brokers,
+		ClientID:              cfg.Kafka.ClientID,
+		BidEventsTopic:        cfg.Kafka.BidEventsTopic,
+		BidCommandsTopic:      cfg.Kafka.BidCommandsTopic,
+		BidCommandsPartitions: cfg.Kafka.BidCommandsPartitions,
+		AuctionEventsTopic:    cfg.Kafka.AuctionEventsTopic,
+		OrderEventsTopic:      cfg.Kafka.OrderEventsTopic,
 	})
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("init kafka producer: %w", err)

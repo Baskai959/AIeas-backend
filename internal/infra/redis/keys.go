@@ -60,6 +60,10 @@ func (b KeyBuilder) AuctionStream(auctionID uint64) string {
 	return b.key("auction:%d:stream", auctionID)
 }
 
+func (b KeyBuilder) AuctionBidCommandInFlight(auctionID uint64) string {
+	return b.key("auction:%d:bid_commands:inflight", auctionID)
+}
+
 func (b KeyBuilder) AuctionSeq(auctionID uint64) string {
 	return b.key("auction:%d:seq", auctionID)
 }

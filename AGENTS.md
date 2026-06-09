@@ -115,6 +115,7 @@ The `-config` flag walks up parent dirs to find the file; running from a sub-dir
 - Env var naming mirrors YAML, e.g. `MYSQL_DSN`, `REDIS_ADDR`, `JWT_SECRET`, `AUCTION_MIN_INCREMENT_CENT`, `OBJECT_STORAGE_ENABLED`.
 - Observability: `observability.format` (`text` for dev/colored, `json` for prod) and `observability.slowSQLThresholdMs` (GORM slow-SQL warning threshold, ms; <=0 disables) — env names `OBSERVABILITY_FORMAT` / `OBSERVABILITY_SLOW_SQL_THRESHOLD_MS`. `text` mode auto-disables ANSI when stdout is not a TTY; GORM logs are bridged to slog (no ANSI leakage).
 - Add new config: extend the struct in `internal/config/config.go`, add to `Default()`, hook into `applyEnv` if env-overridable, and update both `configs/config.yaml` and `.env.example`.
+- BidDecisionWorker（路线 X）：worker pool 完全并发消费 `aieas.bid.commands`，同 auction 串行性由 Redis 同 shard 单线程兜底；池大小 / commit 模式由 `kafka.bidDecisionWorkerPoolSize` / `bidDecisionCommitMode` / `bidDecisionCommitBatchSize` / `bidDecisionCommitMaxLatencyMs` 控制（默认 32 / batch / 64 / 200ms）。
 
 ## Observability
 

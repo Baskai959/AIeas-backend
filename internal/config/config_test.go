@@ -641,3 +641,57 @@ func TestValidateRejectsEnabledKafkaWithEmptyBroker(t *testing.T) {
 		t.Fatal("expected enabled kafka with empty broker to be rejected")
 	}
 }
+
+// 路线 X：BidDecisionWorker 池 + commit 配置归一化。
+func TestKafkaBidDecisionWorkerConfigDefaults(t *testing.T) {
+	cfg := Default()
+	if cfg.Kafka.BidDecisionWorkerPoolSize != DefaultBidDecisionWorkerPoolSize {
+		t.Fatalf("default pool size = %d, want %d", cfg.Kafka.BidDecisionWorkerPoolSize, DefaultBidDecisionWorkerPoolSize)
+	}
+	if cfg.Kafka.BidDecisionCommitMode != DefaultBidDecisionCommitMode {
+		t.Fatalf("default commit mode = %q, want %q", cfg.Kafka.BidDecisionCommitMode, DefaultBidDecisionCommitMode)
+	}
+	if cfg.Kafka.BidDecisionCommitBatchSize != DefaultBidDecisionCommitBatchSize {
+		t.Fatalf("default commit batch size = %d, want %d", cfg.Kafka.BidDecisionCommitBatchSize, DefaultBidDecisionCommitBatchSize)
+	}
+}
+
+func TestKafkaBidDecisionWorkerConfigNormalize(t *testing.T) {
+	cfg := Default()
+	cfg.Kafka.BidDecisionWorkerPoolSize = 0
+	cfg.Kafka.BidDecisionCommitMode = "garbage"
+	cfg.Kafka.BidDecisionCommitBatchSize = -5
+	cfg.Kafka.BidDecisionCommitMaxLatencyMs = 0
+	cfg.Kafka.normalize()
+	if cfg.Kafka.BidDecisionWorkerPoolSize != DefaultBidDecisionWorkerPoolSize {
+		t.Fatalf("0 pool size should normalize to default, got %d", cfg.Kafka.BidDecisionWorkerPoolSize)
+	}
+	if cfg.Kafka.BidDecisionCommitMode != DefaultBidDecisionCommitMode {
+		t.Fatalf("invalid commit mode should normalize to default, got %q", cfg.Kafka.BidDecisionCommitMode)
+	}
+	if cfg.Kafka.BidDecisionCommitBatchSize != DefaultBidDecisionCommitBatchSize {
+		t.Fatalf("negative batch size should normalize to default, got %d", cfg.Kafka.BidDecisionCommitBatchSize)
+	}
+	if cfg.Kafka.BidDecisionCommitMaxLatencyMs != DefaultBidDecisionCommitMaxLatencyMs {
+		t.Fatalf("0 max latency ms should normalize to default, got %d", cfg.Kafka.BidDecisionCommitMaxLatencyMs)
+	}
+
+	// 上下界 clamp。
+	cfg.Kafka.BidDecisionWorkerPoolSize = 5 // 低于 Min=16
+	cfg.Kafka.normalize()
+	if cfg.Kafka.BidDecisionWorkerPoolSize != MinBidDecisionWorkerPoolSize {
+		t.Fatalf("pool size below min should clamp to %d, got %d", MinBidDecisionWorkerPoolSize, cfg.Kafka.BidDecisionWorkerPoolSize)
+	}
+	cfg.Kafka.BidDecisionWorkerPoolSize = 9999
+	cfg.Kafka.normalize()
+	if cfg.Kafka.BidDecisionWorkerPoolSize != MaxBidDecisionWorkerPoolSize {
+		t.Fatalf("pool size above max should clamp to %d, got %d", MaxBidDecisionWorkerPoolSize, cfg.Kafka.BidDecisionWorkerPoolSize)
+	}
+
+	// "single" 是合法值，应保留。
+	cfg.Kafka.BidDecisionCommitMode = "SINGLE"
+	cfg.Kafka.normalize()
+	if cfg.Kafka.BidDecisionCommitMode != "single" {
+		t.Fatalf("commit mode SINGLE should normalize to single, got %q", cfg.Kafka.BidDecisionCommitMode)
+	}
+}

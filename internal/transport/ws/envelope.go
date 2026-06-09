@@ -36,6 +36,10 @@ const (
 	// TypeGatewayDraining 是 ws-gateway 进入排空状态时下发的提示帧，
 	// 客户端收到后应主动断开连接并按 payload.retryAfterMs 退避重连。
 	TypeGatewayDraining = "gateway.draining"
+	// TypeTimeSync 是客户端主动发起的 WS 校时请求。
+	TypeTimeSync = "time.sync"
+	// TypeTimeSyncResult 是服务端针对 time.sync 的单次校时响应。
+	TypeTimeSyncResult = "time.sync.result"
 )
 
 type Envelope struct {

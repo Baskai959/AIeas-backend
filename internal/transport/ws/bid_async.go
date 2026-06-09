@@ -8,8 +8,11 @@ import (
 )
 
 // 异步竞价队列保护 / 结果重发的默认参数（MVP，进程内）。
+// 默认 maxPendingPerAuction = 2000：与 KafkaConfig.BidAsyncMaxPendingPerAuction
+// 的默认值对齐；server.go 装配时会从配置读取覆盖。压测下旧 1000 上限撞顶频繁，
+// 加倍后给热点拍品留更大缓冲；上层 KafkaConfig.normalize 会把 [100,10000] 收敛。
 const (
-	defaultMaxPendingPerAuction = 500
+	defaultMaxPendingPerAuction = 2000
 	defaultResultAckTimeout     = 2 * time.Second
 	defaultMaxResendAttempts    = 3
 )

@@ -245,8 +245,9 @@ func TestHammerAsyncWaitsUntilDrained(t *testing.T) {
 	}
 }
 
-// TestHammerAsyncTimeoutFallbackForcesFinalize 异步模式 + 超时 fallback：pending 一直 >0 → maxWait 后强制 finalize。
-func TestHammerAsyncTimeoutFallbackForcesFinalize(t *testing.T) {
+// TestHammerAsyncTimeoutKeepsHammerPending 异步模式 + 超时：pending 一直 >0 →
+// maxWait 后保持 HAMMER_PENDING，不 finalize，等待下一轮调度继续 drain。
+func TestHammerAsyncTimeoutKeepsHammerPending(t *testing.T) {
 	ctx := context.Background()
 	auctionRepo, bidRepo, orderRepo, realtime, auction := newRunningAuctionFixture(t, 5004)
 	publisher := &recordingHammerPublisher{}
@@ -275,15 +276,30 @@ func TestHammerAsyncTimeoutFallbackForcesFinalize(t *testing.T) {
 		ClosedBy:  "system",
 		Now:       now,
 	})
-	if err != nil {
-		t.Fatalf("hammer: %v", err)
+	if err != domain.ErrInvalidState {
+		t.Fatalf("hammer err = %v, want ErrInvalidState", err)
 	}
 	elapsed := time.Since(start)
 	if elapsed < 100*time.Millisecond {
 		t.Fatalf("expected barrier to time out after >=100ms, took %v", elapsed)
 	}
-	if !result.Status.Terminal() {
-		t.Fatalf("status = %s, want terminal", result.Status)
+	if result.Status != "" {
+		t.Fatalf("result status = %s, want empty because finalize did not run", result.Status)
+	}
+	current, err := auctionRepo.FindByID(ctx, auction.AuctionID)
+	if err != nil {
+		t.Fatalf("find auction: %v", err)
+	}
+	if current.Status != domain.AuctionStatusHammerPending {
+		t.Fatalf("auction status = %s, want HAMMER_PENDING", current.Status)
+	}
+	for _, e := range publisher.snapshot() {
+		if e.envType == "auction.closed" {
+			t.Fatalf("must not broadcast auction.closed before drain, got %v", e)
+		}
+	}
+	if !gate.IsClosed(auction.AuctionID) {
+		t.Fatalf("gate should remain closed while waiting for drain")
 	}
 }
 

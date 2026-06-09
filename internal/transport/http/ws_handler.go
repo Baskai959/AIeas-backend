@@ -825,9 +825,34 @@ func (h *WSHandler) handleInbound(ctx context.Context, client *corews.Client, en
 			h.hub.Touch(client.AuctionID, client.ID)
 		}
 		return []corews.Envelope{jsonEnvelope("heartbeat.ack", env.RequestID, map[string]interface{}{"ts": time.Now().UTC().UnixMilli()})}
+	case corews.TypeTimeSync:
+		return []corews.Envelope{h.handleTimeSync(env)}
 	default:
 		return h.hub.HandleInbound(ctx, client, env)
 	}
+}
+
+func (h *WSHandler) handleTimeSync(env corews.Envelope) corews.Envelope {
+	requestID := strings.TrimSpace(env.RequestID)
+	var payload struct {
+		RequestID        string `json:"requestId"`
+		ClientSendTimeMS int64  `json:"clientSendTimeMs"`
+		ClientTimeMS     int64  `json:"clientTimeMs"`
+	}
+	if len(env.Payload) > 0 {
+		_ = json.Unmarshal(env.Payload, &payload)
+	}
+	if requestID == "" {
+		requestID = strings.TrimSpace(payload.RequestID)
+	}
+	now := time.Now().UTC()
+	return jsonEnvelope(corews.TypeTimeSyncResult, requestID, map[string]interface{}{
+		"requestId":        requestID,
+		"clientSendTimeMs": payload.ClientSendTimeMS,
+		"clientTimeMs":     payload.ClientTimeMS,
+		"serverTime":       now.Format(time.RFC3339Nano),
+		"serverTimeMs":     now.UnixMilli(),
+	})
 }
 
 func bidAckMetricLabels(handlerMode WSBidPlaceMode, responses []corews.Envelope) (string, string) {

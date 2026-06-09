@@ -49,6 +49,7 @@ func buildMySQLServerDependencies(cfg appconfig.Config, platform *platformDeps) 
 	eventLog := redisinfra.NewEventLog(platform.workerShardedRT, platform.keys)
 	eventLog.SetRankingShardedRT(platform.rankingShardedRT)
 	liveSessionRealtimeStore := redisinfra.NewLiveSessionRealtimeStore(platform.shardedRT, platform.keys)
+	bidCommandInFlight := redisinfra.NewBidCommandInFlightTracker(platform.workerShardedRT, platform.keys, redisinfra.DefaultBidCommandInFlightTTL)
 
 	userRepo := userrepo.NewMySQLUserRepository(platform.db)
 	return ServerDependencies{
@@ -89,7 +90,8 @@ func buildMySQLServerDependencies(cfg appconfig.Config, platform *platformDeps) 
 		BidEventKafkaConsumer:               platform.kafkaBidReader,
 		SettlementEventPublisher:            platform.kafkaProducer,
 		BidCommandConsumer:                  kafkaBidCommandConsumer(platform.kafkaCmdReader),
-		BidCommandPublisher:                 kafkaBidCommandPublisherOrNil(platform.kafkaProducer),
+		BidCommandPublisher:                 kafkaBidCommandPublisherOrNil(platform.kafkaProducer, bidCommandInFlight),
+		BidCommandInFlightTracker:           bidCommandInFlight,
 	}
 }
 
@@ -102,11 +104,13 @@ func kafkaBidCommandConsumer(reader *kafkainfra.BidCommandReader) appruntime.Bid
 }
 
 // kafkaBidCommandPublisherOrNil 仅在 producer 非 nil 时返回非 nil 接口值。
-func kafkaBidCommandPublisherOrNil(producer *kafkainfra.Producer) httptransport.BidCommandPublisher {
+func kafkaBidCommandPublisherOrNil(producer *kafkainfra.Producer, tracker bidCommandInFlightTracker) httptransport.BidCommandPublisher {
 	if producer == nil {
 		return nil
 	}
-	return newKafkaBidCommandPublisher(producer)
+	pub := newKafkaBidCommandPublisher(producer)
+	pub.SetInFlightTracker(tracker)
+	return pub
 }
 
 func pubSubClientsFromShards(sharded *redisinfra.ShardedRTClient) []wstransport.PubSubClient {

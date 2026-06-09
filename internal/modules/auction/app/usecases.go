@@ -14,6 +14,7 @@ type CreateAuctionInput struct {
 	AuctionID         uint64
 	SellerID          string
 	Title             string
+	Subtitle          string
 	Description       string
 	Category          string
 	Brand             string
@@ -40,6 +41,7 @@ type UpdateAuctionInput struct {
 	ActorID           string
 	ActorRole         domain.Role
 	Title             *string
+	Subtitle          *string
 	Description       *string
 	Category          *string
 	Brand             *string

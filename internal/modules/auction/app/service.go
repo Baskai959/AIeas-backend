@@ -374,6 +374,7 @@ func (s *AuctionService) Create(ctx context.Context, in CreateAuctionInput) (dom
 		AuctionID:      auctionID,
 		SellerID:       sellerID,
 		Title:          in.Title,
+		Subtitle:       in.Subtitle,
 		Description:    in.Description,
 		Category:       in.Category,
 		Brand:          in.Brand,
@@ -462,6 +463,9 @@ func (s *AuctionService) Update(ctx context.Context, id uint64, in UpdateAuction
 		}
 		if in.Title != nil {
 			current.Title = strings.TrimSpace(*in.Title)
+		}
+		if in.Subtitle != nil {
+			current.Subtitle = strings.TrimSpace(*in.Subtitle)
 		}
 		if in.Description != nil {
 			current.Description = strings.TrimSpace(*in.Description)
@@ -986,6 +990,7 @@ func skipBidRecordEnrichForRealtimeLot(lot domain.AuctionLot, realtimeOK bool) b
 func buildRuleSnapshot(in CreateAuctionInput) (json.RawMessage, error) {
 	payload := map[string]interface{}{
 		"title":          in.Title,
+		"subtitle":       in.Subtitle,
 		"category":       in.Category,
 		"brand":          in.Brand,
 		"condition":      in.ConditionGrade,
@@ -1010,6 +1015,7 @@ func buildRuleSnapshot(in CreateAuctionInput) (json.RawMessage, error) {
 func snapshotFromAuction(auction domain.AuctionLot) (json.RawMessage, error) {
 	payload := map[string]interface{}{
 		"title":          auction.Title,
+		"subtitle":       auction.Subtitle,
 		"category":       auction.Category,
 		"brand":          auction.Brand,
 		"condition":      auction.ConditionGrade,
@@ -1091,7 +1097,7 @@ func hasLiveSessionLotChangedPatch(in UpdateAuctionInput) bool {
 }
 
 func hasLotDisplayPatch(in UpdateAuctionInput) bool {
-	return in.Title != nil || in.Description != nil || in.Category != nil || in.Brand != nil ||
+	return in.Title != nil || in.Subtitle != nil || in.Description != nil || in.Category != nil || in.Brand != nil ||
 		in.ConditionGrade != nil || in.ImageURLs != nil || in.CoverURL != nil
 }
 
@@ -1101,6 +1107,7 @@ func hasAuctionPricingPatch(in UpdateAuctionInput) bool {
 
 func normalizeAndValidateAuctionContent(in *CreateAuctionInput) error {
 	in.Title = strings.TrimSpace(in.Title)
+	in.Subtitle = strings.TrimSpace(in.Subtitle)
 	in.Description = strings.TrimSpace(in.Description)
 	in.Category = strings.TrimSpace(in.Category)
 	in.Brand = strings.TrimSpace(in.Brand)
@@ -1109,7 +1116,7 @@ func normalizeAndValidateAuctionContent(in *CreateAuctionInput) error {
 	if in.CoverURL == "" && len(in.ImageURLs) > 0 {
 		in.CoverURL = in.ImageURLs[0]
 	}
-	return validateAuctionLotContent(domain.AuctionLot{Title: in.Title, Description: in.Description, Category: in.Category, ConditionGrade: in.ConditionGrade, ImageURLs: in.ImageURLs, CoverURL: in.CoverURL})
+	return validateAuctionLotContent(domain.AuctionLot{Title: in.Title, Subtitle: in.Subtitle, Description: in.Description, Category: in.Category, ConditionGrade: in.ConditionGrade, ImageURLs: in.ImageURLs, CoverURL: in.CoverURL})
 }
 
 func validateAuctionLotContent(lot domain.AuctionLot) error {

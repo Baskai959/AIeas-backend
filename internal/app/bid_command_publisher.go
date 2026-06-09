@@ -14,8 +14,15 @@ type publishRejectMetrics interface {
 	IncBidCommandPublishReject(reason string)
 }
 
+type bidCommandInFlightTracker interface {
+	TrackBidCommand(ctx context.Context, auctionID uint64, bidID string) error
+	ReleaseBidCommand(ctx context.Context, auctionID uint64, bidID string) error
+	PendingForAuction(auctionID uint64) int
+}
+
 // kafkaBidCommandPublisher 把 auction app 的 BidCommandSnapshot 适配为 kafka.BidCommand
-// 并投递到命令流（key=auctionId）。producer 为 nil 时不应构造本适配器（强制走同步降级）。
+// 并投递到命令流。Route X 下 Kafka key 使用 bid/request 维度而非 auctionId；
+// 同拍品正确性由 Redis Lua / idem key 保证。producer 为 nil 时不应构造本适配器（强制走同步降级）。
 //
 // gate 为可选 publisher 闸门：当 auction 进入 HAMMER_PENDING 时，
 // gate.IsClosed(auctionID) 返回 true，本适配器直接拒绝该 auctionId 的新命令，返回
@@ -23,6 +30,7 @@ type publishRejectMetrics interface {
 type kafkaBidCommandPublisher struct {
 	producer *kafkainfra.Producer
 	gate     *auctionapp.HammerPublisherGate
+	tracker  bidCommandInFlightTracker
 	metrics  publishRejectMetrics
 }
 
@@ -39,6 +47,13 @@ func (p *kafkaBidCommandPublisher) SetGate(gate *auctionapp.HammerPublisherGate)
 		return
 	}
 	p.gate = gate
+}
+
+func (p *kafkaBidCommandPublisher) SetInFlightTracker(tracker bidCommandInFlightTracker) {
+	if p == nil {
+		return
+	}
+	p.tracker = tracker
 }
 
 // SetMetrics 注入拒绝埋点。nil 安全。
@@ -63,11 +78,16 @@ func (p *kafkaBidCommandPublisher) PublishBidCommand(ctx context.Context, cmd au
 	if p.producer == nil {
 		return nil
 	}
+	if p.tracker != nil {
+		if err := p.tracker.TrackBidCommand(ctx, cmd.AuctionID, cmd.BidID); err != nil {
+			return err
+		}
+	}
 	var rule json.RawMessage
 	if raw, err := json.Marshal(cmd.IncrementRule); err == nil {
 		rule = raw
 	}
-	return p.producer.PublishBidCommand(ctx, kafkainfra.BidCommand{
+	err := p.producer.PublishBidCommand(ctx, kafkainfra.BidCommand{
 		BidID:                cmd.BidID,
 		AuctionID:            cmd.AuctionID,
 		LiveSessionID:        cmd.LiveSessionID,
@@ -90,4 +110,8 @@ func (p *kafkaBidCommandPublisher) PublishBidCommand(ctx context.Context, cmd au
 		BidderAvatarURL:      cmd.BidderAvatarURL,
 		PreCheckPassed:       true,
 	})
+	if err != nil && p.tracker != nil {
+		_ = p.tracker.ReleaseBidCommand(context.Background(), cmd.AuctionID, cmd.BidID)
+	}
+	return err
 }

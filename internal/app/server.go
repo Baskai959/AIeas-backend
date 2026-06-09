@@ -139,6 +139,9 @@ type ServerDependencies struct {
 	// BidAsyncCoordinator 是异步竞价的进程内协调器（队列保护 + 结果重发）。
 	// 由 NewServerWithDependencies 在 async 依赖齐备时构造，worker 与 WS handler 共享同一实例。
 	BidAsyncCoordinator *wstransport.BidAsyncCoordinator
+	// BidCommandInFlightTracker 是跨实例的拍品级 Kafka command in-flight 计数器。
+	// 多实例落锤 drain 依赖它等待其他实例发布的出价完成 Lua 裁决。
+	BidCommandInFlightTracker bidCommandInFlightTracker
 }
 
 func NewServerWithUserRepository(cfg appconfig.Config, userRepo userports.UserRepository) *server.Hertz {
@@ -164,7 +167,7 @@ func NewServerWithDependencies(cfg appconfig.Config, deps ServerDependencies) *s
 	// 异步竞价协调器：ws handler 用它登记 pending，ws-gateway 收到 bid.result
 	// PubSub 后也用它定向投递并管理 ack 重发。
 	if deps.BidAsyncCoordinator == nil && deps.Hub != nil && (deps.BidCommandPublisher != nil || deps.BidCommandConsumer != nil) {
-		coord := wstransport.NewBidAsyncCoordinator(deps.Hub, 0, 0, 0)
+		coord := wstransport.NewBidAsyncCoordinator(deps.Hub, cfg.Kafka.BidAsyncMaxPendingPerAuction, 0, 0)
 		coord.SetMetrics(deps.MetricsRegistry)
 		deps.BidAsyncCoordinator = coord
 	}
@@ -178,11 +181,15 @@ func NewServerWithDependencies(cfg appconfig.Config, deps ServerDependencies) *s
 	if asyncReadyForHammer {
 		// 闸门宽限：默认 200ms，覆盖 ws handler 在 publish 前/后的入队竞态窗口。
 		hammerGate = auctionapp.NewHammerPublisherGate(200 * time.Millisecond)
-		hammerBarrier = auctionapp.NewInFlightBarrier(deps.BidAsyncCoordinator, hammerGate, cfg.Auction.HammerDrainPollMs)
+		hammerBarrier = auctionapp.NewInFlightBarrier(newHammerDrainCoordinatorSet(
+			deps.BidAsyncCoordinator,
+			deps.BidCommandInFlightTracker,
+		), hammerGate, cfg.Auction.HammerDrainPollMs)
 		hammerBarrier.SetMetrics(hammerBarrierMetricsAdapter{registry: deps.MetricsRegistry})
 		// 把闸门注入命令发布器（如果是已知的 kafka 适配器实例）。
 		if k, ok := deps.BidCommandPublisher.(*kafkaBidCommandPublisher); ok {
 			k.SetGate(hammerGate)
+			k.SetInFlightTracker(deps.BidCommandInFlightTracker)
 			k.SetMetrics(deps.MetricsRegistry)
 		}
 	}

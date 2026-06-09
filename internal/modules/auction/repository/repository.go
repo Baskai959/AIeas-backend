@@ -68,7 +68,7 @@ func (r *MySQLAuctionRepository) List(ctx context.Context, filter domain.Auction
 	}
 	if filter.Keyword != "" {
 		keyword := "%" + strings.TrimSpace(filter.Keyword) + "%"
-		query = query.Where("title LIKE ? OR description LIKE ? OR brand LIKE ?", keyword, keyword, keyword)
+		query = query.Where("title LIKE ? OR subtitle LIKE ? OR description LIKE ? OR brand LIKE ?", keyword, keyword, keyword, keyword)
 	}
 	if filter.LiveSessionID != 0 {
 		query = query.Where("live_session_id = ?", filter.LiveSessionID)
@@ -152,7 +152,7 @@ func (r *MySQLAuctionRepository) Search(ctx context.Context, filter domain.Aucti
 	}
 	if filter.Keyword != "" {
 		keyword := "%" + strings.TrimSpace(filter.Keyword) + "%"
-		query = query.Where("title LIKE ? OR description LIKE ? OR brand LIKE ?", keyword, keyword, keyword)
+		query = query.Where("title LIKE ? OR subtitle LIKE ? OR description LIKE ? OR brand LIKE ?", keyword, keyword, keyword, keyword)
 	}
 	var total int64
 	if err := query.Count(&total).Error; err != nil {
@@ -181,6 +181,7 @@ func (r *MySQLAuctionRepository) Update(ctx context.Context, auction *domain.Auc
 		"seller_id":           row.SellerID,
 		"live_session_id":     row.LiveSessionID,
 		"title":               row.Title,
+		"subtitle":            row.Subtitle,
 		"description":         row.Description,
 		"category":            row.Category,
 		"brand":               row.Brand,
@@ -909,6 +910,7 @@ type auctionRow struct {
 	SellerID          string                   `gorm:"column:seller_id"`
 	LiveSessionID     *uint64                  `gorm:"column:live_session_id"`
 	Title             string                   `gorm:"column:title"`
+	Subtitle          string                   `gorm:"column:subtitle"`
 	Description       string                   `gorm:"column:description"`
 	Category          string                   `gorm:"column:category"`
 	Brand             string                   `gorm:"column:brand"`
@@ -947,6 +949,7 @@ func auctionRowFromDomain(auction domain.AuctionLot) auctionRow {
 		SellerID:          normalizeUserIDForDB(auction.SellerID),
 		LiveSessionID:     cloneUint64Ptr(auction.LiveSessionID),
 		Title:             auction.Title,
+		Subtitle:          auction.Subtitle,
 		Description:       auction.Description,
 		Category:          auction.Category,
 		Brand:             auction.Brand,
@@ -987,6 +990,7 @@ func (r auctionRow) toDomain() domain.AuctionLot {
 		SellerID:          r.SellerID,
 		LiveSessionID:     cloneUint64Ptr(r.LiveSessionID),
 		Title:             r.Title,
+		Subtitle:          r.Subtitle,
 		Description:       r.Description,
 		Category:          r.Category,
 		Brand:             r.Brand,

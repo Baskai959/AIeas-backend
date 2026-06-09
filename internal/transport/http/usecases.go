@@ -142,7 +142,8 @@ type WSAsyncBidUseCase interface {
 	PreCheckForAsync(ctx context.Context, in PlaceBidInput) (BidCommandSnapshot, *domain.BidResult, error)
 }
 
-// BidCommandPublisher 把竞价命令投递到命令流（key=auctionId）。
+// BidCommandPublisher 把竞价命令投递到命令流。
+// Route X 下 Kafka key 不使用 auctionId 固定分区；同拍品一致性由 Redis Lua / idem key 保证。
 // 装配层用 kafka producer 适配实现；producer 为 nil 时不应注入（强制走同步降级）。
 type BidCommandPublisher interface {
 	PublishBidCommand(ctx context.Context, cmd BidCommandSnapshot) error

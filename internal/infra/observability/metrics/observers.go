@@ -1,6 +1,7 @@
 package metrics
 
 import (
+	"strconv"
 	"time"
 
 	redisgo "github.com/redis/go-redis/v9"
@@ -179,6 +180,39 @@ func (r *Registry) ObserveBidResultPush(elapsed time.Duration) {
 	r.bidResultPushDuration.Observe(elapsed.Seconds())
 }
 
+// IncBidWorkerPoolInflight 增加并发裁决 goroutine 计数（worker handle 入口）。
+func (r *Registry) IncBidWorkerPoolInflight() {
+	if !r.Enabled() {
+		return
+	}
+	r.bidWorkerPoolInflight.Inc()
+}
+
+// DecBidWorkerPoolInflight 递减并发裁决 goroutine 计数（worker handle 出口，
+// recover 路径也必须保证调用，避免泄漏）。
+func (r *Registry) DecBidWorkerPoolInflight() {
+	if !r.Enabled() {
+		return
+	}
+	r.bidWorkerPoolInflight.Dec()
+}
+
+// ObserveBidWorkerCommitLag 记录命令从 fetch 到实际 commit 的耗时。
+func (r *Registry) ObserveBidWorkerCommitLag(elapsed time.Duration) {
+	if !r.Enabled() {
+		return
+	}
+	r.bidWorkerCommitLag.Observe(elapsed.Seconds())
+}
+
+// SetBidKafkaPartitionLag 设置某个 partition 当前消费滞后量（字节/条数）。
+func (r *Registry) SetBidKafkaPartitionLag(partition int, lag int64) {
+	if !r.Enabled() {
+		return
+	}
+	r.bidKafkaPartitionLag.WithLabelValues(strconv.Itoa(partition)).Set(float64(lag))
+}
+
 // ObserveBidResultDuration 记录异步出价从 pending 入队到 bid.result 定向推送的端到端耗时。
 func (r *Registry) ObserveBidResultDuration(outcome string, elapsed time.Duration) {
 	if !r.Enabled() {
@@ -339,19 +373,24 @@ func (r *Registry) ObserveDepositReconcileLag(d time.Duration) {
 
 // ----- Redis -----
 
-// ObserveRedisCommand 记录单条 Redis 命令的耗时（带 instance 维度）。
+// ObserveRedisCommand 记录单条 Redis 命令的耗时（带 instance + command 维度）。
 // instance 用于区分多 Redis 实例（默认 "default"）；空串时回退到 "default"，
 // 以保证标签值永远存在，避免 promQL 选择器漏命中。
-func (r *Registry) ObserveRedisCommand(instance, op string, elapsed time.Duration, err error) {
+// command 取自 redis.Cmder.Name() 大写后的命令名（GET/SET/EVALSHA/HMGET/...），
+// Redis 命令集合是低基数封闭集，安全。空串归一为 "UNKNOWN"。
+func (r *Registry) ObserveRedisCommand(instance, command string, elapsed time.Duration, err error) {
 	if !r.Enabled() {
 		return
 	}
 	if instance == "" {
 		instance = "default"
 	}
-	r.redisCommandDuration.WithLabelValues(instance, op).Observe(elapsed.Seconds())
+	if command == "" {
+		command = "UNKNOWN"
+	}
+	r.redisCommandDuration.WithLabelValues(instance, command).Observe(elapsed.Seconds())
 	if err != nil {
-		r.redisCommandErrors.WithLabelValues(instance, op).Inc()
+		r.redisCommandErrors.WithLabelValues(instance, command).Inc()
 	}
 }
 
@@ -362,6 +401,60 @@ func (r *Registry) ObserveRedisLua(script string, elapsed time.Duration, errClas
 	r.redisLuaDuration.WithLabelValues(script).Observe(elapsed.Seconds())
 	if errClass != "" {
 		r.redisLuaErrors.WithLabelValues(script, errClass).Inc()
+	}
+}
+
+// IncBidLuaQueueDepth / DecBidLuaQueueDepth 记录出价 Lua 仲裁在客户端侧的
+// in-flight 深度。shard / instance / script 均为低基数封闭集合；空值兜底到
+// default / bid_place，避免生成缺标签时间序列。
+func (r *Registry) IncBidLuaQueueDepth(shard, instance, script string) {
+	if !r.Enabled() {
+		return
+	}
+	shard, instance, script = normalizeBidLuaLabels(shard, instance, script)
+	r.bidLuaQueueDepth.WithLabelValues(shard, instance, script).Inc()
+}
+
+func (r *Registry) DecBidLuaQueueDepth(shard, instance, script string) {
+	if !r.Enabled() {
+		return
+	}
+	shard, instance, script = normalizeBidLuaLabels(shard, instance, script)
+	r.bidLuaQueueDepth.WithLabelValues(shard, instance, script).Dec()
+}
+
+// ObserveBidLuaRoundTrip 记录出价 Lua 仲裁的客户端观测往返耗时。
+// 该指标不能拆分 Redis 服务端排队时间与执行时间，因此命名为 roundtrip。
+func (r *Registry) ObserveBidLuaRoundTrip(shard, instance, script, status string, elapsed time.Duration) {
+	if !r.Enabled() {
+		return
+	}
+	shard, instance, script = normalizeBidLuaLabels(shard, instance, script)
+	status = normalizeBidLuaStatus(status)
+	r.bidLuaRoundTrip.WithLabelValues(shard, instance, script, status).Observe(elapsed.Seconds())
+}
+
+func normalizeBidLuaLabels(shard, instance, script string) (string, string, string) {
+	if shard == "" {
+		shard = "default"
+	}
+	if instance == "" {
+		instance = "default"
+	}
+	if script == "" {
+		script = "bid_place"
+	}
+	return shard, instance, script
+}
+
+func normalizeBidLuaStatus(status string) string {
+	switch status {
+	case "ok", "noscript", "busy", "timeout", "connection", "error", "panic":
+		return status
+	case "":
+		return "ok"
+	default:
+		return "error"
 	}
 }
 

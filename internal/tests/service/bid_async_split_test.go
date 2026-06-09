@@ -7,6 +7,7 @@ import (
 
 	appconfig "aieas_backend/internal/config"
 	"aieas_backend/internal/domain"
+	"aieas_backend/internal/infra/observability/metrics"
 	auctionapp "aieas_backend/internal/modules/auction/app"
 )
 
@@ -110,6 +111,91 @@ func TestArbitrateFromCommandInvalid(t *testing.T) {
 		t.Fatalf("expected error for empty command")
 	}
 }
+
+// TestArbitrateFromCommandRejectIncrementsBidRejectTotal 验证异步路径下
+// ArbitrateFromCommand 在 Lua 返回 Accepted=false（拒绝）时，会把拒因
+// 写入 aieas_bid_reject_total{reason}，让 dashboard 能 group by reason 看
+// 拒因细分。
+//
+// 历史 bug：异步路径只把 outcome 写到 bid_decision_outcome_total{outcome}，
+// 而 aieas_bid_reject_total 的埋点被遗漏，导致压测窗口里该指标始终为 0。
+func TestArbitrateFromCommandRejectIncrementsBidRejectTotal(t *testing.T) {
+	cfg := appconfig.Default().Auction
+	ctx := context.Background()
+	fixture := newRealtimeAuctionFixtureWithTiming(t, cfg, time.Hour, 1000)
+	mustEnroll(t, fixture, "u_3001")
+
+	reg := metrics.New(metrics.Options{Enabled: true, Namespace: "test"})
+	fixture.bids.SetMetrics(reg)
+
+	// 报价低于 startPrice：Lua 会返回 BELOW_START_PRICE。expected=1000 通过基础校验。
+	expected := int64(1000)
+	cmd := BidCommandSnapshot{
+		BidID:                "rej-async-1",
+		AuctionID:            fixture.auctionID,
+		LiveSessionID:        0,
+		UserID:               "u_3001",
+		Price:                500, // 低于 startPrice=1000
+		ExpectedCurrentPrice: &expected,
+		Source:               "live_ws",
+		MinIncrement:         100,
+		AntiSnipingMS:        60_000,
+		AntiExtendMS:         30_000,
+		AntiExtendMode:       domain.AuctionExtendModeAdd,
+		MaxExtendCount:       cfg.MaxExtendCount,
+		StartPrice:           1000,
+		CapPrice:             2000,
+		IncrementRule:        domain.IncrementRule{Type: domain.IncrementRuleTypeFixed, Amount: 100, MaxBidSteps: 10},
+	}
+	result, err := fixture.bids.ArbitrateFromCommand(ctx, cmd)
+	if err != nil {
+		t.Fatalf("arbitrate: %v", err)
+	}
+	if result.Accepted || result.Duplicate {
+		t.Fatalf("expected rejection, got %+v", result)
+	}
+	if result.Reason == "" {
+		t.Fatalf("expected non-empty reject reason, got %+v", result)
+	}
+	// 同 reason 的 counter 应当 +1。
+	got := counterValueByLabel(t, reg, "test_auction_bid_reject_total", "reason", result.Reason)
+	if got < 1 {
+		t.Fatalf("expected aieas_bid_reject_total{reason=%q} >= 1, got %v", result.Reason, got)
+	}
+}
+
+// counterValueByLabel 读取指定 counter vec 中匹配某 label 的样本值。
+func counterValueByLabel(t *testing.T, reg *metrics.Registry, name, labelName, labelValue string) float64 {
+	t.Helper()
+	families, err := reg.Gatherer().Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	for _, mf := range families {
+		if mf.GetName() != name {
+			continue
+		}
+		for _, m := range mf.GetMetric() {
+			matched := false
+			for _, lp := range m.GetLabel() {
+				if lp.GetName() == labelName && lp.GetValue() == labelValue {
+					matched = true
+					break
+				}
+			}
+			if !matched {
+				continue
+			}
+			if c := m.GetCounter(); c != nil {
+				return c.GetValue()
+			}
+		}
+	}
+	return 0
+}
+
+// 保留 auctionapp 引用，避免 import 在仅添加测试时被误删。
+var _ = auctionapp.BidCommandSnapshot{}
 
 // TestArbitrateFromCommandPreservesAntiSniping 验证异步路径下 ArbitrateFromCommand
 // 重建 bidAuctionSnapshot 时正确把 cmd.AntiSnipingMS / AntiExtendMS 反算回 sec，

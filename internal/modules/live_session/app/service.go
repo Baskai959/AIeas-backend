@@ -830,7 +830,7 @@ func (s *LiveSessionService) UnmountAuction(ctx context.Context, sessionID, auct
 	if auction.LiveSessionID == nil || *auction.LiveSessionID != sessionID {
 		return domain.ErrNotFound
 	}
-	if session.ActiveAuctionID == auctionID || auction.Status == domain.AuctionStatusRunning || auction.Status == domain.AuctionStatusExtended || auction.Status == domain.AuctionStatusHammerPending {
+	if session.ActiveAuctionID == auctionID || auction.Status == domain.AuctionStatusWarmingUp || auction.Status == domain.AuctionStatusRunning || auction.Status == domain.AuctionStatusExtended || auction.Status == domain.AuctionStatusHammerPending {
 		return fmt.Errorf("%w: %w", ErrLiveSessionLotInvalidState, domain.ErrInvalidState)
 	}
 	if auction.Status == domain.AuctionStatusClosedWon || auction.Status == domain.AuctionStatusSettled {
@@ -1070,6 +1070,17 @@ func (s *LiveSessionService) DeactivateAuction(ctx context.Context, sessionID ui
 			_ = s.sessionRealtime.ClearActiveAuction(ctx, sessionID)
 		}
 		session.ActiveAuctionID = 0
+	} else {
+		scheduled, err := s.findScheduledAuction(ctx, sessionID)
+		if err != nil {
+			return domain.LiveSession{}, err
+		}
+		if scheduled != nil {
+			if err := s.resetAuctionToReady(ctx, scheduled); err != nil {
+				return domain.LiveSession{}, err
+			}
+			cancelledAuctionID = scheduled.AuctionID
+		}
 	}
 	if err := s.sessions.Update(ctx, &session); err != nil {
 		return domain.LiveSession{}, err
@@ -1081,6 +1092,21 @@ func (s *LiveSessionService) DeactivateAuction(ctx context.Context, sessionID ui
 		_ = s.lotEvents.NotifyLotChanged(ctx, session.MerchantID, sessionID, cancelledAuctionID, "cancelled")
 	}
 	return session, nil
+}
+
+func (s *LiveSessionService) findScheduledAuction(ctx context.Context, sessionID uint64) (*domain.AuctionLot, error) {
+	if s.auctions == nil {
+		return nil, nil
+	}
+	lots, err := s.auctions.List(ctx, domain.AuctionFilter{LiveSessionID: sessionID, Status: domain.AuctionStatusWarmingUp, Limit: 2})
+	if err != nil {
+		return nil, err
+	}
+	if len(lots) == 0 {
+		return nil, nil
+	}
+	lot := lots[0]
+	return &lot, nil
 }
 
 func (s *LiveSessionService) OnAuctionClosed(ctx context.Context, auctionID uint64) {

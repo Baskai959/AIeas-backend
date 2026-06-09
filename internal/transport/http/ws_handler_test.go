@@ -95,6 +95,45 @@ func TestWSHandlerBidPlaceAckAndBroadcast(t *testing.T) {
 	}
 }
 
+func TestWSHandlerTimeSyncReturnsServerTimeAndEchoesClientFields(t *testing.T) {
+	ctx := context.Background()
+	hub := corews.NewHub()
+	handler := NewWSHandler(hub, nil, 8, 65536, time.Second, 2*time.Second, 5*time.Second, 0, time.Second, nil, nil)
+	client := corews.NewClient("c1", "u_1001", 30001, 8)
+	payload, _ := json.Marshal(map[string]interface{}{
+		"requestId":        "ts-1",
+		"clientSendTimeMs": int64(1_700_000_000_000),
+		"clientTimeMs":     int64(1_700_000_000_000),
+	})
+
+	responses := handler.handleInbound(ctx, client, corews.Envelope{Type: corews.TypeTimeSync, RequestID: "ts-1", Payload: payload})
+	if len(responses) != 1 || responses[0].Type != corews.TypeTimeSyncResult {
+		t.Fatalf("expected time.sync.result, got %+v", responses)
+	}
+	if responses[0].RequestID != "ts-1" {
+		t.Fatalf("expected requestId echoed on envelope, got %q", responses[0].RequestID)
+	}
+	var result struct {
+		RequestID        string `json:"requestId"`
+		ClientSendTimeMS int64  `json:"clientSendTimeMs"`
+		ClientTimeMS     int64  `json:"clientTimeMs"`
+		ServerTime       string `json:"serverTime"`
+		ServerTimeMS     int64  `json:"serverTimeMs"`
+	}
+	if err := json.Unmarshal(responses[0].Payload, &result); err != nil {
+		t.Fatalf("decode time sync result: %v", err)
+	}
+	if result.RequestID != "ts-1" || result.ClientSendTimeMS != 1_700_000_000_000 || result.ClientTimeMS != 1_700_000_000_000 {
+		t.Fatalf("expected client fields echoed, got %+v", result)
+	}
+	if result.ServerTimeMS <= 0 || result.ServerTime == "" {
+		t.Fatalf("expected server time fields, got %+v", result)
+	}
+	if _, err := time.Parse(time.RFC3339Nano, result.ServerTime); err != nil {
+		t.Fatalf("serverTime should be RFC3339Nano: %v", err)
+	}
+}
+
 func TestBidAckMetricLabels(t *testing.T) {
 	mode, result := bidAckMetricLabels(WSBidPlaceAsync, []corews.Envelope{
 		jsonEnvelope("bid.ack", "bid-1", map[string]interface{}{"mode": "ASYNC", "status": "QUEUED", "bidId": "bid-1"}),

@@ -98,12 +98,19 @@ func startAppWorkers(cfg appconfig.Config, deps ServerDependencies, services app
 		deps.OnlineCounter.StartJanitor(workerCtx, time.Minute)
 	}
 
-	// 异步竞价裁决 worker：从 aieas.bid.commands 顺序消费，复用 Lua 裁决，
-	// 再通过实时事件总线按 liveSessionId + userId 定向推 bid.result 给 ws-gateway。
+	// 异步竞价裁决 worker：从 aieas.bid.commands 拉取后交给 worker pool 并发裁决；
+	// Kafka 不承载同拍品顺序保证，正确性由 Redis Lua / idem key 兜底。
+	// 裁决结果再通过实时事件总线按 liveSessionId + userId 定向推 bid.result 给 ws-gateway。
 	if startBusinessWorkers && deps.BidCommandConsumer != nil && services.bid != nil {
 		delivery := bidResultDelivery{coordinator: deps.BidAsyncCoordinator, eventPublisher: deps.RealtimeEventPublisher}
-		decisionWorker := appruntime.NewBidDecisionWorker(deps.BidCommandConsumer, services.bid, delivery)
+		decisionWorker := appruntime.NewBidDecisionWorkerWithOptions(deps.BidCommandConsumer, services.bid, delivery, appruntime.BidDecisionWorkerOptions{
+			PoolSize:           cfg.Kafka.BidDecisionWorkerPoolSize,
+			CommitMode:         cfg.Kafka.BidDecisionCommitMode,
+			CommitBatchSize:    cfg.Kafka.BidDecisionCommitBatchSize,
+			CommitMaxLatencyMs: cfg.Kafka.BidDecisionCommitMaxLatencyMs,
+		})
 		decisionWorker.SetMetrics(deps.MetricsRegistry)
+		decisionWorker.SetInFlightReleaser(deps.BidCommandInFlightTracker)
 		decisionWorker.Start(workerCtx)
 	}
 

@@ -51,6 +51,10 @@ type Registry struct {
 	bidResultAckTimeoutTot  prometheus.Counter
 	bidQueueRejectTotal     *prometheus.CounterVec
 	bidDecisionOutcomeTotal *prometheus.CounterVec
+	// 路线 X：worker pool 完全并发 + 批量 commit 监控指标。
+	bidWorkerPoolInflight prometheus.Gauge
+	bidWorkerCommitLag    prometheus.Histogram
+	bidKafkaPartitionLag  *prometheus.GaugeVec
 
 	// Hammer
 	hammerTotal                   *prometheus.CounterVec
@@ -77,6 +81,8 @@ type Registry struct {
 	redisCommandErrors   *prometheus.CounterVec
 	redisLuaDuration     *prometheus.HistogramVec
 	redisLuaErrors       *prometheus.CounterVec
+	bidLuaQueueDepth     *prometheus.GaugeVec
+	bidLuaRoundTrip      *prometheus.HistogramVec
 
 	// Redis connection pool
 	redisPoolTotalConns        *prometheus.GaugeVec
@@ -261,6 +267,16 @@ func (r *Registry) register() {
 	r.bidDecisionOutcomeTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: ns, Name: "bid_decision_outcome_total", Help: "Async bid decision outcome",
 	}, []string{"outcome"})
+	r.bidWorkerPoolInflight = prometheus.NewGauge(prometheus.GaugeOpts{
+		Namespace: ns, Name: "bid_worker_pool_inflight", Help: "Current concurrent bid decision goroutines (worker pool inflight)",
+	})
+	r.bidWorkerCommitLag = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Namespace: ns, Name: "bid_worker_commit_lag_seconds", Help: "Bid decision command lag from fetch to actual Kafka commit",
+		Buckets: durBucketsFast,
+	})
+	r.bidKafkaPartitionLag = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: ns, Name: "bid_kafka_partition_lag", Help: "Per-partition Kafka consumer lag (messages behind high watermark)",
+	}, []string{"partition"})
 	for _, mode := range []string{"local", "async", "disabled", "unknown"} {
 		for _, result := range []string{"queued", "accepted", "rejected", "unknown"} {
 			r.bidAckDuration.WithLabelValues(mode, result)
@@ -331,10 +347,10 @@ func (r *Registry) register() {
 	r.redisCommandDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Namespace: ns, Name: "redis_command_duration_seconds", Help: "Redis command duration",
 		Buckets: durBucketsRedis,
-	}, []string{"instance", "op"})
+	}, []string{"instance", "command"})
 	r.redisCommandErrors = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: ns, Name: "redis_command_errors_total", Help: "Redis command errors",
-	}, []string{"instance", "op"})
+	}, []string{"instance", "command"})
 	r.redisLuaDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Namespace: ns, Name: "redis_lua_duration_seconds", Help: "Redis Lua script duration",
 		Buckets: durBucketsRedis,
@@ -342,6 +358,13 @@ func (r *Registry) register() {
 	r.redisLuaErrors = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: ns, Name: "redis_lua_errors_total", Help: "Redis Lua script errors",
 	}, []string{"script", "error"})
+	r.bidLuaQueueDepth = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: ns, Name: "bid_lua_queue_depth", Help: "Current client-observed in-flight Lua bid arbitration calls by Redis shard",
+	}, []string{"shard", "instance", "script"})
+	r.bidLuaRoundTrip = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Namespace: ns, Name: "bid_lua_roundtrip_duration_seconds", Help: "Client-observed Redis Lua bid arbitration round-trip duration, including client wait and server execution",
+		Buckets: durBucketsRedis,
+	}, []string{"shard", "instance", "script", "status"})
 
 	// Redis connection pool --------------------------------------------------
 	r.redisPoolTotalConns = prometheus.NewGaugeVec(prometheus.GaugeOpts{
@@ -428,6 +451,7 @@ func (r *Registry) register() {
 		r.bidPlaceModeTotal, r.bidAckDuration, r.bidKafkaEnqueueDuration, r.bidDecisionDuration,
 		r.bidPendingQueueSize, r.bidResultPushDuration, r.bidResultDuration, r.bidResultAckTimeoutTot,
 		r.bidQueueRejectTotal, r.bidDecisionOutcomeTotal,
+		r.bidWorkerPoolInflight, r.bidWorkerCommitLag, r.bidKafkaPartitionLag,
 		r.hammerTotal, r.hammerDuration,
 		r.hammerMySQLTxDuration, r.hammerDuplicateTotal,
 		r.hammerOptimisticConflictTotal, r.hammerMySQLFailTotal,
@@ -437,7 +461,7 @@ func (r *Registry) register() {
 		r.depositReadyTotal, r.depositSyncRedisFailTotal,
 		r.depositReconcileTotal, r.depositReconcileLagSeconds,
 		r.redisCommandDuration, r.redisCommandErrors, r.redisLuaDuration,
-		r.redisLuaErrors,
+		r.redisLuaErrors, r.bidLuaQueueDepth, r.bidLuaRoundTrip,
 		r.redisPoolTotalConns, r.redisPoolIdleConns, r.redisPoolStaleConns,
 		r.redisPoolWaitCount, r.redisPoolWaitDurationTotal, r.redisPoolTimeouts,
 		r.redisPoolHits, r.redisPoolMisses,

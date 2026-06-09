@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"aieas_backend/internal/domain"
+	"aieas_backend/internal/infra/observability/metrics"
 	"aieas_backend/internal/infra/observability/tracing"
 
 	redisgo "github.com/redis/go-redis/v9"
@@ -273,7 +274,7 @@ func (s *AuctionRealtimeStore) PlaceBid(ctx context.Context, input domain.BidInp
 	traceParent := traceCarrier["traceparent"]
 	traceState := traceCarrier["tracestate"]
 	_, shardIdx := s.shardForAuction(input.AuctionID)
-	raw, err := s.scripts.EvalOnShard(ctx, shardIdx, ScriptBidPlace, keys,
+	raw, err := s.evalBidPlace(ctx, shardIdx, keys,
 		input.RequestID,
 		input.AuctionID,
 		input.BidderID,
@@ -313,6 +314,48 @@ func (s *AuctionRealtimeStore) PlaceBid(ctx context.Context, input domain.BidInp
 		s.publishAcceptedResult(ctx, input, result, now)
 	}
 	return result, nil
+}
+
+func (s *AuctionRealtimeStore) evalBidPlace(ctx context.Context, shardIdx int, keys []string, args ...interface{}) (raw interface{}, err error) {
+	var reg *metrics.Registry
+	if s != nil && s.scripts != nil {
+		reg = s.scripts.metricsSnapshot()
+	}
+	shardLabel := bidLuaShardLabel(shardIdx)
+	instanceLabel := bidLuaInstanceLabel(shardIdx)
+	start := time.Now()
+	if reg != nil {
+		reg.IncBidLuaQueueDepth(shardLabel, instanceLabel, ScriptBidPlace)
+		defer func() {
+			status := "ok"
+			if recovered := recover(); recovered != nil {
+				status = "panic"
+				reg.DecBidLuaQueueDepth(shardLabel, instanceLabel, ScriptBidPlace)
+				reg.ObserveBidLuaRoundTrip(shardLabel, instanceLabel, ScriptBidPlace, status, time.Since(start))
+				panic(recovered)
+			}
+			if err != nil {
+				status = classifyRedisLuaError(err)
+			}
+			reg.DecBidLuaQueueDepth(shardLabel, instanceLabel, ScriptBidPlace)
+			reg.ObserveBidLuaRoundTrip(shardLabel, instanceLabel, ScriptBidPlace, status, time.Since(start))
+		}()
+	}
+	return s.scripts.EvalOnShard(ctx, shardIdx, ScriptBidPlace, keys, args...)
+}
+
+func bidLuaShardLabel(shardIdx int) string {
+	if shardIdx < 0 {
+		return "default"
+	}
+	return strconv.Itoa(shardIdx)
+}
+
+func bidLuaInstanceLabel(shardIdx int) string {
+	if shardIdx < 0 {
+		return "default"
+	}
+	return fmt.Sprintf("rt-%d", shardIdx)
 }
 
 // publishAcceptedResult publishes the accepted bid payload to the auction PubSub
