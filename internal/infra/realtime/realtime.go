@@ -57,6 +57,12 @@ func (NoopRealtimeStore) MarkEnrollment(ctx context.Context, auctionID uint64, u
 	return nil
 }
 
+func (NoopRealtimeStore) ResetAuctionParticipation(ctx context.Context, auctionID uint64) error {
+	_ = ctx
+	_ = auctionID
+	return nil
+}
+
 func (NoopRealtimeStore) BidPrerequisites(ctx context.Context, auctionID uint64, userID string) (bool, bool, error) {
 	_ = ctx
 	_ = auctionID

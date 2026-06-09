@@ -877,10 +877,19 @@ func TestMCPLiveControlContextAndOperations(t *testing.T) {
 	if err := userRepo.Update(&merchant); err != nil {
 		t.Fatalf("update merchant ai permission: %v", err)
 	}
+	configRepo := repository.NewMemoryConfigRepository()
+	aiHostingConfig, err := json.Marshal(map[string]bool{"enabled": true})
+	if err != nil {
+		t.Fatalf("marshal ai hosting config: %v", err)
+	}
+	if err := configRepo.Upsert(ctx, &domain.ConfigItem{Key: "merchant.u_2001.live_agent_hook", Value: aiHostingConfig, Description: "test ai hosting", UpdatedBy: "u_2001", UpdatedAt: now}); err != nil {
+		t.Fatalf("enable ai hosting config: %v", err)
+	}
 	h := NewServerWithDependencies(cfg, ServerDependencies{
 		UserRepo:             userRepo,
 		AuctionRepo:          auctionRepo,
 		LiveSessionRepo:      sessionRepo,
+		ConfigRepo:           configRepo,
 		ObjectUploader:       objectstorage.NewMemoryUploader(""),
 		ProductAuditor:       appDisabledProductAuditor{},
 		LiveVoiceSynthesizer: appFakeLiveVoiceSynthesizer{},

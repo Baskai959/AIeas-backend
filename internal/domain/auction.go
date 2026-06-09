@@ -309,15 +309,16 @@ type RankingEntry struct {
 }
 
 type HammerInput struct {
-	RequestID      string
-	AuctionID      uint64
-	ActorID        string
-	ActorRole      Role
-	ClosedBy       string
-	Force          bool
-	ReservePrice   int64
-	Now            time.Time
-	IdempotencyTTL time.Duration
+	RequestID             string
+	AuctionID             uint64
+	ActorID               string
+	ActorRole             Role
+	ClosedBy              string
+	Force                 bool
+	ReservePrice          int64
+	Now                   time.Time
+	IdempotencyTTL        time.Duration
+	SuppressLiveAgentHook bool
 }
 
 type HammerResult struct {

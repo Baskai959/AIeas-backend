@@ -574,13 +574,17 @@ func TestLiveSessionServiceMountActivateDeactivateAndUnmountRules(t *testing.T) 
 func TestLiveSessionServiceDeactivateAuctionBroadcastsLotChanged(t *testing.T) {
 	sessionRepo := repository.NewMemoryLiveSessionRepository()
 	auctionRepo := repository.NewMemoryAuctionRepository()
+	realtime := repository.NewMemoryRealtimeStore()
+	auctionSvc := NewAuctionServiceWithDeps(AuctionServiceDeps{Auctions: auctionRepo, Tx: repository.NoopTxManager{}, Realtime: realtime})
 	lotEvents := &recordingLiveSessionLotEvents{}
 	svc := NewLiveSessionServiceWithDeps(LiveSessionServiceDeps{
-		Sessions:  sessionRepo,
-		Auctions:  auctionRepo,
-		LotEvents: lotEvents,
+		Sessions:        sessionRepo,
+		Auctions:        auctionRepo,
+		Auction:         auctionSvc,
+		AuctionRealtime: realtime,
+		LotEvents:       lotEvents,
 	})
-	svc.SetWriteDeps(repository.NoopTxManager{}, repository.NewMemoryLiveSessionLock(), nil)
+	svc.SetWriteDeps(repository.NoopTxManager{}, repository.NewMemoryLiveSessionLock(), auctionSvc)
 	ctx := context.Background()
 	session := createStartedLiveSession(t, svc, "m_cancel_current", "取消当前拍品场")
 	now := time.Now().UTC()
@@ -603,11 +607,26 @@ func TestLiveSessionServiceDeactivateAuctionBroadcastsLotChanged(t *testing.T) {
 	if _, err := svc.ActivateAuctionWithOptions(ctx, ActivateLiveSessionAuctionInput{SessionID: session.ID, AuctionID: lot.AuctionID, ActorID: "m_cancel_current", ActorRole: domain.RoleMerchant}); err != nil {
 		t.Fatalf("activate: %v", err)
 	}
+	if err := realtime.MarkEnrollment(ctx, lot.AuctionID, "u_cancel"); err != nil {
+		t.Fatalf("mark enrollment: %v", err)
+	}
+	before, exists, err := realtime.GetAuctionState(ctx, lot.AuctionID)
+	if err != nil || !exists || before.ParticipantCount != 1 {
+		t.Fatalf("expected participant count before deactivate=1, state=%+v exists=%v err=%v", before, exists, err)
+	}
 	if _, err := svc.DeactivateAuction(ctx, session.ID, "m_cancel_current", domain.RoleMerchant); err != nil {
 		t.Fatalf("deactivate: %v", err)
 	}
 	if lotEvents.changedSession != session.ID || lotEvents.changedID != lot.AuctionID || lotEvents.changedAction != "cancelled" {
 		t.Fatalf("expected cancelled lot changed event, got session=%d auction=%d action=%q", lotEvents.changedSession, lotEvents.changedID, lotEvents.changedAction)
+	}
+	after, exists, err := realtime.GetAuctionState(ctx, lot.AuctionID)
+	if err != nil || !exists || after.ParticipantCount != 0 {
+		t.Fatalf("expected participant count after deactivate=0, state=%+v exists=%v err=%v", after, exists, err)
+	}
+	enrolled, depositReady, err := realtime.BidPrerequisites(ctx, lot.AuctionID, "u_cancel")
+	if err != nil || enrolled || depositReady {
+		t.Fatalf("expected realtime participation cleared, enrolled=%v depositReady=%v err=%v", enrolled, depositReady, err)
 	}
 }
 

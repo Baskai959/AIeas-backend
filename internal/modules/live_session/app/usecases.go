@@ -14,8 +14,10 @@ type LiveSessionCommandUseCase interface {
 	End(ctx context.Context, sessionID uint64, actorID string, actorRole domain.Role) (domain.LiveSession, error)
 	MountAuction(ctx context.Context, sessionID, auctionID uint64, actorID string, actorRole domain.Role) (domain.AuctionLot, error)
 	UnmountAuction(ctx context.Context, sessionID, auctionID uint64, actorID string, actorRole domain.Role) error
+	UnmountAuctionWithOptions(ctx context.Context, in UnmountLiveSessionAuctionInput) error
 	ActivateAuctionWithOptions(ctx context.Context, in ActivateLiveSessionAuctionInput) (domain.AuctionLot, error)
 	DeactivateAuction(ctx context.Context, sessionID uint64, actorID string, actorRole domain.Role) (domain.LiveSession, error)
+	DeactivateAuctionWithOptions(ctx context.Context, in DeactivateLiveSessionAuctionInput) (domain.LiveSession, error)
 	UpdateAgentHookConfig(ctx context.Context, sessionID uint64, actorID string, actorRole domain.Role, enabled bool) (LiveAgentHookConfig, error)
 }
 

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"aieas_backend/internal/domain"
+	aiapp "aieas_backend/internal/modules/ai/app"
 	"aieas_backend/internal/modules/mcp/ports"
 )
 
@@ -650,7 +651,7 @@ func (s *MCPControlService) OperateLiveSessionLot(ctx context.Context, in MCPLiv
 		return MCPLiveLotOperationResult{}, domain.ErrInvalidArgument
 	}
 	lotName := s.mcpLotDisplayName(ctx, in.AuctionID)
-	if err := s.requestAIControlPermission(ctx, session, "operate_live_session_lot", action, lotName, in.RequestID); err != nil {
+	if err := s.requestAIControlPermission(ctx, session, actor, "operate_live_session_lot", action, lotName, in.RequestID); err != nil {
 		return MCPLiveLotOperationResult{}, err
 	}
 	ctx = context.WithoutCancel(ctx)
@@ -663,7 +664,13 @@ func (s *MCPControlService) OperateLiveSessionLot(ctx context.Context, in MCPLiv
 
 	switch action {
 	case "offShelf":
-		if err := s.sessionSvc.UnmountAuction(ctx, session.ID, in.AuctionID, actor.ID, actor.Role); err != nil {
+		if err := s.sessionSvc.UnmountAuctionWithOptions(ctx, ports.UnmountLiveSessionAuctionInput{
+			SessionID:             session.ID,
+			AuctionID:             in.AuctionID,
+			ActorID:               actor.ID,
+			ActorRole:             actor.Role,
+			SuppressLiveAgentHook: true,
+		}); err != nil {
 			return fail(err)
 		}
 		result.Removed = true
@@ -674,12 +681,13 @@ func (s *MCPControlService) OperateLiveSessionLot(ctx context.Context, in MCPLiv
 		}
 	case "startExplain":
 		lot, err := s.sessionSvc.ActivateAuctionWithOptions(ctx, ports.ActivateLiveSessionAuctionInput{
-			SessionID:   session.ID,
-			AuctionID:   in.AuctionID,
-			ActorID:     actor.ID,
-			ActorRole:   actor.Role,
-			DurationSec: in.DurationSec,
-			StartTime:   in.StartTime,
+			SessionID:             session.ID,
+			AuctionID:             in.AuctionID,
+			ActorID:               actor.ID,
+			ActorRole:             actor.Role,
+			DurationSec:           in.DurationSec,
+			StartTime:             in.StartTime,
+			SuppressLiveAgentHook: true,
 		})
 		if err != nil {
 			return fail(err)
@@ -697,13 +705,14 @@ func (s *MCPControlService) OperateLiveSessionLot(ctx context.Context, in MCPLiv
 			requestID = fmt.Sprintf("mcp-hammer-%d-%d-%d", session.ID, in.AuctionID, time.Now().UTC().UnixNano())
 		}
 		hammerResult, order, err := s.hammerSvc.Hammer(ctx, domain.HammerInput{
-			RequestID: requestID,
-			AuctionID: in.AuctionID,
-			ActorID:   actor.ID,
-			ActorRole: actor.Role,
-			ClosedBy:  actor.ID,
-			Force:     in.Force,
-			Now:       time.Now().UTC(),
+			RequestID:             requestID,
+			AuctionID:             in.AuctionID,
+			ActorID:               actor.ID,
+			ActorRole:             actor.Role,
+			ClosedBy:              actor.ID,
+			Force:                 in.Force,
+			Now:                   time.Now().UTC(),
+			SuppressLiveAgentHook: true,
 		})
 		if err != nil {
 			return fail(err)
@@ -719,7 +728,12 @@ func (s *MCPControlService) OperateLiveSessionLot(ctx context.Context, in MCPLiv
 		if session.ActiveAuctionID != 0 && session.ActiveAuctionID != in.AuctionID {
 			return fail(domain.ErrInvalidState)
 		}
-		updated, err := s.sessionSvc.DeactivateAuction(ctx, session.ID, actor.ID, actor.Role)
+		updated, err := s.sessionSvc.DeactivateAuctionWithOptions(ctx, ports.DeactivateLiveSessionAuctionInput{
+			SessionID:             session.ID,
+			ActorID:               actor.ID,
+			ActorRole:             actor.Role,
+			SuppressLiveAgentHook: true,
+		})
 		if err != nil {
 			return fail(err)
 		}
@@ -996,9 +1010,24 @@ func normalizeMCPLiveLotAction(action string) string {
 	}
 }
 
-func (s *MCPControlService) requestAIControlPermission(ctx context.Context, session domain.LiveSession, toolName, action, lotName, requestID string) error {
-	if s == nil || s.aiAssistant == nil {
+func (s *MCPControlService) requestAIControlPermission(ctx context.Context, session domain.LiveSession, actor MCPActor, toolName, action, lotName, requestID string) error {
+	if s == nil {
 		return nil
+	}
+	if s.sessionSvc != nil {
+		cfg, err := s.sessionSvc.AgentHookConfig(ctx, session.ID, actor.ID, actor.Role)
+		if err != nil {
+			return err
+		}
+		if !cfg.Enabled {
+			return fmt.Errorf("merchant AI hosting is disabled: %w", aiapp.ErrUserRejected)
+		}
+	}
+	if s.aiAssistant == nil {
+		return nil
+	}
+	if _, err := s.aiAssistant.Permission(ctx, ports.PermissionInput{MerchantID: session.MerchantID, ActorID: actor.ID, ActorRole: actor.Role}); err != nil {
+		return err
 	}
 	_, err := s.aiAssistant.RequestApproval(context.WithoutCancel(ctx), ports.ApprovalInput{
 		MerchantID:    session.MerchantID,

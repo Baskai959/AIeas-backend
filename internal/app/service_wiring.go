@@ -720,6 +720,14 @@ func (a mcpLiveSessionUseCaseAdapter) Stats(ctx context.Context, sessionID uint6
 	return mcpports.LiveSessionStats(stats), nil
 }
 
+func (a mcpLiveSessionUseCaseAdapter) AgentHookConfig(ctx context.Context, sessionID uint64, actorID string, actorRole domain.Role) (mcpports.LiveAgentHookConfig, error) {
+	cfg, err := a.svc.AgentHookConfig(ctx, sessionID, actorID, actorRole)
+	if err != nil {
+		return mcpports.LiveAgentHookConfig{}, err
+	}
+	return mcpports.LiveAgentHookConfig(cfg), nil
+}
+
 func (a mcpLiveSessionUseCaseAdapter) MountAuction(ctx context.Context, sessionID, auctionID uint64, actorID string, actorRole domain.Role) (domain.AuctionLot, error) {
 	return a.svc.MountAuction(ctx, sessionID, auctionID, actorID, actorRole)
 }
@@ -728,10 +736,18 @@ func (a mcpLiveSessionUseCaseAdapter) UnmountAuction(ctx context.Context, sessio
 	return a.svc.UnmountAuction(ctx, sessionID, auctionID, actorID, actorRole)
 }
 
+func (a mcpLiveSessionUseCaseAdapter) UnmountAuctionWithOptions(ctx context.Context, in mcpports.UnmountLiveSessionAuctionInput) error {
+	return a.svc.UnmountAuctionWithOptions(ctx, livesessionapp.UnmountLiveSessionAuctionInput(in))
+}
+
 func (a mcpLiveSessionUseCaseAdapter) ActivateAuctionWithOptions(ctx context.Context, in mcpports.ActivateLiveSessionAuctionInput) (domain.AuctionLot, error) {
 	return a.svc.ActivateAuctionWithOptions(ctx, livesessionapp.ActivateLiveSessionAuctionInput(in))
 }
 
 func (a mcpLiveSessionUseCaseAdapter) DeactivateAuction(ctx context.Context, sessionID uint64, actorID string, actorRole domain.Role) (domain.LiveSession, error) {
 	return a.svc.DeactivateAuction(ctx, sessionID, actorID, actorRole)
+}
+
+func (a mcpLiveSessionUseCaseAdapter) DeactivateAuctionWithOptions(ctx context.Context, in mcpports.DeactivateLiveSessionAuctionInput) (domain.LiveSession, error) {
+	return a.svc.DeactivateAuctionWithOptions(ctx, livesessionapp.DeactivateLiveSessionAuctionInput(in))
 }

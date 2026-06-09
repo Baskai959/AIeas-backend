@@ -244,12 +244,28 @@ type UpdateLiveSessionInput struct {
 }
 
 type ActivateLiveSessionAuctionInput struct {
-	SessionID   uint64
-	AuctionID   uint64
-	ActorID     string
-	ActorRole   domain.Role
-	DurationSec int
-	StartTime   *time.Time
+	SessionID             uint64
+	AuctionID             uint64
+	ActorID               string
+	ActorRole             domain.Role
+	DurationSec           int
+	StartTime             *time.Time
+	SuppressLiveAgentHook bool
+}
+
+type UnmountLiveSessionAuctionInput struct {
+	SessionID             uint64
+	AuctionID             uint64
+	ActorID               string
+	ActorRole             domain.Role
+	SuppressLiveAgentHook bool
+}
+
+type DeactivateLiveSessionAuctionInput struct {
+	SessionID             uint64
+	ActorID               string
+	ActorRole             domain.Role
+	SuppressLiveAgentHook bool
 }
 
 type LiveSessionStats struct {
@@ -813,6 +829,19 @@ func (s *LiveSessionService) MountAuction(ctx context.Context, sessionID, auctio
 }
 
 func (s *LiveSessionService) UnmountAuction(ctx context.Context, sessionID, auctionID uint64, actorID string, actorRole domain.Role) error {
+	return s.UnmountAuctionWithOptions(ctx, UnmountLiveSessionAuctionInput{
+		SessionID: sessionID,
+		AuctionID: auctionID,
+		ActorID:   actorID,
+		ActorRole: actorRole,
+	})
+}
+
+func (s *LiveSessionService) UnmountAuctionWithOptions(ctx context.Context, in UnmountLiveSessionAuctionInput) error {
+	sessionID := in.SessionID
+	auctionID := in.AuctionID
+	actorID := in.ActorID
+	actorRole := in.ActorRole
 	if sessionID == 0 || auctionID == 0 {
 		return domain.ErrInvalidArgument
 	}
@@ -840,7 +869,7 @@ func (s *LiveSessionService) UnmountAuction(ctx context.Context, sessionID, auct
 	if err := s.auctions.Update(ctx, &auction); err != nil {
 		return err
 	}
-	if s.hook != nil {
+	if s.hook != nil && !in.SuppressLiveAgentHook {
 		s.hook.EmitLotUnmounted(ctx, session.MerchantID, sessionID, auction.AuctionID)
 	}
 	if s.lotEvents != nil {
@@ -953,7 +982,7 @@ func (s *LiveSessionService) ActivateAuctionWithOptions(ctx context.Context, in 
 		}
 		auction = started
 	}
-	if s.hook != nil {
+	if s.hook != nil && !in.SuppressLiveAgentHook {
 		durationSec := in.DurationSec
 		if durationSec <= 0 && !auction.StartTime.IsZero() && !auction.EndTime.IsZero() && auction.EndTime.After(auction.StartTime) {
 			durationSec = int(auction.EndTime.Sub(auction.StartTime).Seconds())
@@ -987,7 +1016,7 @@ func (s *LiveSessionService) scheduleAuctionActivation(ctx context.Context, sess
 	if s.auction != nil {
 		s.auction.InvalidateAuctionSnapshot(ctx, auction.AuctionID)
 	}
-	if s.hook != nil {
+	if s.hook != nil && !in.SuppressLiveAgentHook {
 		s.hook.EmitLotScheduled(ctx, session.MerchantID, session.ID, auction.AuctionID, auction.StartTime, auction.DurationSec)
 	}
 	if s.lotEvents != nil {
@@ -1044,6 +1073,17 @@ func (s *LiveSessionService) ActivateDueScheduledAuction(ctx context.Context, au
 }
 
 func (s *LiveSessionService) DeactivateAuction(ctx context.Context, sessionID uint64, actorID string, actorRole domain.Role) (domain.LiveSession, error) {
+	return s.DeactivateAuctionWithOptions(ctx, DeactivateLiveSessionAuctionInput{
+		SessionID: sessionID,
+		ActorID:   actorID,
+		ActorRole: actorRole,
+	})
+}
+
+func (s *LiveSessionService) DeactivateAuctionWithOptions(ctx context.Context, in DeactivateLiveSessionAuctionInput) (domain.LiveSession, error) {
+	sessionID := in.SessionID
+	actorID := in.ActorID
+	actorRole := in.ActorRole
 	session, err := s.sessions.Get(ctx, sessionID)
 	if err != nil {
 		return domain.LiveSession{}, err
@@ -1085,7 +1125,7 @@ func (s *LiveSessionService) DeactivateAuction(ctx context.Context, sessionID ui
 	if err := s.sessions.Update(ctx, &session); err != nil {
 		return domain.LiveSession{}, err
 	}
-	if cancelledAuctionID != 0 && s.hook != nil {
+	if cancelledAuctionID != 0 && s.hook != nil && !in.SuppressLiveAgentHook {
 		s.hook.EmitLotCancelled(ctx, session.MerchantID, sessionID, cancelledAuctionID)
 	}
 	if cancelledAuctionID != 0 && s.lotEvents != nil {
@@ -1315,6 +1355,9 @@ func (s *LiveSessionService) resetAuctionToReady(ctx context.Context, auction *d
 			minIncrement = 1
 		}
 		if _, err := realtime.InitAuction(ctx, *auction, domain.MinIncrementForPrice(auction.IncrementRule, auction.StartPrice, minIncrement)); err != nil {
+			return err
+		}
+		if err := realtime.ResetAuctionParticipation(ctx, auction.AuctionID); err != nil {
 			return err
 		}
 	}

@@ -65,6 +65,7 @@ type AuctionRealtimeReader interface {
 type AuctionRealtimeWriter interface {
 	InitAuction(ctx context.Context, auction domain.AuctionLot, minIncrement int64) (domain.AuctionState, error)
 	MarkEnrollment(ctx context.Context, auctionID uint64, userID string) error
+	ResetAuctionParticipation(ctx context.Context, auctionID uint64) error
 	BidPrerequisites(ctx context.Context, auctionID uint64, userID string) (bool, bool, error)
 	PlaceBid(ctx context.Context, input domain.BidInput) (domain.BidResult, error)
 	Hammer(ctx context.Context, input domain.HammerInput) (domain.HammerResult, error)

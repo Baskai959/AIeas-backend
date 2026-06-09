@@ -138,6 +138,24 @@ func (s *MemoryRealtimeStore) MarkEnrollment(ctx context.Context, auctionID uint
 	return nil
 }
 
+func (s *MemoryRealtimeStore) ResetAuctionParticipation(ctx context.Context, auctionID uint64) error {
+	_ = ctx
+	if auctionID == 0 {
+		return domain.ErrInvalidArgument
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	auction := s.auctions[auctionID]
+	if auction == nil {
+		return nil
+	}
+	auction.enrolled = make(map[string]struct{})
+	auction.deposits = make(map[string]struct{})
+	auction.state.ParticipantCount = 0
+	auction.state.Version++
+	return nil
+}
+
 func (s *MemoryRealtimeStore) BidResultByRequestID(ctx context.Context, auctionID uint64, requestID string) (domain.BidResult, bool, error) {
 	_ = ctx
 	if requestID == "" {

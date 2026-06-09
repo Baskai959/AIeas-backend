@@ -175,6 +175,8 @@ const (
 	systemBlacklistActorID       = adminports.SystemBlacklistActorID
 )
 
+var ErrUserRejected = aiapp.ErrUserRejected
+
 func readBlacklistStrategyConfig(ctx context.Context, configs repository.ConfigRepository) (domain.BlacklistStrategyConfig, error) {
 	return adminports.ReadBlacklistStrategyConfig(ctx, configs)
 }
@@ -218,6 +220,14 @@ func (a testMCPLiveSessionUseCaseAdapter) Stats(ctx context.Context, sessionID u
 	return mcpports.LiveSessionStats(stats), nil
 }
 
+func (a testMCPLiveSessionUseCaseAdapter) AgentHookConfig(ctx context.Context, sessionID uint64, actorID string, actorRole domain.Role) (mcpports.LiveAgentHookConfig, error) {
+	cfg, err := a.svc.AgentHookConfig(ctx, sessionID, actorID, actorRole)
+	if err != nil {
+		return mcpports.LiveAgentHookConfig{}, err
+	}
+	return mcpports.LiveAgentHookConfig(cfg), nil
+}
+
 func (a testMCPLiveSessionUseCaseAdapter) MountAuction(ctx context.Context, sessionID, auctionID uint64, actorID string, actorRole domain.Role) (domain.AuctionLot, error) {
 	return a.svc.MountAuction(ctx, sessionID, auctionID, actorID, actorRole)
 }
@@ -226,10 +236,18 @@ func (a testMCPLiveSessionUseCaseAdapter) UnmountAuction(ctx context.Context, se
 	return a.svc.UnmountAuction(ctx, sessionID, auctionID, actorID, actorRole)
 }
 
+func (a testMCPLiveSessionUseCaseAdapter) UnmountAuctionWithOptions(ctx context.Context, in mcpports.UnmountLiveSessionAuctionInput) error {
+	return a.svc.UnmountAuctionWithOptions(ctx, UnmountLiveSessionAuctionInput(in))
+}
+
 func (a testMCPLiveSessionUseCaseAdapter) ActivateAuctionWithOptions(ctx context.Context, in mcpports.ActivateLiveSessionAuctionInput) (domain.AuctionLot, error) {
 	return a.svc.ActivateAuctionWithOptions(ctx, ActivateLiveSessionAuctionInput(in))
 }
 
 func (a testMCPLiveSessionUseCaseAdapter) DeactivateAuction(ctx context.Context, sessionID uint64, actorID string, actorRole domain.Role) (domain.LiveSession, error) {
 	return a.svc.DeactivateAuction(ctx, sessionID, actorID, actorRole)
+}
+
+func (a testMCPLiveSessionUseCaseAdapter) DeactivateAuctionWithOptions(ctx context.Context, in mcpports.DeactivateLiveSessionAuctionInput) (domain.LiveSession, error) {
+	return a.svc.DeactivateAuctionWithOptions(ctx, DeactivateLiveSessionAuctionInput(in))
 }

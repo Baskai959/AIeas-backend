@@ -18,6 +18,7 @@ type mcpControlFixture struct {
 	session     domain.LiveSession
 	synthesizer *fakeLiveVoiceSynthesizer
 	broadcaster *fakeLiveVoiceBroadcaster
+	hook        *fakeMCPControlLiveAgentHook
 }
 
 func newMCPControlFixture(t *testing.T) mcpControlFixture {
@@ -28,7 +29,8 @@ func newMCPControlFixture(t *testing.T) mcpControlFixture {
 	realtimeStore := repository.NewMemoryRealtimeStore()
 	bidRepo := repository.NewMemoryBidRepository()
 	auctionSvc := NewAuctionServiceWithDeps(AuctionServiceDeps{Auctions: auctionRepo, Tx: repository.NoopTxManager{}, Realtime: realtimeStore})
-	sessionSvc := NewLiveSessionServiceWithDeps(LiveSessionServiceDeps{Sessions: sessionRepo, Auctions: auctionRepo, Tx: repository.NoopTxManager{}, Lock: repository.NewMemoryLiveSessionLock(), Auction: auctionSvc, Bids: bidRepo, AuctionRealtime: realtimeStore})
+	hook := &fakeMCPControlLiveAgentHook{enabled: true}
+	sessionSvc := NewLiveSessionServiceWithDeps(LiveSessionServiceDeps{Sessions: sessionRepo, Auctions: auctionRepo, Tx: repository.NoopTxManager{}, Lock: repository.NewMemoryLiveSessionLock(), Auction: auctionSvc, Bids: bidRepo, AuctionRealtime: realtimeStore, LiveAgentHook: hook})
 	now := time.Now().UTC()
 	session := domain.LiveSession{
 		MerchantID: "m_1",
@@ -57,7 +59,7 @@ func newMCPControlFixture(t *testing.T) mcpControlFixture {
 		LiveVoiceSynthesizer: synthesizer,
 		LiveVoiceBroadcaster: broadcaster,
 	})
-	return mcpControlFixture{svc: svc, auctions: auctionRepo, sessions: sessionRepo, session: session, synthesizer: synthesizer, broadcaster: broadcaster}
+	return mcpControlFixture{svc: svc, auctions: auctionRepo, sessions: sessionRepo, session: session, synthesizer: synthesizer, broadcaster: broadcaster, hook: hook}
 }
 
 func TestMCPControlServiceReadAndOperate(t *testing.T) {
@@ -98,6 +100,9 @@ func TestMCPControlServiceReadAndOperate(t *testing.T) {
 	}
 	if result.Context.CurrentAuctionState.RemainSeconds <= 0 {
 		t.Fatalf("expected positive remain seconds, got %+v", result.Context.CurrentAuctionState)
+	}
+	if fixture.hook.started != 0 {
+		t.Fatalf("MCP start auction should not emit live agent hook, got %d", fixture.hook.started)
 	}
 
 	voice, err := fixture.svc.CreateLiveVoiceBroadcast(ctx, MCPLiveVoiceBroadcastInput{
@@ -186,6 +191,20 @@ func TestMCPControlServiceErrors(t *testing.T) {
 			wantErr: domain.ErrInvalidArgument,
 		},
 		{
+			name: "operate rejects when ai hosting disabled",
+			run: func(ctx context.Context, fixture mcpControlFixture) error {
+				fixture.hook.enabled = false
+				lot := mcpControlReadyLot(91006, "m_1")
+				lot.LiveSessionID = &fixture.session.ID
+				if err := fixture.auctions.Create(ctx, &lot); err != nil {
+					return err
+				}
+				_, err := fixture.svc.OperateLiveSessionLot(ctx, MCPLiveLotOperationInput{LiveSessionID: fixture.session.ID, AuctionID: lot.AuctionID, Action: "startExplain", DurationSec: 600}, MCPActor{ID: "m_1", Role: domain.RoleMerchant})
+				return err
+			},
+			wantErr: ErrUserRejected,
+		},
+		{
 			name: "voice rejects empty text",
 			run: func(ctx context.Context, fixture mcpControlFixture) error {
 				_, err := fixture.svc.CreateLiveVoiceBroadcast(ctx, MCPLiveVoiceBroadcastInput{LiveSessionID: fixture.session.ID, Text: "   "}, MCPActor{ID: "m_1", Role: domain.RoleMerchant})
@@ -266,6 +285,77 @@ type fakeLiveVoiceBroadcaster struct {
 	delivered int
 	payload   LiveVoiceBroadcastPayload
 	err       error
+}
+
+type fakeMCPControlLiveAgentHook struct {
+	enabled bool
+	started int
+}
+
+func (f *fakeMCPControlLiveAgentHook) EmitLiveStarted(ctx context.Context, merchantID string, sessionID uint64) {
+	_ = ctx
+	_ = merchantID
+	_ = sessionID
+}
+
+func (f *fakeMCPControlLiveAgentHook) EmitLotMounted(ctx context.Context, merchantID string, sessionID, auctionID uint64) {
+	_ = ctx
+	_ = merchantID
+	_ = sessionID
+	_ = auctionID
+}
+
+func (f *fakeMCPControlLiveAgentHook) EmitLotUnmounted(ctx context.Context, merchantID string, sessionID, auctionID uint64) {
+	_ = ctx
+	_ = merchantID
+	_ = sessionID
+	_ = auctionID
+}
+
+func (f *fakeMCPControlLiveAgentHook) EmitLotStarted(ctx context.Context, merchantID string, sessionID, auctionID uint64, durationSec int) {
+	_ = ctx
+	_ = merchantID
+	_ = sessionID
+	_ = auctionID
+	_ = durationSec
+	f.started++
+}
+
+func (f *fakeMCPControlLiveAgentHook) EmitLotScheduled(ctx context.Context, merchantID string, sessionID, auctionID uint64, startTime time.Time, durationSec int) {
+	_ = ctx
+	_ = merchantID
+	_ = sessionID
+	_ = auctionID
+	_ = startTime
+	_ = durationSec
+}
+
+func (f *fakeMCPControlLiveAgentHook) EmitLotCancelled(ctx context.Context, merchantID string, sessionID, auctionID uint64) {
+	_ = ctx
+	_ = merchantID
+	_ = sessionID
+	_ = auctionID
+}
+
+func (f *fakeMCPControlLiveAgentHook) GetConfig(ctx context.Context, merchantID string) (LiveAgentHookConfig, error) {
+	_ = ctx
+	_ = merchantID
+	return LiveAgentHookConfig{Enabled: f.enabled}, nil
+}
+
+func (f *fakeMCPControlLiveAgentHook) SetConfig(ctx context.Context, merchantID, updatedBy string, enabled bool) (LiveAgentHookConfig, error) {
+	_ = ctx
+	_ = merchantID
+	_ = updatedBy
+	f.enabled = enabled
+	return LiveAgentHookConfig{Enabled: enabled}, nil
+}
+
+func (f *fakeMCPControlLiveAgentHook) EmitConfigChanged(ctx context.Context, merchantID string, sessionID uint64, enabled bool) {
+	_ = ctx
+	_ = merchantID
+	_ = sessionID
+	_ = enabled
 }
 
 func (f *fakeLiveVoiceBroadcaster) BroadcastLiveVoice(ctx context.Context, liveSessionID uint64, payload LiveVoiceBroadcastPayload) (int, error) {

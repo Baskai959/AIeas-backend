@@ -362,6 +362,11 @@ func (s *streamEnabledRealtime) MarkEnrollment(ctx context.Context, auctionID ui
 	_ = userID
 	return nil
 }
+func (s *streamEnabledRealtime) ResetAuctionParticipation(ctx context.Context, auctionID uint64) error {
+	_ = ctx
+	_ = auctionID
+	return nil
+}
 func (s *streamEnabledRealtime) BidPrerequisites(ctx context.Context, auctionID uint64, userID string) (bool, bool, error) {
 	_ = ctx
 	_ = auctionID

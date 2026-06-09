@@ -55,12 +55,32 @@ type AuctionStateUseCase interface {
 
 // ActivateLiveSessionAuctionInput 是直播场次内开拍时的最小控制载荷。
 type ActivateLiveSessionAuctionInput struct {
-	SessionID   uint64
-	AuctionID   uint64
-	ActorID     string
-	ActorRole   domain.Role
-	DurationSec int
-	StartTime   *time.Time
+	SessionID             uint64
+	AuctionID             uint64
+	ActorID               string
+	ActorRole             domain.Role
+	DurationSec           int
+	StartTime             *time.Time
+	SuppressLiveAgentHook bool
+}
+
+type UnmountLiveSessionAuctionInput struct {
+	SessionID             uint64
+	AuctionID             uint64
+	ActorID               string
+	ActorRole             domain.Role
+	SuppressLiveAgentHook bool
+}
+
+type DeactivateLiveSessionAuctionInput struct {
+	SessionID             uint64
+	ActorID               string
+	ActorRole             domain.Role
+	SuppressLiveAgentHook bool
+}
+
+type LiveAgentHookConfig struct {
+	Enabled bool `json:"enabled"`
 }
 
 // LiveSessionStats 是 MCP control 展示直播态势时的统计快照。
@@ -86,10 +106,13 @@ type LiveSessionUseCase interface {
 	ListLots(ctx context.Context, sessionID uint64, actorID string, actorRole domain.Role) ([]domain.AuctionLot, error)
 	ListBidsPaged(ctx context.Context, sessionID uint64, sortBy string, limit, offset int, actorID string, actorRole domain.Role) ([]domain.BidRecord, error)
 	Stats(ctx context.Context, sessionID uint64, actorID string, actorRole domain.Role) (LiveSessionStats, error)
+	AgentHookConfig(ctx context.Context, sessionID uint64, actorID string, actorRole domain.Role) (LiveAgentHookConfig, error)
 	MountAuction(ctx context.Context, sessionID, auctionID uint64, actorID string, actorRole domain.Role) (domain.AuctionLot, error)
 	UnmountAuction(ctx context.Context, sessionID, auctionID uint64, actorID string, actorRole domain.Role) error
+	UnmountAuctionWithOptions(ctx context.Context, in UnmountLiveSessionAuctionInput) error
 	ActivateAuctionWithOptions(ctx context.Context, in ActivateLiveSessionAuctionInput) (domain.AuctionLot, error)
 	DeactivateAuction(ctx context.Context, sessionID uint64, actorID string, actorRole domain.Role) (domain.LiveSession, error)
+	DeactivateAuctionWithOptions(ctx context.Context, in DeactivateLiveSessionAuctionInput) (domain.LiveSession, error)
 }
 
 // OrderUseCase 是 MCP read 查询订单边界端口。
@@ -106,6 +129,10 @@ type HammerUseCase interface {
 // ApprovalRequester 是 MCP control 请求 AI 审批端口。
 type ApprovalRequester = aiports.ApprovalRequester
 
+type PermissionReader interface {
+	Permission(ctx context.Context, in PermissionInput) (domain.MerchantAIPermission, error)
+}
+
 // StatusNotifier 是 MCP read/control 状态回传端口。
 type StatusNotifier = aiports.StatusNotifier
 
@@ -115,11 +142,15 @@ type BroadcastNotifier = aiports.BroadcastNotifier
 // ApprovalInput 是 AI 审批请求载荷。
 type ApprovalInput = aiports.ApprovalInput
 
+// PermissionInput 是 AI 托管权限查询载荷。
+type PermissionInput = aiports.PermissionInput
+
 // ApprovalDecision 是 AI 审批结果。
 type ApprovalDecision = aiports.ApprovalDecision
 
 // AIAssistantFacade 汇总 MCP control 使用到的 AI 助手能力。
 type AIAssistantFacade interface {
+	PermissionReader
 	ApprovalRequester
 	StatusNotifier
 	BroadcastNotifier

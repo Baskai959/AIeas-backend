@@ -565,7 +565,7 @@ func (s *HammerService) hammerInternal(ctx context.Context, in domain.HammerInpu
 		payload["orderId"] = order.ID
 	}
 	broadcastJSON(s.publisher, result.AuctionID, "auction.closed", payload)
-	if s.hook != nil && auction.LiveSessionID != nil {
+	if s.hook != nil && auction.LiveSessionID != nil && !in.SuppressLiveAgentHook {
 		reason := ""
 		if result.Status == domain.AuctionStatusClosedFailed {
 			reason = "未达到保留价或无人有效出价"
@@ -773,6 +773,12 @@ func (noopRealtimeStore) MarkEnrollment(ctx context.Context, auctionID uint64, u
 	_ = ctx
 	_ = auctionID
 	_ = userID
+	return nil
+}
+
+func (noopRealtimeStore) ResetAuctionParticipation(ctx context.Context, auctionID uint64) error {
+	_ = ctx
+	_ = auctionID
 	return nil
 }
 

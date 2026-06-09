@@ -216,6 +216,21 @@ func (s *AuctionRealtimeStore) MarkEnrollment(ctx context.Context, auctionID uin
 	return err
 }
 
+func (s *AuctionRealtimeStore) ResetAuctionParticipation(ctx context.Context, auctionID uint64) error {
+	if auctionID == 0 {
+		return domain.ErrInvalidArgument
+	}
+	client, _ := s.shardForAuction(auctionID)
+	pipe := client.Pipeline()
+	pipe.Del(ctx, s.keys.AuctionEnrolled(auctionID), s.keys.AuctionDeposits(auctionID))
+	pipe.HSet(ctx, s.keys.AuctionState(auctionID),
+		"participant_count", 0,
+		"version", time.Now().UTC().UnixMilli(),
+	)
+	_, err := pipe.Exec(ctx)
+	return err
+}
+
 func (s *AuctionRealtimeStore) BidResultByRequestID(ctx context.Context, auctionID uint64, requestID string) (domain.BidResult, bool, error) {
 	requestID = strings.TrimSpace(requestID)
 	if requestID == "" {

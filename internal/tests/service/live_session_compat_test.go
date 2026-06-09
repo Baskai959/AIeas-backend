@@ -23,6 +23,8 @@ type LiveSessionService = livesessionapp.LiveSessionService
 type CreateLiveSessionInput = livesessionapp.CreateLiveSessionInput
 type UpdateLiveSessionInput = livesessionapp.UpdateLiveSessionInput
 type ActivateLiveSessionAuctionInput = livesessionapp.ActivateLiveSessionAuctionInput
+type UnmountLiveSessionAuctionInput = livesessionapp.UnmountLiveSessionAuctionInput
+type DeactivateLiveSessionAuctionInput = livesessionapp.DeactivateLiveSessionAuctionInput
 type LiveSessionStats = livesessionapp.LiveSessionStats
 type LiveAgentHookConfig = livesessionapp.LiveAgentHookConfig
 
