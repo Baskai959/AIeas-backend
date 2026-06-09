@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strconv"
 	"sync"
 	"time"
@@ -25,6 +26,10 @@ type TimerScheduler struct {
 	interval  time.Duration
 	mu        sync.Mutex
 	cancels   map[uint64]context.CancelFunc
+	// graceMs 是 timer 触发落锤前的 anti-sniping 宽限：当 now 已过 endTime，但
+	// max(state.AntiSnipingMS, graceMs) 时间还没到，仍保持 RUNNING/EXTENDED 不进
+	// hammer 分支，给异步出价命令最后一刻把 endTime 推后的机会。0 等价于历史行为。
+	graceMs int64
 }
 
 func NewTimerScheduler(realtime auctionports.AuctionRealtimeStore, hammer *auctionapp.HammerService, publisher eventPublisher, interval time.Duration) *TimerScheduler {
@@ -35,6 +40,18 @@ func NewTimerScheduler(realtime auctionports.AuctionRealtimeStore, hammer *aucti
 		interval = time.Second
 	}
 	return &TimerScheduler{realtime: realtime, hammer: hammer, publisher: publisher, interval: interval, cancels: make(map[uint64]context.CancelFunc)}
+}
+
+// SetHammerAntiSnipingGraceMs 注入 timer 的 anti-sniping 宽限期（毫秒）。
+// <=0 表示禁用宽限（保持历史严格 now.Before(endTime) 行为）。装配期一次性写入。
+func (s *TimerScheduler) SetHammerAntiSnipingGraceMs(grace int64) {
+	if s == nil {
+		return
+	}
+	if grace < 0 {
+		grace = 0
+	}
+	s.graceMs = grace
 }
 
 func (s *TimerScheduler) Schedule(auctionID uint64) {
@@ -99,11 +116,24 @@ func (s *TimerScheduler) run(ctx context.Context, auctionID uint64) {
 				tickPayload["liveSessionId"] = state.LiveSessionID
 			}
 			broadcastJSON(s.publisher, auctionID, "timer.tick", tickPayload)
-			if now.Before(state.EndTime) {
+			// anti-sniping grace：到点后再宽限 max(state.AntiSnipingMS, graceMs)，
+			// 才允许进入 hammer 分支；这一窗口让异步链路里"最后一刻"的出价命令
+			// 仍有机会延长 endTime（通过 bid.lua 写入新 end_ts_ms）。
+			// CAP_PRICE / Force=true 走 BidService 直接调 Hammer，不经过 timer，因此
+			// 不受本宽限影响。
+			grace := s.graceMs
+			if state.AntiSnipingMS > grace {
+				grace = state.AntiSnipingMS
+			}
+			hammerThreshold := state.EndTime
+			if grace > 0 {
+				hammerThreshold = hammerThreshold.Add(time.Duration(grace) * time.Millisecond)
+			}
+			if now.Before(hammerThreshold) {
 				continue
 			}
 			if s.hammer != nil {
-				_, _, _ = s.hammer.Hammer(ctx, domain.HammerInput{
+				_, _, hammerErr := s.hammer.Hammer(ctx, domain.HammerInput{
 					RequestID:      "auto-" + strconvFormatTime(now.UTC()),
 					AuctionID:      auctionID,
 					ActorID:        "system",
@@ -112,6 +142,11 @@ func (s *TimerScheduler) run(ctx context.Context, auctionID uint64) {
 					Now:            now.UTC(),
 					IdempotencyTTL: 24 * time.Hour,
 				})
+				// BeginHammerPending 二次确认发现 endTime 被推后时返回 ErrInvalidState；
+				// 此时不结束 timer，下一轮 tick 会重新读 state 重新判断。
+				if errors.Is(hammerErr, domain.ErrInvalidState) {
+					continue
+				}
 			}
 			s.Stop(auctionID)
 			return

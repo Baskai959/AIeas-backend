@@ -59,6 +59,10 @@ type Registry struct {
 	hammerDuplicateTotal          prometheus.Counter
 	hammerOptimisticConflictTotal prometheus.Counter
 	hammerMySQLFailTotal          prometheus.Counter
+	hammerPendingTotal            *prometheus.CounterVec
+	hammerDrainDuration           prometheus.Histogram
+	hammerDrainTimeoutTotal       prometheus.Counter
+	bidCommandPublishRejectTotal  *prometheus.CounterVec
 
 	// Enroll & Deposit
 	enrollTotal                *prometheus.CounterVec
@@ -287,6 +291,19 @@ func (r *Registry) register() {
 	r.hammerMySQLFailTotal = prometheus.NewCounter(prometheus.CounterOpts{
 		Namespace: ns, Name: "auction_hammer_mysql_fail_total", Help: "Hammer MySQL persistence failures",
 	})
+	r.hammerPendingTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: ns, Name: "auction_hammer_pending_total", Help: "Hammer pending transitions by trigger",
+	}, []string{"trigger"})
+	r.hammerDrainDuration = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Namespace: ns, Name: "auction_hammer_drain_duration_seconds", Help: "Hammer drain barrier wait duration",
+		Buckets: durBucketsFast,
+	})
+	r.hammerDrainTimeoutTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: ns, Name: "auction_hammer_drain_timeout_total", Help: "Hammer drain barrier timeout fallback count",
+	})
+	r.bidCommandPublishRejectTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: ns, Name: "bid_command_publish_reject_total", Help: "Bid command publisher rejections by reason",
+	}, []string{"reason"})
 
 	// Enroll & deposit -----------------------------------------------------
 	r.enrollTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
@@ -414,6 +431,8 @@ func (r *Registry) register() {
 		r.hammerTotal, r.hammerDuration,
 		r.hammerMySQLTxDuration, r.hammerDuplicateTotal,
 		r.hammerOptimisticConflictTotal, r.hammerMySQLFailTotal,
+		r.hammerPendingTotal, r.hammerDrainDuration, r.hammerDrainTimeoutTotal,
+		r.bidCommandPublishRejectTotal,
 		r.enrollTotal, r.enrollDuration,
 		r.depositReadyTotal, r.depositSyncRedisFailTotal,
 		r.depositReconcileTotal, r.depositReconcileLagSeconds,

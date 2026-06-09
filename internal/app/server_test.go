@@ -1102,19 +1102,25 @@ func TestAuctionAuditCallbackRouteRequiresExplicitRejectedConclusion(t *testing.
 		t.Fatalf("expected status-only callback to keep PENDING_AUDIT, got %s", pendingLot.Status)
 	}
 
-	payload := `{"requestId":"audit-callback-rejected-conclusion","status":"COMPLETED","isApproved":false,"callback_context":{"auctionId":` + strconv.FormatUint(created.AuctionID, 10) + `,"scope":"auction_lot_content","taskId":"` + taskID + `"}}`
+	rejectReason := "商品信息中存在品牌信息不一致，涉嫌虚假宣传。"
+	payload := `{"request_id":"audit-callback-rejected-conclusion","status":"COMPLETED","is_approved":false,"reject_reason":"` + rejectReason + `","callback_context":{"auctionId":` + strconv.FormatUint(created.AuctionID, 10) + `,"scope":"auction_lot_content","taskId":"` + taskID + `"}}`
 	callbackResp := doJSONWithHeaders(t, h.Engine, consts.MethodPost, "/api/v1/auctions/audit/callback", payload)
 	if callbackResp.status != 200 || callbackResp.body.Code != 0 {
 		t.Fatalf("expected audit callback success, got status=%d raw=%s", callbackResp.status, callbackResp.raw)
 	}
 	var callbackData struct {
-		Success    bool   `json:"success"`
-		IsApproved bool   `json:"isApproved"`
-		LotStatus  string `json:"lotStatus"`
+		Success       bool     `json:"success"`
+		IsApproved    bool     `json:"isApproved"`
+		LotStatus     string   `json:"lotStatus"`
+		RejectReason  string   `json:"rejectReason"`
+		RejectReasons []string `json:"rejectReasons"`
 	}
 	mustDecodeData(t, callbackResp.body.Data, &callbackData)
 	if !callbackData.Success || callbackData.IsApproved || callbackData.LotStatus != string(domain.AuctionStatusAuditRejected) {
 		t.Fatalf("expected explicit rejected callback to mark AUDIT_REJECTED, got %+v", callbackData)
+	}
+	if callbackData.RejectReason != rejectReason || len(callbackData.RejectReasons) != 1 || callbackData.RejectReasons[0] != rejectReason {
+		t.Fatalf("expected callback reject reason, got %+v", callbackData)
 	}
 
 	getResp := doJSONWithHeaders(t, h.Engine, consts.MethodGet, "/api/v1/auctions/"+strconv.FormatUint(created.AuctionID, 10), "", ut.Header{Key: "Authorization", Value: "Bearer " + merchantToken})
@@ -1122,11 +1128,15 @@ func TestAuctionAuditCallbackRouteRequiresExplicitRejectedConclusion(t *testing.
 		t.Fatalf("expected auction get success, got status=%d raw=%s", getResp.status, getResp.raw)
 	}
 	var lot struct {
-		Status domain.AuctionStatus `json:"status"`
+		Status            domain.AuctionStatus `json:"status"`
+		AuditRejectReason string               `json:"auditRejectReason"`
 	}
 	mustDecodeData(t, getResp.body.Data, &lot)
 	if lot.Status != domain.AuctionStatusAuditRejected {
 		t.Fatalf("expected AUDIT_REJECTED after callback, got %s", lot.Status)
+	}
+	if lot.AuditRejectReason != rejectReason {
+		t.Fatalf("expected audit reject reason after callback, got %q", lot.AuditRejectReason)
 	}
 }
 
@@ -1452,6 +1462,124 @@ func TestAuctionCreateRejectsMissingDisplayContent(t *testing.T) {
 
 	if create.status != 400 || create.body.Code != 20001 {
 		t.Fatalf("expected display content validation error, got status=%d body=%+v raw=%s", create.status, create.body, create.raw)
+	}
+}
+
+func TestAuctionCreateRejectsResetAntiExtendShorterThanAntiSniping(t *testing.T) {
+	h := newTestServer()
+	token := loginForToken(t, h.Engine, "merchant001", "Passw0rd!", "merchant")
+
+	create := doJSONWithHeaders(t, h.Engine, consts.MethodPost, "/api/v1/auctions", `{"title":"反狙击校验","category":"watch","condition":"NEW","description":"反狙击模式校验","imageUrls":["/api/v1/images/test-lot.jpg"],"coverUrl":"/api/v1/images/test-lot.jpg","startPrice":10000,"reservePrice":0,"capPrice":20000,"antiSnipingSec":60,"antiExtendSec":30,"antiExtendMode":"RESET","depositAmount":0,"incrementRule":{"type":"fixed","amount":1000,"maxBidSteps":1}}`, ut.Header{Key: "Authorization", Value: "Bearer " + token})
+
+	if create.status != 400 || create.body.Code != 20001 {
+		t.Fatalf("expected anti-extend validation error, got status=%d body=%+v raw=%s", create.status, create.body, create.raw)
+	}
+}
+
+func TestAuctionCreateAllowsLadderLastStepMaxEqualCapPrice(t *testing.T) {
+	h := newTestServer()
+	token := loginForToken(t, h.Engine, "merchant001", "Passw0rd!", "merchant")
+
+	payload, err := json.Marshal(map[string]interface{}{
+		"title":         "封顶价阶梯拍品",
+		"category":      "watch",
+		"condition":     string(domain.ConditionNew),
+		"description":   "最后一档阶梯上限等于封顶价",
+		"imageUrls":     []string{"/api/v1/images/test-lot.jpg"},
+		"coverUrl":      "/api/v1/images/test-lot.jpg",
+		"startPrice":    10000,
+		"reservePrice":  0,
+		"capPrice":      50000,
+		"depositAmount": 0,
+		"status":        string(domain.AuctionStatusPendingAudit),
+		"incrementRule": map[string]interface{}{
+			"type":        "ladder",
+			"maxBidSteps": 1,
+			"steps": []map[string]interface{}{
+				{"min": 10000, "max": 20000, "amount": 1000},
+				{"min": 20000, "max": 30000, "amount": 2000},
+				{"min": 30000, "max": 50000, "amount": 5000},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+
+	create := doJSONWithHeaders(t, h.Engine, consts.MethodPost, "/api/v1/auctions", string(payload), ut.Header{Key: "Authorization", Value: "Bearer " + token})
+	if create.status != 200 || create.body.Code != 0 {
+		t.Fatalf("expected ladder create success, got status=%d body=%+v raw=%s", create.status, create.body, create.raw)
+	}
+}
+
+func TestAuctionCreateRejectsLadderLastStepMaxMismatchCapPrice(t *testing.T) {
+	h := newTestServer()
+	token := loginForToken(t, h.Engine, "merchant001", "Passw0rd!", "merchant")
+
+	payload, err := json.Marshal(map[string]interface{}{
+		"title":         "封顶价阶梯拍品",
+		"category":      "watch",
+		"condition":     string(domain.ConditionNew),
+		"description":   "最后一档阶梯上限与封顶价不一致",
+		"imageUrls":     []string{"/api/v1/images/test-lot.jpg"},
+		"coverUrl":      "/api/v1/images/test-lot.jpg",
+		"startPrice":    10000,
+		"reservePrice":  0,
+		"capPrice":      50000,
+		"depositAmount": 0,
+		"status":        string(domain.AuctionStatusPendingAudit),
+		"incrementRule": map[string]interface{}{
+			"type":        "ladder",
+			"maxBidSteps": 1,
+			"steps": []map[string]interface{}{
+				{"min": 10000, "max": 20000, "amount": 1000},
+				{"min": 20000, "max": 30000, "amount": 2000},
+				{"min": 30000, "max": 45000, "amount": 5000},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+
+	create := doJSONWithHeaders(t, h.Engine, consts.MethodPost, "/api/v1/auctions", string(payload), ut.Header{Key: "Authorization", Value: "Bearer " + token})
+	if create.status != 400 || create.body.Code != 20001 {
+		t.Fatalf("expected ladder create validation error, got status=%d body=%+v raw=%s", create.status, create.body, create.raw)
+	}
+}
+
+func TestAuctionCreateRejectsLadderFirstStepMinMismatchStartPrice(t *testing.T) {
+	h := newTestServer()
+	token := loginForToken(t, h.Engine, "merchant001", "Passw0rd!", "merchant")
+
+	payload, err := json.Marshal(map[string]interface{}{
+		"title":         "起拍价阶梯拍品",
+		"category":      "watch",
+		"condition":     string(domain.ConditionNew),
+		"description":   "第一档起始价与起拍价不一致",
+		"imageUrls":     []string{"/api/v1/images/test-lot.jpg"},
+		"coverUrl":      "/api/v1/images/test-lot.jpg",
+		"startPrice":    10000,
+		"reservePrice":  0,
+		"capPrice":      50000,
+		"depositAmount": 0,
+		"status":        string(domain.AuctionStatusPendingAudit),
+		"incrementRule": map[string]interface{}{
+			"type":        "ladder",
+			"maxBidSteps": 1,
+			"steps": []map[string]interface{}{
+				{"min": 0, "max": 20000, "amount": 1000},
+				{"min": 20000, "max": 50000, "amount": 5000},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+
+	create := doJSONWithHeaders(t, h.Engine, consts.MethodPost, "/api/v1/auctions", string(payload), ut.Header{Key: "Authorization", Value: "Bearer " + token})
+	if create.status != 400 || create.body.Code != 20001 {
+		t.Fatalf("expected first-step validation error, got status=%d body=%+v raw=%s", create.status, create.body, create.raw)
 	}
 }
 

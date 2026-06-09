@@ -114,6 +114,7 @@ objectStorage:
 		t.Fatalf("unexpected object storage config: %+v", cfg.ObjectStorage)
 	}
 	if cfg.Agent.ProductDescriptionURL != "http://127.0.0.1:8000/api/v1/product-description" ||
+		cfg.Agent.ProductDescriptionTimeout.Std() != 2*time.Minute ||
 		!cfg.Agent.ProductAuditEnabled ||
 		cfg.Agent.LiveAnalysisCallbackAPIKey != "callback-from-env" ||
 		cfg.Agent.Timeout.Std() != 45*time.Second {
@@ -571,6 +572,14 @@ func TestValidateRejectsInvalidAgentProductDescriptionURL(t *testing.T) {
 	cfg.Agent.ProductDescriptionURL = "127.0.0.1:8000/api/v1/product-description"
 	if err := cfg.Validate(); err == nil {
 		t.Fatal("expected invalid agent.productDescriptionURL to be rejected")
+	}
+}
+
+func TestValidateRejectsNonPositiveAgentProductDescriptionTimeout(t *testing.T) {
+	cfg := Default()
+	cfg.Agent.ProductDescriptionTimeout = 0
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected non-positive agent.productDescriptionTimeout to be rejected")
 	}
 }
 

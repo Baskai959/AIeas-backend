@@ -168,7 +168,29 @@ func NewServerWithDependencies(cfg appconfig.Config, deps ServerDependencies) *s
 		coord.SetMetrics(deps.MetricsRegistry)
 		deps.BidAsyncCoordinator = coord
 	}
+	// 异步落锤过渡态：当 async 闭环齐备时构造 publisher 闸门 + in-flight 屏障，
+	// 注入到 publisher 适配器（拒绝新命令）与 HammerService（屏障等待 + finalize）。
+	asyncReadyForHammer := deps.BidCommandPublisher != nil && deps.BidAsyncCoordinator != nil
+	var (
+		hammerGate    *auctionapp.HammerPublisherGate
+		hammerBarrier *auctionapp.InFlightBarrier
+	)
+	if asyncReadyForHammer {
+		// 闸门宽限：默认 200ms，覆盖 ws handler 在 publish 前/后的入队竞态窗口。
+		hammerGate = auctionapp.NewHammerPublisherGate(200 * time.Millisecond)
+		hammerBarrier = auctionapp.NewInFlightBarrier(deps.BidAsyncCoordinator, hammerGate, cfg.Auction.HammerDrainPollMs)
+		hammerBarrier.SetMetrics(hammerBarrierMetricsAdapter{registry: deps.MetricsRegistry})
+		// 把闸门注入命令发布器（如果是已知的 kafka 适配器实例）。
+		if k, ok := deps.BidCommandPublisher.(*kafkaBidCommandPublisher); ok {
+			k.SetGate(hammerGate)
+			k.SetMetrics(deps.MetricsRegistry)
+		}
+	}
 	services := buildAppServices(cfg, deps)
+	if asyncReadyForHammer && services.hammer != nil {
+		drainMaxWait := time.Duration(cfg.Auction.HammerDrainMaxWaitMs) * time.Millisecond
+		services.hammer.SetAsyncBidWiring(true, hammerBarrier, hammerGate, drainMaxWait)
+	}
 	workerShutdown := startAppWorkers(cfg, deps, services)
 	asyncBid := asyncBidWiring{coordinator: deps.BidAsyncCoordinator, publisher: deps.BidCommandPublisher}
 	if asyncBid.coordinator != nil && asyncBid.publisher != nil && services.bid != nil {

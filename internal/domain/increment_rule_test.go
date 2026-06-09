@@ -46,9 +46,8 @@ func TestIncrementRuleValidationRejectsInvalidRules(t *testing.T) {
 		json.RawMessage(`{"type":"fixed","amount":100,"maxBidSteps":3,"steps":[{"min":0,"amount":100}]}`),
 		json.RawMessage(`{"type":"ladder","amount":100,"maxBidSteps":3,"steps":[{"min":0,"amount":100}]}`),
 		json.RawMessage(`{"type":"ladder","amount":0,"maxBidSteps":3,"steps":[{"min":0,"amount":100}]}`),
-		json.RawMessage(`{"type":"ladder","maxBidSteps":3,"steps":[{"min":1,"amount":100}]}`),
+		json.RawMessage(`{"type":"ladder","maxBidSteps":3,"steps":[{"min":0,"amount":0}]}`),
 		json.RawMessage(`{"type":"ladder","maxBidSteps":3,"steps":[{"min":0,"max":1000,"amount":100},{"min":1001,"amount":200}]}`),
-		json.RawMessage(`{"type":"ladder","maxBidSteps":3,"steps":[{"min":0,"max":1000,"amount":100}]}`),
 		json.RawMessage(`{"amount":100,"maxBidSteps":3}`),
 		json.RawMessage(`{"type":"fixed","amount":100}`),
 		json.RawMessage(`{"type":"fixed","maxBidSteps":3}`),
@@ -78,6 +77,49 @@ func TestValidateAuctionPricingAllowsUnalignedCapPrice(t *testing.T) {
 		{name: "reserve above cap", start: 1000, reserve: 2500, cap: 2000},
 	} {
 		if err := ValidateAuctionPricing(tc.start, tc.reserve, tc.cap, rule); !errors.Is(err, ErrInvalidArgument) {
+			t.Fatalf("%s: expected invalid argument, got %v", tc.name, err)
+		}
+	}
+}
+
+func TestValidateAuctionPricingLadderLastStepMustMatchCapPrice(t *testing.T) {
+	withCap := json.RawMessage(`{"type":"ladder","maxBidSteps":5,"steps":[{"min":1000,"max":10000,"amount":500},{"min":10000,"max":20550,"amount":1000}]}`)
+	if err := ValidateAuctionPricing(1000, 5000, 20550, withCap); err != nil {
+		t.Fatalf("expected ladder pricing with cap-aligned last step to be valid: %v", err)
+	}
+
+	withoutCap := json.RawMessage(`{"type":"ladder","maxBidSteps":5,"steps":[{"min":1000,"max":10000,"amount":500},{"min":10000,"amount":1000}]}`)
+	if err := ValidateAuctionPricing(1000, 5000, 0, withoutCap); err != nil {
+		t.Fatalf("expected ladder pricing without cap and open-ended last step to be valid: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name string
+		cap  int64
+		rule json.RawMessage
+	}{
+		{
+			name: "first step min mismatch start price",
+			cap:  20550,
+			rule: json.RawMessage(`{"type":"ladder","maxBidSteps":5,"steps":[{"min":0,"max":10000,"amount":500},{"min":10000,"max":20550,"amount":1000}]}`),
+		},
+		{
+			name: "cap set but last step max omitted",
+			cap:  20550,
+			rule: json.RawMessage(`{"type":"ladder","maxBidSteps":5,"steps":[{"min":1000,"max":10000,"amount":500},{"min":10000,"amount":1000}]}`),
+		},
+		{
+			name: "cap set but last step max mismatched",
+			cap:  20550,
+			rule: json.RawMessage(`{"type":"ladder","maxBidSteps":5,"steps":[{"min":1000,"max":10000,"amount":500},{"min":10000,"max":20000,"amount":1000}]}`),
+		},
+		{
+			name: "cap missing but last step max provided",
+			cap:  0,
+			rule: json.RawMessage(`{"type":"ladder","maxBidSteps":5,"steps":[{"min":1000,"max":10000,"amount":500},{"min":10000,"max":20000,"amount":1000}]}`),
+		},
+	} {
+		if err := ValidateAuctionPricing(1000, 5000, tc.cap, tc.rule); !errors.Is(err, ErrInvalidArgument) {
 			t.Fatalf("%s: expected invalid argument, got %v", tc.name, err)
 		}
 	}

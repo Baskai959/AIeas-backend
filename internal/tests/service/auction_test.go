@@ -209,6 +209,35 @@ func TestAuctionServiceCreateRejectsSystemStatus(t *testing.T) {
 	}
 }
 
+func TestAuctionServiceCreateRejectsResetAntiExtendShorterThanAntiSniping(t *testing.T) {
+	ctx := context.Background()
+	auctionRepo := repository.NewMemoryAuctionRepository()
+	svc := NewAuctionService(auctionRepo, repository.NoopTxManager{})
+
+	start := time.Now().UTC().Add(time.Minute)
+	_, err := svc.Create(ctx, CreateAuctionInput{
+		ActorID:        "u_2001",
+		ActorRole:      domain.RoleMerchant,
+		Title:          "Watch",
+		Category:       "luxury",
+		ConditionGrade: domain.ConditionNew,
+		Description:    "rare watch",
+		StartPrice:     1000,
+		ReservePrice:   5000,
+		CapPrice:       6000,
+		AntiSnipingSec: 60,
+		AntiExtendSec:  30,
+		AntiExtendMode: domain.AuctionExtendModeReset,
+		StartTime:      start,
+		EndTime:        start.Add(time.Hour),
+		AuctionType:    domain.AuctionTypeEnglish,
+		DepositAmount:  100,
+	})
+	if !errors.Is(err, domain.ErrInvalidArgument) {
+		t.Fatalf("expected invalid argument, got %v", err)
+	}
+}
+
 func TestAuctionServiceUpdateAllowsPendingAuditAndRejectsReadyOrSystemStatus(t *testing.T) {
 	ctx := context.Background()
 	auctionRepo := repository.NewMemoryAuctionRepository()
@@ -251,6 +280,46 @@ func TestAuctionServiceUpdateAllowsPendingAuditAndRejectsReadyOrSystemStatus(t *
 
 	running := domain.AuctionStatusRunning
 	if _, err := svc.Update(ctx, auction.AuctionID, UpdateAuctionInput{ActorID: "u_2001", ActorRole: domain.RoleMerchant, Status: &running}); !errors.Is(err, domain.ErrInvalidArgument) {
+		t.Fatalf("expected invalid argument, got %v", err)
+	}
+}
+
+func TestAuctionServiceUpdateRejectsResetAntiExtendShorterThanAntiSniping(t *testing.T) {
+	ctx := context.Background()
+	auctionRepo := repository.NewMemoryAuctionRepository()
+	svc := NewAuctionService(auctionRepo, repository.NoopTxManager{})
+
+	start := time.Now().UTC().Add(time.Minute)
+	auction, err := svc.Create(ctx, CreateAuctionInput{
+		ActorID:        "u_2001",
+		ActorRole:      domain.RoleMerchant,
+		Title:          "Watch",
+		Category:       "luxury",
+		ConditionGrade: domain.ConditionNew,
+		Description:    "rare watch",
+		StartPrice:     1000,
+		ReservePrice:   5000,
+		CapPrice:       6000,
+		Status:         domain.AuctionStatusDraft,
+		StartTime:      start,
+		EndTime:        start.Add(time.Hour),
+		AuctionType:    domain.AuctionTypeEnglish,
+		DepositAmount:  100,
+	})
+	if err != nil {
+		t.Fatalf("create auction: %v", err)
+	}
+
+	mode := domain.AuctionExtendModeReset
+	antiSnipingSec := 60
+	antiExtendSec := 30
+	if _, err := svc.Update(ctx, auction.AuctionID, UpdateAuctionInput{
+		ActorID:        "u_2001",
+		ActorRole:      domain.RoleMerchant,
+		AntiSnipingSec: &antiSnipingSec,
+		AntiExtendSec:  &antiExtendSec,
+		AntiExtendMode: &mode,
+	}); !errors.Is(err, domain.ErrInvalidArgument) {
 		t.Fatalf("expected invalid argument, got %v", err)
 	}
 }
@@ -371,10 +440,11 @@ func TestAuctionServiceAuditCallbackUpdatesPendingLot(t *testing.T) {
 	}
 	rejectedTaskID := rejected.AuditTaskID
 	if _, err := svc.HandleAuditCallback(ctx, AuctionAuditCallbackInput{
-		RequestID:  "audit-rejected-1",
-		Status:     "COMPLETED",
-		Success:    true,
-		IsApproved: false,
+		RequestID:     "audit-rejected-1",
+		Status:        "COMPLETED",
+		Success:       true,
+		IsApproved:    false,
+		RejectReasons: []string{"商品信息中存在品牌信息不一致，涉嫌虚假宣传。"},
 		Context: map[string]any{
 			"auctionId": rejected.AuctionID,
 			"taskId":    rejectedTaskID,
@@ -392,6 +462,9 @@ func TestAuctionServiceAuditCallbackUpdatesPendingLot(t *testing.T) {
 	if rejectedStored.AuditTaskID != "" {
 		t.Fatalf("expected audit task id to be cleared after rejection, got %q", rejectedStored.AuditTaskID)
 	}
+	if rejectedStored.AuditRejectReason != "商品信息中存在品牌信息不一致，涉嫌虚假宣传。" {
+		t.Fatalf("expected audit reject reason after rejection, got %q", rejectedStored.AuditRejectReason)
+	}
 	resubmitStatus := domain.AuctionStatusPendingAudit
 	resubmitted, err := svc.Update(ctx, rejected.AuctionID, UpdateAuctionInput{
 		ActorID:   "u_2001",
@@ -403,6 +476,9 @@ func TestAuctionServiceAuditCallbackUpdatesPendingLot(t *testing.T) {
 	}
 	if resubmitted.Status != domain.AuctionStatusPendingAudit {
 		t.Fatalf("expected rejected auction can be resubmitted, got %s", resubmitted.Status)
+	}
+	if resubmitted.AuditRejectReason != "" {
+		t.Fatalf("expected audit reject reason to be cleared after resubmit, got %q", resubmitted.AuditRejectReason)
 	}
 	if resubmitted.AuditTaskID == "" || resubmitted.AuditTaskID == rejectedTaskID {
 		t.Fatalf("expected resubmit to create a fresh audit task id, old=%q new=%q", rejectedTaskID, resubmitted.AuditTaskID)

@@ -73,6 +73,8 @@ func (s *MemoryRealtimeStore) InitAuction(ctx context.Context, auction domain.Au
 		EndTime:       auction.EndTime,
 		Version:       time.Now().UTC().UnixMilli(),
 		Source:        "redis",
+		AntiSnipingMS: int64(auction.AntiSnipingSec) * 1000,
+		AntiExtendMS:  int64(auction.AntiExtendSec) * 1000,
 	}
 	if auction.LiveSessionID != nil {
 		state.LiveSessionID = *auction.LiveSessionID

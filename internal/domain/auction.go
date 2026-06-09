@@ -51,6 +51,16 @@ func NormalizeAuctionExtendMode(m AuctionExtendMode) AuctionExtendMode {
 	return AuctionExtendMode(normalized)
 }
 
+func ValidateAuctionAntiExtendConfig(antiSnipingSec, antiExtendSec int, mode AuctionExtendMode) error {
+	if antiSnipingSec <= 0 || antiExtendSec <= 0 {
+		return ErrInvalidArgument
+	}
+	if NormalizeAuctionExtendMode(mode) == AuctionExtendModeReset && antiExtendSec < antiSnipingSec {
+		return ErrInvalidArgument
+	}
+	return nil
+}
+
 func (s AuctionStatus) Valid() bool {
 	switch s {
 	case AuctionStatusDraft, AuctionStatusPendingAudit, AuctionStatusAuditRejected, AuctionStatusReady,
@@ -101,41 +111,42 @@ func CanTransitionAuction(from, to AuctionStatus) bool {
 }
 
 type AuctionLot struct {
-	AuctionID        uint64            `json:"auctionId"`
-	SellerID         string            `json:"sellerId"`
-	LiveSessionID    *uint64           `json:"liveSessionId,omitempty"`
-	Title            string            `json:"title"`
-	Description      string            `json:"description,omitempty"`
-	Category         string            `json:"category"`
-	CategoryID       string            `json:"categoryId,omitempty"`
-	Brand            string            `json:"brand,omitempty"`
-	ConditionGrade   ConditionGrade    `json:"condition"`
-	ImageURLs        []string          `json:"imageUrls"`
-	ImageURL         string            `json:"imageUrl,omitempty"`
-	CoverURL         string            `json:"coverUrl,omitempty"`
-	AuctionType      AuctionType       `json:"auctionType"`
-	StartPrice       int64             `json:"startPrice"`
-	ReservePrice     int64             `json:"reservePrice"`
-	CapPrice         int64             `json:"capPrice"`
-	IncrementRule    json.RawMessage   `json:"incrementRule"`
-	AntiSnipingSec   int               `json:"antiSnipingSec"`
-	AntiExtendSec    int               `json:"antiExtendSec"`
-	AntiExtendMode   AuctionExtendMode `json:"antiExtendMode"`
-	DepositAmount    int64             `json:"depositAmount"`
-	Status           AuctionStatus     `json:"status"`
-	RuleSnapshot     json.RawMessage   `json:"ruleSnapshot"`
-	AuditTaskID      string            `json:"-"`
-	StartTime        time.Time         `json:"startTime"`
-	EndTime          time.Time         `json:"endTime"`
-	DurationSec      int               `json:"durationSec,omitempty"`
-	WinnerID         *string           `json:"winnerId,omitempty"`
-	DealPrice        *int64            `json:"dealPrice,omitempty"`
-	ClosedAt         *time.Time        `json:"closedAt,omitempty"`
-	ClosedBy         string            `json:"closedBy,omitempty"`
-	CurrentPrice     int64             `json:"currentPrice,omitempty"`
-	LeaderBidderID   string            `json:"leaderBidderId,omitempty"`
-	BidCount         int               `json:"bidCount,omitempty"`
-	ParticipantCount int               `json:"participantCount,omitempty"`
+	AuctionID         uint64            `json:"auctionId"`
+	SellerID          string            `json:"sellerId"`
+	LiveSessionID     *uint64           `json:"liveSessionId,omitempty"`
+	Title             string            `json:"title"`
+	Description       string            `json:"description,omitempty"`
+	Category          string            `json:"category"`
+	CategoryID        string            `json:"categoryId,omitempty"`
+	Brand             string            `json:"brand,omitempty"`
+	ConditionGrade    ConditionGrade    `json:"condition"`
+	ImageURLs         []string          `json:"imageUrls"`
+	ImageURL          string            `json:"imageUrl,omitempty"`
+	CoverURL          string            `json:"coverUrl,omitempty"`
+	AuctionType       AuctionType       `json:"auctionType"`
+	StartPrice        int64             `json:"startPrice"`
+	ReservePrice      int64             `json:"reservePrice"`
+	CapPrice          int64             `json:"capPrice"`
+	IncrementRule     json.RawMessage   `json:"incrementRule"`
+	AntiSnipingSec    int               `json:"antiSnipingSec"`
+	AntiExtendSec     int               `json:"antiExtendSec"`
+	AntiExtendMode    AuctionExtendMode `json:"antiExtendMode"`
+	DepositAmount     int64             `json:"depositAmount"`
+	Status            AuctionStatus     `json:"status"`
+	RuleSnapshot      json.RawMessage   `json:"ruleSnapshot"`
+	AuditTaskID       string            `json:"-"`
+	AuditRejectReason string            `json:"auditRejectReason,omitempty"`
+	StartTime         time.Time         `json:"startTime"`
+	EndTime           time.Time         `json:"endTime"`
+	DurationSec       int               `json:"durationSec,omitempty"`
+	WinnerID          *string           `json:"winnerId,omitempty"`
+	DealPrice         *int64            `json:"dealPrice,omitempty"`
+	ClosedAt          *time.Time        `json:"closedAt,omitempty"`
+	ClosedBy          string            `json:"closedBy,omitempty"`
+	CurrentPrice      int64             `json:"currentPrice,omitempty"`
+	LeaderBidderID    string            `json:"leaderBidderId,omitempty"`
+	BidCount          int               `json:"bidCount,omitempty"`
+	ParticipantCount  int               `json:"participantCount,omitempty"`
 	// Version 是 MySQL 行级乐观锁版本号，仅在落槌路径（CloseWithVersion）参与 CAS。
 	Version   int64     `json:"version"`
 	CreatedAt time.Time `json:"createdAt"`
@@ -205,6 +216,10 @@ type AuctionState struct {
 	Version          int64           `json:"version"`
 	Source           string          `json:"source"`
 	ServerTime       *time.Time      `json:"serverTime,omitempty"`
+	// AntiSnipingMS / AntiExtendMS 在 InitAuction 写入 Redis state，timer 读出做
+	// anti-sniping grace 兜底；变更走 invalidateAuctionSnapshot + 下一轮 InitAuction。
+	AntiSnipingMS int64 `json:"antiSnipingMs,omitempty"`
+	AntiExtendMS  int64 `json:"antiExtendMs,omitempty"`
 }
 
 type BidRiskResult string

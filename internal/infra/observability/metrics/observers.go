@@ -258,6 +258,47 @@ func (r *Registry) IncHammerMySQLFail() {
 	r.hammerMySQLFailTotal.Inc()
 }
 
+// IncHammerPending 记录一次 HAMMER_PENDING 过渡，trigger 维度限定低基数：
+// timer / cap_price / expired / manual / system / unknown。
+func (r *Registry) IncHammerPending(trigger string) {
+	if !r.Enabled() {
+		return
+	}
+	switch trigger {
+	case "timer", "cap_price", "expired", "manual", "system":
+	default:
+		trigger = "unknown"
+	}
+	r.hammerPendingTotal.WithLabelValues(trigger).Inc()
+}
+
+// ObserveHammerDrain 记录一次屏障实际等待时长（不论 ok/timeout 都记录）。
+func (r *Registry) ObserveHammerDrain(elapsed time.Duration) {
+	if !r.Enabled() {
+		return
+	}
+	r.hammerDrainDuration.Observe(elapsed.Seconds())
+}
+
+// IncHammerDrainTimeout 记录一次屏障超时 fallback。
+func (r *Registry) IncHammerDrainTimeout() {
+	if !r.Enabled() {
+		return
+	}
+	r.hammerDrainTimeoutTotal.Inc()
+}
+
+// IncBidCommandPublishReject 记录一次 publisher 闸门拒绝（reason=hammer_pending）。
+func (r *Registry) IncBidCommandPublishReject(reason string) {
+	if !r.Enabled() {
+		return
+	}
+	if reason == "" {
+		reason = "unknown"
+	}
+	r.bidCommandPublishRejectTotal.WithLabelValues(reason).Inc()
+}
+
 // ----- Enroll & deposit -----
 
 func (r *Registry) ObserveEnroll(result string, elapsed time.Duration) {

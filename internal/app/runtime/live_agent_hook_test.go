@@ -123,6 +123,9 @@ func TestLiveSessionEmitsLiveAgentHooks(t *testing.T) {
 		StartPrice:     1000,
 		ReservePrice:   1000,
 		IncrementRule:  domain.DefaultIncrementRule(),
+		AntiSnipingSec: 15,
+		AntiExtendSec:  30,
+		AntiExtendMode: domain.AuctionExtendModeAdd,
 		Status:         domain.AuctionStatusReady,
 		DurationSec:    600,
 	}
@@ -165,6 +168,9 @@ func TestLiveSessionEmitsLiveAgentHooks(t *testing.T) {
 		StartPrice:     1000,
 		ReservePrice:   1000,
 		IncrementRule:  domain.DefaultIncrementRule(),
+		AntiSnipingSec: 15,
+		AntiExtendSec:  30,
+		AntiExtendMode: domain.AuctionExtendModeAdd,
 		Status:         domain.AuctionStatusReady,
 		DurationSec:    300,
 	}

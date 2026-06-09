@@ -183,3 +183,89 @@ func (c *fakeAuctionSnapshotCache) Invalidate(ctx context.Context, auctionID uin
 	c.invalidated = append(c.invalidated, auctionID)
 	return nil
 }
+
+// TestAuctionServiceUpdateInvalidatesSnapshotOnAntiSnipingChange 验证 AuctionService.Update
+// 检测到 anti-sniping 相关字段变化时调用 invalidateAuctionSnapshot；否则不动 cache。
+//
+// 现状：Start 后 Update 的 AntiSnipingSec/AntiExtendSec/AntiExtendMode 改变后，BidService
+// 仍可能读到旧 snapshot（Redis TTL 数小时）造成 anti-sniping 不延长。
+func TestAuctionServiceUpdateInvalidatesSnapshotOnAntiSnipingChange(t *testing.T) {
+	ctx := context.Background()
+	auctionRepo := repository.NewMemoryAuctionRepository()
+	snapshots := &fakeAuctionSnapshotCache{}
+	cfg := appconfig.Default().Auction
+	svc := NewAuctionServiceWithDeps(AuctionServiceDeps{
+		Auctions:         auctionRepo,
+		Tx:               repository.NoopTxManager{},
+		Realtime:         repository.NoopRealtimeStore{},
+		AuctionConfig:    cfg,
+		AuctionSnapshots: snapshots,
+	})
+	auction := domain.AuctionLot{
+		AuctionID:      30001,
+		SellerID:       "u_2001",
+		Title:          "Watch",
+		Category:       "luxury",
+		ConditionGrade: domain.ConditionNew,
+		AuctionType:    domain.AuctionTypeEnglish,
+		StartPrice:     1000,
+		ReservePrice:   1000,
+		CapPrice:       2000,
+		IncrementRule:  json.RawMessage(`{"type":"fixed","amount":100,"maxBidSteps":10}`),
+		AntiSnipingSec: 60,
+		AntiExtendSec:  30,
+		AntiExtendMode: domain.AuctionExtendModeAdd,
+		DepositAmount:  100,
+		Status:         domain.AuctionStatusReady,
+		StartTime:      time.Now().Add(-time.Minute),
+		EndTime:        time.Now().Add(time.Hour),
+	}
+	if err := auctionRepo.Create(ctx, &auction); err != nil {
+		t.Fatalf("create auction: %v", err)
+	}
+
+	// Update 仅改 anti-sniping 字段。
+	newAntiSnipingSec := 30
+	if _, err := svc.Update(ctx, auction.AuctionID, UpdateAuctionInput{
+		ActorID:           "u_2001",
+		ActorRole:         domain.RoleMerchant,
+		AntiSnipingSec:    &newAntiSnipingSec,
+		AllowSystemStatus: true,
+	}); err != nil {
+		t.Fatalf("update anti-sniping: %v", err)
+	}
+	if len(snapshots.invalidated) != 1 || snapshots.invalidated[0] != auction.AuctionID {
+		t.Fatalf("expected snapshot invalidate after anti-sniping change, got %+v", snapshots.invalidated)
+	}
+
+	// 改回 anti-extend mode 也应触发 invalidate。
+	mode := domain.AuctionExtendModeReset
+	newAntiExtendSec := 60
+	if _, err := svc.Update(ctx, auction.AuctionID, UpdateAuctionInput{
+		ActorID:           "u_2001",
+		ActorRole:         domain.RoleMerchant,
+		AntiExtendMode:    &mode,
+		AntiExtendSec:     &newAntiExtendSec,
+		AllowSystemStatus: true,
+	}); err != nil {
+		t.Fatalf("update anti-extend mode: %v", err)
+	}
+	if len(snapshots.invalidated) != 2 {
+		t.Fatalf("expected second snapshot invalidate after anti-extend mode change, got %+v", snapshots.invalidated)
+	}
+
+	// 仅改非 anti-sniping 字段（depositAmount）不应触发 invalidate。
+	prev := len(snapshots.invalidated)
+	newDeposit := int64(200)
+	if _, err := svc.Update(ctx, auction.AuctionID, UpdateAuctionInput{
+		ActorID:           "u_2001",
+		ActorRole:         domain.RoleMerchant,
+		DepositAmount:     &newDeposit,
+		AllowSystemStatus: true,
+	}); err != nil {
+		t.Fatalf("update deposit: %v", err)
+	}
+	if len(snapshots.invalidated) != prev {
+		t.Fatalf("non anti-sniping change should not invalidate snapshot, before=%d after=%d", prev, len(snapshots.invalidated))
+	}
+}

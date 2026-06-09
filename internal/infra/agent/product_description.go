@@ -44,7 +44,7 @@ type LiveAuctionHookClient struct {
 }
 
 func NewProductDescriptionClient(cfg appconfig.AgentConfig) *ProductDescriptionClient {
-	timeout := cfg.Timeout.Std()
+	timeout := cfg.ProductDescriptionTimeout.Std()
 	return &ProductDescriptionClient{
 		endpoint: strings.TrimSpace(cfg.ProductDescriptionURL),
 		client: &http.Client{

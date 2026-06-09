@@ -74,6 +74,24 @@ type depositTelemetryAdapter struct {
 	metrics *metrics.Registry
 }
 
+// hammerBarrierMetricsAdapter 把 *metrics.Registry 适配为 auctionapp.HammerBarrierMetrics。
+// nil 安全：内部方法都 nil-check。
+type hammerBarrierMetricsAdapter struct {
+	registry *metrics.Registry
+}
+
+func (a hammerBarrierMetricsAdapter) ObserveHammerDrain(elapsed time.Duration) {
+	if a.registry != nil {
+		a.registry.ObserveHammerDrain(elapsed)
+	}
+}
+
+func (a hammerBarrierMetricsAdapter) IncHammerDrainTimeout() {
+	if a.registry != nil {
+		a.registry.IncHammerDrainTimeout()
+	}
+}
+
 func (a depositTelemetryAdapter) StartEnroll(ctx context.Context, auctionID uint64, userID string) (context.Context, depositapp.DepositSpan) {
 	ctx, span := tracing.StartSpan(ctx, "deposit.enroll",
 		attribute.Int64("auction.id", int64(auctionID)),
@@ -277,6 +295,7 @@ func buildAppServices(cfg appconfig.Config, deps ServerDependencies) appServices
 		OnClose:       onAuctionClosed,
 	})
 	timer := appruntime.NewTimerScheduler(deps.RealtimeStore, hammerService, wsEnvelopePublisherAdapter{publisher: deps.Hub, eventPublisher: realtimeEvents}, time.Second)
+	timer.SetHammerAntiSnipingGraceMs(int64(cfg.Auction.HammerAntiSnipingGraceMs))
 	auctionService := auctionapp.NewAuctionServiceWithDeps(auctionapp.AuctionServiceDeps{
 		Auctions:         deps.AuctionRepo,
 		Bids:             deps.BidRepo,

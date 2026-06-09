@@ -140,13 +140,16 @@ type IDGenConfig struct {
 }
 
 type AuctionConfig struct {
-	MinIncrementCent  int64    `yaml:"minIncrementCent"`
-	AntiSnipeMs       int64    `yaml:"antiSnipeMs"`
-	ExtendMs          int64    `yaml:"extendMs"`
-	MaxExtendCount    int      `yaml:"maxExtendCount"`
-	FreqLimitCount    int      `yaml:"freqLimitCount"`
-	FreqWindowMs      int64    `yaml:"freqWindowMs"`
-	BidIdempotencyTTL Duration `yaml:"bidIdempotencyTTL"`
+	MinIncrementCent         int64    `yaml:"minIncrementCent"`
+	AntiSnipeMs              int64    `yaml:"antiSnipeMs"`
+	ExtendMs                 int64    `yaml:"extendMs"`
+	MaxExtendCount           int      `yaml:"maxExtendCount"`
+	FreqLimitCount           int      `yaml:"freqLimitCount"`
+	FreqWindowMs             int64    `yaml:"freqWindowMs"`
+	BidIdempotencyTTL        Duration `yaml:"bidIdempotencyTTL"`
+	HammerDrainMaxWaitMs     int      `yaml:"hammerDrainMaxWaitMs"`
+	HammerDrainPollMs        int      `yaml:"hammerDrainPollMs"`
+	HammerAntiSnipingGraceMs int      `yaml:"hammerAntiSnipingGraceMs"`
 }
 
 type RiskControlConfig struct {
@@ -181,6 +184,7 @@ type ObjectStorageConfig struct {
 
 type AgentConfig struct {
 	ProductDescriptionURL      string   `yaml:"productDescriptionURL"`
+	ProductDescriptionTimeout  Duration `yaml:"productDescriptionTimeout"`
 	ProductAuditEnabled        bool     `yaml:"productAuditEnabled"`
 	ProductAuditURL            string   `yaml:"productAuditURL"`
 	ProductAuditCallbackURL    string   `yaml:"productAuditCallbackURL"`
@@ -327,13 +331,16 @@ func Default() Config {
 			WorkerID: 1,
 		},
 		Auction: AuctionConfig{
-			MinIncrementCent:  100,
-			AntiSnipeMs:       30000,
-			ExtendMs:          30000,
-			MaxExtendCount:    20,
-			FreqLimitCount:    10,
-			FreqWindowMs:      1000,
-			BidIdempotencyTTL: Duration(30 * time.Second),
+			MinIncrementCent:         100,
+			AntiSnipeMs:              30000,
+			ExtendMs:                 30000,
+			MaxExtendCount:           20,
+			FreqLimitCount:           10,
+			FreqWindowMs:             1000,
+			BidIdempotencyTTL:        Duration(30 * time.Second),
+			HammerDrainMaxWaitMs:     5000,
+			HammerDrainPollMs:        50,
+			HammerAntiSnipingGraceMs: 500,
 		},
 		RiskControl: RiskControlConfig{
 			Enabled: true,
@@ -362,6 +369,7 @@ func Default() Config {
 		},
 		Agent: AgentConfig{
 			ProductDescriptionURL:      "http://127.0.0.1:8000/api/v1/product-description",
+			ProductDescriptionTimeout:  Duration(2 * time.Minute),
 			ProductAuditEnabled:        true,
 			ProductAuditURL:            "http://127.0.0.1:8000/api/v1/product-audit",
 			ProductAuditCallbackURL:    "http://127.0.0.1:8888/api/v1/auctions/audit/callback",
@@ -559,6 +567,9 @@ func (c *Config) Validate() error {
 	}
 	if err := validateHTTPURL(c.Agent.ProductDescriptionURL, "agent.productDescriptionURL"); err != nil {
 		return err
+	}
+	if c.Agent.ProductDescriptionTimeout.Std() <= 0 {
+		return fmt.Errorf("agent.productDescriptionTimeout must be positive")
 	}
 	if c.Agent.ProductAuditEnabled {
 		if strings.TrimSpace(c.Agent.ProductAuditURL) == "" {

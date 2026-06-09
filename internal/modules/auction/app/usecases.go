@@ -55,6 +55,7 @@ type UpdateAuctionInput struct {
 	AntiExtendMode    *domain.AuctionExtendMode
 	DepositAmount     *int64
 	Status            *domain.AuctionStatus
+	AuditRejectReason *string
 	StartTime         *time.Time
 	EndTime           *time.Time
 	DurationSec       *int
@@ -79,6 +80,7 @@ type AuctionAuditCallbackResult struct {
 	LotStatus     string   `json:"lotStatus,omitempty"`
 	Success       bool     `json:"success"`
 	IsApproved    bool     `json:"isApproved"`
+	RejectReason  string   `json:"rejectReason,omitempty"`
 	RejectReasons []string `json:"rejectReasons,omitempty"`
 	RiskLabels    []string `json:"riskLabels,omitempty"`
 	Scope         string   `json:"scope,omitempty"`

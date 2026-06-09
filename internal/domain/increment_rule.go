@@ -35,7 +35,8 @@ type IncrementRule struct {
 }
 
 // IncrementStep is a ladder increment band. Min is inclusive, Max is exclusive.
-// The last step must omit Max.
+// The first step min is validated against auction start price in ValidateAuctionPricing.
+// The last step may omit Max, or bind Max to the auction cap price.
 type IncrementStep struct {
 	Min    int64  `json:"min"`
 	Max    *int64 `json:"max,omitempty"`
@@ -117,8 +118,25 @@ func ValidateAuctionPricing(startPrice, reservePrice, capPrice int64, raw json.R
 	if capPrice > 0 && reservePrice > 0 && reservePrice > capPrice {
 		return ErrInvalidArgument
 	}
-	_, err := ParseIncrementRule(raw)
-	return err
+	rule, err := ParseIncrementRule(raw)
+	if err != nil {
+		return err
+	}
+	if rule.Type == IncrementRuleTypeLadder {
+		first := rule.Steps[0]
+		if first.Min != startPrice {
+			return ErrInvalidArgument
+		}
+		last := rule.Steps[len(rule.Steps)-1]
+		if capPrice > 0 {
+			if last.Max == nil || *last.Max != capPrice {
+				return ErrInvalidArgument
+			}
+		} else if last.Max != nil {
+			return ErrInvalidArgument
+		}
+	}
+	return nil
 }
 
 func ValidateBidPrice(startPrice, currentPrice, capPrice, price int64, rule IncrementRule) string {
@@ -201,9 +219,6 @@ func validateLadderSteps(steps []IncrementStep) error {
 	if len(steps) == 0 || len(steps) > maxIncrementRuleSteps {
 		return ErrInvalidArgument
 	}
-	if steps[0].Min != 0 {
-		return ErrInvalidArgument
-	}
 	for i, step := range steps {
 		if step.Min < 0 || step.Amount <= 0 {
 			return ErrInvalidArgument
@@ -217,7 +232,7 @@ func validateLadderSteps(steps []IncrementStep) error {
 			}
 			continue
 		}
-		if step.Max != nil {
+		if step.Max != nil && *step.Max <= step.Min {
 			return ErrInvalidArgument
 		}
 	}

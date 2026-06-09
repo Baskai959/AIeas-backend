@@ -240,6 +240,8 @@ func (s *AuctionService) HandleAuditCallback(ctx context.Context, in AuctionAudi
 	}
 	scope := callbackContextString(in.Context, "scope")
 	taskID := callbackContextString(in.Context, "taskId")
+	rejectReasons := compactStrings(in.RejectReasons)
+	rejectReason := strings.Join(rejectReasons, "；")
 	lotStatus := ""
 	if in.Success {
 		if current, err := s.auctions.FindByID(ctx, auctionID); err == nil {
@@ -253,7 +255,8 @@ func (s *AuctionService) HandleAuditCallback(ctx context.Context, in AuctionAudi
 					LotStatus:     lotStatus,
 					Success:       in.Success,
 					IsApproved:    in.IsApproved,
-					RejectReasons: compactStrings(in.RejectReasons),
+					RejectReason:  rejectReason,
+					RejectReasons: rejectReasons,
 					RiskLabels:    compactStrings(in.RiskLabels),
 					Scope:         scope,
 				}, nil
@@ -265,7 +268,11 @@ func (s *AuctionService) HandleAuditCallback(ctx context.Context, in AuctionAudi
 		if in.IsApproved {
 			nextStatus = domain.AuctionStatusReady
 		}
-		auction, err := s.Update(ctx, auctionID, UpdateAuctionInput{ActorID: "agent", ActorRole: domain.RoleAdmin, Status: &nextStatus, AllowSystemStatus: true})
+		auditRejectReason := ""
+		if !in.IsApproved {
+			auditRejectReason = rejectReason
+		}
+		auction, err := s.Update(ctx, auctionID, UpdateAuctionInput{ActorID: "agent", ActorRole: domain.RoleAdmin, Status: &nextStatus, AuditRejectReason: &auditRejectReason, AllowSystemStatus: true})
 		if err != nil {
 			if !errorsIsIgnoredAuditState(err) {
 				return AuctionAuditCallbackResult{}, err
@@ -285,7 +292,8 @@ func (s *AuctionService) HandleAuditCallback(ctx context.Context, in AuctionAudi
 		LotStatus:     lotStatus,
 		Success:       in.Success,
 		IsApproved:    in.IsApproved,
-		RejectReasons: compactStrings(in.RejectReasons),
+		RejectReason:  rejectReason,
+		RejectReasons: rejectReasons,
 		RiskLabels:    compactStrings(in.RiskLabels),
 		Scope:         scope,
 	}, nil
@@ -322,6 +330,9 @@ func (s *AuctionService) Create(ctx context.Context, in CreateAuctionInput) (dom
 	}
 	in.AntiExtendMode = domain.NormalizeAuctionExtendMode(in.AntiExtendMode)
 	if !in.AntiExtendMode.Valid() || in.DurationSec < 0 {
+		return domain.AuctionLot{}, domain.ErrInvalidArgument
+	}
+	if err := domain.ValidateAuctionAntiExtendConfig(in.AntiSnipingSec, in.AntiExtendSec, in.AntiExtendMode); err != nil {
 		return domain.AuctionLot{}, domain.ErrInvalidArgument
 	}
 	if len(in.IncrementRule) == 0 {
@@ -428,12 +439,16 @@ func (s *AuctionService) List(ctx context.Context, filter domain.AuctionFilter, 
 func (s *AuctionService) Update(ctx context.Context, id uint64, in UpdateAuctionInput) (domain.AuctionLot, error) {
 	var auction domain.AuctionLot
 	shouldAudit := false
+	shouldInvalidateSnapshot := false
 	if err := s.tx.WithinTx(ctx, func(txCtx context.Context) error {
 		current, err := s.auctions.FindByID(txCtx, id)
 		if err != nil {
 			return err
 		}
 		originalStatus := current.Status
+		originalAntiSnipingSec := current.AntiSnipingSec
+		originalAntiExtendSec := current.AntiExtendSec
+		originalAntiExtendMode := current.AntiExtendMode
 		if !canAccessSellerOwned(in.ActorID, in.ActorRole, current.SellerID) {
 			return domain.ErrForbidden
 		}
@@ -547,6 +562,9 @@ func (s *AuctionService) Update(ctx context.Context, id uint64, in UpdateAuction
 			}
 		}
 		current.AntiExtendMode = domain.NormalizeAuctionExtendMode(current.AntiExtendMode)
+		if err := domain.ValidateAuctionAntiExtendConfig(current.AntiSnipingSec, current.AntiExtendSec, current.AntiExtendMode); err != nil {
+			return domain.ErrInvalidArgument
+		}
 		if in.Status != nil {
 			nextStatus := *in.Status
 			if !in.AllowSystemStatus {
@@ -563,12 +581,19 @@ func (s *AuctionService) Update(ctx context.Context, id uint64, in UpdateAuction
 			}
 			current.Status = nextStatus
 		}
+		if in.AuditRejectReason != nil {
+			current.AuditRejectReason = strings.TrimSpace(*in.AuditRejectReason)
+		}
 		current.Status = s.statusAfterProductAuditGate(current.Status)
 		if current.Status == domain.AuctionStatusPendingAudit && (hasLotDisplayPatch(in) || current.Status != originalStatus) {
 			current.AuditTaskID = newAuctionAuditTaskID(current.AuctionID)
+			current.AuditRejectReason = ""
 			shouldAudit = true
 		} else if in.Status != nil && current.Status != domain.AuctionStatusPendingAudit {
 			current.AuditTaskID = ""
+			if current.Status != domain.AuctionStatusAuditRejected {
+				current.AuditRejectReason = ""
+			}
 		}
 		snapshot, err := snapshotFromAuction(current)
 		if err != nil {
@@ -578,6 +603,14 @@ func (s *AuctionService) Update(ctx context.Context, id uint64, in UpdateAuction
 		if err := s.auctions.Update(txCtx, &current); err != nil {
 			return err
 		}
+		// 检测 anti-sniping 相关字段变化，事务成功后需 invalidate snapshot 缓存：
+		// 否则 Start 后 Update 这些字段，BidService 仍读到旧 snapshot 导致异步路径
+		// 把旧 AntiSnipingSec/AntiExtendSec 传给 Lua，anti-sniping 失效。
+		if current.AntiSnipingSec != originalAntiSnipingSec ||
+			current.AntiExtendSec != originalAntiExtendSec ||
+			current.AntiExtendMode != originalAntiExtendMode {
+			shouldInvalidateSnapshot = true
+		}
 		auction = current
 		return nil
 	}); err != nil {
@@ -585,6 +618,9 @@ func (s *AuctionService) Update(ctx context.Context, id uint64, in UpdateAuction
 	}
 	if shouldAudit {
 		s.triggerLotContentAudit(auction)
+	}
+	if shouldInvalidateSnapshot {
+		s.invalidateAuctionSnapshot(ctx, auction.AuctionID)
 	}
 	if auction.LiveSessionID != nil && hasLiveSessionLotChangedPatch(in) {
 		broadcastAuctionJSON(s.publisher, auction.AuctionID, "live_session.lot_changed", map[string]interface{}{

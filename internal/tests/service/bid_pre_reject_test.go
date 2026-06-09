@@ -22,13 +22,12 @@ func newFixedRuleRaw(amount int64, maxBidSteps int) json.RawMessage {
 }
 
 func newLadderRuleRaw() json.RawMessage {
-	max1 := int64(2000)
+	lastMax := int64(2000)
 	rule := domain.IncrementRule{
 		Type:        domain.IncrementRuleTypeLadder,
 		MaxBidSteps: 5,
 		Steps: []domain.IncrementStep{
-			{Min: 0, Max: &max1, Amount: 100},
-			{Min: 2000, Amount: 200},
+			{Min: 1000, Max: &lastMax, Amount: 100},
 		},
 	}
 	raw, _ := json.Marshal(rule)

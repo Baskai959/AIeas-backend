@@ -40,6 +40,14 @@ type HammerService struct {
 	hook       HammerLiveAgentHook
 	events     auctionports.SettlementEventPublisher
 	payTimeout time.Duration
+
+	// asyncBidEnabled 表示装配期是否启用了异步竞价闭环。
+	// 同步模式（false）下 Hammer 走快路径，行为完全不变；
+	// 异步模式下 Hammer 走 BeginHammerPending → 屏障 → finalizeHammer 三步。
+	asyncBidEnabled bool
+	barrier         *InFlightBarrier
+	publisherGate   *HammerPublisherGate
+	drainMaxWait    time.Duration
 }
 
 type HammerServiceDeps struct {
@@ -58,6 +66,11 @@ type HammerServiceDeps struct {
 	Events          auctionports.SettlementEventPublisher
 	OnClose         func(ctx context.Context, auctionID uint64)
 	OrderPayTimeout time.Duration
+	// 异步落锤过渡态相关：装配期注入。同步模式三个字段都留空即可。
+	AsyncBidEnabled bool
+	Barrier         *InFlightBarrier
+	PublisherGate   *HammerPublisherGate
+	DrainMaxWait    time.Duration
 }
 
 func NewHammerService(auctions auctionports.AuctionRepository, orders auctionports.OrderRepository, deposits auctionports.DepositRepository, realtime auctionports.AuctionRealtimeStore, tx auctionports.TxManager, publisher HammerEventPublisher) *HammerService {
@@ -77,7 +90,20 @@ func NewHammerServiceWithDeps(deps HammerServiceDeps) *HammerService {
 	if payTimeout <= 0 {
 		payTimeout = orderports.DefaultPayTimeout
 	}
-	return &HammerService{auctions: deps.Auctions, bids: deps.Bids, orders: deps.Orders, deposits: deps.Deposits, realtime: realtime, tx: tx, publisher: deps.Publisher, orderID: deps.OrderID, sessions: deps.Sessions, onClose: deps.OnClose, metrics: deps.Metrics, tracer: deps.Tracer, hook: deps.LiveAgentHook, events: deps.Events, payTimeout: payTimeout}
+	drainMaxWait := deps.DrainMaxWait
+	if drainMaxWait <= 0 {
+		drainMaxWait = 5 * time.Second
+	}
+	return &HammerService{
+		auctions: deps.Auctions, bids: deps.Bids, orders: deps.Orders, deposits: deps.Deposits,
+		realtime: realtime, tx: tx, publisher: deps.Publisher, orderID: deps.OrderID,
+		sessions: deps.Sessions, onClose: deps.OnClose, metrics: deps.Metrics, tracer: deps.Tracer,
+		hook: deps.LiveAgentHook, events: deps.Events, payTimeout: payTimeout,
+		asyncBidEnabled: deps.AsyncBidEnabled,
+		barrier:         deps.Barrier,
+		publisherGate:   deps.PublisherGate,
+		drainMaxWait:    drainMaxWait,
+	}
 }
 
 func (s *HammerService) SetOnClose(fn func(ctx context.Context, auctionID uint64)) {
@@ -110,6 +136,151 @@ func (s *HammerService) SetSettlementEventPublisher(publisher auctionports.Settl
 	s.events = publisher
 }
 
+// SetAsyncBidWiring 装配期注入异步竞价过渡态依赖。任一为 nil 时不影响同步路径。
+//
+// 注意：barrier / gate / drainMaxWait 之间互相依赖（barrier 需要 gate；drainMaxWait 仅在
+// async 模式下生效）。本函数对 drainMaxWait<=0 的入参做兜底（默认 5s）。
+func (s *HammerService) SetAsyncBidWiring(enabled bool, barrier *InFlightBarrier, gate *HammerPublisherGate, drainMaxWait time.Duration) {
+	if s == nil {
+		return
+	}
+	s.asyncBidEnabled = enabled
+	s.barrier = barrier
+	s.publisherGate = gate
+	if drainMaxWait > 0 {
+		s.drainMaxWait = drainMaxWait
+	}
+}
+
+// BeginHammerPendingResult 是 BeginHammerPending 的返回结果。
+type BeginHammerPendingResult struct {
+	// AlreadyClosed 表示 auction 已经处于 HAMMER_PENDING / 终态 / SETTLED，
+	// 调用方应该直接返回缓存结果，不再走 finalizeHammer。
+	AlreadyClosed bool
+	// AlreadyPending 表示 auction 已经在 HAMMER_PENDING（避免重复广播）。
+	AlreadyPending bool
+	// TransitionedAt 是过渡态切换时刻。
+	TransitionedAt time.Time
+	// HammerInput 是被 normalize 后的 HammerInput，供后续 FinalizeHammer 使用。
+	HammerInput domain.HammerInput
+}
+
+// BeginHammerPending 把 auction 切到 HAMMER_PENDING，并广播 auction.state(HAMMER_PENDING)。
+// 与 Hammer 共享入参语义。仅做"过渡态"切换：不调 Redis Lua、不写 order、不释放保证金。
+//
+// 流程：
+//  1. normalize HammerInput；
+//  2. 取 auction，做与 Hammer 同样的鉴权/早期校验（仅只读那部分，避免重复 close）；
+//  3. 已是 HAMMER_PENDING / 终态：直接返回（AlreadyClosed/AlreadyPending=true）；
+//  4. version-CAS 把状态写入 HAMMER_PENDING；
+//  5. 广播 auction.state(HAMMER_PENDING)；
+//  6. 关闭 publisher 闸门（如已注入）防止新命令入队。
+func (s *HammerService) BeginHammerPending(ctx context.Context, in domain.HammerInput) (BeginHammerPendingResult, error) {
+	in.RequestID = strings.TrimSpace(in.RequestID)
+	if in.RequestID == "" {
+		in.RequestID = "hammer-pending-" + strconv.FormatInt(time.Now().UTC().UnixNano(), 10)
+	}
+	if in.AuctionID == 0 {
+		return BeginHammerPendingResult{}, domain.ErrInvalidArgument
+	}
+	if in.Now.IsZero() {
+		in.Now = time.Now().UTC()
+	}
+	if in.IdempotencyTTL <= 0 {
+		in.IdempotencyTTL = 24 * time.Hour
+	}
+	// Force=true（CAP_PRICE / 管理员强制）路径直接进入过渡态，不做 anti-sniping 复核：
+	// 这是一个"立即落锤"语义，与 timer/auto-hammer 不同。
+	if !in.Force {
+		// 二次确认：进入 BeginHammerPending 之前再读一次 Redis state；如果 anti-sniping
+		// 链路刚好把 endTime 推后到 now 之后，则不切 HAMMER_PENDING、不关闸门、不广播，
+		// 让本轮 timer tick 回到 RUNNING/EXTENDED 等下一拍判断。
+		if state, ok, err := s.realtime.GetAuctionState(ctx, in.AuctionID); err == nil && ok && !state.EndTime.IsZero() && in.Now.Before(state.EndTime) {
+			return BeginHammerPendingResult{}, domain.ErrInvalidState
+		}
+	}
+	auction, err := s.auctions.FindByID(ctx, in.AuctionID)
+	if err != nil {
+		return BeginHammerPendingResult{}, err
+	}
+	if in.ActorRole != domain.RoleAdmin && !(in.ActorRole == domain.RoleMerchant && in.ActorID == auction.SellerID) {
+		return BeginHammerPendingResult{}, domain.ErrForbidden
+	}
+	// 已经在 HAMMER_PENDING：不重复广播，但仍然要 Close 闸门（幂等），并直接进入 finalize。
+	if auction.Status == domain.AuctionStatusHammerPending {
+		if s.publisherGate != nil {
+			s.publisherGate.Close(in.AuctionID)
+		}
+		return BeginHammerPendingResult{AlreadyPending: true, TransitionedAt: in.Now, HammerInput: in}, nil
+	}
+	// 已经是终态/已结算：调用方根据现有逻辑回放幂等结果，不再过渡也不广播。
+	if auction.Status.Terminal() || auction.Status == domain.AuctionStatusSettled {
+		return BeginHammerPendingResult{AlreadyClosed: true, TransitionedAt: in.Now, HammerInput: in}, nil
+	}
+	// 状态机：仅允许从 RUNNING/EXTENDED 切到 HAMMER_PENDING。
+	if !domain.CanTransitionAuction(auction.Status, domain.AuctionStatusHammerPending) {
+		return BeginHammerPendingResult{}, domain.ErrInvalidState
+	}
+	// CAS 写状态。若发生乐观锁冲突，仍按 invalid_state 处理（保留与 finalizeHammer 一致的语义）。
+	pending := auction
+	pending.Status = domain.AuctionStatusHammerPending
+	if in.ClosedBy != "" {
+		pending.ClosedBy = in.ClosedBy
+	}
+	expectedVersion := pending.Version
+	allowedFrom := []domain.AuctionStatus{domain.AuctionStatusRunning, domain.AuctionStatusExtended}
+	if err := s.auctions.CloseWithVersion(ctx, &pending, expectedVersion, allowedFrom); err != nil {
+		// 闸门优先关闭：防止 publish 已经发过来的命令在我们还没切完状态前进入 worker。
+		// 这里失败一般说明状态又被别的路径推进了；重新读一次返回 alreadyClosed/alreadyPending 即可。
+		if existing, fetchErr := s.auctions.FindByID(ctx, in.AuctionID); fetchErr == nil {
+			if existing.Status == domain.AuctionStatusHammerPending {
+				if s.publisherGate != nil {
+					s.publisherGate.Close(in.AuctionID)
+				}
+				return BeginHammerPendingResult{AlreadyPending: true, TransitionedAt: in.Now, HammerInput: in}, nil
+			}
+			if existing.Status.Terminal() || existing.Status == domain.AuctionStatusSettled {
+				return BeginHammerPendingResult{AlreadyClosed: true, TransitionedAt: in.Now, HammerInput: in}, nil
+			}
+		}
+		return BeginHammerPendingResult{}, err
+	}
+	// 闸门关闭：禁止新命令入队，必须发生在状态切换之后、屏障开始之前。
+	if s.publisherGate != nil {
+		s.publisherGate.Close(in.AuctionID)
+	}
+	// 广播 auction.state(HAMMER_PENDING)。复用 auction.state 帧，前端识别 status 即可。
+	s.broadcastHammerPendingState(pending, in.Now)
+	return BeginHammerPendingResult{TransitionedAt: in.Now, HammerInput: in}, nil
+}
+
+func (s *HammerService) broadcastHammerPendingState(auction domain.AuctionLot, now time.Time) {
+	if s.publisher == nil || auction.AuctionID == 0 {
+		return
+	}
+	state := domain.AuctionState{
+		AuctionID:     auction.AuctionID,
+		Status:        domain.AuctionStatusHammerPending,
+		StartPrice:    auction.StartPrice,
+		CapPrice:      auction.CapPrice,
+		IncrementRule: auction.IncrementRule,
+		CurrentPrice:  auction.CurrentPrice,
+		LeaderBidderID: auction.LeaderBidderID,
+		BidCount:       auction.BidCount,
+		ParticipantCount: auction.ParticipantCount,
+		StartTime:        auction.StartTime,
+		EndTime:          auction.EndTime,
+		Version:          auction.Version,
+		Source:           "mysql",
+	}
+	if auction.LiveSessionID != nil {
+		state.LiveSessionID = *auction.LiveSessionID
+	}
+	serverTime := now.UTC()
+	state.ServerTime = &serverTime
+	broadcastJSON(s.publisher, auction.AuctionID, "auction.state", state)
+}
+
 func (s *HammerService) Hammer(ctx context.Context, in domain.HammerInput) (domain.HammerResult, *domain.OrderDeal, error) {
 	ctx, span := startAuctionSpan(ctx, s.tracer, "hammer.close",
 		Int64Attr("auction.id", int64(in.AuctionID)),
@@ -119,7 +290,19 @@ func (s *HammerService) Hammer(ctx context.Context, in domain.HammerInput) (doma
 	)
 	defer span.End()
 	start := time.Now()
-	result, order, err := s.hammerInternal(ctx, in)
+	// 收口入口：sync 模式 / Force=true（CAP_PRICE / 管理员强制）走快路径，行为完全不变。
+	// 否则进入 BeginHammerPending → 屏障 → finalize 三步路径。
+	useFastPath := !s.asyncBidEnabled || in.Force || s.barrier == nil
+	var (
+		result domain.HammerResult
+		order  *domain.OrderDeal
+		err    error
+	)
+	if useFastPath {
+		result, order, err = s.hammerInternal(ctx, in)
+	} else {
+		result, order, err = s.hammerWithDrain(ctx, in)
+	}
 	elapsed := time.Since(start)
 	span.SetAttributes(
 		StringAttr("auction.status", string(result.Status)),
@@ -146,6 +329,60 @@ func (s *HammerService) Hammer(ctx context.Context, in domain.HammerInput) (doma
 		}
 	}
 	return result, order, err
+}
+
+// hammerWithDrain 是异步模式下 Hammer 的实现：
+//  1. BeginHammerPending：切 HAMMER_PENDING + 广播 auction.state；
+//  2. 屏障等待 in-flight 排空（pending=0 + 闸门已关 + 宽限期已过）；
+//  3. 真正落锤（finalizeHammer）；
+//  4. finalize 完成后清理闸门（不论成功/失败）。
+//
+// 屏障 ok=false 时强制 finalize（fallback），并打 IncHammerDrainTimeout 指标。
+func (s *HammerService) hammerWithDrain(ctx context.Context, in domain.HammerInput) (domain.HammerResult, *domain.OrderDeal, error) {
+	pending, err := s.BeginHammerPending(ctx, in)
+	if err != nil {
+		return domain.HammerResult{}, nil, err
+	}
+	// HammerPending 指标埋点。
+	s.recordHammerPending(in)
+	if pending.AlreadyClosed {
+		// 已经是终态：直接走 hammerInternal，让它复用已有的 existingCloseResult 逻辑回缓存 / 重放。
+		defer s.openGate(in.AuctionID)
+		return s.hammerInternal(ctx, pending.HammerInput)
+	}
+	// 屏障等待。
+	maxWait := s.drainMaxWait
+	if maxWait <= 0 {
+		maxWait = 5 * time.Second
+	}
+	ok := true
+	if s.barrier != nil {
+		ok = s.barrier.WaitDrain(ctx, in.AuctionID, maxWait)
+	}
+	if !ok && s.metrics != nil {
+		// barrier 内部已埋一次 timeout 指标；这里是包装语义，不重复打。
+		_ = ok
+	}
+	// 真正落锤。无论 ok=true/false 都进 finalize。
+	result, order, finalErr := s.hammerInternal(ctx, pending.HammerInput)
+	s.openGate(in.AuctionID)
+	return result, order, finalErr
+}
+
+func (s *HammerService) recordHammerPending(in domain.HammerInput) {
+	type pendingMetrics interface {
+		IncHammerPending(trigger string)
+	}
+	if pm, ok := s.metrics.(pendingMetrics); ok {
+		pm.IncHammerPending(HammerTriggerFromInput(in))
+	}
+}
+
+func (s *HammerService) openGate(auctionID uint64) {
+	if s == nil || s.publisherGate == nil || auctionID == 0 {
+		return
+	}
+	s.publisherGate.Open(auctionID)
 }
 
 func (s *HammerService) hammerInternal(ctx context.Context, in domain.HammerInput) (domain.HammerResult, *domain.OrderDeal, error) {

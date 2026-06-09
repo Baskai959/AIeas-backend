@@ -101,6 +101,8 @@ type auctionAuditCallbackRequest struct {
 	Success            *bool          `json:"success"`
 	IsApproved         *bool          `json:"isApproved"`
 	IsApprovedSnake    *bool          `json:"is_approved"`
+	RejectReason       string         `json:"rejectReason"`
+	RejectReasonSnake  string         `json:"reject_reason"`
 	RejectReasons      []string       `json:"rejectReasons"`
 	RejectReasonsSnake []string       `json:"reject_reasons"`
 	RiskLabels         []string       `json:"riskLabels"`
@@ -161,7 +163,7 @@ func (h *AuctionHandler) AuditCallback(ctx context.Context, c *app.RequestContex
 		Status:        req.Status,
 		Success:       success,
 		IsApproved:    approved,
-		RejectReasons: firstNonEmptyStringSlice(req.RejectReasons, req.RejectReasonsSnake),
+		RejectReasons: auditCallbackRejectReasons(req),
 		RiskLabels:    firstNonEmptyStringSlice(req.RiskLabels, req.RiskLabelsSnake),
 		Context:       firstNonNilMap(req.Context, req.CallbackContext),
 	})
@@ -226,6 +228,15 @@ func firstNonEmptyStringSlice(values ...[]string) []string {
 		}
 	}
 	return nil
+}
+
+func auditCallbackRejectReasons(req auctionAuditCallbackRequest) []string {
+	reasons := make([]string, 0, 1+len(req.RejectReasons)+len(req.RejectReasonsSnake))
+	if reason := firstNonEmpty(req.RejectReason, req.RejectReasonSnake); reason != "" {
+		reasons = append(reasons, reason)
+	}
+	reasons = append(reasons, firstNonEmptyStringSlice(req.RejectReasons, req.RejectReasonsSnake)...)
+	return reasons
 }
 
 func firstNonNilMap(values ...map[string]any) map[string]any {

@@ -236,15 +236,18 @@ func TestMCPLiveLotActionMessagesUseLotName(t *testing.T) {
 func mcpControlReadyLot(id uint64, sellerID string) domain.AuctionLot {
 	now := time.Now().UTC()
 	return domain.AuctionLot{
-		AuctionID:     id,
-		SellerID:      sellerID,
-		AuctionType:   domain.AuctionTypeEnglish,
-		StartPrice:    1000,
-		IncrementRule: domain.DefaultIncrementRule(),
-		Status:        domain.AuctionStatusReady,
-		StartTime:     now,
-		EndTime:       now.Add(time.Hour),
-		DurationSec:   600,
+		AuctionID:      id,
+		SellerID:       sellerID,
+		AuctionType:    domain.AuctionTypeEnglish,
+		StartPrice:     1000,
+		IncrementRule:  domain.DefaultIncrementRule(),
+		AntiSnipingSec: 15,
+		AntiExtendSec:  30,
+		AntiExtendMode: domain.AuctionExtendModeAdd,
+		Status:         domain.AuctionStatusReady,
+		StartTime:      now,
+		EndTime:        now.Add(time.Hour),
+		DurationSec:    600,
 	}
 }
 

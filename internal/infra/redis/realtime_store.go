@@ -147,6 +147,8 @@ func (s *AuctionRealtimeStore) InitAuction(ctx context.Context, auction domain.A
 		"increment_rule_type", ruleType,
 		"increment_fixed_amount", incrementFixedAmount,
 		"anti_extend_mode", string(domain.NormalizeAuctionExtendMode(auction.AntiExtendMode)),
+		"anti_sniping_ms", int64(auction.AntiSnipingSec)*1000,
+		"anti_extend_ms", int64(auction.AntiExtendSec)*1000,
 	)
 	_, err = pipe.Exec(ctx)
 	if err != nil {
@@ -193,6 +195,8 @@ func (s *AuctionRealtimeStore) GetAuctionState(ctx context.Context, auctionID ui
 		ExtendCount:      int(parseInt(values["extend_count"], 0)),
 		Version:          parseInt(values["version"], 0),
 		Source:           "redis",
+		AntiSnipingMS:    parseInt(values["anti_sniping_ms"], 0),
+		AntiExtendMS:     parseInt(values["anti_extend_ms"], 0),
 	}
 	return state, true, nil
 }

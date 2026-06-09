@@ -209,6 +209,18 @@ func (c *BidAsyncCoordinator) PendingQueueSize() int {
 	return len(c.pending)
 }
 
+// PendingForAuction 返回某 auction 当前的待裁决数。屏障判断是否可以真正落锤
+// 使用：pending=0 表示 in-flight 全部排空（已 publish 未裁决的命令、worker 处理中、
+// 已 deliver 但等待 ack 的全部计入）。
+func (c *BidAsyncCoordinator) PendingForAuction(auctionID uint64) int {
+	if c == nil || auctionID == 0 {
+		return 0
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.auctionCount[auctionID]
+}
+
 func (c *BidAsyncCoordinator) deliver(sessionID uint64, userID string, env Envelope) {
 	if c.hub == nil || sessionID == 0 {
 		return

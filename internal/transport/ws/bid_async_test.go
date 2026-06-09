@@ -97,6 +97,41 @@ func TestBidAsyncCoordinatorQueueProtection(t *testing.T) {
 	}
 }
 
+// TestBidAsyncCoordinatorPendingForAuction 验证 per-auction pending 计数
+// 在 TryEnqueue / HandleAck 流程下与全局 PendingQueueSize 的预期一致。
+func TestBidAsyncCoordinatorPendingForAuction(t *testing.T) {
+	coord := NewBidAsyncCoordinator(nil, 100, time.Hour, 3)
+	if got := coord.PendingForAuction(20); got != 0 {
+		t.Fatalf("initial pending = %d, want 0", got)
+	}
+	if ok, _ := coord.TryEnqueue(20, 900, "u1", "b1"); !ok {
+		t.Fatalf("enqueue u1 failed")
+	}
+	if ok, _ := coord.TryEnqueue(20, 900, "u2", "b2"); !ok {
+		t.Fatalf("enqueue u2 failed")
+	}
+	if ok, _ := coord.TryEnqueue(21, 900, "u3", "b3"); !ok {
+		t.Fatalf("enqueue u3 failed")
+	}
+	if got := coord.PendingForAuction(20); got != 2 {
+		t.Fatalf("pending(20) = %d, want 2", got)
+	}
+	if got := coord.PendingForAuction(21); got != 1 {
+		t.Fatalf("pending(21) = %d, want 1", got)
+	}
+	coord.HandleAck("b1")
+	if got := coord.PendingForAuction(20); got != 1 {
+		t.Fatalf("pending(20) after ack b1 = %d, want 1", got)
+	}
+	coord.HandleAck("b2")
+	if got := coord.PendingForAuction(20); got != 0 {
+		t.Fatalf("pending(20) after both ack = %d, want 0", got)
+	}
+	if got := coord.PendingForAuction(0); got != 0 {
+		t.Fatalf("pending(0) = %d, want 0", got)
+	}
+}
+
 func TestBidAsyncCoordinatorAckReleasesPending(t *testing.T) {
 	hub := NewHub()
 	client := NewClientWithSession("c1", "u1", 0, 900, 8)

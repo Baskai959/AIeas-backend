@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"aieas_backend/internal/domain"
+	auctionapp "aieas_backend/internal/modules/auction/app"
 	corews "aieas_backend/internal/transport/ws"
 
 	"github.com/cloudwego/hertz/pkg/app"
@@ -997,6 +998,16 @@ func (h *WSHandler) handleBidPlaceAsync(ctx context.Context, client *corews.Clie
 	snapshot.LiveSessionID = orDefaultUint64(snapshot.LiveSessionID, client.LiveSessionID)
 	enqueueStart := time.Now()
 	if err := h.cmdPublisher.PublishBidCommand(ctx, snapshot); err != nil {
+		// 闸门拒绝（HAMMER_PENDING）：明确回 REJECTED reason=AUCTION_HAMMER_PENDING，
+		// 不降级走同步（同步路径同样会被状态机拒），并释放队列计数。
+		if errors.Is(err, auctionapp.ErrHammerPending) {
+			h.asyncCoord.HandleAck(in.RequestID)
+			h.recordBidQueueReject("AUCTION_HAMMER_PENDING")
+			return []corews.Envelope{jsonEnvelope("bid.ack", in.RequestID, map[string]interface{}{
+				"mode": "ASYNC", "status": "REJECTED", "accepted": false, "reason": "AUCTION_HAMMER_PENDING",
+				"auctionId": in.AuctionID, "bidId": in.RequestID,
+			})}
+		}
 		// 发布失败：释放 pending，回退同步执行，绝不丢请求。
 		h.asyncCoord.HandleAck(in.RequestID)
 		h.recordBidPlaceMode("async_fallback_sync")

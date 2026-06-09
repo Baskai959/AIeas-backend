@@ -57,6 +57,17 @@ func TestLiveAnalysisClientRequestsAsyncReport(t *testing.T) {
 	}
 }
 
+func TestNewProductDescriptionClientUsesDedicatedTimeout(t *testing.T) {
+	client := NewProductDescriptionClient(appconfig.AgentConfig{
+		ProductDescriptionURL:     "http://127.0.0.1:8000/api/v1/product-description",
+		ProductDescriptionTimeout: appconfig.Duration(2 * time.Minute),
+		Timeout:                   appconfig.Duration(time.Second),
+	})
+	if client.client.Timeout != 2*time.Minute {
+		t.Fatalf("expected product description timeout 2m, got %s", client.client.Timeout)
+	}
+}
+
 func TestLiveAnalysisClientReturnsAsyncAgentErrorMessage(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

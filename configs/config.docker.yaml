@@ -103,6 +103,13 @@ auction:
   freqWindowMs: 1000
   # 出价请求幂等 key 的短期保留时间。
   bidIdempotencyTTL: 30s
+  # 异步模式下，落锤前等待 in-flight 命令排空的最长时间（毫秒）；超时后强制 finalize。
+  hammerDrainMaxWaitMs: 5000
+  # 异步模式下，落锤屏障轮询周期（毫秒）；不要忙等。
+  hammerDrainPollMs: 50
+  # timer 触发落锤的 anti-sniping 宽限期（毫秒）：到点后再等待 max(state.antiSnipingMs, 该值)
+  # 才允许进入 hammer 分支，给异步出价命令最后一刻的延长留窗口。默认 500ms。
+  hammerAntiSnipingGraceMs: 500
 
 # 风控总开关配置。
 riskControl:
@@ -158,23 +165,25 @@ objectStorage:
 # 外部 Agent 服务配置。
 agent:
   # 商品描述生成接口地址。
-  productDescriptionURL: "http://agent:8000/api/v1/product-description"
+  productDescriptionURL: "http://47.97.82.143:8000/api/v1/product-description"
+  # 商品描述优化接口超时时间。
+  productDescriptionTimeout: 2m
   # 是否启用商品 AI 审核；false 时提交审核默认直接通过。
   productAuditEnabled: true
   # 商品 AI 审核接口地址。
-  productAuditURL: "http://agent:8000/api/v1/product-audit"
+  productAuditURL: "http://47.97.82.143:8000/api/v1/product-audit"
   # 商品审核结果回调地址。
-  productAuditCallbackURL: "https://api.example.com/api/v1/auctions/audit/callback"
+  productAuditCallbackURL: "http://47.97.82.143:8888/api/v1/auctions/audit/callback"
   # 直播分析异步接口地址。
-  liveAnalysisURL: "http://agent:8000/api/v1/live-analysis/async"
+  liveAnalysisURL: "http://47.97.82.143:8000/api/v1/live-analysis/async"
   # 直播分析回调地址。
-  liveAnalysisCallbackURL: "https://api.example.com/api/v1/live-analysis/callback"
-  # 直播分析回调鉴权 key；建议留占位值并在 docker/prod.env 写 AGENT_LIVE_ANALYSIS_CALLBACK_API_KEY。
+  liveAnalysisCallbackURL: "http://47.97.82.143:8888/api/v1/live-analysis/callback"
+  # 直播分析回调鉴权 key；建议留占位值并在 .env 写 AGENT_LIVE_ANALYSIS_CALLBACK_API_KEY。
   liveAnalysisCallbackAPIKey: "change-me-in-local-dev-live-analysis-callback"
   # 直播拍卖助手 hook 地址。
-  liveAuctionHookURL: "http://agent:8000/api/v1/live-assistant"
-  # Agent HTTP 请求超时时间。
-  timeout: 30s
+  liveAuctionHookURL: "http://47.97.82.143:8000/api/v1/live-assistant"
+  # 其他 Agent HTTP 请求超时时间。
+  timeout: 45s
 
 # 豆包 TTS 配置。
 doubaoTTS:

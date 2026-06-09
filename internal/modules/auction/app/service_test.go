@@ -31,15 +31,18 @@ func TestAuctionServiceCancelBroadcastsClosedEventWithLiveSessionID(t *testing.T
 	auctionRepo := auctionrepo.NewMemoryAuctionRepository()
 	publisher := &recordingAuctionEventPublisher{}
 	auction := domain.AuctionLot{
-		AuctionID:     91001,
-		SellerID:      "u_2001",
-		LiveSessionID: &liveSessionID,
-		Title:         "cancelled lot",
-		AuctionType:   domain.AuctionTypeEnglish,
-		StartPrice:    1200,
-		Status:        domain.AuctionStatusReady,
-		StartTime:     now,
-		EndTime:       now.Add(time.Hour),
+		AuctionID:      91001,
+		SellerID:       "u_2001",
+		LiveSessionID:  &liveSessionID,
+		Title:          "cancelled lot",
+		AuctionType:    domain.AuctionTypeEnglish,
+		StartPrice:     1200,
+		AntiSnipingSec: 15,
+		AntiExtendSec:  30,
+		AntiExtendMode: domain.AuctionExtendModeAdd,
+		Status:         domain.AuctionStatusReady,
+		StartTime:      now,
+		EndTime:        now.Add(time.Hour),
 	}
 	if err := auctionRepo.Create(ctx, &auction); err != nil {
 		t.Fatalf("create auction: %v", err)
@@ -91,6 +94,9 @@ func TestAuctionServiceUpdateBroadcastsLiveSessionLotChanged(t *testing.T) {
 		ConditionGrade: domain.ConditionGood,
 		AuctionType:    domain.AuctionTypeEnglish,
 		StartPrice:     1200,
+		AntiSnipingSec: 15,
+		AntiExtendSec:  30,
+		AntiExtendMode: domain.AuctionExtendModeAdd,
 		Status:         domain.AuctionStatusReady,
 		StartTime:      now,
 		EndTime:        now.Add(time.Hour),

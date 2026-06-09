@@ -511,6 +511,11 @@ func (s *BidService) ArbitrateFromCommand(ctx context.Context, cmd BidCommandSna
 	if source == "" {
 		source = "live_ws"
 	}
+	// 异步路径下 cmd 携带的是 ms 字段（来自 PreCheckForAsync 的 sec*1000），但
+	// arbitrate 在向 Lua 传 ARGV 时统一从 bidAuctionSnapshot.AntiSnipingSec*1000 /
+	// AntiExtendSec*1000 计算；这里把 ms 反算回 sec 写入 snapshot，避免 Lua 收到
+	// 0 导致 anti_snipe_ms>0 && extend_ms>0 永远 false（不延长 endTime）。
+	// PreCheckForAsync 写入的 ms 已是 sec*1000，整除可精确还原。
 	auction := bidAuctionSnapshot{
 		AuctionID:      cmd.AuctionID,
 		SellerID:       cmd.SellerID,
@@ -519,6 +524,8 @@ func (s *BidService) ArbitrateFromCommand(ctx context.Context, cmd BidCommandSna
 		CapPrice:       cmd.CapPrice,
 		ParsedRule:     cmd.IncrementRule,
 		ParsedRuleOK:   true,
+		AntiSnipingSec: int(cmd.AntiSnipingMS / 1000),
+		AntiExtendSec:  int(cmd.AntiExtendMS / 1000),
 		AntiExtendMode: cmd.AntiExtendMode,
 	}
 	riskControl := s.currentRiskControl(ctx)

@@ -256,9 +256,9 @@ func TestLiveSessionServiceListLotsFilterBySession(t *testing.T) {
 	opened := createStartedLiveSession(t, svc, "m_x", "live")
 	now := time.Now().UTC()
 	other := uint64(99999)
-	in := domain.AuctionLot{AuctionID: 7001, SellerID: "m_x", AuctionType: domain.AuctionTypeEnglish, Status: domain.AuctionStatusReady, LiveSessionID: &opened.ID, StartTime: now, EndTime: now.Add(time.Hour)}
-	out := domain.AuctionLot{AuctionID: 7002, SellerID: "m_x", AuctionType: domain.AuctionTypeEnglish, Status: domain.AuctionStatusReady, LiveSessionID: &other, StartTime: now, EndTime: now.Add(time.Hour)}
-	none := domain.AuctionLot{AuctionID: 7003, SellerID: "m_x", AuctionType: domain.AuctionTypeEnglish, Status: domain.AuctionStatusReady, StartTime: now, EndTime: now.Add(time.Hour)}
+	in := domain.AuctionLot{AuctionID: 7001, SellerID: "m_x", AuctionType: domain.AuctionTypeEnglish, AntiSnipingSec: 15, AntiExtendSec: 30, AntiExtendMode: domain.AuctionExtendModeAdd, Status: domain.AuctionStatusReady, LiveSessionID: &opened.ID, StartTime: now, EndTime: now.Add(time.Hour)}
+	out := domain.AuctionLot{AuctionID: 7002, SellerID: "m_x", AuctionType: domain.AuctionTypeEnglish, AntiSnipingSec: 15, AntiExtendSec: 30, AntiExtendMode: domain.AuctionExtendModeAdd, Status: domain.AuctionStatusReady, LiveSessionID: &other, StartTime: now, EndTime: now.Add(time.Hour)}
+	none := domain.AuctionLot{AuctionID: 7003, SellerID: "m_x", AuctionType: domain.AuctionTypeEnglish, AntiSnipingSec: 15, AntiExtendSec: 30, AntiExtendMode: domain.AuctionExtendModeAdd, Status: domain.AuctionStatusReady, StartTime: now, EndTime: now.Add(time.Hour)}
 	for _, lot := range []domain.AuctionLot{in, out, none} {
 		l := lot
 		if err := auctionRepo.Create(ctx, &l); err != nil {
@@ -292,6 +292,9 @@ func TestLiveSessionServiceListLotsAllowsBuyerForLiveSessionWithIncrementRule(t 
 		ReservePrice:   1000,
 		CapPrice:       20000,
 		IncrementRule:  rule,
+		AntiSnipingSec: 15,
+		AntiExtendSec:  30,
+		AntiExtendMode: domain.AuctionExtendModeAdd,
 		Status:         domain.AuctionStatusReady,
 		StartTime:      now,
 		EndTime:        now.Add(time.Hour),
@@ -539,7 +542,7 @@ func TestLiveSessionServiceMountActivateDeactivateAndUnmountRules(t *testing.T) 
 		t.Fatalf("start session: %v", err)
 	}
 	now := time.Now().UTC()
-	lot := domain.AuctionLot{AuctionID: 8101, SellerID: "m_lot", AuctionType: domain.AuctionTypeEnglish, Status: domain.AuctionStatusReady, StartPrice: 100, StartTime: now, EndTime: now.Add(time.Hour)}
+	lot := domain.AuctionLot{AuctionID: 8101, SellerID: "m_lot", AuctionType: domain.AuctionTypeEnglish, AntiSnipingSec: 15, AntiExtendSec: 30, AntiExtendMode: domain.AuctionExtendModeAdd, Status: domain.AuctionStatusReady, StartPrice: 100, StartTime: now, EndTime: now.Add(time.Hour)}
 	if err := auctionRepo.Create(ctx, &lot); err != nil {
 		t.Fatalf("create lot: %v", err)
 	}
@@ -582,14 +585,17 @@ func TestLiveSessionServiceDeactivateAuctionBroadcastsLotChanged(t *testing.T) {
 	session := createStartedLiveSession(t, svc, "m_cancel_current", "取消当前拍品场")
 	now := time.Now().UTC()
 	lot := domain.AuctionLot{
-		AuctionID:     8102,
-		SellerID:      "m_cancel_current",
-		AuctionType:   domain.AuctionTypeEnglish,
-		Status:        domain.AuctionStatusReady,
-		StartPrice:    100,
-		StartTime:     now,
-		EndTime:       now.Add(time.Hour),
-		LiveSessionID: &session.ID,
+		AuctionID:      8102,
+		SellerID:       "m_cancel_current",
+		AuctionType:    domain.AuctionTypeEnglish,
+		Status:         domain.AuctionStatusReady,
+		StartPrice:     100,
+		AntiSnipingSec: 15,
+		AntiExtendSec:  30,
+		AntiExtendMode: domain.AuctionExtendModeAdd,
+		StartTime:      now,
+		EndTime:        now.Add(time.Hour),
+		LiveSessionID:  &session.ID,
 	}
 	if err := auctionRepo.Create(ctx, &lot); err != nil {
 		t.Fatalf("create lot: %v", err)
@@ -619,14 +625,17 @@ func TestLiveSessionServiceScheduleFutureAuctionDoesNotActivateSession(t *testin
 	session := createStartedLiveSession(t, svc, "m_schedule", "预约开拍场")
 	now := time.Now().UTC()
 	lot := domain.AuctionLot{
-		AuctionID:     8110,
-		SellerID:      "m_schedule",
-		LiveSessionID: &session.ID,
-		AuctionType:   domain.AuctionTypeEnglish,
-		Status:        domain.AuctionStatusReady,
-		StartPrice:    100,
-		StartTime:     now,
-		EndTime:       now.Add(time.Hour),
+		AuctionID:      8110,
+		SellerID:       "m_schedule",
+		LiveSessionID:  &session.ID,
+		AuctionType:    domain.AuctionTypeEnglish,
+		Status:         domain.AuctionStatusReady,
+		StartPrice:     100,
+		AntiSnipingSec: 15,
+		AntiExtendSec:  30,
+		AntiExtendMode: domain.AuctionExtendModeAdd,
+		StartTime:      now,
+		EndTime:        now.Add(time.Hour),
 	}
 	if err := auctionRepo.Create(ctx, &lot); err != nil {
 		t.Fatalf("create lot: %v", err)
@@ -675,6 +684,9 @@ func TestLiveSessionServiceActivateDueScheduledAuctionStartsAuction(t *testing.T
 		Status:         domain.AuctionStatusWarmingUp,
 		StartPrice:     100,
 		IncrementRule:  domain.DefaultIncrementRule(),
+		AntiSnipingSec: 15,
+		AntiExtendSec:  30,
+		AntiExtendMode: domain.AuctionExtendModeAdd,
 		StartTime:      startAt,
 		EndTime:        startAt.Add(10 * time.Minute),
 		DurationSec:    600,
@@ -720,7 +732,7 @@ func TestLiveSessionServiceActivateAuctionReturnsErrorWhenRealtimeWriteFails(t *
 	ctx := context.Background()
 	session := createStartedLiveSession(t, svc, "m_rt_fail", "rt fail")
 	now := time.Now().UTC()
-	lot := domain.AuctionLot{AuctionID: 8103, SellerID: "m_rt_fail", LiveSessionID: &session.ID, AuctionType: domain.AuctionTypeEnglish, Status: domain.AuctionStatusReady, StartPrice: 100, StartTime: now, EndTime: now.Add(time.Hour)}
+	lot := domain.AuctionLot{AuctionID: 8103, SellerID: "m_rt_fail", LiveSessionID: &session.ID, AuctionType: domain.AuctionTypeEnglish, AntiSnipingSec: 15, AntiExtendSec: 30, AntiExtendMode: domain.AuctionExtendModeAdd, Status: domain.AuctionStatusReady, StartPrice: 100, StartTime: now, EndTime: now.Add(time.Hour)}
 	if err := auctionRepo.Create(ctx, &lot); err != nil {
 		t.Fatalf("create lot: %v", err)
 	}
@@ -766,18 +778,21 @@ func TestLiveSessionServiceRestartClosedFailedLot(t *testing.T) {
 	closedAt := now.Add(-time.Minute)
 	dealPrice := int64(100)
 	lot := domain.AuctionLot{
-		AuctionID:     8102,
-		SellerID:      "m_restart",
-		LiveSessionID: &session.ID,
-		AuctionType:   domain.AuctionTypeEnglish,
-		Status:        domain.AuctionStatusClosedFailed,
-		StartPrice:    100,
-		DurationSec:   600,
-		StartTime:     now.Add(-time.Minute),
-		EndTime:       now,
-		DealPrice:     &dealPrice,
-		ClosedAt:      &closedAt,
-		ClosedBy:      "merchant",
+		AuctionID:      8102,
+		SellerID:       "m_restart",
+		LiveSessionID:  &session.ID,
+		AuctionType:    domain.AuctionTypeEnglish,
+		Status:         domain.AuctionStatusClosedFailed,
+		StartPrice:     100,
+		AntiSnipingSec: 15,
+		AntiExtendSec:  30,
+		AntiExtendMode: domain.AuctionExtendModeAdd,
+		DurationSec:    600,
+		StartTime:      now.Add(-time.Minute),
+		EndTime:        now,
+		DealPrice:      &dealPrice,
+		ClosedAt:       &closedAt,
+		ClosedBy:       "merchant",
 	}
 	if err := auctionRepo.Create(ctx, &lot); err != nil {
 		t.Fatalf("create lot: %v", err)
@@ -809,14 +824,17 @@ func TestLiveSessionServiceListAuctionBidsUsesCurrentRound(t *testing.T) {
 	session := createStartedLiveSession(t, svc, "m_round", "重拍场")
 	now := time.Now().UTC()
 	lot := domain.AuctionLot{
-		AuctionID:     8103,
-		SellerID:      "m_round",
-		LiveSessionID: &session.ID,
-		AuctionType:   domain.AuctionTypeEnglish,
-		Status:        domain.AuctionStatusRunning,
-		StartPrice:    100,
-		StartTime:     now,
-		EndTime:       now.Add(10 * time.Minute),
+		AuctionID:      8103,
+		SellerID:       "m_round",
+		LiveSessionID:  &session.ID,
+		AuctionType:    domain.AuctionTypeEnglish,
+		Status:         domain.AuctionStatusRunning,
+		StartPrice:     100,
+		AntiSnipingSec: 15,
+		AntiExtendSec:  30,
+		AntiExtendMode: domain.AuctionExtendModeAdd,
+		StartTime:      now,
+		EndTime:        now.Add(10 * time.Minute),
 	}
 	if err := auctionRepo.Create(ctx, &lot); err != nil {
 		t.Fatalf("create lot: %v", err)
@@ -988,10 +1006,10 @@ type fakeLiveAgentHook struct {
 	enabled bool
 }
 
-func (h *fakeLiveAgentHook) EmitLiveStarted(context.Context, string, uint64)                  {}
-func (h *fakeLiveAgentHook) EmitLotMounted(context.Context, string, uint64, uint64)           {}
-func (h *fakeLiveAgentHook) EmitLotUnmounted(context.Context, string, uint64, uint64)         {}
-func (h *fakeLiveAgentHook) EmitLotStarted(context.Context, string, uint64, uint64, int)      {}
+func (h *fakeLiveAgentHook) EmitLiveStarted(context.Context, string, uint64)             {}
+func (h *fakeLiveAgentHook) EmitLotMounted(context.Context, string, uint64, uint64)      {}
+func (h *fakeLiveAgentHook) EmitLotUnmounted(context.Context, string, uint64, uint64)    {}
+func (h *fakeLiveAgentHook) EmitLotStarted(context.Context, string, uint64, uint64, int) {}
 func (h *fakeLiveAgentHook) EmitLotScheduled(context.Context, string, uint64, uint64, time.Time, int) {
 }
 func (h *fakeLiveAgentHook) EmitLotCancelled(context.Context, string, uint64, uint64) {}

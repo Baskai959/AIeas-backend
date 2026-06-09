@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"aieas_backend/internal/domain"
+	auctionapp "aieas_backend/internal/modules/auction/app"
 	corews "aieas_backend/internal/transport/ws"
 )
 
@@ -185,4 +186,25 @@ type stubSyncBids struct {
 
 func (s stubSyncBids) Place(ctx context.Context, in PlaceBidInput) (domain.BidResult, error) {
 	return s.result, s.err
+}
+
+// TestWSHandlerAsyncRejectsOnHammerPending 异步分支：publisher 返回 ErrHammerPending → ack
+// REJECTED reason=AUCTION_HAMMER_PENDING，且不降级同步、释放队列计数。
+func TestWSHandlerAsyncRejectsOnHammerPending(t *testing.T) {
+	// fakeCmdPublisher 不能直接返回 ErrHammerPending（避免循环 import），用 wrapper。
+	publisher := &fakeCmdPublisher{err: auctionapp.ErrHammerPending}
+	// 注意：返回 err 时不附 ErrHammerPending sentinel；为了 errors.Is 命中，使用 errs 字段。
+	handler, coord := newAsyncHandler(t, fakeAsyncBids{}, publisher, stubSyncBids{result: domain.BidResult{Accepted: true}})
+	client := corews.NewClientWithSession("c1", "u1", 10, 900, 8)
+	responses := handler.handleInbound(context.Background(), client, bidPlaceEnvelope("b1", 10))
+	if len(responses) != 1 {
+		t.Fatalf("expected 1 ack, got %d", len(responses))
+	}
+	ack := decodeAck(t, responses[0])
+	if ack["mode"] != "ASYNC" || ack["status"] != "REJECTED" || ack["reason"] != "AUCTION_HAMMER_PENDING" {
+		t.Fatalf("expected ASYNC/REJECTED/AUCTION_HAMMER_PENDING ack, got %+v", ack)
+	}
+	if coord.PendingQueueSize() != 0 {
+		t.Fatalf("hammer-pending reject should release pending, got %d", coord.PendingQueueSize())
+	}
 }
