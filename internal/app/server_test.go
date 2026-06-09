@@ -411,9 +411,7 @@ func TestMCPInitializeAndToolsList(t *testing.T) {
 		t.Fatalf("expected read tools/list success, status=%d raw=%s", readToolsResp.status, readToolsResp.raw)
 	}
 	var toolsResult struct {
-		Tools []struct {
-			Name string `json:"name"`
-		} `json:"tools"`
+		Tools []mcpListedTool `json:"tools"`
 	}
 	mustDecodeData(t, readToolsResp.body.Result, &toolsResult)
 	if !containsTool(toolsResult.Tools, "get_current_time") ||
@@ -480,6 +478,22 @@ func TestMCPInitializeAndToolsList(t *testing.T) {
 		!containsTool(toolsResult.Tools, "live_voice_broadcast") ||
 		len(toolsResult.Tools) != 4 {
 		t.Fatalf("expected only control tools from control MCP, got %+v", toolsResult.Tools)
+	}
+	operateTool, ok := findMCPTool(toolsResult.Tools, "operate_live_session_lot")
+	if !ok {
+		t.Fatalf("operate_live_session_lot tool not found: %+v", toolsResult.Tools)
+	}
+	if strings.Contains(operateTool.Description, "上架") || strings.Contains(operateTool.Description, "讲解") {
+		t.Fatalf("operate_live_session_lot description should not expose onShelf or explain wording: %q", operateTool.Description)
+	}
+	actionSchema, ok := operateTool.InputSchema["properties"].(map[string]interface{})["action"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("operate_live_session_lot action schema missing: %+v", operateTool.InputSchema)
+	}
+	for _, value := range actionSchema["enum"].([]interface{}) {
+		if value == "onShelf" {
+			t.Fatalf("operate_live_session_lot action enum should not include onShelf: %+v", actionSchema["enum"])
+		}
 	}
 	controlTimeResp := doMCPPath(t, h.Engine, "/mcp/control", controlAPIKey, `{"jsonrpc":"2.0","id":23,"method":"tools/call","params":{"name":"get_current_time","arguments":{}}}`)
 	if controlTimeResp.status != 200 || controlTimeResp.body.Error != nil {
@@ -833,6 +847,7 @@ func TestMCPLiveControlContextAndOperations(t *testing.T) {
 	lot := domain.AuctionLot{
 		AuctionID:      91001,
 		SellerID:       "u_2001",
+		LiveSessionID:  &session.ID,
 		AuctionType:    domain.AuctionTypeEnglish,
 		StartPrice:     1000,
 		ReservePrice:   0,
@@ -881,20 +896,15 @@ func TestMCPLiveControlContextAndOperations(t *testing.T) {
 	if contextPayload.Data.Session == nil || contextPayload.Data.Session.ID != session.ID {
 		t.Fatalf("unexpected live context: %+v", contextPayload.Data)
 	}
-	if len(contextPayload.Data.Lots.CandidateLots) != 1 || contextPayload.Data.Lots.CandidateLots[0].AuctionID != lot.AuctionID {
-		t.Fatalf("expected candidate lot before on shelf, got %+v", contextPayload.Data.Lots.CandidateLots)
+	if len(contextPayload.Data.Lots.UpcomingLots) != 1 || contextPayload.Data.Lots.UpcomingLots[0].AuctionID != lot.AuctionID {
+		t.Fatalf("expected upcoming lot before start auction, got %+v", contextPayload.Data.Lots.UpcomingLots)
 	}
 
 	onShelfBody := `{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"operate_live_session_lot","arguments":{"liveSessionId":` + strconv.FormatUint(session.ID, 10) + `,"auctionId":91001,"action":"onShelf"}}}`
 	onShelfResp := doMCPPath(t, h.Engine, "/mcp/control", "merchant-live-control-key", onShelfBody)
-	if onShelfResp.status != 200 || onShelfResp.body.Error != nil {
-		t.Fatalf("expected onShelf success, status=%d raw=%s", onShelfResp.status, onShelfResp.raw)
+	if onShelfResp.status != 200 || onShelfResp.body.Error == nil || onShelfResp.body.Error.Code != -32602 {
+		t.Fatalf("expected onShelf to be removed from MCP actions, status=%d raw=%s", onShelfResp.status, onShelfResp.raw)
 	}
-	onShelf := decodeMCPToolEnvelope[mcpDisplayLiveLotOperationResult](t, onShelfResp)
-	if onShelf.Data.Lot == nil || onShelf.Data.Lot.LiveSessionID == nil || *onShelf.Data.Lot.LiveSessionID != session.ID || onShelf.Data.Context == nil || len(onShelf.Data.Context.Lots.UpcomingLots) != 1 {
-		t.Fatalf("unexpected onShelf result: %+v", onShelf.Data)
-	}
-	assertMCPDisplayMoney(t, onShelf.Data.Lot.StartPrice, "10.00")
 
 	missingDurationBody := `{"jsonrpc":"2.0","id":13,"method":"tools/call","params":{"name":"operate_live_session_lot","arguments":{"liveSessionId":` + strconv.FormatUint(session.ID, 10) + `,"auctionId":91001,"action":"startExplain"}}}`
 	missingDurationResp := doMCPPath(t, h.Engine, "/mcp/control", "merchant-live-control-key", missingDurationBody)
@@ -2791,15 +2801,28 @@ func doMCPPath(t *testing.T, engine *route.Engine, path, apiKey, body string) te
 	return testMCPResult{status: resp.Code, body: decoded, raw: resp.Body.String()}
 }
 
-func containsTool(tools []struct {
-	Name string `json:"name"`
-}, name string) bool {
+type mcpListedTool struct {
+	Name        string                 `json:"name"`
+	Description string                 `json:"description"`
+	InputSchema map[string]interface{} `json:"inputSchema"`
+}
+
+func containsTool(tools []mcpListedTool, name string) bool {
 	for _, tool := range tools {
 		if tool.Name == name {
 			return true
 		}
 	}
 	return false
+}
+
+func findMCPTool(tools []mcpListedTool, name string) (mcpListedTool, bool) {
+	for _, tool := range tools {
+		if tool.Name == name {
+			return tool, true
+		}
+	}
+	return mcpListedTool{}, false
 }
 
 func ptrInt64(v int64) *int64 {

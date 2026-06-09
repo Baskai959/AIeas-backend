@@ -53,7 +53,7 @@ type AuctionStateUseCase interface {
 	State(ctx context.Context, id uint64, actorID string, actorRole domain.Role) (domain.AuctionState, error)
 }
 
-// ActivateLiveSessionAuctionInput 是直播场次内开始讲解时的最小控制载荷。
+// ActivateLiveSessionAuctionInput 是直播场次内开拍时的最小控制载荷。
 type ActivateLiveSessionAuctionInput struct {
 	SessionID   uint64
 	AuctionID   uint64

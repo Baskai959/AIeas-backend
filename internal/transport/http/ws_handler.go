@@ -78,12 +78,17 @@ const (
 	WSLiveSessionLookupRealtime WSLiveSessionLookupMode = "realtime"
 )
 
+type WSUserProfileLookup interface {
+	FindByID(id string) (domain.User, error)
+}
+
 type WSHandler struct {
 	hub              *corews.Hub
 	bids             WSBidUseCase
 	rankings         WSAuctionRankingUseCase
 	sessions         WSLiveSessionLookupUseCase
 	auctions         WSAuctionStateUseCase
+	userProfiles     WSUserProfileLookup
 	realtimeSnapshot WSAuctionRealtimeSnapshotProvider
 	sessionRealtime  WSLiveSessionRealtimeReader
 	bidPlaceMode     WSBidPlaceMode
@@ -178,6 +183,10 @@ func (h *WSHandler) SetAuctionService(auctions WSAuctionStateUseCase) {
 
 func (h *WSHandler) SetAuctionRankingService(rankings WSAuctionRankingUseCase) {
 	h.rankings = rankings
+}
+
+func (h *WSHandler) SetUserProfileLookup(userProfiles WSUserProfileLookup) {
+	h.userProfiles = userProfiles
 }
 
 func (h *WSHandler) SetRealtimeSnapshotProvider(store WSAuctionRealtimeSnapshotProvider) {
@@ -924,7 +933,7 @@ func (h *WSHandler) handleChatSend(client *corews.Client, env corews.Envelope) [
 		"id":              messageID,
 		"roomId":          expectedRoomID,
 		"userId":          client.UserID,
-		"nickname":        client.UserID,
+		"nickname":        h.resolveChatNickname(client.UserID),
 		"content":         content,
 		"clientMessageId": clientMessageID,
 		"createdAt":       createdAt,
@@ -938,6 +947,25 @@ func (h *WSHandler) handleChatSend(client *corews.Client, env corews.Envelope) [
 			"createdAt":       createdAt,
 		}),
 	}
+}
+
+func (h *WSHandler) resolveChatNickname(userID string) string {
+	userID = strings.TrimSpace(userID)
+	if userID == "" {
+		return ""
+	}
+	if h == nil || h.userProfiles == nil {
+		return userID
+	}
+	user, err := h.userProfiles.FindByID(userID)
+	if err != nil {
+		return userID
+	}
+	nickname := strings.TrimSpace(user.Nickname)
+	if nickname == "" {
+		return userID
+	}
+	return nickname
 }
 
 func chatErrorEnvelope(requestID, roomID, clientMessageID, reason string) corews.Envelope {

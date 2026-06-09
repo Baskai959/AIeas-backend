@@ -61,8 +61,8 @@ func readToolDefinitions() []toolDefinition {
 func controlToolDefinitions() []toolDefinition {
 	return []toolDefinition{
 		tool("get_current_time", "获取服务端当前时间。只读，无副作用。", objectSchema(map[string]interface{}{}, nil)),
-		tool("get_merchant_live_control_context", "获取商家当前直播场次控制台上下文。参数只需要 merchantId，返回当前场次、讲解中拍品、成交/流拍/待讲解/可上架拍品。", objectSchema(map[string]interface{}{"merchantId": stringProp("商家用户 ID")}, []string{"merchantId"})),
-		tool("operate_live_session_lot", "模拟商家直播中的拍品操作。支持 onShelf 上架、offShelf 下架、startExplain 开始拍卖/讲解、hammer 落槌、endLive 下播；startExplain 必须传 durationSec，可选 startTime 预约开拍。", operateLiveSessionLotSchema()),
+		tool("get_merchant_live_control_context", "获取商家当前直播场次控制台上下文。参数只需要 merchantId，返回当前场次、开拍中拍品、成交/流拍/待开拍拍品。", objectSchema(map[string]interface{}{"merchantId": stringProp("商家用户 ID")}, []string{"merchantId"})),
+		tool("operate_live_session_lot", "模拟商家直播中的拍品操作。支持 offShelf 下架、startExplain 开拍、hammer 落槌、endLive 下播；startExplain 必须传 durationSec，可选 startTime 预约开拍。", operateLiveSessionLotSchema()),
 		tool("live_voice_broadcast", "直播语音播报。传入直播场次 ID 和播报文本，服务端调用豆包 TTS 合成语音，并通过 live.voice_broadcast WebSocket 事件推送给订阅该场次的用户端。", objectSchema(map[string]interface{}{"liveSessionId": integerProp("直播场次 ID"), "text": stringProp("播报文本，1-1000 字"), "requestId": stringProp("可选请求 ID，用于关联 MCP 调用和 WebSocket 播报事件")}, []string{"liveSessionId", "text"})),
 	}
 }
@@ -71,8 +71,8 @@ func operateLiveSessionLotSchema() map[string]interface{} {
 	schema := objectSchema(map[string]interface{}{
 		"liveSessionId": integerProp("直播场次 ID"),
 		"auctionId":     integerProp("拍品 ID"),
-		"action":        enumProp([]string{"onShelf", "offShelf", "startExplain", "hammer", "endLive"}),
-		"durationSec":   optionalIntegerProp("拍卖/讲解时长，单位秒；action=startExplain 时必填且必须大于 0"),
+		"action":        enumProp([]string{"offShelf", "startExplain", "hammer", "endLive"}),
+		"durationSec":   optionalIntegerProp("拍卖时长，单位秒；action=startExplain 时必填且必须大于 0"),
 		"startTime":     stringProp("预约开拍时间，RFC3339；仅 action=startExplain 时可传，未来时间表示定时开拍，不传表示立即开拍"),
 		"force":         booleanProp("hammer/endLive 时是否强制结束；hammer 默认 true"),
 		"requestId":     stringProp("可选幂等请求 ID，建议 hammer 时传入"),

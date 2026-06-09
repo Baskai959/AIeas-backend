@@ -203,7 +203,7 @@ func NewServerWithDependencies(cfg appconfig.Config, deps ServerDependencies) *s
 	if asyncBid.coordinator != nil && asyncBid.publisher != nil && services.bid != nil {
 		asyncBid.bids = services.bid
 	}
-	h := newServerWithServices(services.auth, services.auction, services.bid, services.deposit, services.hammer, services.order, services.admin, services.liveSession, services.liveSession, deps.RealtimeStore, deps.LiveSessionRealtimeStore, services.marketplace, services.marketplace, services.liveAnalysis, services.aiAssistant, services.aiAssistant, services.mcpRead, services.mcpControl, services.riskControl, deps.AuditRepo, deps.Hub, deps.Idempotency, deps.ObjectUploader, deps.DescriptionGen, deps.MetricsRegistry, deps.Tracing, deps.ReadinessProbes, deps.DistributedRateLimiter, deps.FeatureFlags, deps.WSHandshakeLimiter, asyncBid, cfg)
+	h := newServerWithServices(services.auth, services.auction, services.bid, deps.UserRepo, services.deposit, services.hammer, services.order, services.admin, services.liveSession, services.liveSession, deps.RealtimeStore, deps.LiveSessionRealtimeStore, services.marketplace, services.marketplace, services.liveAnalysis, services.aiAssistant, services.aiAssistant, services.mcpRead, services.mcpControl, services.riskControl, deps.AuditRepo, deps.Hub, deps.Idempotency, deps.ObjectUploader, deps.DescriptionGen, deps.MetricsRegistry, deps.Tracing, deps.ReadinessProbes, deps.DistributedRateLimiter, deps.FeatureFlags, deps.WSHandshakeLimiter, asyncBid, cfg)
 	if deps.Hub != nil {
 		h.OnShutdown = append(h.OnShutdown, func(ctx context.Context) {
 			_ = deps.Hub.Drain(ctx, cfg.WebSocket.DrainTimeout.Std())
@@ -231,6 +231,7 @@ func newServerWithServices(
 	authService httptransport.AuthUseCase,
 	auctionService httptransport.AuctionUseCase,
 	bidService httptransport.WSBidUseCase,
+	userProfiles httptransport.WSUserProfileLookup,
 	depositService httptransport.DepositUseCase,
 	hammerService httptransport.HammerUseCase,
 	orderService httptransport.OrderUseCase,
@@ -305,6 +306,7 @@ func newServerWithServices(
 		authService:              authService,
 		auctionService:           auctionService,
 		bidService:               bidService,
+		userProfiles:             userProfiles,
 		depositService:           depositService,
 		hammerService:            hammerService,
 		orderService:             orderService,

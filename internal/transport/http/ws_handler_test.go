@@ -265,6 +265,7 @@ drained:
 func TestWSHandlerChatSendAckAndBroadcast(t *testing.T) {
 	hub := corews.NewHub()
 	handler := NewWSHandler(hub, nil, 8, 65536, time.Second, 2*time.Second, 5*time.Second, 0, time.Second, nil, nil)
+	handler.SetUserProfileLookup(repository.NewSeedUserRepository())
 	sender := corews.NewClientWithSession("c1", "u_1001", 0, 9001, 8)
 	receiver := corews.NewClientWithSession("c2", "u_1002", 0, 9001, 8)
 	if err := hub.SubscribeLiveSessionOnly(9001, sender); err != nil {
@@ -319,7 +320,7 @@ onlineDrained:
 		if err := json.Unmarshal(env.Payload, &message); err != nil {
 			t.Fatalf("decode chat message: %v", err)
 		}
-		if message.RoomID != "9001" || message.UserID != "u_1001" || message.Nickname != "u_1001" || message.Content != "这件很漂亮" || message.ClientMessageID != "client-chat-1" || message.ID != ack.MessageID || message.CreatedAt != ack.CreatedAt {
+		if message.RoomID != "9001" || message.UserID != "u_1001" || message.Nickname != "竞拍用户001" || message.Content != "这件很漂亮" || message.ClientMessageID != "client-chat-1" || message.ID != ack.MessageID || message.CreatedAt != ack.CreatedAt {
 			t.Fatalf("unexpected chat message: %+v", message)
 		}
 	case <-time.After(time.Second):

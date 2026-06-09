@@ -64,6 +64,7 @@ func TestMCPControlServiceReadAndOperate(t *testing.T) {
 	fixture := newMCPControlFixture(t)
 	ctx := context.Background()
 	lot := mcpControlReadyLot(91001, "m_1")
+	lot.LiveSessionID = &fixture.session.ID
 	if err := fixture.auctions.Create(ctx, &lot); err != nil {
 		t.Fatalf("create auction: %v", err)
 	}
@@ -76,26 +77,11 @@ func TestMCPControlServiceReadAndOperate(t *testing.T) {
 	if contextPayload.Session == nil || contextPayload.Session.ID != fixture.session.ID {
 		t.Fatalf("expected active session, got %+v", contextPayload.Session)
 	}
-	if len(contextPayload.Lots.CandidateLots) != 1 || contextPayload.Lots.CandidateLots[0].AuctionID != lot.AuctionID {
-		t.Fatalf("expected candidate lot, got %+v", contextPayload.Lots.CandidateLots)
+	if len(contextPayload.Lots.UpcomingLots) != 1 || contextPayload.Lots.UpcomingLots[0].AuctionID != lot.AuctionID {
+		t.Fatalf("expected upcoming lot, got %+v", contextPayload.Lots.UpcomingLots)
 	}
 
 	result, err := fixture.svc.OperateLiveSessionLot(ctx, MCPLiveLotOperationInput{
-		LiveSessionID: fixture.session.ID,
-		AuctionID:     lot.AuctionID,
-		Action:        "上架",
-	}, actor)
-	if err != nil {
-		t.Fatalf("operate on shelf: %v", err)
-	}
-	if result.Action != "onShelf" || result.Lot == nil || result.Lot.LiveSessionID == nil || *result.Lot.LiveSessionID != fixture.session.ID {
-		t.Fatalf("unexpected operation result: %+v", result)
-	}
-	if result.Context == nil || len(result.Context.Lots.UpcomingLots) != 1 {
-		t.Fatalf("expected refreshed context with upcoming lot, got %+v", result.Context)
-	}
-
-	result, err = fixture.svc.OperateLiveSessionLot(ctx, MCPLiveLotOperationInput{
 		LiveSessionID: fixture.session.ID,
 		AuctionID:     lot.AuctionID,
 		Action:        "startExplain",
@@ -157,7 +143,7 @@ func TestMCPControlServiceErrors(t *testing.T) {
 				if err := fixture.auctions.Create(ctx, &lot); err != nil {
 					return err
 				}
-				_, err := fixture.svc.OperateLiveSessionLot(ctx, MCPLiveLotOperationInput{LiveSessionID: ended.ID, AuctionID: lot.AuctionID, Action: "onShelf"}, MCPActor{ID: "m_1", Role: domain.RoleMerchant})
+				_, err := fixture.svc.OperateLiveSessionLot(ctx, MCPLiveLotOperationInput{LiveSessionID: ended.ID, AuctionID: lot.AuctionID, Action: "startExplain", DurationSec: 600}, MCPActor{ID: "m_1", Role: domain.RoleMerchant})
 				return err
 			},
 			wantErr: domain.ErrInvalidState,
@@ -175,13 +161,23 @@ func TestMCPControlServiceErrors(t *testing.T) {
 			wantErr: domain.ErrInvalidArgument,
 		},
 		{
-			name: "start explain requires durationSec",
+			name: "on shelf action is not exposed through MCP",
 			run: func(ctx context.Context, fixture mcpControlFixture) error {
 				lot := mcpControlReadyLot(91004, "m_1")
 				if err := fixture.auctions.Create(ctx, &lot); err != nil {
 					return err
 				}
-				if _, err := fixture.svc.OperateLiveSessionLot(ctx, MCPLiveLotOperationInput{LiveSessionID: fixture.session.ID, AuctionID: lot.AuctionID, Action: "onShelf"}, MCPActor{ID: "m_1", Role: domain.RoleMerchant}); err != nil {
+				_, err := fixture.svc.OperateLiveSessionLot(ctx, MCPLiveLotOperationInput{LiveSessionID: fixture.session.ID, AuctionID: lot.AuctionID, Action: "onShelf"}, MCPActor{ID: "m_1", Role: domain.RoleMerchant})
+				return err
+			},
+			wantErr: domain.ErrInvalidArgument,
+		},
+		{
+			name: "start auction requires durationSec",
+			run: func(ctx context.Context, fixture mcpControlFixture) error {
+				lot := mcpControlReadyLot(91005, "m_1")
+				lot.LiveSessionID = &fixture.session.ID
+				if err := fixture.auctions.Create(ctx, &lot); err != nil {
 					return err
 				}
 				_, err := fixture.svc.OperateLiveSessionLot(ctx, MCPLiveLotOperationInput{LiveSessionID: fixture.session.ID, AuctionID: lot.AuctionID, Action: "startExplain"}, MCPActor{ID: "m_1", Role: domain.RoleMerchant})
@@ -229,6 +225,9 @@ func TestMCPLiveLotActionMessagesUseLotName(t *testing.T) {
 		}
 		if strings.Contains(message, "91001") {
 			t.Fatalf("expected message not to expose auction id, got %q", message)
+		}
+		if strings.Contains(message, "讲解") {
+			t.Fatalf("expected message to describe start action as auction start, got %q", message)
 		}
 	}
 }

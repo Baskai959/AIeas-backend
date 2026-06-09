@@ -21,6 +21,7 @@ type routeWiring struct {
 	authService              httptransport.AuthUseCase
 	auctionService           httptransport.AuctionUseCase
 	bidService               httptransport.WSBidUseCase
+	userProfiles             httptransport.WSUserProfileLookup
 	depositService           httptransport.DepositUseCase
 	hammerService            httptransport.HammerUseCase
 	orderService             httptransport.OrderUseCase
@@ -133,6 +134,7 @@ func newWiredWSHandler(wiring routeWiring) *httptransport.WSHandler {
 	if rankingService, ok := wiring.bidService.(httptransport.WSAuctionRankingUseCase); ok {
 		wsHandler.SetAuctionRankingService(rankingService)
 	}
+	wsHandler.SetUserProfileLookup(wiring.userProfiles)
 	wsHandler.SetRealtimeSnapshotProvider(wiring.realtimeStore)
 	wsHandler.SetLiveSessionRealtimeStore(wiring.liveSessionRealtimeStore)
 	wsHandler.SetBidModeMetrics(wiring.metricsRegistry)

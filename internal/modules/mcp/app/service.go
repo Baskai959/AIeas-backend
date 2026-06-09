@@ -662,12 +662,6 @@ func (s *MCPControlService) OperateLiveSessionLot(ctx context.Context, in MCPLiv
 	}
 
 	switch action {
-	case "onShelf":
-		lot, err := s.sessionSvc.MountAuction(ctx, session.ID, in.AuctionID, actor.ID, actor.Role)
-		if err != nil {
-			return fail(err)
-		}
-		result.Lot = &lot
 	case "offShelf":
 		if err := s.sessionSvc.UnmountAuction(ctx, session.ID, in.AuctionID, actor.ID, actor.Role); err != nil {
 			return fail(err)
@@ -989,11 +983,9 @@ func (s *MCPControlService) currentLiveControlSession(ctx context.Context, merch
 
 func normalizeMCPLiveLotAction(action string) string {
 	switch strings.ToLower(strings.TrimSpace(action)) {
-	case "onshelf", "on_shelf", "mount", "上架":
-		return "onShelf"
 	case "offshelf", "off_shelf", "unmount", "下架":
 		return "offShelf"
-	case "startexplain", "start_explain", "activate", "讲解", "开始讲解":
+	case "startexplain", "start_explain", "activate", "开拍", "开始拍卖":
 		return "startExplain"
 	case "hammer", "close", "落槌", "成交":
 		return "hammer"
@@ -1039,12 +1031,10 @@ func (s *MCPControlService) mcpLotDisplayName(ctx context.Context, auctionID uin
 func MCPLiveLotActionApprovalMessage(action, lotName string) string {
 	lotName = mcpQuoteLotName(lotName)
 	switch action {
-	case "onShelf":
-		return fmt.Sprintf("AI 请求上架%s，是否允许执行？", lotName)
 	case "offShelf":
 		return fmt.Sprintf("AI 请求下架%s，是否允许执行？", lotName)
 	case "startExplain":
-		return fmt.Sprintf("AI 请求开始讲解%s，是否允许执行？", lotName)
+		return fmt.Sprintf("AI 请求开拍%s，是否允许执行？", lotName)
 	case "hammer":
 		return fmt.Sprintf("AI 请求对%s落槌成交，是否允许执行？", lotName)
 	case "endLive":
@@ -1057,12 +1047,10 @@ func MCPLiveLotActionApprovalMessage(action, lotName string) string {
 func MCPLiveLotActionRunningMessage(action, lotName string) string {
 	lotName = mcpQuoteLotName(lotName)
 	switch action {
-	case "onShelf":
-		return fmt.Sprintf("正在上架%s", lotName)
 	case "offShelf":
 		return fmt.Sprintf("正在下架%s", lotName)
 	case "startExplain":
-		return fmt.Sprintf("正在开始讲解%s", lotName)
+		return fmt.Sprintf("正在开拍%s", lotName)
 	case "hammer":
 		return fmt.Sprintf("正在对%s落槌", lotName)
 	case "endLive":
@@ -1075,12 +1063,10 @@ func MCPLiveLotActionRunningMessage(action, lotName string) string {
 func MCPLiveLotActionCompletedMessage(action, lotName string) string {
 	lotName = mcpQuoteLotName(lotName)
 	switch action {
-	case "onShelf":
-		return fmt.Sprintf("%s已上架", lotName)
 	case "offShelf":
 		return fmt.Sprintf("%s已下架", lotName)
 	case "startExplain":
-		return fmt.Sprintf("%s已开始讲解", lotName)
+		return fmt.Sprintf("%s已开拍", lotName)
 	case "hammer":
 		return fmt.Sprintf("%s已落槌", lotName)
 	case "endLive":
