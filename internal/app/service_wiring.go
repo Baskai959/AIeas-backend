@@ -337,6 +337,9 @@ func buildAppServices(cfg appconfig.Config, deps ServerDependencies) appServices
 		LotEvents:       liveSessionLotHubNotifier{hub: deps.Hub, eventPublisher: realtimeEvents},
 		AISwitch:        aiAssistantService,
 	})
+	if deps.Hub != nil {
+		deps.Hub.SetLiveSessionViewerRecorder(liveSessionViewerRecorder{sessions: liveSessionService})
+	}
 	hammerService.SetLiveSessionService(liveSessionService)
 	bidService := auctionapp.NewBidServiceWithDeps(auctionapp.BidServiceDeps{
 		Bids:             deps.BidRepo,
@@ -545,6 +548,19 @@ type depositParticipantNotifier struct {
 	publisher interface {
 		Broadcast(auctionID uint64, env auctionports.EventEnvelope) int
 	}
+}
+
+type liveSessionViewerRecorder struct {
+	sessions interface {
+		IncrCounters(ctx context.Context, sessionID uint64, c domain.LiveSessionCounters) error
+	}
+}
+
+func (r liveSessionViewerRecorder) RecordLiveSessionView(ctx context.Context, liveSessionID uint64, online int) error {
+	if r.sessions == nil || liveSessionID == 0 || online <= 0 {
+		return nil
+	}
+	return r.sessions.IncrCounters(ctx, liveSessionID, domain.LiveSessionCounters{ViewerTotalAdd: 1, ViewerPeakAtMin: online})
 }
 
 func (n depositParticipantNotifier) NotifyParticipantUpdated(ctx context.Context, auctionID uint64, participantCount int) int {

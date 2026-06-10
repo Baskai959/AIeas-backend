@@ -740,6 +740,9 @@ func (s *AuctionService) startWithTiming(ctx context.Context, id uint64, actorID
 	rtAuction := warmed
 	rtAuction.Status = domain.AuctionStatusRunning
 	minIncrement := domain.MinIncrementForPrice(rtAuction.IncrementRule, rtAuction.StartPrice, s.cfg.MinIncrementCent)
+	if err := s.realtime.ResetAuctionParticipation(ctx, rtAuction.AuctionID); err != nil {
+		return domain.AuctionLot{}, err
+	}
 	state, err := s.realtime.InitAuction(ctx, rtAuction, minIncrement)
 	if err != nil {
 		return domain.AuctionLot{}, err

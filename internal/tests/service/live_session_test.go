@@ -443,7 +443,7 @@ func TestLiveSessionServiceCloseFlushesAndResetsStore(t *testing.T) {
 	ctx := context.Background()
 
 	opened := createStartedLiveSession(t, svc, "m_close", "live")
-	if err := svc.IncrCounters(ctx, opened.ID, domain.LiveSessionCounters{LotsTotalDelta: 5, GMVCentDelta: 9999, ViewerPeakAtMin: 11}); err != nil {
+	if err := svc.IncrCounters(ctx, opened.ID, domain.LiveSessionCounters{LotsTotalDelta: 5, GMVCentDelta: 9999, ViewerTotalAdd: 2, ViewerPeakAtMin: 11}); err != nil {
 		t.Fatalf("incr: %v", err)
 	}
 	closed, err := svc.CloseSession(ctx, opened.ID)
@@ -453,11 +453,11 @@ func TestLiveSessionServiceCloseFlushesAndResetsStore(t *testing.T) {
 	if closed.Status != domain.LiveSessionStatusEnded {
 		t.Fatalf("expected ENDED, got %s", closed.Status)
 	}
-	if closed.LotsTotal != 5 || closed.GMVCent != 9999 || closed.ViewerPeak != 11 {
+	if closed.LotsTotal != 5 || closed.GMVCent != 9999 || closed.ViewerPeak != 11 || closed.ViewerTotal != 2 {
 		t.Fatalf("close should have flushed deltas, got %+v", closed)
 	}
 	counters, peak, _ := store.LoadCounters(ctx, opened.ID)
-	if counters.LotsTotalDelta != 0 || counters.GMVCentDelta != 0 || peak != 0 {
+	if counters.LotsTotalDelta != 0 || counters.GMVCentDelta != 0 || counters.ViewerTotalAdd != 0 || peak != 0 {
 		t.Fatalf("expected store reset after close, got counters=%+v peak=%d", counters, peak)
 	}
 }

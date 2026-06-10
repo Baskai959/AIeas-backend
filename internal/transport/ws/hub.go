@@ -34,6 +34,10 @@ type LiveSessionEventPublisher interface {
 	PublishLiveSessionEvent(ctx context.Context, liveSessionID uint64, eventType, requestID string, seq int64, payload json.RawMessage, onlineOnly bool) error
 }
 
+type LiveSessionViewerRecorder interface {
+	RecordLiveSessionView(ctx context.Context, liveSessionID uint64, online int) error
+}
+
 type ReplaySource interface {
 	ReplaySince(ctx context.Context, auctionID uint64, lastSeq int64) ([]Envelope, bool, error)
 }
@@ -58,6 +62,7 @@ type Hub struct {
 	eventWindow    int
 	onlineCounter  OnlineCounter
 	sessionEvents  LiveSessionEventPublisher
+	viewerRecorder LiveSessionViewerRecorder
 	replaySource   ReplaySource
 	onlineTimeout  time.Duration
 	instancePrefix string
@@ -91,6 +96,12 @@ func (h *Hub) SetLiveSessionEventPublisher(publisher LiveSessionEventPublisher) 
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.sessionEvents = publisher
+}
+
+func (h *Hub) SetLiveSessionViewerRecorder(recorder LiveSessionViewerRecorder) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.viewerRecorder = recorder
 }
 
 // SetMetrics 注入观测性指标实现。nil 安全：传 nil 等同于关闭打点。
@@ -422,6 +433,7 @@ func (h *Hub) Subscribe(auctionID uint64, client *Client) error {
 		sessionOnline := h.joinOnline(liveSessionOnlineKey(client.LiveSessionID), client.ID, client.UserID, h.liveSessionOnlineClientCount(client.LiveSessionID))
 		h.markOnlineTouched(liveSessionOnlineKey(client.LiveSessionID), client.ID)
 		h.emitLiveSessionPresence(client.LiveSessionID, sessionOnline)
+		h.recordLiveSessionView(client.LiveSessionID, sessionOnline)
 	}
 	if reg := h.metricsSnapshot(); reg != nil {
 		reg.IncWSConnect()
@@ -443,6 +455,7 @@ func (h *Hub) SubscribeLiveSessionOnly(liveSessionID uint64, client *Client) err
 		online := h.joinOnline(liveSessionOnlineKey(liveSessionID), client.ID, client.UserID, h.liveSessionOnlineClientCount(liveSessionID))
 		h.markOnlineTouched(liveSessionOnlineKey(liveSessionID), client.ID)
 		h.emitLiveSessionPresence(liveSessionID, online)
+		h.recordLiveSessionView(liveSessionID, online)
 	}
 	if reg := h.metricsSnapshot(); reg != nil {
 		reg.IncWSConnect()
@@ -692,6 +705,28 @@ func (h *Hub) metricsSnapshot() HubMetrics {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 	return h.metrics
+}
+
+func (h *Hub) liveSessionViewerRecorderSnapshot() LiveSessionViewerRecorder {
+	if h == nil {
+		return nil
+	}
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.viewerRecorder
+}
+
+func (h *Hub) recordLiveSessionView(liveSessionID uint64, online int) {
+	if liveSessionID == 0 || online <= 0 {
+		return
+	}
+	recorder := h.liveSessionViewerRecorderSnapshot()
+	if recorder == nil {
+		return
+	}
+	ctx, cancel := h.onlineCounterContext()
+	defer cancel()
+	_ = recorder.RecordLiveSessionView(ctx, liveSessionID, online)
 }
 
 // BroadcastSessionEnd 把 LiveSessionEnded 事件推送给所有订阅了该 liveSessionId 的客户端，

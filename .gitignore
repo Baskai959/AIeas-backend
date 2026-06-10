@@ -1,6 +1,7 @@
 .env
 .env.*
-.docs
+.docs/
+docs/
 .oh-my-code
 !.env.example
 docker/prod.env

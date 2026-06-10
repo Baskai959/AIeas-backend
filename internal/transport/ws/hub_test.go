@@ -251,6 +251,35 @@ func TestHubLiveSessionOnlineCountWithoutActiveAuction(t *testing.T) {
 	}
 }
 
+func TestHubRecordsLiveSessionViewerCounters(t *testing.T) {
+	recorder := &recordingLiveSessionViewerRecorder{}
+	hub := NewHubWithOnlineCounter(NewMemoryOnlineCounter())
+	hub.SetLiveSessionViewerRecorder(recorder)
+	buyer1 := NewClientWithSession("buyer-viewer-1", "u1", 0, 9101, 4)
+	buyer2 := NewClientWithSession("buyer-viewer-2", "u2", 0, 9101, 4)
+	merchant := NewClientWithSession("merchant-viewer", "m1", 0, 9101, 4)
+	merchant.CountOnline = false
+
+	if err := hub.SubscribeLiveSessionOnly(9101, buyer1); err != nil {
+		t.Fatalf("subscribe buyer1: %v", err)
+	}
+	if err := hub.SubscribeLiveSessionOnly(9101, merchant); err != nil {
+		t.Fatalf("subscribe merchant: %v", err)
+	}
+	if err := hub.SubscribeLiveSessionOnly(9101, buyer2); err != nil {
+		t.Fatalf("subscribe buyer2: %v", err)
+	}
+	if len(recorder.calls) != 2 {
+		t.Fatalf("expected two viewer records, got %+v", recorder.calls)
+	}
+	if recorder.calls[0].sessionID != 9101 || recorder.calls[0].online != 1 {
+		t.Fatalf("unexpected first viewer record: %+v", recorder.calls[0])
+	}
+	if recorder.calls[1].sessionID != 9101 || recorder.calls[1].online != 2 {
+		t.Fatalf("unexpected second viewer record: %+v", recorder.calls[1])
+	}
+}
+
 func TestHubLiveSessionOnlineCountWithActiveAuction(t *testing.T) {
 	hub := NewHubWithOnlineCounter(NewMemoryOnlineCounter())
 	client := NewClientWithSession("buyer", "u1", 31002, 9002, 4)
@@ -751,6 +780,20 @@ type countingOnlineCounter struct {
 func (c *countingOnlineCounter) Touch(ctx context.Context, auctionID uint64, connectionID, userID string) (int, error) {
 	c.touchCount.Add(1)
 	return c.MemoryOnlineCounter.Touch(ctx, auctionID, connectionID, userID)
+}
+
+type liveSessionViewerRecord struct {
+	sessionID uint64
+	online    int
+}
+
+type recordingLiveSessionViewerRecorder struct {
+	calls []liveSessionViewerRecord
+}
+
+func (r *recordingLiveSessionViewerRecorder) RecordLiveSessionView(_ context.Context, liveSessionID uint64, online int) error {
+	r.calls = append(r.calls, liveSessionViewerRecord{sessionID: liveSessionID, online: online})
+	return nil
 }
 
 type liveSessionPublishCall struct {

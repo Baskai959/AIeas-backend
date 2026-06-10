@@ -182,6 +182,51 @@ func TestAuctionServiceStartWithTimingOverridesStoredDuration(t *testing.T) {
 	}
 }
 
+func TestAuctionServiceStartClearsStaleParticipation(t *testing.T) {
+	ctx := context.Background()
+	auctionRepo := repository.NewMemoryAuctionRepository()
+	realtime := repository.NewMemoryRealtimeStore()
+	svc := NewAuctionServiceWithDeps(AuctionServiceDeps{Auctions: auctionRepo, Tx: repository.NoopTxManager{}, Realtime: realtime})
+
+	auction, err := svc.Create(ctx, CreateAuctionInput{
+		ActorID:           "u_2001",
+		ActorRole:         domain.RoleMerchant,
+		Title:             "Watch",
+		Category:          "luxury",
+		ConditionGrade:    domain.ConditionNew,
+		Description:       "rare watch",
+		StartPrice:        1000,
+		ReservePrice:      5000,
+		CapPrice:          6000,
+		AuctionType:       domain.AuctionTypeEnglish,
+		DepositAmount:     100,
+		DurationSec:       600,
+		Status:            domain.AuctionStatusReady,
+		AllowSystemStatus: true,
+	})
+	if err != nil {
+		t.Fatalf("create auction: %v", err)
+	}
+	if err := realtime.MarkEnrollment(ctx, auction.AuctionID, "u_stale"); err != nil {
+		t.Fatalf("seed stale enrollment: %v", err)
+	}
+	start := time.Now().UTC().Truncate(time.Second)
+	if _, err := svc.StartWithTiming(ctx, auction.AuctionID, "u_2001", domain.RoleMerchant, start, start.Add(time.Minute)); err != nil {
+		t.Fatalf("start with timing: %v", err)
+	}
+	state, exists, err := realtime.GetAuctionState(ctx, auction.AuctionID)
+	if err != nil || !exists {
+		t.Fatalf("get realtime state: exists=%v err=%v", exists, err)
+	}
+	if state.ParticipantCount != 0 {
+		t.Fatalf("expected participant count reset on start, got %+v", state)
+	}
+	enrolled, depositReady, err := realtime.BidPrerequisites(ctx, auction.AuctionID, "u_stale")
+	if err != nil || enrolled || depositReady {
+		t.Fatalf("expected stale participation cleared, enrolled=%v depositReady=%v err=%v", enrolled, depositReady, err)
+	}
+}
+
 func TestAuctionServiceCreateRejectsSystemStatus(t *testing.T) {
 	ctx := context.Background()
 	auctionRepo := repository.NewMemoryAuctionRepository()

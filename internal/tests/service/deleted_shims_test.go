@@ -146,6 +146,10 @@ type MCPLiveControlDependencies struct {
 }
 
 func NewMCPControlService(deps MCPLiveControlDependencies) *MCPControlService {
+	var aiAssistant mcpports.AIAssistantFacade
+	if deps.AIAssistant != nil {
+		aiAssistant = deps.AIAssistant
+	}
 	return mcpapp.NewMCPControlService(mcpapp.MCPLiveControlDependencies{
 		Auctions:             deps.Auctions,
 		Sessions:             deps.Sessions,
@@ -154,7 +158,7 @@ func NewMCPControlService(deps MCPLiveControlDependencies) *MCPControlService {
 		HammerSvc:            deps.HammerSvc,
 		LiveVoiceSynthesizer: deps.LiveVoiceSynthesizer,
 		LiveVoiceBroadcaster: deps.LiveVoiceBroadcaster,
-		AIAssistant:          deps.AIAssistant,
+		AIAssistant:          aiAssistant,
 	})
 }
 
