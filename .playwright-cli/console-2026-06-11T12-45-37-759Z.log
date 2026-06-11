@@ -1,0 +1,3 @@
+[     115ms] [LOG] [vite] connecting... @ http://127.0.0.1:3031/@vite/client:183
+[     128ms] [LOG] [vite] connected. @ http://127.0.0.1:3031/@vite/client:211
+[    1725ms] [VERBOSE] [DOM] Input elements should have autocomplete attributes (suggested: "current-password"): (More info: https://goo.gl/9p2vKq) %o @ http://127.0.0.1:3031/login:0

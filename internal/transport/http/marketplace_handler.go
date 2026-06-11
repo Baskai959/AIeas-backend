@@ -65,7 +65,7 @@ func (h *MarketplaceHandler) Categories(ctx context.Context, c *app.RequestConte
 }
 
 func (h *MarketplaceHandler) SearchMerchants(ctx context.Context, c *app.RequestContext) {
-	merchants, err := h.marketplace.SearchMerchants(ctx, strings.TrimSpace(c.Query("keyword")), parseQueryInt(c, "limit", 20), parseQueryInt(c, "offset", 0))
+	merchants, err := h.marketplace.SearchMerchants(ctx, AuthUserID(c), AuthRole(c), strings.TrimSpace(c.Query("keyword")), parseQueryInt(c, "limit", 20), parseQueryInt(c, "offset", 0))
 	if err != nil {
 		writeServiceError(c, err)
 		return
@@ -78,12 +78,39 @@ func (h *MarketplaceHandler) Merchant(ctx context.Context, c *app.RequestContext
 	if merchantID == "" {
 		merchantID = strings.TrimSpace(c.Param("merchantId"))
 	}
-	merchant, err := h.marketplace.GetMerchant(ctx, merchantID)
+	merchant, err := h.marketplace.GetMerchant(ctx, AuthUserID(c), AuthRole(c), merchantID)
 	if err != nil {
 		writeServiceError(c, err)
 		return
 	}
 	WriteSuccess(c, merchant)
+}
+
+func (h *MarketplaceHandler) FollowMerchant(ctx context.Context, c *app.RequestContext) {
+	merchant, err := h.marketplace.FollowMerchant(ctx, AuthUserID(c), AuthRole(c), strings.TrimSpace(c.Param("id")))
+	if err != nil {
+		writeServiceError(c, err)
+		return
+	}
+	WriteSuccess(c, merchant)
+}
+
+func (h *MarketplaceHandler) UnfollowMerchant(ctx context.Context, c *app.RequestContext) {
+	merchant, err := h.marketplace.UnfollowMerchant(ctx, AuthUserID(c), AuthRole(c), strings.TrimSpace(c.Param("id")))
+	if err != nil {
+		writeServiceError(c, err)
+		return
+	}
+	WriteSuccess(c, merchant)
+}
+
+func (h *MarketplaceHandler) MyFollowedMerchants(ctx context.Context, c *app.RequestContext) {
+	follows, total, err := h.marketplace.MyFollowedMerchants(ctx, AuthUserID(c), AuthRole(c), parseQueryInt(c, "limit", 20), parseQueryInt(c, "offset", 0))
+	if err != nil {
+		writeServiceError(c, err)
+		return
+	}
+	WriteSuccess(c, map[string]interface{}{"follows": follows, "total": total})
 }
 
 func auctionStatusQuery(c *app.RequestContext, name string) (domain.AuctionStatus, bool) {

@@ -10,22 +10,36 @@ type Category struct {
 
 type LiveSessionView struct {
 	LiveSession
-	MerchantName       string                 `json:"merchantName"`
-	VideoSource        string                 `json:"videoSource"`
-	VideoURL           string                 `json:"videoUrl"`
-	DigitalHuman       map[string]interface{} `json:"digitalHuman"`
-	AIAssistantEnabled bool                   `json:"aiAssistantEnabled"`
-	OnlineCount        int                    `json:"onlineCount"`
+	MerchantName          string                 `json:"merchantName"`
+	MerchantFollowerCount int                    `json:"merchantFollowerCount"`
+	VideoSource           string                 `json:"videoSource"`
+	VideoURL              string                 `json:"videoUrl"`
+	DigitalHuman          map[string]interface{} `json:"digitalHuman"`
+	AIAssistantEnabled    bool                   `json:"aiAssistantEnabled"`
+	OnlineCount           int                    `json:"onlineCount"`
 }
 
 type MerchantView struct {
 	ID                 string           `json:"id"`
 	Name               string           `json:"name"`
 	AvatarURL          string           `json:"avatarUrl"`
+	Location           string           `json:"location"`
 	FollowerCount      int              `json:"followerCount"`
+	IsFollowed         bool             `json:"isFollowed"`
 	LiveRoomID         string           `json:"liveRoomId,omitempty"`
 	LiveSessionID      uint64           `json:"liveSessionId,omitempty"`
 	CurrentLiveSession *LiveSessionView `json:"currentLiveSession,omitempty"`
+}
+
+type MerchantFollow struct {
+	BuyerID    string    `json:"buyerId"`
+	MerchantID string    `json:"merchantId"`
+	CreatedAt  time.Time `json:"createdAt"`
+}
+
+type FollowedMerchant struct {
+	Merchant   MerchantView `json:"merchant"`
+	FollowedAt time.Time    `json:"followedAt"`
 }
 
 type AuctionParticipationRecord struct {

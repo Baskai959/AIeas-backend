@@ -85,19 +85,20 @@ type LiveAgentHookConfig struct {
 
 // LiveSessionStats 是 MCP control 展示直播态势时的统计快照。
 type LiveSessionStats struct {
-	LiveSessionID        uint64 `json:"liveSessionId"`
-	Online               int    `json:"online"`
-	LotsTotal            int    `json:"lotsTotal"`
-	LotsSold             int    `json:"lotsSold"`
-	LotsUnsold           int    `json:"lotsUnsold"`
-	BidCount             int    `json:"bidCount"`
-	GMVCent              int64  `json:"gmvCent"`
-	ViewerPeak           int    `json:"viewerPeak"`
-	ViewerTotal          int    `json:"viewerTotal"`
-	ActiveAuctionID      uint64 `json:"activeAuctionId"`
-	CurrentBidCount      int    `json:"currentBidCount"`
-	CurrentRemainSeconds int64  `json:"currentRemainSeconds"`
-	CurrentPrice         int64  `json:"currentPrice"`
+	LiveSessionID         uint64 `json:"liveSessionId"`
+	Online                int    `json:"online"`
+	LotsTotal             int    `json:"lotsTotal"`
+	LotsSold              int    `json:"lotsSold"`
+	LotsUnsold            int    `json:"lotsUnsold"`
+	BidCount              int    `json:"bidCount"`
+	GMVCent               int64  `json:"gmvCent"`
+	ViewerPeak            int    `json:"viewerPeak"`
+	ViewerTotal           int    `json:"viewerTotal"`
+	MerchantFollowerCount int    `json:"merchantFollowerCount"`
+	ActiveAuctionID       uint64 `json:"activeAuctionId"`
+	CurrentBidCount       int    `json:"currentBidCount"`
+	CurrentRemainSeconds  int64  `json:"currentRemainSeconds"`
+	CurrentPrice          int64  `json:"currentPrice"`
 }
 
 // LiveSessionUseCase 是 MCP read/control 调用直播场次能力的端口。

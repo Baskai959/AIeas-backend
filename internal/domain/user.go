@@ -55,6 +55,7 @@ type User struct {
 	Account      string
 	Nickname     string
 	AvatarURL    string
+	Location     string
 	Role         Role
 	Status       UserStatus
 	AIPermission MerchantAIPermission
@@ -73,13 +74,14 @@ type SafeUser struct {
 	ID           string               `json:"id"`
 	Nickname     string               `json:"nickname"`
 	AvatarURL    string               `json:"avatarUrl,omitempty"`
+	Location     string               `json:"location,omitempty"`
 	Role         Role                 `json:"role"`
 	Status       UserStatus           `json:"status,omitempty"`
 	AIPermission MerchantAIPermission `json:"aiPermission,omitempty"`
 }
 
 func (u User) Safe() SafeUser {
-	return SafeUser{ID: u.ID, Nickname: u.Nickname, AvatarURL: u.AvatarURL, Role: u.Role, Status: u.Status, AIPermission: NormalizeMerchantAIPermission(u.AIPermission)}
+	return SafeUser{ID: u.ID, Nickname: u.Nickname, AvatarURL: u.AvatarURL, Location: u.Location, Role: u.Role, Status: u.Status, AIPermission: NormalizeMerchantAIPermission(u.AIPermission)}
 }
 
 var (

@@ -294,7 +294,7 @@ func TestAuthProfileAndAvatarUpdate(t *testing.T) {
 	h := newTestServer()
 	token := loginForToken(t, h.Engine, "buyer001", "Passw0rd!", "buyer")
 
-	patch := doJSONWithHeaders(t, h.Engine, consts.MethodPatch, "/api/v1/auth/me", `{"nickname":"  新昵称001  "}`, ut.Header{Key: "Authorization", Value: "Bearer " + token}, ut.Header{Key: "Idempotency-Key", Value: "profile-update-1"})
+	patch := doJSONWithHeaders(t, h.Engine, consts.MethodPatch, "/api/v1/auth/me", `{"nickname":"  新昵称001  ","location":"  杭州  "}`, ut.Header{Key: "Authorization", Value: "Bearer " + token}, ut.Header{Key: "Idempotency-Key", Value: "profile-update-1"})
 	if patch.status != 200 || patch.body.Code != 0 {
 		t.Fatalf("expected profile update success, got status=%d raw=%s", patch.status, patch.raw)
 	}
@@ -302,9 +302,10 @@ func TestAuthProfileAndAvatarUpdate(t *testing.T) {
 		ID        string `json:"id"`
 		Nickname  string `json:"nickname"`
 		AvatarURL string `json:"avatarUrl"`
+		Location  string `json:"location"`
 	}
 	mustDecodeData(t, patch.body.Data, &profile)
-	if profile.ID != "u_1001" || profile.Nickname != "新昵称001" || profile.AvatarURL != "" {
+	if profile.ID != "u_1001" || profile.Nickname != "新昵称001" || profile.AvatarURL != "" || profile.Location != "杭州" {
 		t.Fatalf("unexpected profile update payload: %+v", profile)
 	}
 
@@ -315,7 +316,7 @@ func TestAuthProfileAndAvatarUpdate(t *testing.T) {
 		t.Fatalf("expected avatar upload success, got status=%d raw=%s", upload.status, upload.raw)
 	}
 	mustDecodeData(t, upload.body.Data, &profile)
-	if profile.Nickname != "新昵称001" || !strings.HasPrefix(profile.AvatarURL, "/api/v1/images/") {
+	if profile.Nickname != "新昵称001" || !strings.HasPrefix(profile.AvatarURL, "/api/v1/images/") || profile.Location != "杭州" {
 		t.Fatalf("unexpected avatar update payload: %+v", profile)
 	}
 	imageResp := ut.PerformRequest(h.Engine, consts.MethodGet, profile.AvatarURL, nil)
@@ -328,7 +329,7 @@ func TestAuthProfileAndAvatarUpdate(t *testing.T) {
 		t.Fatalf("expected me after avatar success, got status=%d raw=%s", me.status, me.raw)
 	}
 	mustDecodeData(t, me.body.Data, &profile)
-	if profile.Nickname != "新昵称001" || !strings.HasPrefix(profile.AvatarURL, "/api/v1/images/") {
+	if profile.Nickname != "新昵称001" || !strings.HasPrefix(profile.AvatarURL, "/api/v1/images/") || profile.Location != "杭州" {
 		t.Fatalf("expected me to include updated profile, got %+v", profile)
 	}
 }

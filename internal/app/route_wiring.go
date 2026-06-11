@@ -198,6 +198,9 @@ func registerRESTAPIRoutes(h *server.Hertz, wiring restRouteWiring) {
 		marketplace.GET("/categories", wiring.marketplaceHandler.Categories)
 		marketplace.GET("/search/merchants", wiring.marketplaceHandler.SearchMerchants)
 		marketplace.GET("/merchants/:id", wiring.marketplaceHandler.Merchant)
+		marketplace.POST("/merchants/:id/follow", httptransport.RoleAuth(domain.RoleBuyer), httptransport.WithIdempotency(wiring.idempotencyStore, wiring.idempotencyTTLValue(), wiring.marketplaceHandler.FollowMerchant))
+		marketplace.DELETE("/merchants/:id/follow", httptransport.RoleAuth(domain.RoleBuyer), httptransport.WithIdempotency(wiring.idempotencyStore, wiring.idempotencyTTLValue(), wiring.marketplaceHandler.UnfollowMerchant))
+		marketplace.GET("/merchant-follows/mine", httptransport.RoleAuth(domain.RoleBuyer), wiring.marketplaceHandler.MyFollowedMerchants)
 		marketplace.GET("/auction-participations/mine", httptransport.RoleAuth(domain.RoleBuyer), wiring.marketplaceHandler.MyParticipations)
 
 		auctionState := v1.Group("/auctions", wiring.authHandler.AuthMiddleware())

@@ -24,6 +24,7 @@ import (
 	depositrepo "aieas_backend/internal/modules/deposit/repository"
 	liveanalysisports "aieas_backend/internal/modules/live_analysis/ports"
 	livesessionports "aieas_backend/internal/modules/live_session/ports"
+	marketplaceports "aieas_backend/internal/modules/marketplace/ports"
 	mcpapp "aieas_backend/internal/modules/mcp/app"
 	orderports "aieas_backend/internal/modules/order/ports"
 	orderrepo "aieas_backend/internal/modules/order/repository"
@@ -66,6 +67,7 @@ func NewServerWithConfig(cfg appconfig.Config) *server.Hertz {
 type ServerDependencies struct {
 	AuthService              *authapp.AuthService
 	UserRepo                 userports.UserRepository
+	MerchantFollowRepo       marketplaceports.MerchantFollowRepository
 	AuctionRepo              auctionports.AuctionRepository
 	LiveSessionRepo          livesessionports.LiveSessionRepository
 	LiveAnalysisReportRepo   liveanalysisports.LiveAnalysisReportRepository

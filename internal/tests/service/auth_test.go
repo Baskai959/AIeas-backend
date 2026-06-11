@@ -18,10 +18,12 @@ func TestAuthServiceUpdateProfile(t *testing.T) {
 		name      string
 		userID    string
 		nickname  string
+		location  string
 		wantName  string
+		wantPlace string
 		wantError error
 	}{
-		{name: "ok", userID: "u_1001", nickname: "  新昵称001  ", wantName: "新昵称001"},
+		{name: "ok", userID: "u_1001", nickname: "  新昵称001  ", location: "  杭州  ", wantName: "新昵称001", wantPlace: "杭州"},
 		{name: "empty nickname", userID: "u_1001", nickname: "  ", wantError: domain.ErrInvalidArgument},
 		{name: "too long nickname", userID: "u_1001", nickname: strings.Repeat("长", 65), wantError: domain.ErrInvalidArgument},
 		{name: "disabled user", userID: "u_1002", nickname: "停用账号新昵称", wantError: domain.ErrAccountDisabled},
@@ -31,7 +33,7 @@ func TestAuthServiceUpdateProfile(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			users := repository.NewSeedUserRepository()
 			svc := authapp.NewAuthService(users, jwtpkg.NewManager("test-secret", time.Hour), authTestPasswordHasher{})
-			got, err := svc.UpdateProfile(UpdateProfileInput{UserID: tt.userID, Nickname: &tt.nickname})
+			got, err := svc.UpdateProfile(UpdateProfileInput{UserID: tt.userID, Nickname: &tt.nickname, Location: &tt.location})
 			if tt.wantError != nil {
 				if !errors.Is(err, tt.wantError) {
 					t.Fatalf("expected error %v, got %v", tt.wantError, err)
@@ -44,12 +46,15 @@ func TestAuthServiceUpdateProfile(t *testing.T) {
 			if got.Nickname != tt.wantName {
 				t.Fatalf("expected nickname %q, got %+v", tt.wantName, got)
 			}
+			if got.Location != tt.wantPlace {
+				t.Fatalf("expected location %q, got %+v", tt.wantPlace, got)
+			}
 			stored, err := users.FindByID(tt.userID)
 			if err != nil {
 				t.Fatalf("find stored user: %v", err)
 			}
-			if stored.Nickname != tt.wantName {
-				t.Fatalf("expected stored nickname %q, got %+v", tt.wantName, stored)
+			if stored.Nickname != tt.wantName || stored.Location != tt.wantPlace {
+				t.Fatalf("expected stored profile name=%q location=%q, got %+v", tt.wantName, tt.wantPlace, stored)
 			}
 		})
 	}

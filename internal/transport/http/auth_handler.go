@@ -47,6 +47,7 @@ type logoutRequest struct {
 
 type updateProfileRequest struct {
 	Nickname *string `json:"nickname"`
+	Location *string `json:"location"`
 }
 
 func (h *AuthHandler) Login(ctx context.Context, c *app.RequestContext) {
@@ -93,13 +94,14 @@ func (h *AuthHandler) Me(ctx context.Context, c *app.RequestContext) {
 func (h *AuthHandler) UpdateProfile(ctx context.Context, c *app.RequestContext) {
 	_ = ctx
 	var req updateProfileRequest
-	if err := c.BindJSON(&req); err != nil || req.Nickname == nil {
+	if err := c.BindJSON(&req); err != nil || (req.Nickname == nil && req.Location == nil) {
 		WriteError(c, 400, 20001, "参数不合法", nil)
 		return
 	}
 	user, err := h.auth.UpdateProfile(authapp.UpdateProfileInput{
 		UserID:   AuthUserID(c),
 		Nickname: req.Nickname,
+		Location: req.Location,
 	})
 	if err != nil {
 		status, code, msg := HTTPStatusAndCode(err)

@@ -15,7 +15,8 @@ func TestMarketplaceSearchLotsOnlyReturnsPublicVisibleLots(t *testing.T) {
 	auctionRepo := repository.NewMemoryAuctionRepository()
 	sessionRepo := repository.NewMemoryLiveSessionRepository()
 	depositRepo := repository.NewMemoryDepositRepository()
-	svc := marketplaceapp.NewMarketplaceService(auctionRepo, sessionRepo, depositRepo, repository.NewMemoryOrderRepository(), repository.NewSeedUserRepository())
+	userRepo := repository.NewSeedUserRepository()
+	svc := marketplaceapp.NewMarketplaceService(auctionRepo, sessionRepo, depositRepo, repository.NewMemoryOrderRepository(), userRepo, userRepo)
 	now := time.Now().UTC()
 	liveSession := domain.LiveSession{ID: 70001, MerchantID: "u_2001", Title: "开播直播间", Status: domain.LiveSessionStatusLive}
 	endedSession := domain.LiveSession{ID: 70002, MerchantID: "u_2001", Title: "已结束直播间", Status: domain.LiveSessionStatusEnded}
@@ -56,7 +57,19 @@ func TestMarketplaceSearchLotsOnlyReturnsPublicVisibleLots(t *testing.T) {
 	unmounted.AuctionID = 10004
 	unmounted.Title = "未上架翡翠"
 	unmounted.LiveSessionID = nil
-	for _, lot := range []*domain.AuctionLot{&ready, &draft, &ended, &unmounted} {
+	hammerPending := ready
+	hammerPending.AuctionID = 10005
+	hammerPending.Title = "落槌确认翡翠"
+	hammerPending.Status = domain.AuctionStatusHammerPending
+	closedWon := ready
+	closedWon.AuctionID = 10006
+	closedWon.Title = "已成交翡翠"
+	closedWon.Status = domain.AuctionStatusClosedWon
+	settled := ready
+	settled.AuctionID = 10007
+	settled.Title = "已结算翡翠"
+	settled.Status = domain.AuctionStatusSettled
+	for _, lot := range []*domain.AuctionLot{&ready, &draft, &ended, &unmounted, &hammerPending, &closedWon, &settled} {
 		if err := auctionRepo.Create(ctx, lot); err != nil {
 			t.Fatalf("create lot %d: %v", lot.AuctionID, err)
 		}
@@ -81,10 +94,75 @@ func TestMarketplaceSearchLotsOnlyReturnsPublicVisibleLots(t *testing.T) {
 	if total != 0 || len(lots) != 0 {
 		t.Fatalf("hidden status should not be visible, total=%d lots=%+v", total, lots)
 	}
+	lots, total, err = svc.SearchLots(ctx, domain.AuctionSearchFilter{Status: domain.AuctionStatusHammerPending, Limit: 20})
+	if err != nil {
+		t.Fatalf("search hammer pending status: %v", err)
+	}
+	if total != 0 || len(lots) != 0 {
+		t.Fatalf("hammer pending status should not be visible in discover, total=%d lots=%+v", total, lots)
+	}
+}
+
+func TestMarketplaceSearchLotsTreatsExtendedAsRunningForBuyer(t *testing.T) {
+	ctx := context.Background()
+	auctionRepo := repository.NewMemoryAuctionRepository()
+	sessionRepo := repository.NewMemoryLiveSessionRepository()
+	depositRepo := repository.NewMemoryDepositRepository()
+	userRepo := repository.NewSeedUserRepository()
+	svc := marketplaceapp.NewMarketplaceService(auctionRepo, sessionRepo, depositRepo, repository.NewMemoryOrderRepository(), userRepo, userRepo)
+	now := time.Now().UTC()
+	liveSession := domain.LiveSession{ID: 71001, MerchantID: "u_2001", Title: "开播直播间", Status: domain.LiveSessionStatusLive}
+	if err := sessionRepo.Create(ctx, &liveSession); err != nil {
+		t.Fatalf("create live session: %v", err)
+	}
+	liveSessionID := liveSession.ID
+	base := domain.AuctionLot{
+		SellerID:       "u_2001",
+		LiveSessionID:  &liveSessionID,
+		Title:          "直播竞拍拍品",
+		Description:    "用户端竞拍中筛选",
+		Category:       "珠宝玉石",
+		AuctionType:    domain.AuctionTypeEnglish,
+		StartPrice:     10000,
+		DepositAmount:  5000,
+		StartTime:      now,
+		EndTime:        now.Add(time.Hour),
+		IncrementRule:  domain.DefaultIncrementRule(),
+		ConditionGrade: domain.ConditionGood,
+	}
+	running := base
+	running.AuctionID = 11001
+	running.Status = domain.AuctionStatusRunning
+	extended := base
+	extended.AuctionID = 11002
+	extended.Status = domain.AuctionStatusExtended
+	ready := base
+	ready.AuctionID = 11003
+	ready.Status = domain.AuctionStatusReady
+	for _, lot := range []*domain.AuctionLot{&running, &extended, &ready} {
+		if err := auctionRepo.Create(ctx, lot); err != nil {
+			t.Fatalf("create lot %d: %v", lot.AuctionID, err)
+		}
+	}
+	lots, total, err := svc.SearchLots(ctx, domain.AuctionSearchFilter{Status: domain.AuctionStatusRunning, Limit: 20})
+	if err != nil {
+		t.Fatalf("search running lots: %v", err)
+	}
+	got := make(map[uint64]domain.AuctionStatus, len(lots))
+	for _, lot := range lots {
+		got[lot.AuctionID] = lot.Status
+	}
+	if total != 2 || len(lots) != 2 || got[running.AuctionID] != domain.AuctionStatusRunning || got[extended.AuctionID] != domain.AuctionStatusExtended {
+		t.Fatalf("expected running and extended lots, total=%d lots=%+v", total, lots)
+	}
+	if _, ok := got[ready.AuctionID]; ok {
+		t.Fatalf("ready lot should not match running filter: %+v", lots)
+	}
 }
 
 func TestMarketplaceCategoriesMatchDiscoverFilterCategories(t *testing.T) {
-	svc := marketplaceapp.NewMarketplaceService(repository.NewMemoryAuctionRepository(), repository.NewMemoryLiveSessionRepository(), repository.NewMemoryDepositRepository(), repository.NewMemoryOrderRepository(), repository.NewSeedUserRepository())
+	userRepo := repository.NewSeedUserRepository()
+	svc := marketplaceapp.NewMarketplaceService(repository.NewMemoryAuctionRepository(), repository.NewMemoryLiveSessionRepository(), repository.NewMemoryDepositRepository(), repository.NewMemoryOrderRepository(), userRepo, userRepo)
 	categories := svc.Categories(context.Background())
 	expected := []domain.Category{
 		{ID: "jewelry", Name: "珠宝玉石", IconName: "gem"},
@@ -119,7 +197,8 @@ func TestMarketplaceMyParticipationsAggregatesDepositLotRoomAndOrder(t *testing.
 	sessionRepo := repository.NewMemoryLiveSessionRepository()
 	depositRepo := repository.NewMemoryDepositRepository()
 	orderRepo := repository.NewMemoryOrderRepository()
-	svc := marketplaceapp.NewMarketplaceService(auctionRepo, sessionRepo, depositRepo, orderRepo, repository.NewSeedUserRepository())
+	userRepo := repository.NewSeedUserRepository()
+	svc := marketplaceapp.NewMarketplaceService(auctionRepo, sessionRepo, depositRepo, orderRepo, userRepo, userRepo)
 	now := time.Now().UTC()
 	session := domain.LiveSession{ID: 70001, MerchantID: "u_2001", Title: "珠宝直播", Status: domain.LiveSessionStatusLive, ActiveAuctionID: 10001}
 	if err := sessionRepo.Create(ctx, &session); err != nil {
@@ -171,19 +250,73 @@ func TestMarketplaceMyParticipationsAggregatesDepositLotRoomAndOrder(t *testing.
 func TestMarketplaceMerchantViewIncludesCurrentLiveSession(t *testing.T) {
 	ctx := context.Background()
 	sessionRepo := repository.NewMemoryLiveSessionRepository()
-	svc := marketplaceapp.NewMarketplaceService(repository.NewMemoryAuctionRepository(), sessionRepo, repository.NewMemoryDepositRepository(), repository.NewMemoryOrderRepository(), repository.NewSeedUserRepository())
+	userRepo := repository.NewSeedUserRepository()
+	merchantUser, err := userRepo.FindByID("u_2001")
+	if err != nil {
+		t.Fatalf("find merchant: %v", err)
+	}
+	merchantUser.Location = "杭州"
+	if err := userRepo.Update(&merchantUser); err != nil {
+		t.Fatalf("update merchant location: %v", err)
+	}
+	svc := marketplaceapp.NewMarketplaceService(repository.NewMemoryAuctionRepository(), sessionRepo, repository.NewMemoryDepositRepository(), repository.NewMemoryOrderRepository(), userRepo, userRepo)
 	session := domain.LiveSession{ID: 70001, MerchantID: "u_2001", Title: "当前直播", Status: domain.LiveSessionStatusLive}
 	if err := sessionRepo.Create(ctx, &session); err != nil {
 		t.Fatalf("create session: %v", err)
 	}
-	merchant, err := svc.GetMerchant(ctx, "u_2001")
+	merchant, err := svc.GetMerchant(ctx, "u_1001", domain.RoleBuyer, "u_2001")
 	if err != nil {
 		t.Fatalf("get merchant: %v", err)
 	}
-	if merchant.ID != "u_2001" || merchant.Name != "商家001" || merchant.LiveSessionID != session.ID || merchant.LiveRoomID != "70001" || merchant.CurrentLiveSession == nil {
+	if merchant.ID != "u_2001" || merchant.Name != "商家001" || merchant.Location != "杭州" || merchant.LiveSessionID != session.ID || merchant.LiveRoomID != "70001" || merchant.CurrentLiveSession == nil {
 		t.Fatalf("unexpected merchant view: %+v", merchant)
 	}
 	if merchant.CurrentLiveSession.MerchantName != "商家001" {
 		t.Fatalf("expected current live session merchant name, got %+v", merchant.CurrentLiveSession)
+	}
+}
+
+func TestMarketplaceFollowMerchantUpdatesFollowerCountAndFollowingList(t *testing.T) {
+	ctx := context.Background()
+	sessionRepo := repository.NewMemoryLiveSessionRepository()
+	userRepo := repository.NewSeedUserRepository()
+	svc := marketplaceapp.NewMarketplaceService(repository.NewMemoryAuctionRepository(), sessionRepo, repository.NewMemoryDepositRepository(), repository.NewMemoryOrderRepository(), userRepo, userRepo)
+	session := domain.LiveSession{ID: 70001, MerchantID: "u_2001", Title: "当前直播", Status: domain.LiveSessionStatusLive}
+	if err := sessionRepo.Create(ctx, &session); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	merchant, err := svc.FollowMerchant(ctx, "u_1001", domain.RoleBuyer, "2001")
+	if err != nil {
+		t.Fatalf("follow merchant: %v", err)
+	}
+	if !merchant.IsFollowed || merchant.FollowerCount != 1 {
+		t.Fatalf("expected followed merchant with one follower, got %+v", merchant)
+	}
+	merchant, err = svc.FollowMerchant(ctx, "u_1001", domain.RoleBuyer, "u_2001")
+	if err != nil {
+		t.Fatalf("follow merchant again: %v", err)
+	}
+	if merchant.FollowerCount != 1 {
+		t.Fatalf("repeat follow should not duplicate follower count, got %+v", merchant)
+	}
+	view := svc.LiveSessionView(ctx, session)
+	if view.MerchantFollowerCount != 1 {
+		t.Fatalf("expected live session merchant follower count, got %+v", view)
+	}
+	follows, total, err := svc.MyFollowedMerchants(ctx, "1001", domain.RoleBuyer, 20, 0)
+	if err != nil {
+		t.Fatalf("my followed merchants: %v", err)
+	}
+	if total != 1 || len(follows) != 1 || follows[0].Merchant.ID != "u_2001" || follows[0].Merchant.CurrentLiveSession == nil {
+		t.Fatalf("expected followed merchant with current live session, total=%d follows=%+v", total, follows)
+	}
+
+	merchant, err = svc.UnfollowMerchant(ctx, "u_1001", domain.RoleBuyer, "u_2001")
+	if err != nil {
+		t.Fatalf("unfollow merchant: %v", err)
+	}
+	if merchant.IsFollowed || merchant.FollowerCount != 0 {
+		t.Fatalf("expected unfollowed merchant with zero followers, got %+v", merchant)
 	}
 }

@@ -16,12 +16,13 @@ type MarketplaceService struct {
 	deposits marketplaceports.DepositRepository
 	orders   marketplaceports.OrderRepository
 	users    marketplaceports.UserRepository
+	follows  marketplaceports.MerchantFollowRepository
 	realtime marketplaceports.AuctionRealtimeStore
 	hub      marketplaceports.OnlineCounter
 }
 
-func NewMarketplaceService(auctions marketplaceports.AuctionRepository, sessions marketplaceports.LiveSessionRepository, deposits marketplaceports.DepositRepository, orders marketplaceports.OrderRepository, users marketplaceports.UserRepository) *MarketplaceService {
-	return &MarketplaceService{auctions: auctions, sessions: sessions, deposits: deposits, orders: orders, users: users}
+func NewMarketplaceService(auctions marketplaceports.AuctionRepository, sessions marketplaceports.LiveSessionRepository, deposits marketplaceports.DepositRepository, orders marketplaceports.OrderRepository, users marketplaceports.UserRepository, follows marketplaceports.MerchantFollowRepository) *MarketplaceService {
+	return &MarketplaceService{auctions: auctions, sessions: sessions, deposits: deposits, orders: orders, users: users, follows: follows}
 }
 
 func (s *MarketplaceService) SetRealtime(realtime marketplaceports.AuctionRealtimeStore) {
@@ -42,9 +43,13 @@ func (s *MarketplaceService) SearchLots(ctx context.Context, filter domain.Aucti
 	if s == nil || s.auctions == nil {
 		return nil, 0, domain.ErrNotFound
 	}
-	filter.VisibleStatuses = publicAuctionStatuses()
-	if filter.Status != "" && !publicAuctionStatus(filter.Status) {
+	filter.VisibleStatuses = discoverAuctionStatuses()
+	if filter.Status != "" && !discoverAuctionStatus(filter.Status) {
 		return []domain.AuctionLot{}, 0, nil
+	}
+	if filter.Status == domain.AuctionStatusRunning {
+		filter.VisibleStatuses = []domain.AuctionStatus{domain.AuctionStatusRunning, domain.AuctionStatusExtended}
+		filter.Status = ""
 	}
 	liveSessionIDs, err := s.liveSessionIDs(ctx)
 	if err != nil {
@@ -146,7 +151,7 @@ func (s *MarketplaceService) Categories(ctx context.Context) []domain.Category {
 	return defaultCategories()
 }
 
-func (s *MarketplaceService) SearchMerchants(ctx context.Context, keyword string, limit, offset int) ([]domain.MerchantView, error) {
+func (s *MarketplaceService) SearchMerchants(ctx context.Context, viewerID string, viewerRole domain.Role, keyword string, limit, offset int) ([]domain.MerchantView, error) {
 	if s == nil || s.users == nil {
 		return nil, domain.ErrNotFound
 	}
@@ -162,27 +167,101 @@ func (s *MarketplaceService) SearchMerchants(ctx context.Context, keyword string
 	}
 	merchants := make([]domain.MerchantView, 0, len(users))
 	for _, user := range users {
-		merchants = append(merchants, s.merchantView(ctx, user))
+		merchants = append(merchants, s.merchantView(ctx, user, viewerID, viewerRole))
 	}
 	return merchants, nil
 }
 
-func (s *MarketplaceService) GetMerchant(ctx context.Context, merchantID string) (domain.MerchantView, error) {
-	if s == nil || s.users == nil {
-		return domain.MerchantView{}, domain.ErrNotFound
-	}
-	merchantID = strings.TrimSpace(merchantID)
-	if merchantID == "" {
-		return domain.MerchantView{}, domain.ErrInvalidArgument
-	}
-	user, err := s.users.FindByID(merchantID)
+func (s *MarketplaceService) GetMerchant(ctx context.Context, viewerID string, viewerRole domain.Role, merchantID string) (domain.MerchantView, error) {
+	user, err := s.getActiveMerchant(merchantID)
 	if err != nil {
 		return domain.MerchantView{}, err
 	}
-	if user.Role != domain.RoleMerchant || user.Status != domain.UserStatusActive {
-		return domain.MerchantView{}, domain.ErrNotFound
+	return s.merchantView(ctx, user, viewerID, viewerRole), nil
+}
+
+func (s *MarketplaceService) FollowMerchant(ctx context.Context, buyerID string, role domain.Role, merchantID string) (domain.MerchantView, error) {
+	buyerID = strings.TrimSpace(buyerID)
+	if s == nil || s.follows == nil || buyerID == "" || role != domain.RoleBuyer {
+		return domain.MerchantView{}, domain.ErrForbidden
 	}
-	return s.merchantView(ctx, user), nil
+	user, err := s.getActiveMerchant(merchantID)
+	if err != nil {
+		return domain.MerchantView{}, err
+	}
+	if sameUserID(buyerID, user.ID) {
+		return domain.MerchantView{}, domain.ErrInvalidArgument
+	}
+	if _, err := s.follows.FollowMerchant(ctx, buyerID, user.ID); err != nil {
+		return domain.MerchantView{}, err
+	}
+	return s.merchantView(ctx, user, buyerID, role), nil
+}
+
+func (s *MarketplaceService) UnfollowMerchant(ctx context.Context, buyerID string, role domain.Role, merchantID string) (domain.MerchantView, error) {
+	buyerID = strings.TrimSpace(buyerID)
+	if s == nil || s.follows == nil || buyerID == "" || role != domain.RoleBuyer {
+		return domain.MerchantView{}, domain.ErrForbidden
+	}
+	user, err := s.getActiveMerchant(merchantID)
+	if err != nil {
+		return domain.MerchantView{}, err
+	}
+	if err := s.follows.UnfollowMerchant(ctx, buyerID, user.ID); err != nil {
+		return domain.MerchantView{}, err
+	}
+	return s.merchantView(ctx, user, buyerID, role), nil
+}
+
+func (s *MarketplaceService) MyFollowedMerchants(ctx context.Context, buyerID string, role domain.Role, limit, offset int) ([]domain.FollowedMerchant, int64, error) {
+	buyerID = strings.TrimSpace(buyerID)
+	if s == nil || s.follows == nil || s.users == nil || buyerID == "" || role != domain.RoleBuyer {
+		return nil, 0, domain.ErrForbidden
+	}
+	follows, err := s.follows.ListMerchantFollowsByBuyer(ctx, buyerID, limit, offset)
+	if err != nil {
+		return nil, 0, err
+	}
+	total, err := s.follows.CountMerchantFollowsByBuyer(ctx, buyerID)
+	if err != nil {
+		return nil, 0, err
+	}
+	out := make([]domain.FollowedMerchant, 0, len(follows))
+	for _, follow := range follows {
+		user, err := s.users.FindByID(follow.MerchantID)
+		if err != nil {
+			if errors.Is(err, domain.ErrUserNotFound) || errors.Is(err, domain.ErrNotFound) {
+				continue
+			}
+			return nil, 0, err
+		}
+		if user.Role != domain.RoleMerchant || user.Status != domain.UserStatusActive {
+			continue
+		}
+		out = append(out, domain.FollowedMerchant{
+			Merchant:   s.merchantView(ctx, user, buyerID, role),
+			FollowedAt: follow.CreatedAt,
+		})
+	}
+	return out, total, nil
+}
+
+func (s *MarketplaceService) getActiveMerchant(merchantID string) (domain.User, error) {
+	if s == nil || s.users == nil {
+		return domain.User{}, domain.ErrNotFound
+	}
+	merchantID = strings.TrimSpace(merchantID)
+	if merchantID == "" {
+		return domain.User{}, domain.ErrInvalidArgument
+	}
+	user, err := s.users.FindByID(merchantID)
+	if err != nil {
+		return domain.User{}, err
+	}
+	if user.Role != domain.RoleMerchant || user.Status != domain.UserStatusActive {
+		return domain.User{}, domain.ErrNotFound
+	}
+	return user, nil
 }
 
 func (s *MarketplaceService) LiveSessionView(ctx context.Context, session domain.LiveSession) domain.LiveSessionView {
@@ -195,6 +274,11 @@ func (s *MarketplaceService) LiveSessionView(ctx context.Context, session domain
 	if s != nil && s.users != nil {
 		if user, err := s.users.FindByID(session.MerchantID); err == nil {
 			view.MerchantName = strings.TrimSpace(user.Nickname)
+		}
+	}
+	if s != nil && s.follows != nil && strings.TrimSpace(session.MerchantID) != "" {
+		if count, err := s.follows.CountMerchantFollowers(ctx, session.MerchantID); err == nil {
+			view.MerchantFollowerCount = count
 		}
 	}
 	if s != nil && s.hub != nil {
@@ -271,12 +355,23 @@ func (s *MarketplaceService) participationOrder(ctx context.Context, deposit dom
 	return order, true
 }
 
-func (s *MarketplaceService) merchantView(ctx context.Context, user domain.User) domain.MerchantView {
+func (s *MarketplaceService) merchantView(ctx context.Context, user domain.User, viewerID string, viewerRole domain.Role) domain.MerchantView {
 	view := domain.MerchantView{
 		ID:            user.ID,
 		Name:          strings.TrimSpace(user.Nickname),
 		AvatarURL:     strings.TrimSpace(user.AvatarURL),
+		Location:      strings.TrimSpace(user.Location),
 		FollowerCount: 0,
+	}
+	if s != nil && s.follows != nil {
+		if count, err := s.follows.CountMerchantFollowers(ctx, user.ID); err == nil {
+			view.FollowerCount = count
+		}
+		if viewerRole == domain.RoleBuyer && strings.TrimSpace(viewerID) != "" {
+			if followed, err := s.follows.IsFollowingMerchant(ctx, viewerID, user.ID); err == nil {
+				view.IsFollowed = followed
+			}
+		}
 	}
 	if s == nil || s.sessions == nil {
 		return view
@@ -312,6 +407,24 @@ func publicAuctionStatuses() []domain.AuctionStatus {
 
 func publicAuctionStatus(status domain.AuctionStatus) bool {
 	for _, visible := range publicAuctionStatuses() {
+		if status == visible {
+			return true
+		}
+	}
+	return false
+}
+
+func discoverAuctionStatuses() []domain.AuctionStatus {
+	return []domain.AuctionStatus{
+		domain.AuctionStatusReady,
+		domain.AuctionStatusWarmingUp,
+		domain.AuctionStatusRunning,
+		domain.AuctionStatusExtended,
+	}
+}
+
+func discoverAuctionStatus(status domain.AuctionStatus) bool {
+	for _, visible := range discoverAuctionStatuses() {
 		if status == visible {
 			return true
 		}

@@ -116,7 +116,7 @@ func (s *AuthService) Me(userID string) (domain.SafeUser, error) {
 
 func (s *AuthService) UpdateProfile(in UpdateProfileInput) (domain.SafeUser, error) {
 	userID := strings.TrimSpace(in.UserID)
-	if userID == "" || in.Nickname == nil {
+	if userID == "" || (in.Nickname == nil && in.Location == nil) {
 		return domain.SafeUser{}, domain.ErrInvalidArgument
 	}
 	user, err := s.users.FindByID(userID)
@@ -126,11 +126,20 @@ func (s *AuthService) UpdateProfile(in UpdateProfileInput) (domain.SafeUser, err
 	if user.Status == domain.UserStatusDisabled {
 		return domain.SafeUser{}, domain.ErrAccountDisabled
 	}
-	nickname := strings.TrimSpace(*in.Nickname)
-	if nickname == "" || utf8.RuneCountInString(nickname) > 64 {
-		return domain.SafeUser{}, domain.ErrInvalidArgument
+	if in.Nickname != nil {
+		nickname := strings.TrimSpace(*in.Nickname)
+		if nickname == "" || utf8.RuneCountInString(nickname) > 64 {
+			return domain.SafeUser{}, domain.ErrInvalidArgument
+		}
+		user.Nickname = nickname
 	}
-	user.Nickname = nickname
+	if in.Location != nil {
+		location := strings.TrimSpace(*in.Location)
+		if utf8.RuneCountInString(location) > 64 {
+			return domain.SafeUser{}, domain.ErrInvalidArgument
+		}
+		user.Location = location
+	}
 	if err := s.users.Update(&user); err != nil {
 		return domain.SafeUser{}, err
 	}

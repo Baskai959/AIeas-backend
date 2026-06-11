@@ -54,6 +54,7 @@ func buildMySQLServerDependencies(cfg appconfig.Config, platform *platformDeps) 
 	userRepo := userrepo.NewMySQLUserRepository(platform.db)
 	return ServerDependencies{
 		UserRepo:                            userRepo,
+		MerchantFollowRepo:                  userRepo,
 		AuctionRepo:                         auctionrepo.NewMySQLAuctionRepository(platform.db, mysqlinfra.ResolveDB),
 		LiveSessionRepo:                     livesessionrepo.NewMySQLLiveSessionRepository(platform.db, mysqlinfra.ResolveDB),
 		LiveAnalysisReportRepo:              liveanalysisrepo.NewMySQLLiveAnalysisReportRepository(platform.db, mysqlinfra.ResolveDB),

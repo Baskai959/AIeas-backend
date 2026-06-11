@@ -1,0 +1,45 @@
+- generic [ref=e3]:
+  - generic [ref=e5]:
+    - generic [ref=e7]:
+      - img "商家竞拍后台" [ref=e8]
+      - generic [ref=e9]: 商家竞拍后台
+    - list [ref=e10]:
+      - listitem [ref=e11]:
+        - generic [ref=e12] [cursor=pointer]:
+          - generic [ref=e15]: 商
+          - generic [ref=e17]: 商家001
+  - generic [ref=e18]:
+    - complementary [ref=e19]:
+      - generic [ref=e20]:
+        - menu [ref=e22]:
+          - generic [ref=e23]:
+            - generic [ref=e24]:
+              - generic [ref=e25] [cursor=pointer]:
+                - generic [ref=e26]:
+                  - img [ref=e28]
+                  - text: 我的直播间
+                - img [ref=e31]
+              - menuitem "我的直播间" [ref=e33] [cursor=pointer]:
+                - generic [ref=e35]:
+                  - img [ref=e37]
+                  - text: 我的直播间
+            - generic [ref=e40] [cursor=pointer]:
+              - generic [ref=e41]:
+                - img [ref=e43]
+                - text: 拍品管理
+              - img [ref=e46]
+            - generic [ref=e49] [cursor=pointer]:
+              - generic [ref=e50]:
+                - img [ref=e52]
+                - text: 成交订单
+              - img [ref=e55]
+        - img [ref=e58] [cursor=pointer]
+    - generic [ref=e60]:
+      - generic [ref=e61]:
+        - list [ref=e63]:
+          - listitem [ref=e64]: 我的直播间
+          - img [ref=e66]
+          - listitem [ref=e68]: 我的直播间
+        - main [ref=e69]:
+          - img [ref=e73]
+      - generic [ref=e75]: 商家竞拍后台

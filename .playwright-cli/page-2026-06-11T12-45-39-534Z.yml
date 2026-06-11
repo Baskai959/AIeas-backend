@@ -1,0 +1,46 @@
+- generic [ref=e3]:
+  - generic [ref=e5]:
+    - img "直播竞拍控场场景" [ref=e6]
+    - generic [ref=e8]:
+      - generic [ref=e9]:
+        - img "商家竞拍后台" [ref=e10]
+        - generic [ref=e11]: 商家竞拍后台
+      - generic [ref=e12]:
+        - heading "直播竞拍运营，一屏掌控" [level=1] [ref=e13]
+        - paragraph [ref=e14]: 从拍品准备、直播控场到成交复盘，用清晰稳定的后台完成日常运营。
+      - generic [ref=e15]:
+        - generic [ref=e16]: 拍品准备
+        - generic [ref=e17]: 直播控场
+        - generic [ref=e18]: 成交复盘
+  - generic [ref=e19]:
+    - generic [ref=e21]:
+      - generic [ref=e22]:
+        - generic [ref=e23]: 登录商家后台
+        - generic [ref=e24]: 进入拍品、直播间和成交订单管理工作台。
+      - generic [ref=e26]:
+        - generic [ref=e27]:
+          - generic [ref=e29]:
+            - strong [ref=e30]:
+              - img [ref=e31]
+            - text: 账号
+          - generic [ref=e39]:
+            - img [ref=e41]
+            - textbox "账号" [ref=e44]:
+              - /placeholder: 请输入商家账号
+              - text: merchant001
+        - generic [ref=e45]:
+          - generic [ref=e47]:
+            - strong [ref=e48]:
+              - img [ref=e49]
+            - text: 密码
+          - generic [ref=e57]:
+            - img [ref=e59]
+            - textbox "密码" [ref=e62]
+            - img [ref=e64] [cursor=pointer]
+        - generic [ref=e67]:
+          - generic [ref=e70] [cursor=pointer]:
+            - checkbox "记住账号"
+            - text: 记住账号
+          - button "登录后台" [ref=e74] [cursor=pointer]
+          - generic [ref=e76]: 仅限已授权商家账号访问。
+    - contentinfo [ref=e78]: 商家竞拍后台

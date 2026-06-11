@@ -294,6 +294,7 @@ CREATE TABLE `user` (
   `nickname` varchar(64) NOT NULL COMMENT '昵称',
   `password_hash` char(64) NOT NULL COMMENT '密码哈希',
   `avatar_url` varchar(512) DEFAULT NULL COMMENT '头像 URL',
+  `location` varchar(64) DEFAULT NULL COMMENT '所在地',
   `role` varchar(16) NOT NULL DEFAULT 'buyer' COMMENT '角色：buyer/merchant/admin',
   `status` varchar(16) NOT NULL DEFAULT 'ACTIVE' COMMENT '账号状态：ACTIVE/DISABLED',
   `ai_permission` varchar(16) NOT NULL DEFAULT 'ASK' COMMENT '商家 AI 控制权限：ASK=执行前询问/ALLOW=自动允许/DENY=自动拒绝',

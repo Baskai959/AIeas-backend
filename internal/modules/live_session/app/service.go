@@ -33,6 +33,10 @@ type liveSessionTxManager interface {
 
 type LiveSessionAuctionRealtimeStore = auctionports.AuctionRealtimeStore
 
+type MerchantFollowerCounter interface {
+	CountMerchantFollowers(ctx context.Context, merchantID string) (int, error)
+}
+
 type LiveSessionAuctionUseCase interface {
 	StartWithTiming(ctx context.Context, auctionID uint64, actorID string, actorRole domain.Role, startTime, endTime time.Time) (domain.AuctionLot, error)
 	InvalidateAuctionSnapshot(ctx context.Context, auctionID uint64)
@@ -83,6 +87,7 @@ type LiveSessionService struct {
 	bids            livesessionports.BidReader
 	orders          livesessionports.OrderReader
 	users           livesessionports.UserReader
+	follows         MerchantFollowerCounter
 	auctionRealtime LiveSessionAuctionRealtimeStore
 	hub             OnlineCounter
 	sessionRealtime livesessionports.LiveSessionRealtimeStore
@@ -113,6 +118,7 @@ type LiveSessionServiceDeps struct {
 	Bids            livesessionports.BidReader
 	Orders          livesessionports.OrderReader
 	Users           livesessionports.UserReader
+	Followers       MerchantFollowerCounter
 	AuctionRealtime LiveSessionAuctionRealtimeStore
 	OnlineCounter   OnlineCounter
 	SessionRealtime livesessionports.LiveSessionRealtimeStore
@@ -145,6 +151,7 @@ func NewLiveSessionServiceWithDeps(deps LiveSessionServiceDeps) *LiveSessionServ
 		bids:              deps.Bids,
 		orders:            deps.Orders,
 		users:             deps.Users,
+		follows:           deps.Followers,
 		auctionRealtime:   deps.AuctionRealtime,
 		hub:               deps.OnlineCounter,
 		sessionRealtime:   deps.SessionRealtime,
@@ -284,19 +291,20 @@ type DeactivateLiveSessionAuctionInput struct {
 }
 
 type LiveSessionStats struct {
-	LiveSessionID        uint64 `json:"liveSessionId"`
-	Online               int    `json:"online"`
-	LotsTotal            int    `json:"lotsTotal"`
-	LotsSold             int    `json:"lotsSold"`
-	LotsUnsold           int    `json:"lotsUnsold"`
-	BidCount             int    `json:"bidCount"`
-	GMVCent              int64  `json:"gmvCent"`
-	ViewerPeak           int    `json:"viewerPeak"`
-	ViewerTotal          int    `json:"viewerTotal"`
-	ActiveAuctionID      uint64 `json:"activeAuctionId"`
-	CurrentBidCount      int    `json:"currentBidCount"`
-	CurrentRemainSeconds int64  `json:"currentRemainSeconds"`
-	CurrentPrice         int64  `json:"currentPrice"`
+	LiveSessionID         uint64 `json:"liveSessionId"`
+	Online                int    `json:"online"`
+	LotsTotal             int    `json:"lotsTotal"`
+	LotsSold              int    `json:"lotsSold"`
+	LotsUnsold            int    `json:"lotsUnsold"`
+	BidCount              int    `json:"bidCount"`
+	GMVCent               int64  `json:"gmvCent"`
+	ViewerPeak            int    `json:"viewerPeak"`
+	ViewerTotal           int    `json:"viewerTotal"`
+	MerchantFollowerCount int    `json:"merchantFollowerCount"`
+	ActiveAuctionID       uint64 `json:"activeAuctionId"`
+	CurrentBidCount       int    `json:"currentBidCount"`
+	CurrentRemainSeconds  int64  `json:"currentRemainSeconds"`
+	CurrentPrice          int64  `json:"currentPrice"`
 }
 
 func (s *LiveSessionService) Create(ctx context.Context, in CreateLiveSessionInput) (domain.LiveSession, error) {
@@ -1313,6 +1321,11 @@ func (s *LiveSessionService) Stats(ctx context.Context, sessionID uint64, actorI
 		return LiveSessionStats{}, domain.ErrForbidden
 	}
 	stats := LiveSessionStats{LiveSessionID: session.ID, LotsTotal: session.LotsTotal, LotsSold: session.LotsSold, LotsUnsold: session.LotsUnsold, BidCount: session.BidCount, GMVCent: session.GMVCent, ViewerPeak: session.ViewerPeak, ViewerTotal: session.ViewerTotal, ActiveAuctionID: session.ActiveAuctionID}
+	if s.follows != nil {
+		if count, err := s.follows.CountMerchantFollowers(ctx, session.MerchantID); err == nil {
+			stats.MerchantFollowerCount = count
+		}
+	}
 	if stats.LotsTotal == 0 {
 		lots, err := s.auctions.List(ctx, domain.AuctionFilter{LiveSessionID: sessionID, Limit: 100})
 		if err == nil {

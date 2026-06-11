@@ -199,7 +199,7 @@ agent:
   # 商品描述优化接口超时时间。
   productDescriptionTimeout: 2m
   # 是否启用商品 AI 审核；false 时提交审核默认直接通过。
-  productAuditEnabled: true
+  productAuditEnabled: false
   # 商品 AI 审核接口地址。
   productAuditURL: "http://127.0.0.1:8000/api/v1/product-audit"
   # 商品审核结果回调地址。

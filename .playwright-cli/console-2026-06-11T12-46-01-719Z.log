@@ -1,0 +1,7 @@
+[      51ms] [LOG] [vite] connecting... @ http://127.0.0.1:3031/@vite/client:183
+[      55ms] [LOG] [vite] connected. @ http://127.0.0.1:3031/@vite/client:211
+[     151ms] [ERROR] Failed to load resource: the server responded with a status of 401 (Unauthorized) @ http://127.0.0.1:3031/api/v1/live-sessions?merchantId=u_2001&limit=50&offset=0:0
+[     154ms] [ERROR] Failed to load resource: the server responded with a status of 401 (Unauthorized) @ http://127.0.0.1:3031/api/v1/auth/refresh:0
+[     220ms] [LOG] [vite] connecting... @ http://127.0.0.1:3031/@vite/client:183
+[     228ms] [LOG] [vite] connected. @ http://127.0.0.1:3031/@vite/client:211
+[     358ms] [VERBOSE] [DOM] Input elements should have autocomplete attributes (suggested: "current-password"): (More info: https://goo.gl/9p2vKq) %o @ http://127.0.0.1:3031/login:0

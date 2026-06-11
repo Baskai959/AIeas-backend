@@ -37,6 +37,16 @@ type UserRepository interface {
 	FindByID(id string) (domain.User, error)
 }
 
+// MerchantFollowRepository 是商城模块维护买家关注商家关系所需端口。
+type MerchantFollowRepository interface {
+	FollowMerchant(ctx context.Context, buyerID, merchantID string) (domain.MerchantFollow, error)
+	UnfollowMerchant(ctx context.Context, buyerID, merchantID string) error
+	IsFollowingMerchant(ctx context.Context, buyerID, merchantID string) (bool, error)
+	CountMerchantFollowers(ctx context.Context, merchantID string) (int, error)
+	ListMerchantFollowsByBuyer(ctx context.Context, buyerID string, limit, offset int) ([]domain.MerchantFollow, error)
+	CountMerchantFollowsByBuyer(ctx context.Context, buyerID string) (int64, error)
+}
+
 // AuctionRealtimeStore 是商城模块读取实时拍卖状态的端口。
 type AuctionRealtimeStore interface {
 	GetAuctionState(ctx context.Context, auctionID uint64) (domain.AuctionState, bool, error)

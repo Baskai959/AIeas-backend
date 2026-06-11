@@ -20,6 +20,7 @@ type RefreshResult struct {
 type UpdateProfileInput struct {
 	UserID   string
 	Nickname *string
+	Location *string
 }
 
 // AuthUseCase 暴露认证模块对 HTTP transport 的最小应用边界。

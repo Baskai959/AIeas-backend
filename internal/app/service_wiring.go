@@ -33,6 +33,7 @@ import (
 	livesessionports "aieas_backend/internal/modules/live_session/ports"
 	livesessionrepo "aieas_backend/internal/modules/live_session/repository"
 	marketplaceapp "aieas_backend/internal/modules/marketplace/app"
+	marketplaceports "aieas_backend/internal/modules/marketplace/ports"
 	mcpapp "aieas_backend/internal/modules/mcp/app"
 	mcpports "aieas_backend/internal/modules/mcp/ports"
 	orderapp "aieas_backend/internal/modules/order/app"
@@ -144,6 +145,13 @@ func (a depositTraceSpanAdapter) RecordError(err error) {
 func withDefaultServerDependencies(cfg appconfig.Config, deps ServerDependencies) ServerDependencies {
 	if deps.UserRepo == nil {
 		deps.UserRepo = userrepo.NewSeedUserRepository()
+	}
+	if deps.MerchantFollowRepo == nil {
+		if repo, ok := deps.UserRepo.(marketplaceports.MerchantFollowRepository); ok {
+			deps.MerchantFollowRepo = repo
+		} else {
+			deps.MerchantFollowRepo = userrepo.NewSeedUserRepository()
+		}
 	}
 	if deps.AuctionRepo == nil {
 		deps.AuctionRepo = auctionrepo.NewMemoryAuctionRepository()
@@ -329,6 +337,7 @@ func buildAppServices(cfg appconfig.Config, deps ServerDependencies) appServices
 		Bids:            deps.BidRepo,
 		Orders:          deps.OrderRepo,
 		Users:           deps.UserRepo,
+		Followers:       deps.MerchantFollowRepo,
 		AuctionRealtime: deps.RealtimeStore,
 		OnlineCounter:   deps.Hub,
 		SessionRealtime: deps.LiveSessionRealtimeStore,
@@ -362,7 +371,7 @@ func buildAppServices(cfg appconfig.Config, deps ServerDependencies) appServices
 	if deps.Hub != nil {
 		deps.Hub.SetMetrics(deps.MetricsRegistry)
 	}
-	marketplaceService := marketplaceapp.NewMarketplaceService(deps.AuctionRepo, deps.LiveSessionRepo, deps.DepositRepo, deps.OrderRepo, deps.UserRepo)
+	marketplaceService := marketplaceapp.NewMarketplaceService(deps.AuctionRepo, deps.LiveSessionRepo, deps.DepositRepo, deps.OrderRepo, deps.UserRepo, deps.MerchantFollowRepo)
 	marketplaceService.SetRealtime(deps.RealtimeStore)
 	marketplaceService.SetOnlineCounter(deps.Hub)
 	adminService := adminapp.NewAdminService(deps.UserRepo, auctionService, hammerService, orderService, riskService, deps.AuditRepo)
