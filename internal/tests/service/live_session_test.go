@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -22,6 +23,16 @@ func (s *failingSetActiveAuctionStore) SetActiveAuction(ctx context.Context, ses
 		return s.err
 	}
 	return s.MemoryLiveSessionRealtimeStore.SetActiveAuction(ctx, sessionID, auctionID)
+}
+
+type countingLiveSessionRepository struct {
+	*repository.MemoryLiveSessionRepository
+	getCalls atomic.Int64
+}
+
+func (r *countingLiveSessionRepository) Get(ctx context.Context, id uint64) (domain.LiveSession, error) {
+	r.getCalls.Add(1)
+	return r.MemoryLiveSessionRepository.Get(ctx, id)
 }
 
 type fakeLiveSessionOnlineCounter struct {
@@ -148,6 +159,67 @@ func TestLiveSessionServiceIncrCounters(t *testing.T) {
 	// ViewerPeak should be max(3, 2) = 3
 	if got.ViewerPeak != 3 {
 		t.Fatalf("viewerPeak=%d, want 3 (max-only update)", got.ViewerPeak)
+	}
+}
+
+func TestLiveSessionServiceActiveAuctionAndSessionCachesLookup(t *testing.T) {
+	ctx := context.Background()
+	sessionRepo := &countingLiveSessionRepository{MemoryLiveSessionRepository: repository.NewMemoryLiveSessionRepository()}
+	auctionRepo := repository.NewMemoryAuctionRepository()
+	svc := NewLiveSessionService(sessionRepo, auctionRepo)
+	session := domain.LiveSession{
+		ID:              90000027,
+		MerchantID:      "m_hot",
+		Title:           "热点直播间",
+		Status:          domain.LiveSessionStatusLive,
+		ActiveAuctionID: 10000027,
+	}
+	if err := sessionRepo.Create(ctx, &session); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	sessionRepo.getCalls.Store(0)
+
+	for i := 0; i < 20; i++ {
+		auctionID, liveSessionID, err := svc.ActiveAuctionAndSession(ctx, session.ID)
+		if err != nil {
+			t.Fatalf("active lookup %d: %v", i, err)
+		}
+		if auctionID != session.ActiveAuctionID || liveSessionID != session.ID {
+			t.Fatalf("unexpected active lookup result auction=%d session=%d", auctionID, liveSessionID)
+		}
+	}
+	if calls := sessionRepo.getCalls.Load(); calls != 1 {
+		t.Fatalf("expected cached active lookup to hit repository once, got %d", calls)
+	}
+}
+
+func TestLiveSessionServiceActiveAuctionAndSessionUsesRealtimeBeforeRepository(t *testing.T) {
+	ctx := context.Background()
+	sessionRepo := &countingLiveSessionRepository{MemoryLiveSessionRepository: repository.NewMemoryLiveSessionRepository()}
+	auctionRepo := repository.NewMemoryAuctionRepository()
+	realtime := repository.NewMemoryLiveSessionRealtimeStore()
+	svc := NewLiveSessionServiceWithDeps(LiveSessionServiceDeps{
+		Sessions:        sessionRepo,
+		Auctions:        auctionRepo,
+		SessionRealtime: realtime,
+	})
+	const (
+		sessionID = uint64(90000028)
+		auctionID = uint64(10000028)
+	)
+	if err := realtime.SetActiveAuction(ctx, sessionID, auctionID); err != nil {
+		t.Fatalf("set realtime active auction: %v", err)
+	}
+
+	gotAuctionID, gotSessionID, err := svc.ActiveAuctionAndSession(ctx, sessionID)
+	if err != nil {
+		t.Fatalf("active lookup: %v", err)
+	}
+	if gotAuctionID != auctionID || gotSessionID != sessionID {
+		t.Fatalf("unexpected active lookup result auction=%d session=%d", gotAuctionID, gotSessionID)
+	}
+	if calls := sessionRepo.getCalls.Load(); calls != 0 {
+		t.Fatalf("expected realtime active lookup to skip repository, got %d Get calls", calls)
 	}
 }
 

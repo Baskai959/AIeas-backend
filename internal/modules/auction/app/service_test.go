@@ -24,6 +24,94 @@ func (p *recordingAuctionEventPublisher) Broadcast(auctionID uint64, env auction
 	return 1
 }
 
+type streamExtendedRealtimeStore struct {
+	noopRealtimeStore
+	result domain.BidResult
+}
+
+func (s streamExtendedRealtimeStore) StreamEnabled() bool {
+	return true
+}
+
+func (s streamExtendedRealtimeStore) PlaceBid(ctx context.Context, input domain.BidInput) (domain.BidResult, error) {
+	_ = ctx
+	_ = input
+	return s.result, nil
+}
+
+func TestBidServiceArbitratePublishesTimerExtendedInStreamMode(t *testing.T) {
+	ctx := context.Background()
+	now := time.Now().UTC()
+	auctionID := uint64(91000)
+	liveSessionID := uint64(90000)
+	publisher := &recordingAuctionEventPublisher{}
+	result := domain.BidResult{
+		RequestID:      "bid-extended-1",
+		AuctionID:      auctionID,
+		LiveSessionID:  liveSessionID,
+		BidderID:       "u_1001",
+		Price:          1500,
+		Accepted:       true,
+		CurrentPrice:   1500,
+		LeaderBidderID: "u_1001",
+		EndTime:        now.Add(30 * time.Second),
+		Extended:       true,
+		ExtendCount:    1,
+		Seq:            7,
+		AuctionStatus:  domain.AuctionStatusExtended,
+	}
+	svc := NewBidServiceWithDeps(BidServiceDeps{
+		Realtime:  streamExtendedRealtimeStore{result: result},
+		Publisher: publisher,
+	})
+
+	got, err := svc.arbitrate(ctx, bidCheckSnapshot{
+		in: PlaceBidInput{
+			RequestID: "bid-extended-1",
+			AuctionID: auctionID,
+			BidderID:  "u_1001",
+			UserRole:  domain.RoleBuyer,
+			Price:     1500,
+			Source:    "live_ws",
+		},
+		auction: bidAuctionSnapshot{
+			AuctionID:      auctionID,
+			SellerID:       "u_2001",
+			LiveSessionID:  liveSessionID,
+			StartPrice:     1000,
+			AntiSnipingSec: 15,
+			AntiExtendSec:  30,
+			AntiExtendMode: domain.AuctionExtendModeAdd,
+		},
+		liveSessionID: liveSessionID,
+		now:           now,
+		minIncrement:  100,
+		streamEnabled: true,
+	})
+	if err != nil {
+		t.Fatalf("arbitrate: %v", err)
+	}
+	if !got.Accepted || !got.Extended {
+		t.Fatalf("expected accepted extended result, got %+v", got)
+	}
+	if publisher.calls != 1 || publisher.auctionID != auctionID || publisher.env.Type != "timer.extended" {
+		t.Fatalf("unexpected broadcast: calls=%d auctionID=%d env=%+v", publisher.calls, publisher.auctionID, publisher.env)
+	}
+	var payload struct {
+		AuctionID     uint64    `json:"auctionId"`
+		LiveSessionID uint64    `json:"liveSessionId"`
+		EndTime       time.Time `json:"endTime"`
+		ExtendCount   int       `json:"extendCount"`
+		ServerTime    time.Time `json:"serverTime"`
+	}
+	if err := json.Unmarshal(publisher.env.Payload, &payload); err != nil {
+		t.Fatalf("decode payload: %v", err)
+	}
+	if payload.AuctionID != auctionID || payload.LiveSessionID != liveSessionID || !payload.EndTime.Equal(result.EndTime) || payload.ExtendCount != result.ExtendCount || payload.ServerTime.IsZero() {
+		t.Fatalf("unexpected timer.extended payload: %+v", payload)
+	}
+}
+
 func TestAuctionServiceCancelBroadcastsClosedEventWithLiveSessionID(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now().UTC()

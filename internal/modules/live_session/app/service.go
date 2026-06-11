@@ -11,7 +11,11 @@ import (
 	"aieas_backend/internal/domain"
 	auctionports "aieas_backend/internal/modules/auction/ports"
 	livesessionports "aieas_backend/internal/modules/live_session/ports"
+
+	"golang.org/x/sync/singleflight"
 )
+
+const activeAuctionLookupCacheTTL = 2 * time.Second
 
 var (
 	ErrLiveSessionBusy            = errors.New("live session is busy with another auction")
@@ -87,7 +91,17 @@ type LiveSessionService struct {
 	lotEvents       LiveSessionLotEventNotifier
 	aiSwitch        AIAssistantSwitchNotifier
 
+	activeLookupMu    sync.RWMutex
+	activeLookupCache map[uint64]activeAuctionLookupCacheEntry
+	activeLookupGroup singleflight.Group
+
 	mu sync.Mutex // 保护场次开关与闭播计数 flush 的临界区
+}
+
+type activeAuctionLookupCacheEntry struct {
+	auctionID uint64
+	sessionID uint64
+	expiresAt time.Time
 }
 
 type LiveSessionServiceDeps struct {
@@ -123,21 +137,22 @@ func NewLiveSessionServiceWithDeps(deps LiveSessionServiceDeps) *LiveSessionServ
 		lock = newMemoryLiveSessionLock()
 	}
 	return &LiveSessionService{
-		sessions:        deps.Sessions,
-		auctions:        deps.Auctions,
-		tx:              tx,
-		lock:            lock,
-		auction:         deps.Auction,
-		bids:            deps.Bids,
-		orders:          deps.Orders,
-		users:           deps.Users,
-		auctionRealtime: deps.AuctionRealtime,
-		hub:             deps.OnlineCounter,
-		sessionRealtime: deps.SessionRealtime,
-		onEnded:         deps.OnEnded,
-		hook:            deps.LiveAgentHook,
-		lotEvents:       deps.LotEvents,
-		aiSwitch:        deps.AISwitch,
+		sessions:          deps.Sessions,
+		auctions:          deps.Auctions,
+		tx:                tx,
+		lock:              lock,
+		auction:           deps.Auction,
+		bids:              deps.Bids,
+		orders:            deps.Orders,
+		users:             deps.Users,
+		auctionRealtime:   deps.AuctionRealtime,
+		hub:               deps.OnlineCounter,
+		sessionRealtime:   deps.SessionRealtime,
+		onEnded:           deps.OnEnded,
+		hook:              deps.LiveAgentHook,
+		lotEvents:         deps.LotEvents,
+		aiSwitch:          deps.AISwitch,
+		activeLookupCache: make(map[uint64]activeAuctionLookupCacheEntry),
 	}
 }
 
@@ -411,6 +426,7 @@ func (s *LiveSessionService) Start(ctx context.Context, sessionID uint64, actorI
 	if err := s.sessions.Update(ctx, &current); err != nil {
 		return domain.LiveSession{}, err
 	}
+	s.activeAuctionLookupCacheRefresh(current.ID, 0)
 	if s.hook != nil {
 		s.hook.EmitLiveStarted(ctx, current.MerchantID, current.ID)
 	}
@@ -469,6 +485,7 @@ func (s *LiveSessionService) CloseSession(ctx context.Context, sessionID uint64)
 	if err := s.sessions.Update(ctx, &current); err != nil {
 		return domain.LiveSession{}, err
 	}
+	s.activeAuctionLookupCacheRefresh(current.ID, 0)
 	if activeAuctionID != 0 && s.lock != nil {
 		_ = s.lock.Release(ctx, sessionID, activeAuctionID)
 	}
@@ -967,6 +984,7 @@ func (s *LiveSessionService) ActivateAuctionWithOptions(ctx context.Context, in 
 		}
 		return domain.AuctionLot{}, err
 	}
+	s.activeAuctionLookupCacheRefresh(in.SessionID, in.AuctionID)
 	if s.auction != nil {
 		started, err := s.auction.StartWithTiming(ctx, in.AuctionID, in.ActorID, in.ActorRole, startTime, endTime)
 		if err != nil {
@@ -978,6 +996,7 @@ func (s *LiveSessionService) ActivateAuctionWithOptions(ctx context.Context, in 
 			}
 			session.ActiveAuctionID = 0
 			_ = s.sessions.Update(ctx, &session)
+			s.activeAuctionLookupCacheRefresh(in.SessionID, 0)
 			return domain.AuctionLot{}, err
 		}
 		auction = started
@@ -1125,6 +1144,7 @@ func (s *LiveSessionService) DeactivateAuctionWithOptions(ctx context.Context, i
 	if err := s.sessions.Update(ctx, &session); err != nil {
 		return domain.LiveSession{}, err
 	}
+	s.activeAuctionLookupCacheRefresh(sessionID, session.ActiveAuctionID)
 	if cancelledAuctionID != 0 && s.hook != nil && !in.SuppressLiveAgentHook {
 		s.hook.EmitLotCancelled(ctx, session.MerchantID, sessionID, cancelledAuctionID)
 	}
@@ -1171,15 +1191,110 @@ func (s *LiveSessionService) OnAuctionClosed(ctx context.Context, auctionID uint
 		}
 		session.ActiveAuctionID = 0
 		_ = s.sessions.Update(ctx, &session)
+		s.activeAuctionLookupCacheRefresh(sessionID, 0)
 	}
 }
 
 func (s *LiveSessionService) ActiveAuctionAndSession(ctx context.Context, sessionID uint64) (uint64, uint64, error) {
-	session, err := s.sessions.Get(ctx, sessionID)
+	if s == nil || s.sessions == nil {
+		return 0, 0, domain.ErrNotFound
+	}
+	if sessionID == 0 {
+		return 0, 0, domain.ErrInvalidArgument
+	}
+	if entry, ok := s.activeAuctionLookupCacheGet(sessionID); ok {
+		return entry.auctionID, entry.sessionID, nil
+	}
+	value, err, _ := s.activeLookupGroup.Do(fmt.Sprintf("active-auction:%d", sessionID), func() (interface{}, error) {
+		if entry, ok := s.activeAuctionLookupCacheGet(sessionID); ok {
+			return entry, nil
+		}
+		if s.sessionRealtime != nil {
+			if auctionID, ok, err := s.sessionRealtime.ActiveAuction(ctx, sessionID); err != nil {
+				return activeAuctionLookupCacheEntry{}, err
+			} else if ok {
+				entry := activeAuctionLookupCacheEntry{
+					auctionID: auctionID,
+					sessionID: sessionID,
+					expiresAt: time.Now().Add(activeAuctionLookupCacheTTL),
+				}
+				s.activeAuctionLookupCacheSet(entry)
+				return entry, nil
+			}
+		}
+		session, err := s.sessions.Get(ctx, sessionID)
+		if err != nil {
+			return activeAuctionLookupCacheEntry{}, err
+		}
+		entry := activeAuctionLookupCacheEntry{
+			auctionID: session.ActiveAuctionID,
+			sessionID: session.ID,
+			expiresAt: time.Now().Add(activeAuctionLookupCacheTTL),
+		}
+		s.activeAuctionLookupCacheSet(entry)
+		return entry, nil
+	})
 	if err != nil {
 		return 0, 0, err
 	}
-	return session.ActiveAuctionID, session.ID, nil
+	entry, ok := value.(activeAuctionLookupCacheEntry)
+	if !ok {
+		return 0, 0, domain.ErrInvalidState
+	}
+	return entry.auctionID, entry.sessionID, nil
+}
+
+func (s *LiveSessionService) activeAuctionLookupCacheGet(sessionID uint64) (activeAuctionLookupCacheEntry, bool) {
+	if s == nil || sessionID == 0 {
+		return activeAuctionLookupCacheEntry{}, false
+	}
+	now := time.Now()
+	s.activeLookupMu.RLock()
+	entry, ok := s.activeLookupCache[sessionID]
+	if !ok || now.After(entry.expiresAt) {
+		s.activeLookupMu.RUnlock()
+		if ok {
+			s.activeAuctionLookupCacheDelete(sessionID)
+		}
+		return activeAuctionLookupCacheEntry{}, false
+	}
+	s.activeLookupMu.RUnlock()
+	return entry, true
+}
+
+func (s *LiveSessionService) activeAuctionLookupCacheSet(entry activeAuctionLookupCacheEntry) {
+	if s == nil || entry.sessionID == 0 {
+		return
+	}
+	if entry.expiresAt.IsZero() {
+		entry.expiresAt = time.Now().Add(activeAuctionLookupCacheTTL)
+	}
+	s.activeLookupMu.Lock()
+	if s.activeLookupCache == nil {
+		s.activeLookupCache = make(map[uint64]activeAuctionLookupCacheEntry)
+	}
+	s.activeLookupCache[entry.sessionID] = entry
+	s.activeLookupMu.Unlock()
+}
+
+func (s *LiveSessionService) activeAuctionLookupCacheRefresh(sessionID, auctionID uint64) {
+	if s == nil || sessionID == 0 {
+		return
+	}
+	s.activeAuctionLookupCacheSet(activeAuctionLookupCacheEntry{
+		auctionID: auctionID,
+		sessionID: sessionID,
+		expiresAt: time.Now().Add(activeAuctionLookupCacheTTL),
+	})
+}
+
+func (s *LiveSessionService) activeAuctionLookupCacheDelete(sessionID uint64) {
+	if s == nil || sessionID == 0 {
+		return
+	}
+	s.activeLookupMu.Lock()
+	delete(s.activeLookupCache, sessionID)
+	s.activeLookupMu.Unlock()
 }
 
 func (s *LiveSessionService) ActiveAuctionFromRealtime(ctx context.Context, sessionID uint64) (uint64, bool, error) {

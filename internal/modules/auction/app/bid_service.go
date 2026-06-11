@@ -932,6 +932,11 @@ func (s *BidService) arbitrate(ctx context.Context, snap bidCheckSnapshot) (doma
 		}
 		s.observeBidStage("risk_record_freq", "ok", stageStart)
 	}
+	if streamEnabled && result.Accepted && !result.Duplicate && result.Extended {
+		stageStart = time.Now()
+		s.publishTimerExtended(result)
+		s.observeBidStage("publish_timer_extended", bidStageResult(result), stageStart)
+	}
 	if !streamEnabled {
 		stageStart = time.Now()
 		s.publishBidResult(ctx, result)
@@ -2081,24 +2086,29 @@ func (s *BidService) publishBidResult(ctx context.Context, result domain.BidResu
 	if result.Accepted {
 		broadcastJSONWithSeq(s.publisher, result.AuctionID, "bid.accepted", result.Seq, result)
 		s.scheduleRankingBroadcast(result.AuctionID)
-		if result.Extended {
-			serverTime := time.Now().UTC()
-			if result.ServerTime != nil {
-				serverTime = result.ServerTime.UTC()
-			}
-			extendedPayload := map[string]interface{}{
-				"auctionId":   result.AuctionID,
-				"endTime":     result.EndTime,
-				"extendCount": result.ExtendCount,
-				"serverTime":  serverTime,
-			}
-			if result.LiveSessionID != 0 {
-				extendedPayload["liveSessionId"] = result.LiveSessionID
-			}
-			broadcastJSON(s.publisher, result.AuctionID, "timer.extended", extendedPayload)
-		}
+		s.publishTimerExtended(result)
 		return
 	}
+}
+
+func (s *BidService) publishTimerExtended(result domain.BidResult) {
+	if !result.Extended {
+		return
+	}
+	serverTime := time.Now().UTC()
+	if result.ServerTime != nil {
+		serverTime = result.ServerTime.UTC()
+	}
+	extendedPayload := map[string]interface{}{
+		"auctionId":   result.AuctionID,
+		"endTime":     result.EndTime,
+		"extendCount": result.ExtendCount,
+		"serverTime":  serverTime,
+	}
+	if result.LiveSessionID != 0 {
+		extendedPayload["liveSessionId"] = result.LiveSessionID
+	}
+	broadcastJSON(s.publisher, result.AuctionID, "timer.extended", extendedPayload)
 }
 
 func broadcastJSONWithSeq(publisher EventPublisher, auctionID uint64, eventType string, seq int64, payload interface{}) {
